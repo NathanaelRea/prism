@@ -12,14 +12,22 @@ pub(crate) enum DatabaseError {
         path: PathBuf,
         user_version: i64,
     },
-    NonCanonicalRepositorySchema {
-        path: PathBuf,
-    },
     ProtectedLegacyExecution {
         path: PathBuf,
         count: i64,
     },
-    MissingMigrationBaseline,
+    LegacyWorkerActive {
+        path: PathBuf,
+    },
+    LegacyProcessActive {
+        path: PathBuf,
+        pid: u32,
+    },
+    LegacyProcessInspection {
+        path: PathBuf,
+        pid: u32,
+        details: String,
+    },
     Backup {
         path: PathBuf,
         backup: PathBuf,
@@ -71,19 +79,26 @@ impl fmt::Display for DatabaseError {
                 "database {} has an unknown historical schema (user_version={user_version}); the original was not modified",
                 path.display()
             ),
-            Self::NonCanonicalRepositorySchema { path } => write!(
-                formatter,
-                "SQLx-owned repository database {} does not match the canonical migration schema",
-                path.display()
-            ),
             Self::ProtectedLegacyExecution { path, count } => write!(
                 formatter,
                 "database {} has {count} protected queued, claimed, recovery-pending, running, waiting, or paused legacy execution record(s); resolve them with the previous Prism version before migration",
                 path.display()
             ),
-            Self::MissingMigrationBaseline => {
-                formatter.write_str("repository migration history has no baseline")
-            }
+            Self::LegacyWorkerActive { path } => write!(
+                formatter,
+                "database {} still has a Prism Worker endpoint; stop the old Worker before the destructive workflow cutover",
+                path.display()
+            ),
+            Self::LegacyProcessActive { path, pid } => write!(
+                formatter,
+                "database {} still references active legacy process {pid}; stop it before the destructive workflow cutover",
+                path.display()
+            ),
+            Self::LegacyProcessInspection { path, pid, details } => write!(
+                formatter,
+                "cannot safely inspect legacy process {pid} referenced by {}: {details}",
+                path.display()
+            ),
             Self::Backup {
                 path,
                 backup,
@@ -145,9 +160,10 @@ impl Error for DatabaseError {
             Self::Query(source) => Some(source),
             Self::WrongDatabase { .. }
             | Self::UnknownHistoricalSchema { .. }
-            | Self::NonCanonicalRepositorySchema { .. }
             | Self::ProtectedLegacyExecution { .. }
-            | Self::MissingMigrationBaseline
+            | Self::LegacyWorkerActive { .. }
+            | Self::LegacyProcessActive { .. }
+            | Self::LegacyProcessInspection { .. }
             | Self::StaleClaim
             | Self::Conflict { .. }
             | Self::OutputBudgetExceeded { .. }

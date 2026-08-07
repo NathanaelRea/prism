@@ -32,7 +32,7 @@ module that owns the capability.
 Browser launch policy is Linux (`xdg-open`, `gio open`, then `wslview`) or macOS
 (`open`) and always uses direct argv. Prism does not invoke `cmd` or a shell to
 open URLs. Shell selection and POSIX quoting are shared by direct terminal
-handoff, tmux, Plan mode, and Worktrunk command hints.
+handoff, tmux, generalized Workflow execution, and Worktrunk command hints.
 
 ## `cfg` Inventory
 

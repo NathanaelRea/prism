@@ -2,23 +2,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use prism::{
-    DefinitionSnapshot, ExecutionContext, LaunchWorkflow, StepFuture, StepImplementation,
-    WorkerConfig, WorkflowOperations, WorkflowStep, WorkflowWorker,
+    DefinitionSnapshot, LaunchWorkflow, WorkerConfig, WorkflowOperations, WorkflowStep,
+    WorkflowWorker,
 };
-
-struct BenchStep;
-
-impl StepImplementation for BenchStep {
-    fn execute<'a>(&'a self, context: ExecutionContext) -> StepFuture<'a> {
-        Box::pin(async move {
-            context
-                .stdout(vec![b'x'; 1024])
-                .await
-                .map_err(|error| error.to_string())?;
-            Ok("{}".into())
-        })
-    }
-}
 
 fn main() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -50,20 +36,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     for index in 0..RUNS {
         let run_id = format!("benchmark-run-{index}");
         operations
-            .launch_materialized(
+            .launch_definition(
                 LaunchWorkflow {
                     run_id: &run_id,
                     definition_snapshot_id: "benchmark-definition",
                     repository: Some("/benchmark"),
                     idempotency_key: &run_id,
+                    input_json: "{}",
                     now_unix_ms: 2,
                 },
                 vec![WorkflowStep {
                     id: format!("benchmark-step-{index}"),
                     key: "execute".into(),
-                    implementation: "benchmark".into(),
+                    implementation: "command".into(),
                     target_id: "local".into(),
-                    input_json: "{}".into(),
+                    input_json: r#"{"program":"true"}"#.into(),
                     dependencies: Vec::new(),
                     resources: Vec::new(),
                 }],
@@ -94,7 +81,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         },
     )
     .await?;
-    worker.register_as("benchmark", prism::ExecutionClass::Command, BenchStep)?;
+    worker.register_builtins()?;
     let (shutdown, receiver) = tokio::sync::watch::channel(false);
     let execution_started = Instant::now();
     let worker_task = tokio::spawn(worker.run(receiver));

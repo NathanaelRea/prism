@@ -96,26 +96,23 @@ impl Tui {
             "1 / 2 / 3    focus status / repos / worktrees sidebars; 3 toggles repo/all worktrees",
             "0            focus main panel for the selected sidebar",
             "Tab / Shift-Tab  move focus between panels",
-            "h/l, left/right arrows  repos: switch view; status plan: switch phase",
-            "Enter       repos: open default-branch tmux; worktrees: open agent or selected plan phase; main comments: details",
+            "h/l, left/right arrows  repos: switch view",
+            "Enter       repos: open default-branch tmux; worktrees: open agent; main comments: details",
             "Ctrl-/       open tmux window 3: terminal",
             "p            repos: pull default branch",
-            "P            worktrees: start or focus a plan run dashboard",
-            "j/k          main comments: move comment selection; status dashboard: move plan output or phase selection",
-            "A            worktrees: start/focus Auto Flow; choose prompt, plan file, or draft plan",
+            "W            launch a context-compatible Workflow Definition with fzf",
+            "Space W      manage workflows, Triggers, packages, extensions, skills, and templates",
+            "Space c      open the unified configuration tree",
+            "u / f        pause or resume the selected Workflow Run / retry its failed Step",
+            "B / s        preview and restart from / skip the selected Workflow Step",
+            "j/k          move the selection in the focused dashboard or comments panel",
             "Space g R    main comments: resolve all inline review conversations",
             "r            repos: reorder or remove repositories",
-            "R            edit repositories/order/keys/remove in repos.toml",
             "C            repos: open a worktree for a remote pull request",
             "c            repos: create worktree session in selected repo",
             "> / <        worktrees: raise/lower priority",
-            "x            worktrees: abort selected agent session when supported",
+            "x            cancel selected Workflow Run, otherwise abort selected agent session",
             "M            worktrees: migrate selected worktree to the default harness",
-            "H            choose the global default harness or add a generic harness",
-            "e            edit selected repository config, then reload",
-            "E            edit user config, then reload",
-            "w            edit Worktrunk user config; affects Prism and standalone wt",
-            "W            repos: edit visible worktree columns in repo config",
             "o            worktrees: open the selected Worktrunk development URL",
             "L            worktrees: inspect bounded Worktrunk hook logs",
             "/            search/filter focused panel",
@@ -542,7 +539,11 @@ impl Tui {
         if candidates.is_empty() {
             return Ok(());
         }
-        let now = crate::execution::now_ms();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
         let items = candidates
             .iter()
             .enumerate()
@@ -557,20 +558,16 @@ impl Tui {
                 } else {
                     format!("{}s ago", age_ms / 1_000)
                 };
-                let kind = match workflow.identity.kind.as_str() {
-                    "auto" => "Auto Flow",
-                    _ => "Plan",
-                };
                 let step = workflow
                     .current_step
                     .as_ref()
                     .map(|step| step.label.as_str())
-                    .unwrap_or(kind);
+                    .unwrap_or("Workflow");
                 view::OrderedToggleItem {
                     id: index.to_string(),
                     label: format!(
                         "{} / {}  {}  {}  {}",
-                        repository.label, workflow.worktree.display, kind, step, age
+                        repository.label, workflow.worktree.display, "Workflow", step, age
                     ),
                     enabled: false,
                 }

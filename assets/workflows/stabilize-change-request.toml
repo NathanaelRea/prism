@@ -1,0 +1,158 @@
+schema_version = 2
+name = "stabilize-change-request"
+description = "Observe one exact Change Request head and perform at most one repair path."
+launch = ["child"]
+tags = ["ci", "review", "stabilization"]
+capabilities = ["agent:run", "workspace:write", "process:run", "provider:read", "provider:write", "git:write"]
+
+[inputs.candidate]
+type = "prism.change-request/v1"
+required = true
+
+[outputs.candidate]
+type = "prism.change-request/v1"
+from = "steps.summarize.outputs.candidate"
+
+[outputs.ready]
+type = "prism.boolean/v1"
+from = "steps.summarize.outputs.ready"
+
+[outputs.ci]
+type = "prism.provider-observation/v1"
+from = "steps.summarize.outputs.ci"
+
+[outputs.review]
+type = "prism.provider-observation/v1"
+from = "steps.summarize.outputs.review"
+
+[outputs.policy]
+type = "prism.provider-observation/v1"
+from = "steps.summarize.outputs.policy"
+
+[outputs.mergeability]
+type = "prism.provider-observation/v1"
+from = "steps.summarize.outputs.mergeability"
+
+[outputs.merge_relation]
+type = "prism.provider-observation/v1"
+from = "steps.summarize.outputs.merge_relation"
+
+[[steps]]
+id = "observe-ci"
+class = "action"
+use = "prism.standard/observe-ci"
+inputs = { candidate = "inputs.candidate" }
+skippable = false
+
+[[steps]]
+id = "observe-review"
+class = "action"
+use = "prism.standard/observe-review"
+depends_on = []
+inputs = { candidate = "inputs.candidate" }
+skippable = false
+
+[[steps]]
+id = "observe-policy"
+class = "action"
+use = "prism.standard/observe-policy"
+depends_on = []
+inputs = { candidate = "inputs.candidate" }
+skippable = false
+
+[[steps]]
+id = "observe-mergeability"
+class = "action"
+use = "prism.standard/observe-mergeability"
+depends_on = []
+inputs = { candidate = "inputs.candidate" }
+skippable = false
+
+[[steps]]
+id = "observe-merge-relation"
+class = "action"
+use = "prism.standard/observe-merge-relation"
+depends_on = []
+inputs = { candidate = "inputs.candidate" }
+skippable = false
+
+[[steps]]
+id = "choose-repair"
+class = "action"
+use = "prism.standard/choose-stabilization-repair"
+depends_on = ["observe-ci", "observe-review", "observe-policy", "observe-mergeability", "observe-merge-relation"]
+inputs = { candidate = "inputs.candidate", ci = "steps.observe-ci.outputs.evidence", review = "steps.observe-review.outputs.evidence", policy = "steps.observe-policy.outputs.evidence", mergeability = "steps.observe-mergeability.outputs.evidence", merge_relation = "steps.observe-merge-relation.outputs.evidence" }
+skippable = false
+
+[[steps]]
+id = "repair-ci"
+class = "action"
+use = "prism.standard/agent-repair-ci"
+inputs = { candidate = "inputs.candidate", evidence = "steps.observe-ci.outputs.evidence" }
+condition = "steps.choose-repair.outputs.repair_kind == 'ci'"
+on_unknown = "fail"
+resources = ["workspace"]
+skippable = false
+
+[[steps]]
+id = "repair-review"
+class = "action"
+use = "prism.standard/agent-repair-review"
+depends_on = ["choose-repair"]
+inputs = { candidate = "inputs.candidate", evidence = "steps.observe-review.outputs.evidence" }
+condition = "steps.choose-repair.outputs.repair_kind == 'review'"
+on_unknown = "fail"
+resources = ["workspace"]
+skippable = false
+
+[[steps]]
+id = "verify-repair"
+class = "gate"
+use = "prism.standard/verify-repair"
+depends_on = ["repair-ci", "repair-review"]
+inputs = { ci_candidate = "steps.repair-ci.outputs.candidate", review_candidate = "steps.repair-review.outputs.candidate" }
+condition = "steps.choose-repair.outputs.needs_repair == true"
+on_unknown = "fail"
+skippable = false
+
+[[steps]]
+id = "commit-repair"
+class = "action"
+use = "prism.standard/commit-repair"
+inputs = { verification = "steps.verify-repair.outputs.result", ci_candidate = "steps.repair-ci.outputs.candidate", review_candidate = "steps.repair-review.outputs.candidate" }
+condition = "steps.choose-repair.outputs.needs_repair == true"
+on_unknown = "fail"
+skippable = false
+
+[[steps]]
+id = "push-successor"
+class = "action"
+use = "prism.standard/push-successor"
+inputs = { candidate = "steps.commit-repair.outputs.candidate" }
+condition = "steps.choose-repair.outputs.needs_repair == true"
+on_unknown = "fail"
+skippable = false
+
+[[steps]]
+id = "resolve-addressed-threads"
+class = "action"
+use = "prism.standard/resolve-addressed-threads"
+inputs = { candidate = "steps.push-successor.outputs.candidate", report = "steps.repair-review.outputs.report", observation = "steps.observe-review.outputs.evidence" }
+condition = "steps.choose-repair.outputs.repair_kind == 'review'"
+on_unknown = "fail"
+skippable = false
+
+[[steps]]
+id = "reobserve"
+class = "action"
+use = "prism.standard/reobserve-change-request"
+depends_on = ["push-successor", "resolve-addressed-threads"]
+inputs = { original = "inputs.candidate", successor = "steps.push-successor.outputs.candidate" }
+skippable = false
+
+[[steps]]
+id = "summarize"
+class = "action"
+use = "prism.standard/summarize-stabilization"
+inputs = { observation = "steps.reobserve.outputs.observation" }
+skippable = false

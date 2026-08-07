@@ -154,8 +154,6 @@ Prism stores per-repository runtime state in `prism.db` under the user's Prism c
 
 - `task_metadata`, `hidden_session`, `agent_state`: worktree session metadata and local session state.
 - `opencode_runtime`: OpenCode server/session records associated with worktrees.
-- `plan_run`, `plan_step_run`, `plan_output_line`: persisted Plan Mode runs, step state, and bounded step output.
-- `auto_run`, `auto_step_run`, `auto_output_line`, `auto_event`: persisted Auto Flow runs, attempts, output, and event history.
 - `pr_cache`, `pr_details_cache`: provider-neutral change-request summary and
   detail caches; the historical table names are retained for migration safety.
 - `event`, `startup_run`, `startup_phase`: observability events and startup timing records.
@@ -163,7 +161,7 @@ Prism stores per-repository runtime state in `prism.db` under the user's Prism c
 The generalized worker owns the separate user-scoped `workflow.db` in the Prism
 config directory. It contains definition snapshots, runs, steps, fenced
 attempts, output, artifacts, approvals, effects, triggers, resource claims,
-import journals, audit events, and control-plane metrics. Repository migrations
+audit events, and control-plane metrics. Repository migrations
 must never be run against this database, and workflow migrations must never be
 run against `prism.db`.
 

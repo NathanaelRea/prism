@@ -3,9 +3,8 @@ use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 
-use crate::auto_flow::PersistedAutoRun;
 use crate::remote::{PrCache, PrSummary};
-use crate::session::{Session, WorktreeRepositoryKey};
+use crate::session::WorktreeRepositoryKey;
 use crate::tui_jobs::JobId;
 use crate::tui_runtime::{RuntimeEvent, TerminalRuntime};
 use crate::view;
@@ -20,6 +19,14 @@ fn merge_is_authoritatively_pending(queue_state: &str) -> bool {
         queue_state.trim().to_ascii_lowercase().as_str(),
         "queued" | "running" | "blocked"
     )
+}
+
+fn current_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
 }
 
 pub(crate) struct RemoteActionDelivery {
@@ -115,50 +122,8 @@ pub(crate) enum RemoteActionValue {
     WorktrunkUserConfig(crate::worktrunk::UserConfigLocation),
     ChangeRequests(Vec<PrSummary>),
     Cache(Box<PrCache>),
-    Resolved {
-        cache: Box<PrCache>,
-        count: usize,
-    },
-    PushPrepared(Box<RemotePushPrepared>),
-    CreatePrepared(Box<crate::remote::dispatcher::CreateChangeRequestGuard>),
-    GuardedPush {
-        persisted: Box<PersistedAutoRun>,
-        cache: Box<PrCache>,
-        progress: Option<crate::auto_flow::stabilization_execute::GuardedPushProgress>,
-    },
-    ReviewResolutionPrepared {
-        persisted: Box<PersistedAutoRun>,
-        cache: Box<PrCache>,
-        thread_ids: Vec<String>,
-        summary: Box<PrSummary>,
-    },
-    ReviewResolutionFinished {
-        persisted: Box<PersistedAutoRun>,
-        cache: Box<PrCache>,
-        resolved: usize,
-    },
-    MergeAuthorization {
-        session: Box<Session>,
-        authorization: Box<crate::auto_flow::stabilization_execute::MergeAuthorization>,
-    },
-    MergeExecution {
-        session: Box<Session>,
-        result: Result<RemoteMergeOutcome, String>,
-    },
-    NotApplicable,
+    Resolved { cache: Box<PrCache>, count: usize },
     Complete,
-}
-
-pub(crate) struct RemotePushPrepared {
-    pub cache: PrCache,
-    pub origin_repository: Option<crate::remote::RemoteRepositoryId>,
-    pub upstream_repository: Option<crate::remote::RemoteRepositoryId>,
-    pub push_guard: Option<crate::remote::dispatcher::PushGuard>,
-}
-
-pub(crate) struct RemoteMergeOutcome {
-    pub execution: crate::auto_flow::stabilization_execute::ManualMergeExecution,
-    pub verification: Option<Result<bool, String>>,
 }
 
 pub(super) fn remote_mutation_targets_overlap(
@@ -266,28 +231,6 @@ pub(super) fn uncertain_remote_mutation_error(
 ) -> Option<&str> {
     match result {
         Err(error) => Some(error),
-        Ok(RemoteActionValue::MergeExecution {
-            result: Err(error), ..
-        }) => Some(error),
-        Ok(RemoteActionValue::MergeExecution {
-            result:
-                Ok(RemoteMergeOutcome {
-                    verification: Some(Err(error)),
-                    ..
-                }),
-            ..
-        }) => Some(error),
-        Ok(RemoteActionValue::MergeExecution {
-            result:
-                Ok(RemoteMergeOutcome {
-                    execution:
-                        crate::auto_flow::stabilization_execute::ManualMergeExecution::Uncertain {
-                            ..
-                        },
-                    ..
-                }),
-            ..
-        }) => Some("provider did not confirm that the merge was accepted"),
         Ok(_) => None,
     }
 }
@@ -323,7 +266,7 @@ impl Tui {
                         },
                         job_id: 0,
                         reason: error,
-                        recorded_unix_ms: crate::auto_flow::unix_ms(),
+                        recorded_unix_ms: current_unix_ms(),
                     }]
                 });
                 (!markers.is_empty()).then(|| (managed.repo.root.clone(), markers))
@@ -375,7 +318,7 @@ impl Tui {
             target: target.clone(),
             job_id,
             reason: reason.to_string(),
-            recorded_unix_ms: crate::auto_flow::unix_ms(),
+            recorded_unix_ms: current_unix_ms(),
         };
         if let Some(existing) = markers
             .iter_mut()

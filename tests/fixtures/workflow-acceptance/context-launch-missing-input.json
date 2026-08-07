@@ -1,0 +1,11 @@
+{
+  "fixture_schema_version": 1,
+  "contract": "contract.launch.context-missing-input",
+  "given": { "context": { "type": "prism.worktree-session/v1", "id": "wt-17" }, "workflow": "acme.release/publish", "required_inputs": ["worktree", "release_channel"], "context_bindings": { "worktree": "wt-17" } },
+  "when": "manual context launch is selected",
+  "expect": [
+    { "event": "input_collection_required", "missing": ["release_channel"], "type": "acme.release-channel/v1" },
+    { "event": "run_not_created_before_valid_input" },
+    { "event": "run_created_once", "after": "valid_typed_input" }
+  ]
+}

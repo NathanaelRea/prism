@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -28,6 +29,213 @@ use super::{
 
 const MERGE_VERIFY_ATTEMPTS: usize = 6;
 const MERGE_VERIFY_INTERVAL: Duration = Duration::from_millis(500);
+
+#[derive(Clone)]
+pub(crate) struct RepositoryProviderPollAdapter {
+    path: PathBuf,
+    config: Config,
+    item_kind: crate::workflow::trigger::ProviderItemKind,
+}
+
+impl RepositoryProviderPollAdapter {
+    pub(crate) fn new(
+        path: PathBuf,
+        config: Config,
+        item_kind: crate::workflow::trigger::ProviderItemKind,
+    ) -> Self {
+        Self {
+            path,
+            config,
+            item_kind,
+        }
+    }
+}
+
+impl crate::workflow::trigger::ProviderPollAdapter for RepositoryProviderPollAdapter {
+    fn poll(
+        &self,
+        request: crate::workflow::trigger::ProviderPollRequest,
+    ) -> crate::workflow::trigger::ProviderPollFuture<'_> {
+        let adapter = self.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || adapter.poll_blocking(request))
+                .await
+                .map_err(
+                    |error| crate::workflow::trigger::ProviderPollError::Failed {
+                        safe_diagnostic: format!("provider poll task failed: {error}"),
+                    },
+                )?
+        })
+    }
+}
+
+impl RepositoryProviderPollAdapter {
+    fn poll_blocking(
+        self,
+        request: crate::workflow::trigger::ProviderPollRequest,
+    ) -> Result<
+        crate::workflow::trigger::ProviderPollBatch,
+        crate::workflow::trigger::ProviderPollError,
+    > {
+        let (adapter, discovered) =
+            Adapter::resolve(&self.path, &self.config).map_err(|message| {
+                crate::workflow::trigger::ProviderPollError::Failed {
+                    safe_diagnostic: message,
+                }
+            })?;
+        let prior_revisions = poll_checkpoint_revisions(request.checkpoint.as_ref())?;
+        let items: Vec<crate::workflow::trigger::ProviderItemObservation> = match self.item_kind {
+            crate::workflow::trigger::ProviderItemKind::Issue => adapter
+                .discover_issues()
+                .map(|items| items.into_iter().map(normalize_issue_for_trigger).collect())
+                .map_err(provider_poll_error)?,
+            crate::workflow::trigger::ProviderItemKind::ChangeRequest => {
+                let mut open = adapter
+                    .list_change_requests(&discovered.repository.id, None)
+                    .map_err(provider_poll_error)?;
+                let observed_native_ids = open
+                    .iter()
+                    .map(|item| item.change_request.id.native_id().as_str().to_string())
+                    .collect::<std::collections::BTreeSet<_>>();
+                let prefix = format!(
+                    "{}:{}:{}:change_request:",
+                    discovered.repository.id.provider().config_label(),
+                    discovered.repository.id.host(),
+                    discovered.repository.id.project_path()
+                );
+                for provider_item_id in prior_revisions.keys() {
+                    let Some(native_id) = provider_item_id.strip_prefix(&prefix) else {
+                        continue;
+                    };
+                    if observed_native_ids.contains(native_id) {
+                        continue;
+                    }
+                    let native_id = super::NativeChangeRequestId::new(native_id.to_string())
+                        .map_err(|error| crate::workflow::trigger::ProviderPollError::Failed {
+                            safe_diagnostic: format!("provider checkpoint contains an invalid Change Request identity: {error}"),
+                        })?;
+                    let id =
+                        ChangeRequestId::new(discovered.repository.id.clone(), native_id, None);
+                    open.push(
+                        adapter
+                            .observe_change_request(&id)
+                            .map_err(provider_poll_error)?,
+                    );
+                }
+                open.into_iter()
+                    .map(normalize_change_request_for_trigger)
+                    .collect()
+            }
+        };
+        bounded_changed_provider_page(items, prior_revisions, request.max_items)
+    }
+}
+
+fn poll_checkpoint_revisions(
+    checkpoint: Option<&serde_json::Value>,
+) -> Result<BTreeMap<String, String>, crate::workflow::trigger::ProviderPollError> {
+    let Some(checkpoint) = checkpoint else {
+        return Ok(BTreeMap::new());
+    };
+    let revisions = checkpoint
+        .get("observation_revisions")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    serde_json::from_value(revisions).map_err(|error| {
+        crate::workflow::trigger::ProviderPollError::Failed {
+            safe_diagnostic: format!("provider checkpoint is invalid: {error}"),
+        }
+    })
+}
+
+fn bounded_changed_provider_page(
+    mut items: Vec<crate::workflow::trigger::ProviderItemObservation>,
+    mut revisions: BTreeMap<String, String>,
+    max_items: usize,
+) -> Result<crate::workflow::trigger::ProviderPollBatch, crate::workflow::trigger::ProviderPollError>
+{
+    if max_items == 0 {
+        return Err(crate::workflow::trigger::ProviderPollError::Failed {
+            safe_diagnostic: "provider poll item limit must be greater than zero".into(),
+        });
+    }
+    items.sort_by(|left, right| left.provider_item_id.cmp(&right.provider_item_id));
+    items.retain(|item| revisions.get(&item.provider_item_id) != Some(&item.revision()));
+    items.truncate(max_items);
+    for item in &items {
+        revisions.insert(item.provider_item_id.clone(), item.revision());
+    }
+    Ok(crate::workflow::trigger::ProviderPollBatch {
+        items,
+        checkpoint: serde_json::json!({"observation_revisions": revisions}),
+    })
+}
+
+fn normalize_issue_for_trigger(
+    item: ProviderItemObservation,
+) -> crate::workflow::trigger::ProviderItemObservation {
+    crate::workflow::trigger::ProviderItemObservation {
+        provider_item_id: item.id.canonical_key(),
+        kind: crate::workflow::trigger::ProviderItemKind::Issue,
+        title: item.title,
+        body: item.body,
+        lifecycle: item.lifecycle,
+        author: item.author,
+        author_relationship: item.author_relationship,
+        labels: item.labels,
+        assignees: item.assignees,
+        updated_at: item.updated_at,
+    }
+}
+
+fn normalize_change_request_for_trigger(
+    item: ChangeRequestSummary,
+) -> crate::workflow::trigger::ProviderItemObservation {
+    let repository = item.change_request.id.repository();
+    let provider_item_id = super::ProviderItemId::new(
+        repository.clone(),
+        item.change_request.id.native_id().as_str(),
+        super::ProviderItemKind::ChangeRequest,
+    )
+    .expect("normalized Change Request identity remains valid")
+    .canonical_key();
+    let lifecycle = match item.lifecycle {
+        LifecycleState::Open => "open".into(),
+        LifecycleState::Closed => "closed".into(),
+        LifecycleState::Merged => "merged".into(),
+        LifecycleState::Unknown(value) => value,
+    };
+    crate::workflow::trigger::ProviderItemObservation {
+        provider_item_id,
+        kind: crate::workflow::trigger::ProviderItemKind::ChangeRequest,
+        title: item.title,
+        body: item.body,
+        lifecycle,
+        author: item.author,
+        author_relationship: None,
+        labels: BTreeMap::new(),
+        assignees: item.requested_reviewers,
+        updated_at: item.updated_at,
+    }
+}
+
+fn provider_poll_error(error: RemoteError) -> crate::workflow::trigger::ProviderPollError {
+    if error.class() == RemoteErrorClass::Unsupported {
+        crate::workflow::trigger::ProviderPollError::Unsupported {
+            provider: error.provider().to_string(),
+            operation: format!("{:?}", error.operation()),
+        }
+    } else if error.retryability() == Retryability::Retryable {
+        crate::workflow::trigger::ProviderPollError::Retryable {
+            safe_diagnostic: error.safe_message().into(),
+            retry_after_unix_ms: None,
+        }
+    } else {
+        crate::workflow::trigger::ProviderPollError::Failed {
+            safe_diagnostic: error.safe_message().into(),
+        }
+    }
+}
 
 enum Adapter<'a> {
     GitHub(GitHubAdapter<'a>),
@@ -99,7 +307,7 @@ impl<'a> Adapter<'a> {
 
     fn discover_issues(&self) -> Result<Vec<ProviderItemObservation>, RemoteError> {
         match self {
-            Self::GitHub(adapter) => adapter.discover_issues("open"),
+            Self::GitHub(adapter) => adapter.discover_issues("all"),
             Self::GitLab(_) => Err(RemoteError::new(
                 ProviderKind::GitLab,
                 RemoteOperation::DiscoverIssues,
@@ -1906,6 +2114,59 @@ fn unix_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn polled_issue(
+        native_id: &str,
+        updated_at: &str,
+    ) -> crate::workflow::trigger::ProviderItemObservation {
+        crate::workflow::trigger::ProviderItemObservation {
+            provider_item_id: format!("github:github.com:acme/widget:issue:{native_id}"),
+            kind: crate::workflow::trigger::ProviderItemKind::Issue,
+            title: format!("Issue {native_id}"),
+            body: String::new(),
+            lifecycle: "open".into(),
+            author: "maintainer".into(),
+            author_relationship: Some("MEMBER".into()),
+            labels: BTreeMap::new(),
+            assignees: Vec::new(),
+            updated_at: Some(updated_at.into()),
+        }
+    }
+
+    #[test]
+    fn provider_poll_checkpoint_pages_only_changed_items_without_omission() {
+        let first = bounded_changed_provider_page(
+            vec![polled_issue("2", "r1"), polled_issue("1", "r1")],
+            BTreeMap::new(),
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            first.items[0].provider_item_id,
+            "github:github.com:acme/widget:issue:1"
+        );
+        let checkpoint = poll_checkpoint_revisions(Some(&first.checkpoint)).unwrap();
+
+        let second = bounded_changed_provider_page(
+            vec![polled_issue("2", "r1"), polled_issue("1", "r1")],
+            checkpoint,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            second.items[0].provider_item_id,
+            "github:github.com:acme/widget:issue:2"
+        );
+        let checkpoint = poll_checkpoint_revisions(Some(&second.checkpoint)).unwrap();
+
+        let unchanged = bounded_changed_provider_page(
+            vec![polled_issue("2", "r1"), polled_issue("1", "r1")],
+            checkpoint,
+            1,
+        )
+        .unwrap();
+        assert!(unchanged.items.is_empty());
+    }
 
     fn repository(provider: ProviderKind, project: &str) -> RemoteRepositoryId {
         let host = match provider {

@@ -8,10 +8,6 @@ pub(crate) enum GitAction {
     LazyGit,
     OpenPr,
     SubmitReview,
-    Push,
-    Merge,
-    CiFix,
-    ReviewFix,
     ResolveAllComments,
 }
 
@@ -57,9 +53,6 @@ impl Tui {
         if !session.is_task_branch(&context.config) {
             return false;
         }
-        if action == GitAction::Push {
-            return true;
-        }
         let Some(summary) = session.pr.summary() else {
             return false;
         };
@@ -82,36 +75,6 @@ impl Tui {
                     })
                 });
         }
-        if matches!(action, GitAction::CiFix | GitAction::ReviewFix) {
-            let supported = self
-                .remote_support_for_action(action, Some(summary))
-                .unwrap_or(crate::remote::SupportLevel::Unknown);
-            let has_input = session.pr.trusted_details().is_ok_and(|details| {
-                details.is_some_and(|details| match action {
-                    GitAction::CiFix => {
-                        !details.ci_failures.is_empty() || !details.failing_checks.is_empty()
-                    }
-                    GitAction::ReviewFix => {
-                        !details.reviews.is_empty() || !details.review_comments.is_empty()
-                    }
-                    _ => unreachable!(),
-                })
-            });
-            let capability_enabled = supported == crate::remote::SupportLevel::Supported
-                || (action == GitAction::CiFix
-                    && supported == crate::remote::SupportLevel::Conditional
-                    && has_input);
-            return capability_enabled
-                && has_input
-                && context
-                    .config
-                    .selected_harness()
-                    .is_ok_and(|harness| harness.describe().headless);
-        }
-        if action == GitAction::Merge {
-            return self.remote_support_for_action(action, Some(summary))
-                == Some(crate::remote::SupportLevel::Supported);
-        }
         true
     }
 
@@ -130,10 +93,6 @@ impl Tui {
             .or_else(|| summary.map(crate::remote::dispatcher::capabilities_for_summary))?;
         Some(match action {
             GitAction::OpenPr => capabilities.fetch_change_request,
-            GitAction::Push => capabilities.create_change_request,
-            GitAction::Merge => capabilities.guarded_merge,
-            GitAction::CiFix => capabilities.ci_logs,
-            GitAction::ReviewFix => capabilities.review_threads,
             GitAction::ResolveAllComments => capabilities.resolve_review_thread,
             GitAction::LazyGit | GitAction::SubmitReview => return None,
         })
@@ -144,16 +103,6 @@ impl Tui {
             .selected_worktree_context()
             .and_then(|context| self.sessions.get(context.session_index))
             .and_then(|session| session.pr.summary());
-        if action == GitAction::Merge
-            && let Some(reason) = self
-                .selected_worktree_context()
-                .and_then(|context| self.sessions.get(context.session_index))
-                .and_then(|session| self.repos.get(session.repo_index))
-                .and_then(|repo| repo.remote_capabilities.as_ref())
-                .and_then(|capabilities| capabilities.guarded_merge_reason.clone())
-        {
-            return Some(reason);
-        }
         match self.remote_support_for_action(action, summary) {
             Some(crate::remote::SupportLevel::Conditional) => {
                 Some("conditional support not established".to_string())

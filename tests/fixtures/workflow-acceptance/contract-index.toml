@@ -1,0 +1,92 @@
+index_schema_version = 1
+status = "target"
+
+[[decision]]
+id = "one-generic-workflow-model"
+contract = "contract.kernel.one-run-ledger"
+fixture = "explicit-dag-branches-and-joins.json"
+
+[[decision]]
+id = "standard-pack-is-user-owned"
+contract = "contract.package.standard-pack-public-resources"
+fixture = "package-customize-update-conflict.json"
+
+[[decision]]
+id = "toml-dag-definitions"
+contract = "contract.definition.schema-v2-dag"
+fixture = "explicit-dag-branches-and-joins.json"
+
+[[decision]]
+id = "child-workflow-reuse"
+contract = "contract.workflow-call.bounded-successor"
+fixture = "bounded-stabilization-iterations.json"
+
+[[decision]]
+id = "six-kernel-step-classes"
+contract = "contract.kernel.six-classes"
+fixture = "explicit-dag-branches-and-joins.json"
+
+[[decision]]
+id = "replaceable-public-extensions"
+contract = "contract.extension.standard-third-party-parity"
+fixture = "extension-crash-cancel-restart.json"
+
+[[decision]]
+id = "json-lines-rust-first"
+contract = "contract.extension.protocol-v1"
+fixture = "contract-versions.json"
+
+[[decision]]
+id = "extensions-are-full-trust"
+contract = "contract.extension.unbrokered-disclosure"
+fixture = "extension-crash-cancel-restart.json"
+
+[[decision]]
+id = "standard-effects-are-brokered"
+contract = "contract.effect.standard-intent-reconciliation"
+fixture = "exact-head-merge-and-cleanup.json"
+
+[[decision]]
+id = "multi-resource-packages"
+contract = "contract.package.resource-closure"
+fixture = "package-customize-update-conflict.json"
+
+[[decision]]
+id = "global-and-repository-scope-no-shadowing"
+contract = "contract.catalog.qualified-identity-collision"
+fixture = "repository-trust-invalidation.json"
+
+[[decision]]
+id = "non-destructive-three-way-update"
+contract = "contract.package.three-way-conflict"
+fixture = "package-customize-update-conflict.json"
+
+[[decision]]
+id = "immutable-run-closure"
+contract = "contract.snapshot.pinned-closure"
+fixture = "package-customize-update-conflict.json"
+
+[[decision]]
+id = "context-launch-and-typed-inputs"
+contract = "contract.launch.context-missing-input"
+fixture = "context-launch-missing-input.json"
+
+[[decision]]
+id = "unified-management-and-configuration"
+contract = "contract.operator.unified-surfaces"
+fixture = "context-launch-missing-input.json"
+
+[[decision]]
+id = "manual-schedule-startup-provider-triggers"
+contract = "contract.trigger.durable-occurrence"
+fixture = "schedule-restart-deduplication.json"
+
+[[decision]]
+id = "provider-neutral-standard-definitions"
+contract = "contract.provider.capability-explicitness"
+fixture = "github-issue-admission-unique-implementation.json"
+
+[[decision]]
+id = "no-plan-auto-migration"
+contract = "contract.cutover.destructive-no-import"
+fixture = "legacy-deletion-targets.txt"

@@ -1,0 +1,12 @@
+{
+  "fixture_schema_version": 1,
+  "contract": "contract.review.resolve-exact-addressed-threads",
+  "given": { "change_request": "github:acme/prism#42", "repair_input_threads": ["T1", "T2"], "repair_report_addressed": ["T2", "T3"], "currently_unresolved": ["T2", "T3", "T4"] },
+  "expect": [
+    { "event": "resolve_intent_persisted", "thread_ids": ["T2"] },
+    { "event": "threads_resolved", "thread_ids": ["T2"] },
+    { "event": "threads_untouched", "thread_ids": ["T1", "T3", "T4"] },
+    { "event": "review_reobserved_after_resolution" },
+    { "event": "gate_remains_blocked", "while_unresolved": ["T3", "T4"] }
+  ]
+}

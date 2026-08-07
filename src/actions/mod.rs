@@ -5,37 +5,23 @@ use std::time::Duration;
 
 use crate::agent::AgentState;
 use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey, AgentSessionWarmupResult};
-use crate::auto_flow::{
-    AutoExecutorDecision, AutoFlowStore, AutoImplementationSource, AutoLaunch, AutoLaunchOptions,
-    AutoRunControlIntent, AutoRunMode, AutoStepKey, AutoStepStatus, PersistedAutoRun,
-    apply_auto_run_control, archive_auto_run, load_auto_run, prepare_auto_run_for_resume,
-};
 use crate::config::Config;
-use crate::git::{branch_behind, git_status_label, pull_branch, selected_dirty};
+use crate::git::{branch_behind, git_status_label, pull_branch};
 use crate::harness::{HarnessConfig, OutputFormat, PromptTransport};
 use crate::lifecycle::{
-    WorktrunkApprovalStatus, check_worktrunk_approval_status, push_branch, run_pre_pr_checks,
-    run_pre_push_checks, run_worktrunk_approval_prompt,
+    WorktrunkApprovalStatus, check_worktrunk_approval_status, run_worktrunk_approval_prompt,
 };
 use crate::observability::append_runtime_message;
 use crate::opencode::{self, OpencodeStatus, load_runtime};
-use crate::plan::{PlanExecution, infer_total_phases, open_plan_mode, select_plan_path};
-use crate::plan_run::{
-    DEFAULT_OUTPUT_LINES_PER_STEP, PlanRunMode, PlanRunStore, PlanStepStatus, abort_plan_step,
-    archive_plan_run, load_plan_run, retry_failed_steps, retry_from_step, save_plan_run,
-    skip_plan_step,
-};
 use crate::process::{
     ProcessPolicy, command_exists, parse_command_words, run_output_allow_failure,
 };
 use crate::remote::dispatcher::{
-    create_change_request as create_pull_request,
     fetch_change_request_branch as fetch_pull_request_branch,
     list_change_requests as fetch_pr_summary_index,
     refresh_change_request_cache as refresh_pr_cache,
     refresh_change_request_details_state as refresh_pr_details_cache_state,
     refresh_repository_policy as refresh_repo_policy_cache,
-    wait_for_change_request_merged as wait_for_pr_merged,
 };
 use crate::remote::{
     PR_SUMMARY_POLL_INTERVAL, PrCache, apply_pr_details_poll_result, apply_pr_summary_poll_result,
@@ -49,21 +35,18 @@ use crate::session::{
 };
 use crate::tmux::TmuxWindow;
 use crate::tui::{
-    DefaultBranchPollResult, DeleteSessionKey, DeleteSessionResult, GitAction, ManagedRepo,
+    DefaultBranchPollResult, DeleteSessionKey, DeleteSessionResult, ManagedRepo,
     OpencodeEventResult, OpencodeListenerKey, OpencodePollKey, OpencodePollResult,
     PrPersistenceRequest, PrPollKey, PrPollResult, PrSummarySessionResult, RemoteActionValue,
-    RemoteMergeOutcome, RemotePushPrepared, SelectedRepoContext, SessionRefreshResult,
-    SessionRefreshSnapshot, TUI_ACTION_JOB_TIMEOUT, Tui, TuiJobKey, TuiJobKind, TuiJobPayload,
-    WtObservation, WtPollResult,
+    SelectedRepoContext, SessionRefreshResult, SessionRefreshSnapshot, TUI_ACTION_JOB_TIMEOUT, Tui,
+    TuiJobKey, TuiJobKind, TuiJobPayload, WtObservation, WtPollResult,
 };
 use crate::tui_jobs::CoalescedFacet;
 
 use crate::util::status_count;
 
-mod auto;
 mod logs;
 mod opencode_actions;
-mod plans;
 mod polling;
 mod pull_requests;
 mod repositories;
@@ -72,38 +55,17 @@ mod tmux_portal;
 mod tools;
 mod worktrees;
 
-fn reject_claimed_control(
-    repo: &Repository,
-    kind: crate::execution::WorkflowKind,
-    run_id: &str,
-    control: &str,
-) -> Result<(), String> {
-    let workflow = crate::execution::WorkflowIdentity::new(kind, run_id);
-    let state = crate::observability::with_writable_db(repo, |path| {
-        crate::execution::dispatch_state(path, &workflow)
-    })?;
-    if state == Some(crate::execution::DispatchState::Claimed) {
-        return Err(format!(
-            "cannot {control} run {run_id} while its executor is active; pause or abort it first"
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests;
 
 #[cfg(test)]
 use crate::worktrunk::discover_columns as discover_wt_columns;
 #[cfg(test)]
-use plans::plan_run_mode_from_parallel_confirmation;
-#[cfg(test)]
 use polling::status_label_with_behind;
 #[cfg(test)]
 use pull_requests::{
-    apply_bulk_review_resolution, ensure_review_resolution_head, open_http_url_in_browser,
-    pr_target_choice_list, remote_pr_choice_keys, remote_pr_worktree_branch, run_browser_opener,
-    unresolved_review_thread_ids, validate_push_target_after_checks,
+    apply_bulk_review_resolution, open_http_url_in_browser, remote_pr_choice_keys,
+    remote_pr_worktree_branch, run_browser_opener, unresolved_review_thread_ids,
 };
 #[cfg(test)]
 use repositories::worktree_column_choices;

@@ -1,0 +1,16 @@
+{
+  "fixture_schema_version": 1,
+  "contract": "contract.definition.schema-v2-dag",
+  "given": { "steps": [
+    { "id": "source", "class": "action" },
+    { "id": "review", "class": "gate", "depends_on": ["source"] },
+    { "id": "verify", "class": "gate", "depends_on": ["source"] },
+    { "id": "join", "class": "notification", "depends_on": ["review", "verify"] }
+  ] },
+  "expect": [
+    { "event": "graph_compiled", "acyclic": true },
+    { "event": "steps_runnable", "ids": ["review", "verify"], "after": "source.completed" },
+    { "event": "step_not_runnable", "id": "join", "until": ["review.completed", "verify.completed"] },
+    { "event": "step_runnable", "id": "join" }
+  ]
+}

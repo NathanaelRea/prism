@@ -1,14 +1,15 @@
 select
-  attempt.id as "id!: String",
-  attempt.step_id as "step_id!: String",
-  attempt.status as "status!: String",
-  attempt.worker_id as "worker_id!: String",
-  attempt.target_id as "target_id!: String",
-  attempt.fencing_token as "fencing_token!: i64",
+  attempt.id,
+  attempt.step_id,
+  attempt.status,
+  attempt.worker_id,
+  attempt.target_id,
+  attempt.fencing_token,
   attempt.process_id,
   attempt.process_start_time_ticks,
-  attempt.started_unix_ms as "started_unix_ms!: i64",
+  attempt.started_unix_ms,
   attempt.finished_unix_ms
+  , attempt.input_revisions_json
 from step_attempt attempt
 join workflow_step step on step.id = attempt.step_id
 where step.run_id = ?

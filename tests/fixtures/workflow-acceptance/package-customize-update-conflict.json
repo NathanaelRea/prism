@@ -1,0 +1,14 @@
+{
+  "fixture_schema_version": 1,
+  "contract": "contract.package.three-way-conflict",
+  "given": { "package": "acme.release", "base": "sha256:base", "local_edit": "workflows/publish.toml: timeout=20", "incoming_edit": "workflows/publish.toml: timeout=30", "retained_run_revision": "sha256:base" },
+  "expect": [
+    { "event": "install_activated_transactionally" },
+    { "event": "working_copy_marked_dirty" },
+    { "event": "update_conflict_detected", "resource": "workflows/publish.toml" },
+    { "event": "local_remains_active", "value": "timeout=20" },
+    { "event": "conflict_candidate_written", "incoming_value": "timeout=30" },
+    { "event": "lock_and_active_revision_unchanged" },
+    { "event": "retained_run_still_resolves", "revision": "sha256:base" }
+  ]
+}

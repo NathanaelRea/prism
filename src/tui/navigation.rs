@@ -25,7 +25,6 @@ pub(crate) enum WorktreeListMode {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum OpenTmuxSessionTarget {
-    PlanPhaseAgent,
     WorktreeAgent,
     RepoPr,
     RepoDefaultAgent(usize),
@@ -84,15 +83,8 @@ impl Tui {
             if self.move_repo_pr_selection(1) {
                 return;
             }
-            if self.move_auto_step_selection(1) {
-                self.main_scroll = self.main_scroll.saturating_add(1);
-                return;
-            }
-            let moved_comment = self.move_comment_selection(1);
+            self.move_comment_selection(1);
             self.main_scroll = self.main_scroll.saturating_add(1);
-            if !moved_comment {
-                self.move_plan_step_selection(1);
-            }
             return;
         }
         match self.focused_panel {
@@ -107,15 +99,8 @@ impl Tui {
             if self.move_repo_pr_selection(-1) {
                 return;
             }
-            if self.move_auto_step_selection(-1) {
-                self.main_scroll = self.main_scroll.saturating_sub(1);
-                return;
-            }
-            let moved_comment = self.move_comment_selection(-1);
+            self.move_comment_selection(-1);
             self.main_scroll = self.main_scroll.saturating_sub(1);
-            if !moved_comment {
-                self.move_plan_step_selection(-1);
-            }
             return;
         }
         match self.focused_panel {
@@ -130,9 +115,7 @@ impl Tui {
             return;
         }
         match self.focused_panel {
-            PanelFocus::Status => {
-                self.move_plan_step_selection(-1);
-            }
+            PanelFocus::Status => {}
             PanelFocus::Repos => {
                 self.repo_main_view = view::RepoMainView::ChangeRequests;
             }
@@ -145,9 +128,7 @@ impl Tui {
             return;
         }
         match self.focused_panel {
-            PanelFocus::Status => {
-                self.move_plan_step_selection(1);
-            }
+            PanelFocus::Status => {}
             PanelFocus::Repos => {
                 self.repo_main_view = view::RepoMainView::Kanban;
             }
@@ -243,9 +224,6 @@ impl Tui {
                 }
             }
             PanelFocus::Worktrees => {
-                if self.main_focused && self.current_plan_dashboard().is_some() {
-                    return OpenTmuxSessionTarget::PlanPhaseAgent;
-                }
                 if self.selected_worktree_context().is_none() {
                     return OpenTmuxSessionTarget::Blocked(
                         "selected repository has no visible worktrees",

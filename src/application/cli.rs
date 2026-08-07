@@ -1,19 +1,16 @@
 use crate::args::{
-    self, AgentCommand, Args, AutoCommand, AutoCommandSource, CommandKind, ConfigCommand,
-    DaemonCommand, DbCommand, DebugCommand, InspectOptions, StatusOptions, WorkerCommand,
+    self, AgentCommand, Args, CommandKind, ConfigCommand, DaemonCommand, DbCommand, DebugCommand,
+    InspectOptions, StatusOptions, WorkerCommand,
 };
-use crate::auto_flow::{AutoImplementationSource, AutoLaunch, AutoLaunchOptions, AutoRunMode};
 use crate::config::Config;
-use crate::git::{current_branch_name, selected_dirty};
 use crate::observability::{self, LogLevel, ObserverOptions};
-use crate::plan_run::PlanRunMode;
 use crate::repo::Repository;
 use crate::tui::ManagedRepo;
 use crate::workspace_state::{
     ControlAction, ControlRequest, InspectRequest, Subject, WorkspaceContext, WorkspaceSnapshot,
     WorkspaceState,
 };
-use crate::{agent_session, config, plan, session, setup, tui, ui_state, workspace};
+use crate::{agent_session, config, session, setup, tui, ui_state, workspace};
 use std::process::Command as ProcessCommand;
 
 pub fn run() -> Result<(), String> {
@@ -72,13 +69,20 @@ pub fn run() -> Result<(), String> {
             crate::tmux::migrate_legacy_agent_sessions(&repo, &config)?;
             run_agent_command(command, &repo, &config)
         }
-        CommandKind::RunPlan(path) => {
-            let (repo, config) = load_single_repo_context(args.repo.as_deref())?;
-            plan::run_plan_mode(&repo.root, &config, path.as_deref())
+        CommandKind::Workflow(arguments) => {
+            crate::application::workflow_cli::run_workflow(args.repo.as_deref(), &arguments)
         }
-        CommandKind::Auto(command) => {
-            let (repo, config) = load_single_repo_context(args.repo.as_deref())?;
-            run_auto_command(&repo, &config, command)
+        CommandKind::Extension(arguments) => {
+            crate::application::workflow_cli::run_extension(args.repo.as_deref(), &arguments)
+        }
+        CommandKind::Package(arguments) => {
+            crate::application::workflow_cli::run_package(args.repo.as_deref(), &arguments)
+        }
+        CommandKind::Skill(arguments) => {
+            crate::application::workflow_cli::run_skill(args.repo.as_deref(), &arguments)
+        }
+        CommandKind::Template(arguments) => {
+            crate::application::workflow_cli::run_template(args.repo.as_deref(), &arguments)
         }
         CommandKind::Debug(command) => {
             let (repo, mut config) = load_single_repo_context(args.repo.as_deref())?;
@@ -339,7 +343,12 @@ fn run_daemon_command(command: DaemonCommand) -> Result<(), String> {
         DaemonCommand::Status { json } => {
             let health = crate::worker::probe_health()?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "schema_version": 1, "observed_unix_ms": crate::execution::now_ms(), "daemon": health, "warnings": [] })).map_err(|error| error.to_string())?);
+                let observed_unix_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+                    .min(i64::MAX as u128) as i64;
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "schema_version": 1, "observed_unix_ms": observed_unix_ms, "daemon": health, "warnings": [] })).map_err(|error| error.to_string())?);
             } else {
                 println!("state = {}", daemon_state_label(&health.state));
                 if let Some(instance) = health.instance_id {
@@ -403,10 +412,7 @@ fn print_workspace_table(snapshot: &WorkspaceSnapshot) {
                 );
             } else {
                 for workflow in workflows {
-                    rendered_workflows.insert((
-                        workflow.identity.kind.as_str(),
-                        workflow.identity.run_id.as_str(),
-                    ));
+                    rendered_workflows.insert(workflow.identity.run_id.as_str());
                     let state = if workflow.dispatch.state.as_deref() == Some("recovery_pending") {
                         "recovery_pending"
                     } else if workflow.pause_requested
@@ -441,10 +447,7 @@ fn print_workspace_table(snapshot: &WorkspaceSnapshot) {
             }
         }
         for workflow in &repo.workflows {
-            if rendered_workflows.contains(&(
-                workflow.identity.kind.as_str(),
-                workflow.identity.run_id.as_str(),
-            )) {
+            if rendered_workflows.contains(workflow.identity.run_id.as_str()) {
                 continue;
             }
             let state = if workflow.dispatch.state.as_deref() == Some("recovery_pending") {
@@ -541,10 +544,9 @@ fn print_subject(snapshot: &WorkspaceSnapshot, subject: &Subject) {
         Subject::Workflow(repo, workflow) => {
             let workflow = &snapshot.repositories[repo].workflows[workflow];
             println!(
-                "workflow = {}\ncanonical_id = {}:{}:{}\nrepository = {}\nworktree = {}\nlifecycle = {}\ndispatch = {}\npause_requested = {}\nprogress = {}/{}",
+                "workflow = {}\ncanonical_id = {}:{}\nrepository = {}\nworktree = {}\nlifecycle = {}\ndispatch = {}\npause_requested = {}\nprogress = {}/{}",
                 workflow.identity.display_id,
                 workflow.identity.repository.display(),
-                workflow.identity.kind,
                 workflow.identity.run_id,
                 workflow.identity.repository.display(),
                 workflow.worktree.path.display(),
@@ -759,6 +761,9 @@ fn run_tui(repo_arg: Option<&std::path::Path>) -> Result<(), String> {
         for entry in discovered_entries {
             let repo = entry.repo;
             let mut config = Config::load(&repo);
+            observability::phase("standard_pack_bootstrap", || {
+                setup::ensure_user_owned_resources(&config)
+            })?;
             let worktrunk_version = observability::phase("ensure_tools", || {
                 config::ensure_required_tools(&repo, &config)
             })?;
@@ -783,6 +788,7 @@ fn run_tui(repo_arg: Option<&std::path::Path>) -> Result<(), String> {
             })?;
             repos.push(ManagedRepo::new(repo, config, entry.key));
         }
+        observability::phase("ensure_generic_worker", crate::worker::ensure_running)?;
         if let Some(repo) = repos.get(selected_repo)
             && setup::maybe_prompt_icon_style(&repo.config)?.is_some()
         {
@@ -818,145 +824,6 @@ fn run_tui(repo_arg: Option<&std::path::Path>) -> Result<(), String> {
         tui.select_repo(selected_repo);
         observability::phase("run_tui", || tui.run())
     })()
-}
-
-fn run_auto_command(
-    repo: &Repository,
-    config: &Config,
-    mut command: AutoCommand,
-) -> Result<(), String> {
-    workspace::ensure_repo_entry(&repo.root)?;
-    if !config.selected_harness()?.describe().headless {
-        return Err(format!(
-            "harness '{}' does not support managed Auto Flow execution; configure headless_command and headless_prompt_transport",
-            config.default_harness
-        ));
-    }
-    validate_auto_command_before_launch(repo, &mut command)?;
-    let branch = current_branch_name(&repo.root, config)?
-        .ok_or_else(|| "Auto Flow cannot start on detached HEAD".to_string())?;
-    if config.is_default_branch(&branch) {
-        return Err("Auto Flow cannot start on the default branch".to_string());
-    }
-    if selected_dirty(&repo.root, config)? {
-        return Err("Auto Flow requires a clean worktree at launch".to_string());
-    }
-    let launch_options = auto_launch_options_for_command(repo, branch, command)?;
-    let launch = AutoLaunch::with_options(&repo.root, &repo.root, launch_options)?.with_harness(
-        config.default_harness.clone(),
-        config.harness_adapter(&config.default_harness)?,
-    );
-    let run_id =
-        crate::worker::launch_bundled_coding(crate::workflow::bundled::BundledCodingLaunch {
-            repository: launch.repo_root.clone(),
-            worktree_path: launch.worktree_path.clone(),
-            task: launch.initial_prompt.clone(),
-            plan_path: launch.plan_path.clone(),
-            draft_plan: launch.implementation_source
-                == crate::auto_flow::AutoImplementationSource::DraftPlan,
-            harness_id: config.default_harness.clone(),
-            variant: Some(launch.variant.clone()),
-        })?;
-    println!(
-        "workflow_run_id = {run_id}\nstatus = queued\nworktree = {}",
-        launch.worktree_path.display()
-    );
-    Ok(())
-}
-
-fn validate_auto_command_before_launch(
-    repo: &Repository,
-    command: &mut AutoCommand,
-) -> Result<(), String> {
-    if command.source != AutoCommandSource::ExistingPlan {
-        return Ok(());
-    }
-    let plan_path = command
-        .plan_path
-        .as_deref()
-        .ok_or_else(|| "auto run-plan requires a plan path".to_string())?;
-    let plan_path = resolve_cli_plan_path(&repo.root, plan_path);
-    let total = plan::infer_total_phases(&plan_path)?;
-    if total == 0 {
-        return Err("could not infer phases; add headings like 'Phase 1'".to_string());
-    }
-    command.plan_path = Some(plan_path);
-    Ok(())
-}
-
-fn auto_launch_options_for_command(
-    repo: &Repository,
-    branch: String,
-    command: AutoCommand,
-) -> Result<AutoLaunchOptions, String> {
-    match command.source {
-        AutoCommandSource::Prompt => {
-            let initial_prompt = command
-                .prompt
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| "prism auto requires an initial prompt for a new run".to_string())?;
-            Ok(AutoLaunchOptions {
-                branch,
-                mode: AutoRunMode::Standard,
-                implementation_source: AutoImplementationSource::Prompt,
-                plan_path: None,
-                plan_run_mode: PlanRunMode::Sequential,
-                variant: "default".to_string(),
-                agent_profile: None,
-                initial_prompt: initial_prompt.to_string(),
-            })
-        }
-        AutoCommandSource::ExistingPlan => {
-            let plan_path = command
-                .plan_path
-                .ok_or_else(|| "auto run-plan requires a plan path".to_string())?;
-            let plan_path = resolve_cli_plan_path(&repo.root, &plan_path);
-            let total = plan::infer_total_phases(&plan_path)?;
-            if total == 0 {
-                return Err("could not infer phases; add headings like 'Phase 1'".to_string());
-            }
-            Ok(AutoLaunchOptions {
-                branch,
-                mode: AutoRunMode::Standard,
-                implementation_source: AutoImplementationSource::ExistingPlan,
-                plan_path: Some(plan_path.clone()),
-                plan_run_mode: PlanRunMode::Sequential,
-                variant: "plan".to_string(),
-                agent_profile: None,
-                initial_prompt: format!("Run plan phases from {}", plan_path.display()),
-            })
-        }
-        AutoCommandSource::DraftPlan => {
-            let initial_prompt = command
-                .prompt
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    "prism auto plan requires a task prompt for a new run".to_string()
-                })?;
-            Ok(AutoLaunchOptions {
-                branch,
-                mode: AutoRunMode::PlanFirst,
-                implementation_source: AutoImplementationSource::DraftPlan,
-                plan_path: Some(repo.root.join("plan.md")),
-                plan_run_mode: PlanRunMode::Sequential,
-                variant: "draft-plan".to_string(),
-                agent_profile: None,
-                initial_prompt: initial_prompt.to_string(),
-            })
-        }
-    }
-}
-
-fn resolve_cli_plan_path(cwd: &std::path::Path, path: &std::path::Path) -> std::path::PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        cwd.join(path)
-    }
 }
 
 fn discover_workspace_sessions(repos: &[ManagedRepo]) -> Result<Vec<session::Session>, String> {
@@ -1046,7 +913,6 @@ fn run_debug_command(
                 )
             );
             println!("worktree_command = {}", config.worktree_command);
-            println!("plan_dir = {}", config.plan_dir);
             println!("review_packet_dir = {}", config.review_packet_dir);
             println!("escape_key = {}", config.escape_key.label());
             println!("tools:");

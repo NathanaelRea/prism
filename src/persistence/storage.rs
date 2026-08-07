@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "storage diagnostics are available to optional debug surfaces"
+)]
+
 use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
 use std::ffi::OsString;

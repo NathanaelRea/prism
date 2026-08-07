@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use ratatui::{
     Frame,
@@ -12,17 +12,8 @@ use ratatui::{
 
 use crate::{
     agent::AgentState,
-    auto_flow::{
-        AutoImplementationSource, AutoOutputKind, AutoOutputLine, AutoRunMode, AutoRunStatus,
-        AutoStepKey, AutoStepRun, AutoStepStatus, PersistedAutoRun,
-        stabilization_model::{StabilizationBlocker, StabilizationWorkKind},
-    },
     config::{Config, IconStyle},
     opencode::OpencodeState,
-    plan_run::{
-        PersistedPlanRun, PlanOutputKind, PlanOutputLine, PlanRunMode, PlanRunStatus, PlanStepRun,
-        PlanStepStatus, plan_output_block_key,
-    },
     remote::{PrCache, PrSummary},
     session::{Session, SessionClassification},
     tui::{PanelFocus, WorktreeListMode},
@@ -45,17 +36,32 @@ pub(crate) struct FrameModel<'a> {
     pub main_focused: bool,
     pub main_scroll: usize,
     pub repo_main_view: RepoMainView,
-    pub worktree_main_view: WorktreeMainView,
     pub worktree_list_mode: WorktreeListMode,
     pub mode_label: &'a str,
     pub status_message: Option<&'a str>,
     pub repo_filter: &'a str,
     pub worktree_filter: &'a str,
     pub leader_hint: Option<LeaderHintModel>,
-    pub auto_dashboard: Option<AutoDashboard>,
-    pub plan_dashboard: Option<PlanDashboard>,
+    pub workflow_dashboard: Option<WorkflowDashboard>,
     pub tmux_portal: Option<TmuxPortalModel<'a>>,
     pub dialog: Option<DialogModel>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WorkflowDashboard {
+    pub run_id: String,
+    pub status: String,
+    pub current_step: Option<String>,
+    pub completed_steps: usize,
+    pub total_steps: usize,
+    pub parent_run_id: Option<String>,
+    pub children: Vec<String>,
+    pub detail: Option<crate::WorkflowProjection>,
+    pub can_pause: bool,
+    pub can_resume: bool,
+    pub can_cancel: bool,
+    pub can_retry: bool,
+    pub current_step_skippable: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -186,8 +192,6 @@ pub(crate) struct WorktreeRow {
     pub pr: PrCache,
     pub wt_columns: BTreeMap<String, String>,
     pub development: Option<DevelopmentEnvironment>,
-    pub auto_status: Option<AutoRunStatus>,
-    pub plan_status: Option<PlanRunStatus>,
     pub updated_label: String,
     pub unseen_comments: bool,
     pub prompt_summary: String,
@@ -270,53 +274,10 @@ impl RepoPrRow {
     }
 }
 
-pub(crate) struct PlanDashboard {
-    pub run: PersistedPlanRun,
-    pub runs: Vec<PlanRunSummary>,
-    pub output_lines: Vec<PlanOutputLine>,
-    pub output_state: PlanOutputViewerState,
-}
-
-pub(crate) struct PlanRunSummary {
-    pub id: String,
-    pub plan_display: String,
-    pub scope_path: String,
-    pub status: crate::plan_run::PlanRunStatus,
-    pub updated_unix_ms: u64,
-    pub selected: bool,
-}
-
-pub(crate) struct AutoDashboard {
-    pub run: PersistedAutoRun,
-    pub linked_plan_dashboard: Option<PlanDashboard>,
-    pub output_lines: Vec<AutoOutputLine>,
-    pub output_state: AutoOutputViewerState,
-    pub worker_status: String,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct AutoOutputViewerState {
-    pub cursor: usize,
-    pub follow: bool,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct PlanOutputViewerState {
-    pub cursor: usize,
-    pub follow: bool,
-    pub expanded_blocks: BTreeSet<String>,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RepoMainView {
     ChangeRequests,
     Kanban,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum WorktreeMainView {
-    Details,
-    Plan,
 }
 
 impl RepoMainView {
@@ -335,12 +296,10 @@ pub(crate) enum WorktreeKind {
     Detached,
 }
 
-mod auto_dashboard;
 mod dialog;
 mod format;
 mod layout;
 mod main_panel;
-mod plan_dashboard;
 mod pr;
 mod repo_panel;
 mod shell;
@@ -358,12 +317,10 @@ pub(crate) fn sidebar_width_for(cols: u16, configured_width: Option<u16>) -> u16
     layout::sidebar_width(cols, configured_width)
 }
 
-use auto_dashboard::*;
 use dialog::*;
 use format::*;
 use layout::*;
 use main_panel::*;
-use plan_dashboard::*;
 pub(crate) use pr::*;
 use repo_panel::*;
 use sidebar::*;

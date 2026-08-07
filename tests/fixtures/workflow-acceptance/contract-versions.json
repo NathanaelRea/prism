@@ -1,0 +1,9 @@
+{
+  "fixture_schema_version": 1,
+  "workflow_definition": 2,
+  "package_manifest": 1,
+  "lockfile": 1,
+  "extension_protocol": { "major": 1, "minor": 0 },
+  "stable_json_envelope": 1,
+  "source": "docs/contracts/workflow-resource-versions.md"
+}

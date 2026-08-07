@@ -12,6 +12,16 @@ pub(crate) enum ApprovalDecision {
     Reject,
 }
 
+pub(crate) struct EvidenceRequest<'a> {
+    pub id: &'a str,
+    pub run_id: &'a str,
+    pub step_id: &'a str,
+    pub subject_json: &'a str,
+    pub evidence_json: &'a str,
+    pub policy_json: &'a str,
+    pub now_unix_ms: i64,
+}
+
 impl ApprovalStore {
     pub(crate) fn new(database: WorkflowDatabase) -> Self {
         Self { database }
@@ -24,14 +34,34 @@ impl ApprovalStore {
         step_id: &str,
         now_unix_ms: i64,
     ) -> Result<(), DatabaseError> {
-        let id = id.to_string();
-        let run_id = run_id.to_string();
-        let step_id = step_id.to_string();
+        self.request_evidence(EvidenceRequest {
+            id,
+            run_id,
+            step_id,
+            subject_json: "{}",
+            evidence_json: "{}",
+            policy_json: "{}",
+            now_unix_ms,
+        })
+        .await
+    }
+
+    pub(crate) async fn request_evidence(
+        &self,
+        request: EvidenceRequest<'_>,
+    ) -> Result<(), DatabaseError> {
+        let id = request.id.to_string();
+        let run_id = request.run_id.to_string();
+        let step_id = request.step_id.to_string();
+        let subject_json = request.subject_json.to_string();
+        let evidence_json = request.evidence_json.to_string();
+        let policy_json = request.policy_json.to_string();
+        let now_unix_ms = request.now_unix_ms;
         self.database
             .write_immediate(|connection| {
                 Box::pin(async move {
                     let changed = sqlx::query(
-                        "update workflow_step set status = 'waiting' where id = ? and run_id = ? and status = 'runnable'",
+                        "update workflow_step set status = 'waiting', runtime_status = 'waiting_approval' where id = ? and run_id = ? and status = 'runnable'",
                     )
                     .bind(&step_id)
                     .bind(&run_id)
@@ -44,7 +74,7 @@ impl ApprovalStore {
                             operation: "request approval",
                         });
                     }
-                    sqlx::query("update workflow_run set status = 'waiting', updated_unix_ms = ? where id = ? and status = 'runnable' and not exists (select 1 from workflow_step where run_id = ? and status in ('runnable','claimed'))")
+                    sqlx::query("update workflow_run set status = 'waiting', runtime_status = 'waiting', updated_unix_ms = ? where id = ? and status = 'runnable' and not exists (select 1 from workflow_step where run_id = ? and status in ('runnable','claimed'))")
                         .bind(now_unix_ms)
                         .bind(&run_id)
                         .bind(&run_id)
@@ -59,6 +89,9 @@ impl ApprovalStore {
                         .execute(&mut *connection)
                         .await
                         .map_err(DatabaseError::Query)?;
+                    sqlx::query("insert into approval_evidence (approval_id, subject_json, evidence_json, policy_json) values (?, ?, ?, ?)")
+                        .bind(&id).bind(subject_json).bind(evidence_json).bind(policy_json)
+                        .execute(&mut *connection).await.map_err(DatabaseError::Query)?;
                     append_run_event(
                         connection,
                         &run_id,
@@ -107,7 +140,14 @@ impl ApprovalStore {
                         });
                     };
                     if let Some(step_id) = step_id {
+                        let class: String = sqlx::query_scalar("select class from workflow_step where id = ?")
+                            .bind(&step_id).fetch_one(&mut *connection).await.map_err(DatabaseError::Query)?;
                         let next = match decision {
+                            ApprovalDecision::Approve
+                                if matches!(class.as_str(), "approval" | "workflow_call") =>
+                            {
+                                "succeeded"
+                            }
                             ApprovalDecision::Approve => "runnable",
                             ApprovalDecision::Reject => "failed",
                         };
@@ -126,6 +166,8 @@ impl ApprovalStore {
                                 operation: "apply approval decision",
                             });
                         }
+                        sqlx::query("update workflow_step set runtime_status = ? where id = ?")
+                            .bind(next).bind(&step_id).execute(&mut *connection).await.map_err(DatabaseError::Query)?;
                     }
                     match decision {
                         ApprovalDecision::Approve => {
@@ -135,6 +177,12 @@ impl ApprovalStore {
                                 .execute(&mut *connection)
                                 .await
                                 .map_err(DatabaseError::Query)?;
+                            let unfinished: i64 = sqlx::query_scalar("select count(*) from workflow_step where run_id = ? and status <> 'succeeded'")
+                                .bind(&run_id).fetch_one(&mut *connection).await.map_err(DatabaseError::Query)?;
+                            if unfinished == 0 {
+                                sqlx::query("update workflow_run set status = 'succeeded', runtime_status = 'succeeded', completed_unix_ms = ?, updated_unix_ms = ? where id = ?")
+                                    .bind(now_unix_ms).bind(now_unix_ms).bind(&run_id).execute(&mut *connection).await.map_err(DatabaseError::Query)?;
+                            }
                         }
                         ApprovalDecision::Reject => {
                             sqlx::query("update workflow_run set status = 'failed', updated_unix_ms = ?, completed_unix_ms = ? where id = ? and status in ('waiting','runnable','paused')")

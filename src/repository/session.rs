@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "session queries support optional prompt restoration"
+)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};

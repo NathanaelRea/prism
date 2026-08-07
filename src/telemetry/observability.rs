@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "observability hooks are enabled by optional runtime surfaces"
+)]
+
 #[cfg(test)]
 use std::cell::{Cell, RefCell};
 use std::ffi::OsStr;

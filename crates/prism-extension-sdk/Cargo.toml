@@ -1,0 +1,13 @@
+[package]
+name = "prism-extension-sdk"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+description = "Rust SDK for authoring Prism process extensions"
+
+[dependencies]
+prism-extension-protocol = { path = "../prism-extension-protocol" }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", default-features = false, features = ["io-util", "io-std", "macros", "rt-multi-thread", "sync"] }

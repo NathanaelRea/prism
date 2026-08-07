@@ -23,8 +23,11 @@ pub enum CommandKind {
     Doctor,
     Config(ConfigCommand),
     Agent(AgentCommand),
-    Auto(AutoCommand),
-    RunPlan(Option<PathBuf>),
+    Workflow(Vec<String>),
+    Extension(Vec<String>),
+    Package(Vec<String>),
+    Skill(Vec<String>),
+    Template(Vec<String>),
     Debug(DebugCommand),
     Db(DbCommand),
     Worker(WorkerCommand),
@@ -75,20 +78,6 @@ pub enum ConfigCommand {
 #[derive(Debug, PartialEq, Eq)]
 pub enum AgentCommand {
     Ensure { branch: String },
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub struct AutoCommand {
-    pub source: AutoCommandSource,
-    pub prompt: Option<String>,
-    pub plan_path: Option<PathBuf>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AutoCommandSource {
-    Prompt,
-    ExistingPlan,
-    DraftPlan,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -194,34 +183,22 @@ impl Args {
                     });
                     break;
                 }
-                "auto" => {
-                    let first = iter.next().map(|arg| arg.to_string_lossy().to_string());
-                    let (source, prompt, plan_path) = match first.as_deref() {
-                        Some("run-plan") => {
-                            let path = iter
-                                .next()
-                                .ok_or_else(|| "auto run-plan requires a plan path".to_string())?;
-                            (
-                                AutoCommandSource::ExistingPlan,
-                                None,
-                                Some(PathBuf::from(path)),
-                            )
-                        }
-                        Some("plan") | Some("plan-first") | Some("intensive") => (
-                            AutoCommandSource::DraftPlan,
-                            iter.next().map(|arg| arg.to_string_lossy().to_string()),
-                            None,
-                        ),
-                        _ => (AutoCommandSource::Prompt, first, None),
+                family @ ("workflow" | "extension" | "package" | "skill" | "template") => {
+                    let arguments = iter
+                        .map(|argument| argument.to_string_lossy().into_owned())
+                        .collect::<Vec<_>>();
+                    if arguments.is_empty() {
+                        return Err(format!("{family} requires a subcommand"));
+                    }
+                    command = match family {
+                        "workflow" => CommandKind::Workflow(arguments),
+                        "extension" => CommandKind::Extension(arguments),
+                        "package" => CommandKind::Package(arguments),
+                        "skill" => CommandKind::Skill(arguments),
+                        "template" => CommandKind::Template(arguments),
+                        _ => unreachable!(),
                     };
-                    command = CommandKind::Auto(AutoCommand {
-                        source,
-                        prompt,
-                        plan_path,
-                    });
-                }
-                "run-plan" | "plan" => {
-                    command = CommandKind::RunPlan(iter.next().map(PathBuf::from));
+                    break;
                 }
                 "debug" => {
                     let value = iter
@@ -415,7 +392,7 @@ impl Args {
 }
 
 pub fn help_text() -> &'static str {
-    "Usage:\n  prism [--repo <path>] [--debug] [--print-logs] [--log-level <level>]\n  prism [--repo <path>] list [--all] [--json]\n  prism [--repo <path>] status [<selector>] [--json]\n  prism [--repo <path>] pause|resume|stop [<workflow-selector>]\n  prism [--repo <path>] recover [<workflow-selector>]\n  prism daemon status [--json]\n  prism daemon start|stop\n  prism [--repo <path>] doctor\n  prism [--repo <path>] config [show|example|schema|paths]\n  prism [--repo <path>] agent ensure --branch <branch>\n  prism [--repo <path>] auto [prompt]\n  prism [--repo <path>] auto run-plan <plan.md>\n  prism [--repo <path>] auto plan [prompt]\n  prism [--repo <path>] auto plan-first [prompt]\n  prism [--repo <path>] auto intensive [prompt]\n  prism [--repo <path>] run-plan [plan.md]\n  prism [--repo <path>] plan [plan.md]\n  prism [--repo <path>] debug paths|info|logs|startup|integrity\n  prism [--repo <path>] debug record [--before <seconds>] [--after <seconds>]\n  prism [--repo <path>] debug --help\n  prism [--repo <path>] db\n  prism [--repo <path>] db path\n  prism [--repo <path>] db <read-only-sql>\n  prism [--repo <path>] db --help\n\nSelectors:\n  c:<short-id>, p:<short-id>, coding:<full-id>, plan:<full-id>, repo:<name>,\n  wt:<branch>, or an absolute repository/worktree path.\n\nDebugging:\n  Use `debug record` while Prism is running to capture its in-memory flight recorder,\n  `debug paths` to find Prism state, `debug logs` to tail the runtime log, and\n  `debug integrity` for read-only database checks. Use `db path` or\n  `db <read-only-sql>` to inspect persisted repo state.\n  Use `--print-logs --log-level trace` to print detailed subprocess logs.\n\nAliases:\n  auto plan-first and auto intensive are aliases for auto plan."
+    "Usage:\n  prism [--repo <path>] [--debug] [--print-logs] [--log-level <level>]\n  prism [--repo <path>] workflow list|show|new|copy|edit|validate|preview|run|history|migrate|updates\n  prism [--repo <path>] workflow pause|resume|cancel|retry|approve|reject\n  prism [--repo <path>] extension list|show|new|edit|check|build|reload|doctor\n  prism [--repo <path>] package new|validate|install|list|show|update|remove\n  prism [--repo <path>] skill list|show|install|remove\n  prism [--repo <path>] template list|show|copy\n  prism [--repo <path>] list [--all] [--json]\n  prism [--repo <path>] status [<selector>] [--json]\n  prism [--repo <path>] pause|resume|stop [<workflow-selector>]\n  prism [--repo <path>] recover [<workflow-selector>]\n  prism daemon status [--json]\n  prism daemon start|stop\n  prism [--repo <path>] doctor\n  prism [--repo <path>] config [show|example|schema|paths]\n  prism [--repo <path>] agent ensure --branch <branch>\n  prism [--repo <path>] debug paths|info|logs|startup|integrity\n  prism [--repo <path>] debug record [--before <seconds>] [--after <seconds>]\n  prism [--repo <path>] debug --help\n  prism [--repo <path>] db\n  prism [--repo <path>] db path\n  prism [--repo <path>] db <read-only-sql>\n  prism [--repo <path>] db --help\n\nWorkflow JSON:\n  Stable --json responses use {schema_version, kind, data}.\n  workflow run accepts repeated --input name=json and --idempotency-key <key>.\n\nSelectors:\n  Use a workflow run id, repo:<name>, wt:<branch>, or an absolute repository/worktree path.\n\nDebugging:\n  Use `debug record` while Prism is running to capture its in-memory flight recorder,\n  `debug paths` to find Prism state, `debug logs` to tail the runtime log, and\n  `debug integrity` for read-only database checks. Use `db path` or\n  `db <read-only-sql>` to inspect persisted repo state.\n  Use `--print-logs --log-level trace` to print detailed subprocess logs."
 }
 
 pub fn debug_help_text() -> &'static str {
@@ -437,61 +414,9 @@ mod tests {
     }
 
     #[test]
-    fn auto_prompt_parses_existing_prompt_first_form() {
-        assert_eq!(
-            parse(&["auto", "implement the task"]),
-            CommandKind::Auto(AutoCommand {
-                source: AutoCommandSource::Prompt,
-                prompt: Some("implement the task".to_string()),
-                plan_path: None,
-            })
-        );
-    }
-
-    #[test]
-    fn auto_run_plan_requires_and_parses_plan_path() {
-        assert_eq!(
-            parse(&["auto", "run-plan", "plan.md"]),
-            CommandKind::Auto(AutoCommand {
-                source: AutoCommandSource::ExistingPlan,
-                prompt: None,
-                plan_path: Some(PathBuf::from("plan.md")),
-            })
-        );
-        assert_eq!(
-            Args::parse([OsString::from("auto"), OsString::from("run-plan")]).unwrap_err(),
-            "auto run-plan requires a plan path"
-        );
-    }
-
-    #[test]
-    fn auto_plan_aliases_parse_as_draft_plan() {
-        for alias in ["plan", "plan-first", "intensive"] {
-            assert_eq!(
-                parse(&["auto", alias, "draft before coding"]),
-                CommandKind::Auto(AutoCommand {
-                    source: AutoCommandSource::DraftPlan,
-                    prompt: Some("draft before coding".to_string()),
-                    plan_path: None,
-                })
-            );
-        }
-    }
-
-    #[test]
-    fn help_documents_auto_plan_forms() {
-        let help = help_text();
-        assert!(help.contains("auto run-plan <plan.md>"));
-        assert!(help.contains("auto plan-first [prompt]"));
-        assert!(help.contains("auto intensive [prompt]"));
-    }
-
-    #[test]
     fn help_documents_current_workflow_selectors() {
         let help = help_text();
-        assert!(help.contains("c:<short-id>"));
-        assert!(help.contains("coding:<full-id>"));
-        assert!(!help.contains("auto:<full-id>"));
+        assert!(help.contains("workflow run id"));
     }
 
     #[test]
@@ -547,8 +472,8 @@ mod tests {
     #[test]
     fn db_query_joins_remaining_arguments() {
         assert_eq!(
-            parse(&["db", "select", "*", "from", "plan_run"]),
-            CommandKind::Db(DbCommand::Query("select * from plan_run".to_string()))
+            parse(&["db", "select", "*", "from", "task_metadata"]),
+            CommandKind::Db(DbCommand::Query("select * from task_metadata".to_string()))
         );
     }
 
@@ -590,20 +515,20 @@ mod tests {
             })
         );
         assert_eq!(
-            parse(&["status", "a:12345678", "--json"]),
+            parse(&["status", "w:12345678", "--json"]),
             CommandKind::Status(StatusOptions {
-                selector: Some("a:12345678".to_string()),
+                selector: Some("w:12345678".to_string()),
                 json: true
             })
         );
         assert_eq!(parse(&["pause"]), CommandKind::Pause(None));
         assert_eq!(
-            parse(&["resume", "p:12345678"]),
-            CommandKind::Resume(Some("p:12345678".to_string()))
+            parse(&["resume", "w:12345678"]),
+            CommandKind::Resume(Some("w:12345678".to_string()))
         );
         assert_eq!(
-            parse(&["stop", "auto:run-1"]),
-            CommandKind::Stop(Some("auto:run-1".to_string()))
+            parse(&["stop", "w:run-1"]),
+            CommandKind::Stop(Some("w:run-1".to_string()))
         );
         assert_eq!(parse(&["recover"]), CommandKind::Recover(None));
     }

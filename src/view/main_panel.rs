@@ -25,14 +25,11 @@ pub(super) fn render_main(frame: &mut Frame<'_>, area: Rect, model: &crate::view
         PanelFocus::Repos => repo_overview_lines(model, width, content_area),
         PanelFocus::Worktrees => worktree_detail_lines(model),
     };
-    if model.focus == PanelFocus::Worktrees {
-        if let Some(dashboard) = &model.auto_dashboard {
-            lines.push(Line::from(""));
-            lines.extend(auto_dashboard_lines(dashboard, width, content_area));
-        } else if let Some(dashboard) = &model.plan_dashboard {
-            lines.push(Line::from(""));
-            lines.extend(plan_dashboard_lines(dashboard, width, content_area));
-        }
+    if model.focus == PanelFocus::Worktrees
+        && let Some(dashboard) = &model.workflow_dashboard
+    {
+        lines.push(Line::from(""));
+        lines.extend(workflow_dashboard_lines(dashboard));
     }
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     let rendered_lines = paragraph.line_count(inner_area.width);
@@ -65,6 +62,106 @@ pub(super) fn render_main(frame: &mut Frame<'_>, area: Rect, model: &crate::view
     if let Some(portal) = &model.tmux_portal {
         render_tmux_portal(frame, areas[1], portal);
     }
+}
+
+fn workflow_dashboard_lines(dashboard: &crate::view::WorkflowDashboard) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(Span::styled("Workflow Run", title_style(false))),
+        Line::from(format!("run: {}", dashboard.run_id)),
+        Line::from(format!("status: {}", dashboard.status)),
+        Line::from(format!(
+            "progress: {}/{}",
+            dashboard.completed_steps, dashboard.total_steps
+        )),
+    ];
+    if let Some(step) = &dashboard.current_step {
+        lines.push(Line::from(format!("selected Step: {step}")));
+    }
+    if let Some(parent) = &dashboard.parent_run_id {
+        lines.push(Line::from(format!("parent: {parent}")));
+    }
+    for child in &dashboard.children {
+        lines.push(Line::from(format!("  child: {child}")));
+    }
+    if let Some(run) = &dashboard.detail {
+        lines.push(Line::from(format!("definition: {}", run.definition_name)));
+        lines.push(Line::from("Steps"));
+        for step in &run.steps {
+            lines.push(Line::from(format!(
+                "  {} [{}] {} inputs={}",
+                step.key, step.status, step.class, step.input_json
+            )));
+        }
+        lines.push(Line::from(format!(
+            "Attempts: {}  Artifacts: {}  Effects: {}  Approvals: {}  Gates: {}",
+            run.attempts.len(),
+            run.artifacts.len(),
+            run.effects.len(),
+            run.approvals.len(),
+            run.gates.len()
+        )));
+        for attempt in &run.attempts {
+            lines.push(Line::from(format!(
+                "  attempt {} [{}] worker={} target={}",
+                attempt.id, attempt.status, attempt.worker_id, attempt.target_id
+            )));
+            for binding in &attempt.bindings {
+                lines.push(Line::from(format!(
+                    "    binding {}:{} = {}",
+                    binding.name, binding.schema_id, binding.value_json
+                )));
+            }
+            for output in attempt.output.iter().rev().take(20).rev() {
+                lines.push(Line::from(format!(
+                    "    {}: {}",
+                    output.stream,
+                    String::from_utf8_lossy(&output.body)
+                )));
+            }
+        }
+        for artifact in &run.artifacts {
+            lines.push(Line::from(format!(
+                "  Artifact {} rev={} digest={} sensitivity={} provenance={}",
+                artifact.id,
+                artifact.revision,
+                artifact.digest,
+                artifact.sensitivity,
+                artifact.trigger_occurrence_id.as_deref().unwrap_or("-")
+            )));
+        }
+        for effect in &run.effects {
+            lines.push(Line::from(format!(
+                "  effect {} [{}] {}",
+                effect.effect_kind, effect.status, effect.idempotency_key
+            )));
+        }
+        for approval in &run.approvals {
+            lines.push(Line::from(format!(
+                "  approval {} [{}] by={}",
+                approval.id,
+                approval.status,
+                approval.decided_by.as_deref().unwrap_or("-")
+            )));
+        }
+        for gate in &run.gates {
+            lines.push(Line::from(format!(
+                "  blocker {} due={} evidence={}",
+                gate.gate_kind,
+                gate.due_unix_ms,
+                gate.evidence_json.as_deref().unwrap_or("-")
+            )));
+        }
+        if !run.events.is_empty() {
+            lines.push(Line::from("History"));
+            for event in run.events.iter().rev().take(20).rev() {
+                lines.push(Line::from(format!(
+                    "  #{} {} {}",
+                    event.sequence, event.kind, event.data_json
+                )));
+            }
+        }
+    }
+    lines
 }
 
 fn render_tmux_portal(frame: &mut Frame<'_>, area: Rect, portal: &TmuxPortalModel<'_>) {

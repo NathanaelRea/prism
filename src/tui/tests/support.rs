@@ -4,13 +4,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::agent::AgentState;
-use crate::auto_flow::{
-    AutoImplementationSource, AutoRun, AutoRunMode, AutoRunStatus, PersistedAutoRun,
-};
 use crate::config::Config;
-use crate::plan_run::{
-    PersistedPlanRun, PlanRun, PlanRunMode, PlanRunStatus, PlanStepRun, PlanStepStatus,
-};
 use crate::remote::{PrCache, PrSummary};
 use crate::repo::Repository;
 use crate::session::Session;
@@ -41,106 +35,6 @@ pub(super) fn test_tui() -> Tui {
         test_session(1, "/repo-two", "feature-two"),
     ];
     Tui::new(repos, 0, sessions)
-}
-
-pub(super) fn test_auto_run(
-    id: &str,
-    worktree_path: &str,
-    updated_unix_ms: u64,
-) -> PersistedAutoRun {
-    PersistedAutoRun {
-        run: AutoRun {
-            harness_id: "opencode".to_string(),
-            adapter_id: "opencode".to_string(),
-            id: id.to_string(),
-            repo_root: "/repo-one".to_string(),
-            worktree_path: PathBuf::from(worktree_path),
-            worktree_incarnation: None,
-            branch: "feature".to_string(),
-            mode: AutoRunMode::Standard,
-            implementation_source: AutoImplementationSource::Prompt,
-            plan_path: None,
-            plan_run_mode: PlanRunMode::Sequential,
-            variant: "default".to_string(),
-            agent_profile: None,
-            prompt_summary: id.to_string(),
-            initial_prompt: String::new(),
-            status: AutoRunStatus::Running,
-            pause_requested: false,
-            selected_step_run_id: None,
-            pr_number: None,
-            pr_url: None,
-            current_head_sha: None,
-            review_baseline_json: None,
-            stabilization_status: None,
-            stabilization_blocker: None,
-            stabilization_next_work: None,
-            pending_push: None,
-            created_unix_ms: 1,
-            updated_unix_ms,
-            archived_unix_ms: None,
-        },
-        steps: Vec::new(),
-    }
-}
-
-pub(super) fn test_plan_run(id: &str, scope_path: &str) -> PersistedPlanRun {
-    PersistedPlanRun {
-        run: PlanRun {
-            harness_id: "opencode".to_string(),
-            adapter_id: "opencode".to_string(),
-            id: id.to_string(),
-            repo_root: "/repo-one".to_string(),
-            scope_path: PathBuf::from(scope_path),
-            plan_path: PathBuf::from("plan.md"),
-            plan_display: "plan.md".to_string(),
-            step_name: "phase".to_string(),
-            start_step: 1,
-            total_steps: 1,
-            mode: PlanRunMode::Sequential,
-            status: PlanRunStatus::Running,
-            pause_requested: false,
-            selected_step: 1,
-            created_unix_ms: 1,
-            updated_unix_ms: 1,
-            archived_unix_ms: None,
-        },
-        steps: Vec::new(),
-    }
-}
-
-pub(super) fn test_plan_run_with_steps(
-    id: &str,
-    scope_path: &str,
-    selected_step: usize,
-) -> PersistedPlanRun {
-    let mut run = test_plan_run(id, scope_path);
-    run.run.total_steps = 3;
-    run.run.selected_step = selected_step;
-    run.steps = (1..=3)
-        .map(|step| PlanStepRun {
-            run_id: id.to_string(),
-            step,
-            prompt: format!("phase {step}"),
-            status: if step == selected_step {
-                PlanStepStatus::Running
-            } else {
-                PlanStepStatus::Queued
-            },
-            execution: crate::harness::ExecutionRef::default(),
-            session: crate::harness::SessionRef::default(),
-            agent_variant: None,
-            started_unix_ms: (step == selected_step).then_some(step as u64),
-            finished_unix_ms: None,
-            exit_code: None,
-            latest_message: None,
-            active_tool: None,
-            todos: Vec::new(),
-            summary: None,
-            error: None,
-        })
-        .collect();
-    run
 }
 
 pub(super) fn test_session(repo_index: usize, root: &str, branch: &str) -> Session {

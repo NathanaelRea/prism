@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "workflow extensions consume the complete harness contract"
+)]
+
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};

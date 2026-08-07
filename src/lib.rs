@@ -7,11 +7,12 @@ pub(crate) use agent_runtime::{agent, agent_session, harness, opencode, tmux};
 mod application;
 pub use application::cli;
 pub(crate) use application::{args, config, setup};
-pub mod auto_flow;
+pub mod extension;
+pub mod package;
 mod persistence;
-pub mod plan_run;
 mod remote;
 mod repository;
+pub mod resource;
 pub(crate) use repository::{git, lifecycle, repo, session, workspace, workspace_state, worktrunk};
 mod system;
 pub(crate) use system::{
@@ -31,16 +32,41 @@ pub(crate) use tui::{
 };
 mod view;
 mod workflow;
+pub use workflow::bundled::{CatalogInstallError, install as install_definition_catalog};
+pub use workflow::definition::{
+    Binding as WorkflowBinding, CatalogDefinition, CompiledRepeat, CompiledStep, ConditionError,
+    ConditionExpr, ConditionValue, DefinitionAuthoringOperations, DefinitionCatalog,
+    DefinitionError, DefinitionMigrationPreview, DefinitionSnapshot as CompiledDefinitionSnapshot,
+    DefinitionUpdate, ExecutableResolution, ExhaustedPolicy, LaunchCompatibility, LaunchMode,
+    PortDefinition, SnapshotDefinition, SourceDiagnostic, WorkflowDefinition,
+    commented_template as workflow_definition_template, diagnose_source,
+    schema_json as workflow_definition_schema,
+};
+pub use workflow::effect::{
+    EffectContractError, Evidence as WorkflowEvidence, ProtectedEffectKind, ReconciliationStatus,
+    protected_effect, validate_effect_request,
+};
 pub use workflow::engine::{
     ArtifactContent, ArtifactPublication, EffectIntent, EffectReconciler, EffectReconciliation,
-    ExecutionClass, ExecutionContext, ReconciliationFuture, ReconciliationResult, StepFuture,
-    StepImplementation, WorkerConfig, WorkerError, WorkflowWorker,
+    ExecutionClass, ExecutionContext, ReconciliationFuture, ReconciliationResult, WorkerConfig,
+    WorkerError, WorkflowWorker,
 };
 pub use workflow::operations::{
-    ApprovalDecision, ControlPlaneMetric, DefinitionSnapshot, LaunchWorkflow, LegacyImportSummary,
-    WorkflowApprovalProjection, WorkflowArtifactProjection, WorkflowAttemptProjection,
-    WorkflowAuditEvent, WorkflowCommand, WorkflowEffectProjection, WorkflowGateProjection,
-    WorkflowOperationError, WorkflowOperations, WorkflowOutputProjection, WorkflowProjection,
-    WorkflowStep, WorkflowStepProjection,
+    ApprovalDecision, ArtifactIntegrityFailure, ControlPlaneMetric, DefinitionSnapshot,
+    EvidenceBoundApproval, LaunchAdmittedImplementation, LaunchWorkflow,
+    ProviderObservationProjection, TriggerDoctorDiagnostic, TriggerHistoryProjection,
+    TriggerProjection, WorkflowApprovalProjection, WorkflowArtifactProjection,
+    WorkflowAttemptProjection, WorkflowAuditEvent, WorkflowCommand, WorkflowControlScope,
+    WorkflowEffectProjection, WorkflowGateProjection, WorkflowHealthReport, WorkflowOperationError,
+    WorkflowOperations, WorkflowOutputProjection, WorkflowProjection, WorkflowStep,
+    WorkflowStepProjection,
 };
-pub(crate) use workflow::{ci, execution, plan, review, verify, worker};
+pub use workflow::trigger::{
+    AdmissionDecision as TriggerAdmissionDecision, AdmissionEvaluation, AdmissionOutcome,
+    AdmissionPolicy, OverlapPolicy, ProviderItemKind as TriggerProviderItemKind,
+    ProviderItemObservation as TriggerProviderItemObservation, ProviderPollAdapter,
+    ProviderPollBatch, ProviderPollError, ProviderPollFuture, ProviderPollPage,
+    ProviderPollRequest, TriggerContractError, TriggerOccurrenceStatus, TriggerRegistration,
+    TriggerSchedule,
+};
+pub(crate) use workflow::worker;

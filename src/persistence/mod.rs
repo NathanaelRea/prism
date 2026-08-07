@@ -1,23 +1,18 @@
-mod adoption;
-
 pub(crate) mod approvals;
 pub(crate) mod artifacts;
-pub(crate) mod auto_flow;
 pub(crate) mod control_plane;
 pub(crate) mod database;
 pub(crate) mod effects;
 pub(crate) mod error;
-pub(crate) mod import;
 pub(crate) mod notification;
 pub(crate) mod observability;
-pub(crate) mod plan_run;
 pub(crate) mod pools;
 pub(crate) mod remote;
 pub(crate) mod run_ledger;
 pub(crate) mod session;
 pub(crate) mod storage;
+pub(crate) mod triggers;
 pub(crate) mod wakeups;
-pub(crate) mod workflow;
 pub(crate) mod workspace;
 
 #[cfg(test)]
@@ -64,14 +59,13 @@ mod architecture_tests {
     #[test]
     fn generalized_persistence_has_no_synchronous_runtime_wrapper() {
         for file in [
-            "adoption.rs",
             "approvals.rs",
             "artifacts.rs",
             "control_plane.rs",
             "effects.rs",
-            "import.rs",
             "pools.rs",
             "run_ledger.rs",
+            "triggers.rs",
             "wakeups.rs",
             "workspace.rs",
         ] {
@@ -101,7 +95,7 @@ mod architecture_tests {
 
     #[test]
     fn execution_envelopes_do_not_own_database_connections() {
-        for file in ["src/workflow/engine.rs", "src/workflow/execution.rs"] {
+        for file in ["src/workflow/engine.rs"] {
             let path = Path::new(file);
             let production = production_source(path);
             for forbidden in ["SqliteConnection", "PoolConnection<", "SqlitePool"] {
@@ -124,14 +118,7 @@ mod architecture_tests {
 
     #[test]
     fn legacy_claim_guards_and_scheduler_are_absent() {
-        let persistence = production_source(Path::new("src/persistence/workflow.rs"));
         let worker = production_source(Path::new("src/workflow/worker.rs"));
-        for forbidden in [["Claim", "Session"].concat(), ["claim", "_guard_"].concat()] {
-            assert!(
-                !persistence.contains(&forbidden),
-                "legacy claim guard remains in repository persistence: {forbidden}"
-            );
-        }
         assert!(
             !worker.contains(&["schedule", "_queued"].concat()),
             "legacy repository scheduler remains in the worker"

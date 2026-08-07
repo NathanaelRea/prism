@@ -1,20 +1,19 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::agent_session::{AgentSessionWarmupKey, AgentSessionWarmupResult};
-use crate::auto_flow::PersistedAutoRun;
 use crate::remote::PrCache;
 use crate::session::{WorktreeRepositoryKey, WorktreeSessionKey};
 use crate::tui_jobs::{JobContext, JobId, JobMessage, JobMetadata, JobOutcome};
 
 use super::{
-    DashboardOutputKey, DashboardOutputResult, DefaultBranchPollResult, DeleteSessionKey,
-    DeleteSessionResult, OpencodeEventResult, OpencodeListenerKey, OpencodePollKey,
-    OpencodePollResult, PrPollKey, PrPollResult, RemoteActionDelivery, RemoteActionValue,
-    SessionRefreshResult, TUI_ACTION_JOB_TIMEOUT, TUI_JOB_SHUTDOWN_GRACE,
-    TUI_MUTATION_SHUTDOWN_BOUND, TUI_TICK_ITEM_BUDGET, TUI_TICK_TIME_BUDGET, TmuxPortalResult, Tui,
-    TuiBackgroundChanges, WORKFLOW_MAINTENANCE_INTERVAL, WorkflowPollResult, WtHookLogPollResult,
-    WtPollResult, maintain_workflow_storage, uncertain_remote_mutation_error,
+    DefaultBranchPollResult, DeleteSessionKey, DeleteSessionResult, OpencodeEventResult,
+    OpencodeListenerKey, OpencodePollKey, OpencodePollResult, PrPollKey, PrPollResult,
+    RemoteActionDelivery, RemoteActionValue, SessionRefreshResult, TUI_ACTION_JOB_TIMEOUT,
+    TUI_JOB_SHUTDOWN_GRACE, TUI_MUTATION_SHUTDOWN_BOUND, TUI_TICK_ITEM_BUDGET,
+    TUI_TICK_TIME_BUDGET, TmuxPortalResult, Tui, TuiBackgroundChanges,
+    WORKFLOW_MAINTENANCE_INTERVAL, WorkflowPollResult, WtHookLogPollResult, WtPollResult,
+    maintain_workflow_storage, uncertain_remote_mutation_error,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -26,7 +25,6 @@ pub(crate) enum TuiJobKind {
     PrDetails,
     PrPersistence,
     WorkflowPoll,
-    DashboardOutput,
     DeleteSession,
     TmuxWarmup,
     TmuxPortal,
@@ -48,7 +46,6 @@ impl TuiJobKind {
             Self::PrDetails => "pr_details",
             Self::PrPersistence => "pr_persistence",
             Self::WorkflowPoll => "workflow_poll",
-            Self::DashboardOutput => "dashboard_output",
             Self::DeleteSession => "delete_session",
             Self::TmuxWarmup => "tmux_warmup",
             Self::TmuxPortal => "tmux_portal",
@@ -68,7 +65,6 @@ pub(crate) enum TuiJobKey {
     Repository(WorktreeRepositoryKey),
     WorktrunkHookLogs(WorktreeRepositoryKey),
     WorkflowRepository(WorktreeRepositoryKey),
-    DashboardOutput(DashboardOutputKey),
     Worktree(WorktreeSessionKey),
     AgentStatePersistence(WorktreeSessionKey),
     Pr(PrPollKey),
@@ -105,7 +101,6 @@ pub(crate) enum TuiJobPayload {
     WorkflowMaintenance,
     PrPoll(PrPollResult),
     WorkflowPoll(WorkflowPollResult),
-    DashboardOutput(DashboardOutputResult),
     DeleteSession(DeleteSessionResult),
     TmuxWarmup(AgentSessionWarmupResult),
     TmuxPortal(TmuxPortalResult),
@@ -132,7 +127,6 @@ impl Tui {
             opencode_status: self.poll_opencode_status(),
             opencode_events: self.poll_opencode_events(),
             workflows: self.poll_workflow_runs(),
-            dashboard_output: self.poll_dashboard_outputs(),
             pull_requests: self.poll_pull_requests(false),
             delete_sessions: self.poll_delete_sessions(),
             status_message: self.expire_status_message(),
@@ -270,10 +264,6 @@ impl Tui {
             TuiJobKey::Opencode(key) => Some(key.worktree.repository.root.clone()),
             TuiJobKey::OpencodeListener(key) => Some(key.worktree.repository.root.clone()),
             TuiJobKey::WorkflowRepository(repository) => Some(repository.root.clone()),
-            TuiJobKey::DashboardOutput(key) => Some(match key {
-                DashboardOutputKey::Plan { repository, .. }
-                | DashboardOutputKey::Auto { repository, .. } => repository.root.clone(),
-            }),
             TuiJobKey::None => None,
         }
     }
@@ -405,7 +395,6 @@ impl Tui {
                     | TuiJobKey::Repository(_)
                     | TuiJobKey::WorktrunkHookLogs(_)
                     | TuiJobKey::WorkflowRepository(_)
-                    | TuiJobKey::DashboardOutput(_)
                     | TuiJobKey::Delete(_) => false,
                 });
             if selected_job { 1 } else { 3 }
@@ -543,31 +532,6 @@ impl Tui {
         Ok(())
     }
 
-    pub(super) fn persist_shutdown_auto_run(
-        &mut self,
-        persisted: &PersistedAutoRun,
-    ) -> Result<(), String> {
-        let managed = self
-            .repos
-            .iter()
-            .find(|managed| managed.repo.root == Path::new(&persisted.run.repo_root))
-            .ok_or_else(|| {
-                format!(
-                    "remote mutation Auto Flow repository no longer exists: {}",
-                    persisted.run.repo_root
-                )
-            })?;
-        let mut persisted = persisted.clone();
-        crate::observability::with_writable_db(&managed.repo, |path| {
-            crate::auto_flow::save_auto_run(
-                &crate::auto_flow::AutoFlowStore::open(path),
-                &mut persisted,
-            )
-        })?;
-        self.remember_auto_run(persisted);
-        Ok(())
-    }
-
     pub(super) fn apply_shutdown_remote_action_result(
         &mut self,
         key: &TuiJobKey,
@@ -581,46 +545,8 @@ impl Tui {
             RemoteActionValue::Resolved { cache, .. } => {
                 self.persist_shutdown_remote_cache(key, cache)
             }
-            RemoteActionValue::PushPrepared(prepared) => {
-                self.persist_shutdown_remote_cache(key, &prepared.cache)
-            }
-            RemoteActionValue::GuardedPush {
-                persisted, cache, ..
-            }
-            | RemoteActionValue::ReviewResolutionFinished {
-                persisted, cache, ..
-            } => {
-                self.persist_shutdown_remote_cache(key, cache)?;
-                self.persist_shutdown_auto_run(persisted)
-            }
-            RemoteActionValue::ReviewResolutionPrepared {
-                persisted, cache, ..
-            } => {
-                self.persist_shutdown_remote_cache(key, cache)?;
-                self.persist_shutdown_auto_run(persisted)
-            }
-            RemoteActionValue::MergeExecution { session, result: _ } => {
-                let managed = self
-                    .repos
-                    .get(session.repo_index)
-                    .ok_or_else(|| "merged worktree repository no longer exists".to_string())?;
-                crate::remote::persist_pr_cache_snapshot(
-                    &managed.repo,
-                    &session.branch,
-                    &session.pr,
-                )?;
-                if let Some(index) = self.sessions.iter().position(|current| {
-                    current.repo_index == session.repo_index && current.path == session.path
-                }) {
-                    self.sessions[index].pr = session.pr.clone();
-                }
-                Ok(())
-            }
             RemoteActionValue::WorktrunkUserConfig(_)
             | RemoteActionValue::ChangeRequests(_)
-            | RemoteActionValue::CreatePrepared(_)
-            | RemoteActionValue::MergeAuthorization { .. }
-            | RemoteActionValue::NotApplicable
             | RemoteActionValue::Complete => Ok(()),
         }?;
         uncertain_remote_mutation_error(result).map_or(Ok(()), |error| {
@@ -730,9 +656,6 @@ impl Tui {
             TuiJobPayload::WorkflowPoll(result) => {
                 let _ = self.workflow_poll_tx.send(result);
             }
-            TuiJobPayload::DashboardOutput(result) => {
-                let _ = self.dashboard_output_tx.send(result);
-            }
             TuiJobPayload::DeleteSession(result) => {
                 let _ = self.delete_session_tx.send(result);
             }
@@ -794,9 +717,6 @@ impl Tui {
             (TuiJobKind::WorkflowPoll, TuiJobKey::WorkflowRepository(repository)) => {
                 self.workflow_polls_in_flight.remove(repository);
             }
-            (TuiJobKind::DashboardOutput, TuiJobKey::DashboardOutput(key)) => {
-                self.dashboard_outputs_in_flight.remove(key);
-            }
             (TuiJobKind::DeleteSession, TuiJobKey::Delete(key)) => {
                 self.delete_sessions_in_flight.remove(key);
             }
@@ -856,9 +776,7 @@ impl Tui {
             TuiJobKey::WorktrunkHookLogs(repository) => {
                 self.repos.iter().any(|repo| &repo.identity == repository)
             }
-            TuiJobKey::WorkflowRepository(_) | TuiJobKey::DashboardOutput(_) => {
-                metadata.generation == self.workflow_revision
-            }
+            TuiJobKey::WorkflowRepository(_) => metadata.generation == self.workflow_revision,
             TuiJobKey::Worktree(key) => {
                 self.worktree_generation_is_current(key, metadata.generation)
             }

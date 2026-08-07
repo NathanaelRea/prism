@@ -1,0 +1,13 @@
+{
+  "fixture_schema_version": 1,
+  "contract": "contract.intake.github-admission-unique-child",
+  "given": { "issue": "github:acme/prism#77", "observation_revision": "sha256:issue-r4", "child_definition_revision": "sha256:implement-r2", "admission_purpose": "issue-implementation", "poll_deliveries": 2 },
+  "expect": [
+    { "event": "provider_item_persisted_before_checkpoint" },
+    { "event": "quarantined_intake_created" },
+    { "event": "agent_classification_is_evidence_not_authority" },
+    { "event": "admission_decision_recorded", "observation_revision": "sha256:issue-r4" },
+    { "event": "implementation_child_created", "count": 1, "uniqueness": ["issue", "observation_revision", "child_definition_revision", "admission_purpose"] },
+    { "event": "second_poll_reuses_unique_child" }
+  ]
+}

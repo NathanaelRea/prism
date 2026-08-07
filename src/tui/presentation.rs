@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::time::Instant;
 
 use crate::agent::AgentState;
@@ -7,10 +6,7 @@ use crate::tui_runtime::TerminalRuntime;
 use crate::view;
 use crate::workspace_state::CiState;
 
-use super::{
-    GitAction, LeaderHint, PanelFocus, Tui, auto_status, choice_list, plan_status,
-    worktree_updated_label,
-};
+use super::{GitAction, LeaderHint, PanelFocus, Tui, choice_list, worktree_updated_label};
 
 impl Tui {
     pub(crate) fn draw(&mut self, runtime: &mut TerminalRuntime) -> Result<(), String> {
@@ -79,20 +75,6 @@ impl Tui {
                     .get(session.repo_index)
                     .map(|repo| repo.label.clone())
                     .unwrap_or_else(|| session.repo_label.clone());
-                let auto_status = self
-                    .worktree_workflow_snapshot(
-                        Path::new(&repo_root),
-                        &session.path,
-                        crate::execution::WorkflowKind::Coding,
-                    )
-                    .and_then(|workflow| auto_status(workflow.lifecycle));
-                let plan_status = self
-                    .worktree_workflow_snapshot(
-                        Path::new(&repo_root),
-                        &session.path,
-                        crate::execution::WorkflowKind::Plan,
-                    )
-                    .and_then(|workflow| plan_status(workflow.lifecycle));
                 let snapshot_status = self
                     .repos
                     .get(session.repo_index)
@@ -135,8 +117,6 @@ impl Tui {
                             quality: view::DevelopmentEnvironmentQuality::from(&managed.wt_quality),
                         })
                     }),
-                    auto_status,
-                    plan_status,
                     updated_label: worktree_updated_label(session),
                     unseen_comments: session.unseen_comments,
                     prompt_summary: session.prompt_summary.clone(),
@@ -202,18 +182,112 @@ impl Tui {
             main_focused: self.main_focused,
             main_scroll: self.main_scroll,
             repo_main_view: self.repo_main_view,
-            worktree_main_view: self.worktree_main_view,
             worktree_list_mode: self.worktree_list_mode,
             mode_label: "normal",
             status_message: self.status_message.as_deref(),
             repo_filter: &self.repo_filter,
             worktree_filter: &self.worktree_filter,
             leader_hint: self.leader_hint_model(),
-            auto_dashboard: self.current_auto_dashboard(),
-            plan_dashboard: self.current_plan_dashboard(),
+            workflow_dashboard: self.current_workflow_dashboard(),
             tmux_portal: self.tmux_portal_model(),
             dialog: self.dialog.clone(),
         }
+    }
+
+    pub(super) fn current_workflow_dashboard(&self) -> Option<view::WorkflowDashboard> {
+        let selected_path = self
+            .selected_worktree_index()
+            .and_then(|index| self.sessions.get(index))
+            .map(|session| &session.path);
+        let candidates = self
+            .workspace_repositories
+            .values()
+            .flat_map(|repository| &repository.workflows)
+            .filter(|workflow| selected_path.is_none_or(|path| &workflow.worktree.path == path))
+            .collect::<Vec<_>>();
+        let workflow = self
+            .selected_workflow_run
+            .as_ref()
+            .and_then(|selected| {
+                candidates
+                    .iter()
+                    .copied()
+                    .find(|workflow| &workflow.identity.run_id == selected)
+            })
+            .or_else(|| {
+                candidates
+                    .into_iter()
+                    .max_by_key(|workflow| workflow.updated_unix_ms)
+            })?;
+        let children = self
+            .workspace_repositories
+            .values()
+            .flat_map(|repository| &repository.workflows)
+            .filter(|candidate| {
+                candidate
+                    .owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.run_id == workflow.identity.run_id)
+            })
+            .map(|candidate| candidate.identity.run_id.clone())
+            .collect();
+        let detail = self
+            .workspace_repositories
+            .values()
+            .flat_map(|repository| &repository.workflow_details)
+            .find(|detail| detail.id == workflow.identity.run_id)
+            .cloned();
+        let current_step_skippable = workflow.current_step.as_ref().is_some_and(|current| {
+            detail.as_ref().is_some_and(|detail| {
+                detail
+                    .steps
+                    .iter()
+                    .any(|step| step.key == current.label && step.skippable)
+            })
+        });
+        Some(view::WorkflowDashboard {
+            run_id: workflow.identity.run_id.clone(),
+            status: workflow.lifecycle.label().into(),
+            current_step: workflow
+                .current_step
+                .as_ref()
+                .map(|step| step.label.clone()),
+            completed_steps: workflow.progress.completed,
+            total_steps: workflow.progress.total,
+            parent_run_id: workflow.owner.as_ref().map(|owner| owner.run_id.clone()),
+            children,
+            detail,
+            can_pause: workflow.available_controls.pause,
+            can_resume: workflow.available_controls.resume,
+            can_cancel: workflow.available_controls.stop,
+            can_retry: workflow.available_controls.recover,
+            current_step_skippable,
+        })
+    }
+
+    pub(super) fn select_adjacent_workflow(&mut self, direction: isize) {
+        let selected_path = self
+            .selected_worktree_index()
+            .and_then(|index| self.sessions.get(index))
+            .map(|session| &session.path);
+        let mut runs = self
+            .workspace_repositories
+            .values()
+            .flat_map(|repository| &repository.workflows)
+            .filter(|workflow| selected_path.is_none_or(|path| &workflow.worktree.path == path))
+            .collect::<Vec<_>>();
+        runs.sort_by_key(|workflow| (workflow.updated_unix_ms, &workflow.identity.run_id));
+        if runs.is_empty() {
+            self.selected_workflow_run = None;
+            return;
+        }
+        let current = self
+            .selected_workflow_run
+            .as_ref()
+            .and_then(|selected| runs.iter().position(|run| &run.identity.run_id == selected))
+            .unwrap_or(runs.len() - 1);
+        let next = (current as isize + direction).rem_euclid(runs.len() as isize) as usize;
+        self.selected_workflow_run = Some(runs[next].identity.run_id.clone());
     }
 
     pub(super) fn tmux_portal_model(&self) -> Option<view::TmuxPortalModel<'_>> {
@@ -317,20 +391,18 @@ impl Tui {
         let mut ci_failed = 0;
         let mut ci_running = 0;
         let mut dirty = 0;
-        let mut active_plans = 0;
-        let mut failed_plans = 0;
-        let mut active_auto = 0;
-        let mut failed_auto = 0;
+        let mut active_workflows = 0;
+        let mut failed_workflows = 0;
+        let mut input_required_workflows = 0;
         for workflow in self
             .workspace_repositories
             .values()
             .flat_map(|repository| &repository.workflows)
         {
-            match (workflow.identity.kind.as_str(), workflow.lifecycle.as_str()) {
-                ("coding", "queued" | "running" | "paused") => active_auto += 1,
-                ("coding", "failed" | "aborted") => failed_auto += 1,
-                ("plan", "queued" | "running" | "paused") => active_plans += 1,
-                ("plan", "failed" | "aborted") => failed_plans += 1,
+            match workflow.lifecycle.as_str() {
+                "queued" | "running" | "paused" | "waiting" => active_workflows += 1,
+                "input_required" => input_required_workflows += 1,
+                "failed" | "aborted" | "recovery_required" => failed_workflows += 1,
                 _ => {}
             }
         }
@@ -407,24 +479,19 @@ impl Tui {
                 attention: running > 0,
             },
             view::StatusRow {
-                label: "auto".to_string(),
-                value: active_auto.to_string(),
-                attention: active_auto > 0,
+                label: "workflows".to_string(),
+                value: active_workflows.to_string(),
+                attention: active_workflows > 0,
             },
             view::StatusRow {
-                label: "auto fail".to_string(),
-                value: failed_auto.to_string(),
-                attention: failed_auto > 0,
+                label: "workflow input".to_string(),
+                value: input_required_workflows.to_string(),
+                attention: input_required_workflows > 0,
             },
             view::StatusRow {
-                label: "plans".to_string(),
-                value: active_plans.to_string(),
-                attention: active_plans > 0,
-            },
-            view::StatusRow {
-                label: "plan fail".to_string(),
-                value: failed_plans.to_string(),
-                attention: failed_plans > 0,
+                label: "workflow fail".to_string(),
+                value: failed_workflows.to_string(),
+                attention: failed_workflows > 0,
             },
             view::StatusRow {
                 label: "attention".to_string(),
@@ -460,7 +527,8 @@ impl Tui {
                 "Shortcuts",
                 &[
                     ("g", "git actions"),
-                    ("p", "plan actions"),
+                    ("W", "workflow management"),
+                    ("c", "configuration"),
                     ("0", "focus main"),
                 ],
             )),
@@ -468,6 +536,8 @@ impl Tui {
                 title: "Shortcuts".to_string(),
                 choices: vec![
                     view::KeyChoice::new("g", "git actions"),
+                    view::KeyChoice::new("W", "workflow management"),
+                    view::KeyChoice::new("c", "configuration"),
                     self.remote_pr_list_choice(),
                     view::KeyChoice::new("W", "worktree columns"),
                     view::KeyChoice::new("0", "focus main"),
@@ -478,7 +548,8 @@ impl Tui {
                 "Shortcuts",
                 &[
                     ("g", "git actions"),
-                    ("p", "plan actions"),
+                    ("W", "workflow management"),
+                    ("c", "configuration"),
                     ("0", "focus main"),
                     ("enter", "terminal"),
                     ("space", "agent if valid"),
@@ -503,13 +574,8 @@ impl Tui {
             (Some(LeaderHint::Git), PanelFocus::Worktrees) => Some(view::ChoiceList {
                 title: "Git Actions".to_string(),
                 choices: vec![
-                    view::KeyChoice::new("a", "auto flow"),
                     self.git_choice(GitAction::LazyGit, "g", "lazygit"),
-                    self.git_choice(GitAction::Push, "P", "push/create PR"),
                     self.git_choice(GitAction::OpenPr, "o", "open PR"),
-                    self.git_choice(GitAction::Merge, "M", "merge"),
-                    self.git_choice(GitAction::CiFix, "c", "CI repair"),
-                    self.git_choice(GitAction::ReviewFix, "f", "review repair"),
                     self.git_choice(GitAction::ResolveAllComments, "R", "resolve all comments"),
                 ],
             }),

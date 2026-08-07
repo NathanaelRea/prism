@@ -1,0 +1,14 @@
+{
+  "fixture_schema_version": 1,
+  "contract": "contract.extension.protocol-v1-supervision",
+  "given": { "revision": "sha256:extension-a", "next_revision": "sha256:extension-b", "protocol": "1.0" },
+  "expect": [
+    { "event": "attempt_dispatched", "revision": "sha256:extension-a", "correlation_id": "call-1" },
+    { "event": "extension_crashed", "attempt": "failed", "diagnostics": "bounded" },
+    { "event": "process_tree_terminated" },
+    { "event": "later_attempt_restarts_process", "revision": "sha256:extension-a", "correlation_id": "call-2" },
+    { "event": "cancel_requested", "correlation_id": "call-2" },
+    { "event": "cancel_acknowledged_or_process_tree_killed" },
+    { "event": "pinned_run_never_switches_revision", "forbidden_revision": "sha256:extension-b" }
+  ]
+}

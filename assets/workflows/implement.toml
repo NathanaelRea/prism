@@ -1,0 +1,58 @@
+schema_version = 2
+name = "implement"
+description = "Implement a typed Task in an exact Worktree Session and verify the candidate."
+launch = ["manual", "child"]
+tags = ["implementation", "verification"]
+capabilities = ["agent:run", "workspace:write", "process:run"]
+
+[inputs.task]
+type = "prism.task/v1"
+required = true
+
+[inputs.worktree]
+type = "prism.worktree-session/v1"
+required = true
+from_context = true
+
+[outputs.candidate]
+type = "prism.candidate-change/v1"
+from = "steps.verified.outputs.candidate"
+
+[outputs.next_task]
+type = "prism.task/v1"
+from = "steps.verified.outputs.next_task"
+
+[outputs.plan_complete]
+type = "prism.boolean/v1"
+from = "steps.verified.outputs.plan_complete"
+
+[[steps]]
+id = "implement"
+class = "action"
+use = "prism.standard/agent-implement"
+inputs = { task = "inputs.task", worktree = "inputs.worktree" }
+resources = ["workspace"]
+skippable = false
+
+[[steps]]
+id = "local-verification"
+class = "gate"
+use = "prism.standard/local-verification"
+inputs = { candidate = "steps.implement.outputs.candidate" }
+skippable = false
+
+[[steps]]
+id = "self-review"
+class = "gate"
+use = "prism.standard/self-review"
+depends_on = ["implement"]
+inputs = { candidate = "steps.implement.outputs.candidate" }
+skippable = false
+
+[[steps]]
+id = "verified"
+class = "action"
+use = "prism.standard/verified-candidate"
+depends_on = ["local-verification", "self-review"]
+inputs = { candidate = "steps.implement.outputs.candidate", local = "steps.local-verification.outputs.result", review = "steps.self-review.outputs.result" }
+skippable = false

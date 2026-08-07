@@ -1,64 +1,63 @@
-schema_version = 1
+schema_version = 2
 name = "plan"
-description = "Create or select an immutable Plan Artifact, approve its exact revision, and fan phases out as bounded child runs."
-capabilities = ["repository_read", "workspace_write", "process_execute", "git_commit", "child_workflow_create"]
+description = "Select or create a typed Plan, then implement its next phase as a child run."
+launch = ["manual"]
+tags = ["planning"]
+capabilities = ["agent:run", "workspace:write", "process:run"]
 
-[inputs.task]
-artifact_type = "builtin:task@1"
+[parameters]
+require_approval = false
 
-[budgets]
-max_attempts = 12
-max_fan_out = 8
-max_child_depth = 2
-max_mutations = 8
+[inputs.plan_source]
+type = "prism.plan-source/v1"
+required = true
+
+[inputs.worktree]
+type = "prism.worktree-session/v1"
+required = true
+from_context = true
+
+[outputs.plan]
+type = "prism.plan/v1"
+from = "steps.select-plan.outputs.result"
+
+[outputs.candidate]
+type = "prism.candidate-change/v1"
+from = "steps.implement-phase.outputs.candidate"
 
 [[steps]]
-id = "create-plan"
+id = "select-plan"
 class = "action"
-implementation = "builtin:create-plan@1"
-capabilities = ["repository_read", "process_execute"]
-[steps.inputs.task]
-from = "run.task"
-artifact_type = "builtin:task@1"
-[steps.outputs.plan]
-artifact_type = "builtin:plan@1"
+use = "prism.standard/plan-parse"
+inputs = { request = "inputs.plan_source" }
+skippable = false
 
 [[steps]]
-id = "review-plan"
-class = "action"
-implementation = "builtin:review-plan@1"
-depends_on = ["create-plan"]
-capabilities = ["repository_read", "process_execute"]
-[steps.inputs.plan]
-from = "create-plan.plan"
-artifact_type = "builtin:plan@1"
-[steps.outputs.plan]
-artifact_type = "builtin:plan@1"
-
-[[steps]]
-id = "approve-plan"
+id = "approve-plan-revision"
 class = "approval"
-implementation = "builtin:approve-plan@1"
-depends_on = ["review-plan"]
-[steps.inputs.plan]
-from = "review-plan.plan"
-artifact_type = "builtin:plan@1"
-[steps.outputs.decision]
-artifact_type = "builtin:human-attestation@1"
+use = "prism.standard/plan-approval"
+inputs = { plan = "steps.select-plan.outputs.result" }
+condition = "parameters.require_approval == true"
+on_unknown = "fail"
+settings = { summary = "Approve the exact selected Plan Artifact revision" }
+skippable = false
 
 [[steps]]
-id = "implement-phases"
+id = "select-phase"
+class = "action"
+use = "prism.standard/plan-phase-task"
+inputs = { plan = "steps.select-plan.outputs.result" }
+skippable = false
+
+[[steps]]
+id = "implement-phase"
 class = "workflow_call"
-implementation = "builtin:workflow-call@1"
-depends_on = ["approve-plan"]
-capabilities = ["child_workflow_create"]
-[steps.inputs.plan]
-from = "review-plan.plan"
-artifact_type = "builtin:plan@1"
-[steps.outputs.commit]
-artifact_type = "builtin:commit@1"
-[steps.child_workflow]
-qualified_name = "builtin:plan-phase"
-revision = "1"
-digest = "1f78377d85daca687e1867f2fdd50072058deb70e9d08bed515f0868aff11e21"
-capabilities = ["repository_read", "workspace_write", "process_execute", "git_commit"]
+workflow = "prism.standard/implement"
+inputs = { task = "steps.select-phase.outputs.task", worktree = "inputs.worktree" }
+skippable = false
+
+[steps.repeat]
+until = "steps.implement-phase.outputs.plan_complete == true"
+max_iterations = 32
+on_exhausted = "input_required"
+successor = { task = "next_task" }

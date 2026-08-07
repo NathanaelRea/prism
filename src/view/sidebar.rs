@@ -265,12 +265,6 @@ pub(super) fn render_worktrees(
                         muted_style(),
                     ));
                 }
-                if let Some(status) = worktree.auto_status {
-                    spans.push(Span::styled(
-                        format!("  auto:{}", auto_status_label(status)),
-                        auto_style(status),
-                    ));
-                }
             }
             let focused = model.focus == PanelFocus::Worktrees && !model.main_focused;
             ListItem::new(Line::from(spans)).style(if worktree.selected {
@@ -637,17 +631,6 @@ pub(super) fn worktree_error_column(worktree: &crate::view::WorktreeRow) -> (&'s
 }
 
 pub(super) fn worktree_activity_column(worktree: &crate::view::WorktreeRow) -> (String, Style) {
-    if let Some(status) = worktree.auto_status {
-        return (
-            format!("a:{}", auto_status_label(status)),
-            auto_style(status),
-        );
-    }
-    if let Some(status) = worktree.plan_status {
-        return (
-            format!("p:{}", plan_run_status_label(status)),
-            plan_run_status_style(status),
-        );
-    }
+    let _ = worktree;
     ("-".to_string(), muted_style())
 }

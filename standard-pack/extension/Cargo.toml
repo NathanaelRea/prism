@@ -1,0 +1,32 @@
+[package]
+name = "prism-standard-extension"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+publish = false
+
+[dependencies]
+prism-extension-sdk = { path = "../../crates/prism-extension-sdk" }
+serde_json = "1"
+serde = "1"
+tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread", "time"] }
+
+[[bin]]
+name = "prism-standard-extension"
+path = "src/main.rs"
+
+[[bin]]
+name = "third-party-fixture"
+path = "src/bin/third_party_fixture.rs"
+
+[[bin]]
+name = "stdout-contamination-fixture"
+path = "src/bin/stdout_contamination_fixture.rs"
+
+[[bin]]
+name = "unresponsive-fixture"
+path = "src/bin/unresponsive_fixture.rs"
+
+[dev-dependencies]
+prism = { path = "../.." }

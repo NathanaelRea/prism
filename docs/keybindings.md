@@ -12,41 +12,39 @@ Prism uses a lazygit-style panel model.
 - `j` / `k` or up/down moves within the focused row panel.
 - `g g` jumps to the top of the focused list.
 - `G` jumps to the bottom of the focused list.
-- `Enter` and `Space Space` share the same go-deeper behavior from Repos and Worktrees: Repos opens the selected repository's default tmux session, and Worktrees opens the selected agent session when valid. Status has no `Enter` action. From a focused Worktrees plan dashboard, `Enter` resumes the selected phase's recorded agent session in tmux when supported.
+- `Enter` and `Space Space` share the same go-deeper behavior from Repos and Worktrees: Repos opens the selected repository's default tmux session, and Worktrees opens the selected agent session when valid. Status has no `Enter` action.
 - Default branch worktrees are not agent targets; `Enter` and `Space Space` show the same blocked message there.
 - `Space Enter` opens tmux window 3: terminal.
 - `Ctrl-/` also opens tmux window 3 where the terminal reports that key combination distinctly; use `Space Enter` as the reliable alternative.
 - `Space g g` opens tmux window 2: lazygit.
-- `Space g P` pushes a guarded pending Change Request Stabilization repair commit and continues stabilization. If actionable review conversations block a run without a pending push, Prism offers to mark all freshly observed conversations resolved before reobserving; the confirmation defaults to No.
 - `Space g o` opens the selected change request in a browser.
 - `o` from the Worktrees panel opens the selected Worktree Session's Worktrunk-configured HTTP(S) development URL. It remains available when listening is false, unknown, or stale; the details view reports that state.
-- `Space g M` runs local checks and observes the selected change request's gates. If only unresolved inline review conversations block the merge and the provider supports resolution, Prism resolves the observed conversations, verifies all gates once more, and merges.
-- `Space g c` starts or appends a managed Change Request Stabilization CI repair for the selected worktree.
-- `Space g f` starts or appends a managed Change Request Stabilization review repair for the selected worktree.
 - `Space g R` resolves all unresolved inline review conversations visible when the key is pressed while `0 Main` is focused.
 - Unavailable `Space g` actions are shown in dark gray and ignored. Remote actions require a known change request and provider capability; repair actions also require a headless-capable harness.
-- `P` opens plan mode from the selected repo or worktree, selects a Markdown plan with `fzf`, and runs each phase through the selected harness. Active plan runs render automatically in the Worktrees main panel for the selected worktree.
-- `A` starts or focuses Auto Flow for the selected non-default worktree. Focusing a run blocked by actionable inline review feedback refreshes its provider and, when supported, offers to mark all unresolved conversations resolved; the confirmation defaults to No.
+- `W` opens `fzf` with manual Workflow Definitions compatible with the selected Repository,
+  Worktree Session, or Change Request. The picker searches qualified ID, name, description, tags,
+  and Step implementation metadata, then Prism collects any missing typed inputs before launch.
+- `{` / `}` selects the previous/next Workflow Run linked to the current Worktree Session for
+  independent parent, child, and iteration inspection.
+- `Space W` opens workflow management for Workflow Definitions, Triggers, packages, extensions,
+  skills, and templates. These destinations use the same operations as their CLI command families.
+- `Space c` opens the unified configuration tree for global and repository settings, tracked
+  repositories/keybindings, Worktrunk configuration, worktree columns, and Harness selection.
 - `>` / `<` raises/lowers the selected worktree priority.
-- `u` pauses/resumes the selected Auto Flow or plan run from Status or the Worktrees main panel; paused Auto Flow resumes only after a dialog describes the next step.
-- `f` retries failed Auto Flow or Plan steps from the active dashboard.
-- `B` retries Auto Flow or Plan execution from the selected step.
-- `s` skips the selected Plan step from the active Plan dashboard.
+- `u` pauses or resumes the selected Workflow Run.
+- `f` retries the selected failed Workflow Step as a new Attempt against the same input revisions.
+- `B` restarts from the selected Step after previewing downstream invalidation.
+- `s` is offered only for a Step whose Definition explicitly marks it skippable and previews the
+  downstream invalidation before applying it.
 - `p` or `Space g p` pulls the selected repository's default branch from the Repos or Worktrees panel.
 - `Space 1` through `Space 9` jump to configured repositories.
 - `r` opens the repository order dialog from the Repos panel. Use `Space` to mark repositories for removal, `J`/`K` to move them down/up, and `Enter` to save. Removals require a second confirmation.
-- `R` edits repository order, key bindings, and tracked repositories in `repos.toml`.
 - `c` creates a worktree session from the Repos panel.
-- `x` aborts the selected agent session from the Worktrees panel when its adapter supports native session cancellation.
+- `x` cancels the selected Workflow Run when one is shown; otherwise it aborts the selected agent
+  session from the Worktrees panel when its adapter supports native session cancellation.
 - `M` migrates the selected Worktree Session to the current global harness, including a worktree previously pinned with `Keep`.
-- `H` opens the global harness chooser. Built-in harnesses can be selected directly; the generic option collects interactive and optional headless commands.
-- Choice dialogs keep unavailable actions visible in dark gray. Their keys are ignored without closing the dialog; Plan and Auto actions use current run and step state to determine availability.
-- `x` also aborts the selected Plan phase from the active Plan dashboard, or accepts `all` when prompted to abort all running phases.
-- `e` edits the selected Prism repository config and reloads after save.
-- `E` edits the Prism user config and reloads after save.
-- `w` discovers and opens the Worktrunk user config. If it is missing, Prism offers to create it through `wt config create`. Changes affect Prism and standalone `wt` commands; Prism does not parse or write this file.
+- Choice dialogs keep unavailable actions visible in dark gray. Their keys are ignored without closing the dialog.
 - `C` opens a picker of remote change requests for the selected repository and creates or selects a local worktree using the request's head branch name. An existing local branch is reused without resetting it.
-- `W` opens the in-app worktree column selector for the selected repository. Use `Space` to enable/disable a column, `J`/`K` to move an enabled column down/up, and `Enter` to save.
 - `L` from the Worktrees panel opens the selected repository's Worktrunk hook-log picker and a bounded sanitized log tail. A matching branch label affects ordering only and does not assert session identity or process liveness.
 - `/` filters the focused Repos or Worktrees panel.
 - `?` opens the in-app keybinding dialog.

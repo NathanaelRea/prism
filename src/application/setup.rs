@@ -4,10 +4,21 @@ use crate::config::{Config, IconStyle};
 use crate::git::{RepositoryCheckout, inspect_repository_checkout, worktree_dirty};
 use crate::harness::{BUILTIN_HARNESS_IDS, harness_label};
 use crate::lifecycle::move_current_branch_to_worktree;
+use crate::package::bootstrap_standard_pack;
 use crate::process::command_exists;
 use crate::repo::Repository;
 use crate::terminal::stdin_is_tty;
 use crate::util::yes;
+
+pub(crate) fn ensure_user_owned_resources(config: &Config) -> Result<bool, String> {
+    let root = config.user_path.parent().ok_or_else(|| {
+        format!(
+            "user configuration path {} has no parent",
+            config.user_path.display()
+        )
+    })?;
+    bootstrap_standard_pack(root).map_err(|error| error.to_string())
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct StartupSetup {

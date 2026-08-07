@@ -1,0 +1,1 @@
+{"type":"hello","hello":{"protocol":{"major":1,"minor":0},"features":["host.read_artifact"],"host":"prism/0.1.4"}}

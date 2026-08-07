@@ -43,6 +43,9 @@ fi
 export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
 export CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-always}"
 
+run scripts/check-workflow-cutover.sh
+run scripts/check-standard-pack-publication.sh
+
 isolated_tmux_dir="$(mktemp -d "${TMPDIR:-/tmp}/prism-full-check-tmux.XXXXXX")"
 sqlx_database="$(mktemp "${TMPDIR:-/tmp}/prism-full-check-sqlx.XXXXXX.db")"
 workflow_database="$(mktemp "${TMPDIR:-/tmp}/prism-full-check-workflow.XXXXXX.db")"
@@ -52,6 +55,12 @@ export TMUX_TMPDIR="$isolated_tmux_dir"
 run cargo fmt --check
 run cargo sqlx migrate run --source migrations/repository --database-url "sqlite://$sqlx_database"
 run cargo sqlx migrate run --source migrations/workflow --database-url "sqlite://$workflow_database"
+repository_legacy_count="$(sqlite3 "$sqlx_database" "select count(*) from sqlite_master where name in ('auto_run','auto_step_run','plan_run','plan_step_run','workflow_execution')")"
+workflow_import_count="$(sqlite3 "$workflow_database" "select count(*) from sqlite_master where name = 'import_journal'")"
+if [ "$repository_legacy_count" -ne 0 ] || [ "$workflow_import_count" -ne 0 ]; then
+  printf 'fresh databases retain legacy workflow schema objects\n' >&2
+  exit 1
+fi
 # Checked queries compile against the compatible union; migration tests validate each real target.
 for migration in migrations/workflow/*.sql; do
   run sqlite3 "$sqlx_database" ".read $migration"

@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "configuration exposes optional harness adapter capabilities"
+)]
+
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
@@ -31,13 +36,11 @@ default_harness = "opencode"
 default_base = "main"
 merge_method = "squash" # squash, merge, or rebase
 escape_key = "esc-esc" # esc-esc or ctrl-space
-plan_dir = "plans"
 review_packet_dir = ".agent/review"
 worktree_command = "wt"
 opencode_port_base = 41000
 opencode_port_span = 1000
 opencode_shutdown_owned_servers = false
-opencode_plan_plugin = false
 
 [ui]
 icon_style = "unicode" # or "nerd-font"
@@ -69,38 +72,6 @@ fzf = "fzf"
 # provider = "forgejo"
 # credential_env = "FORGEJO_TOKEN" # variable name only; never put a token here
 
-[checks]
-pre_pr = []
-pre_push = []
-review_fix = []
-
-[auto]
-merge = false
-cleanup_after_merge = false
-require_review_approval = false
-push_initial = true
-push_repairs = false
-review_wait_enabled = true
-review_reviewer_identities = ["Copilot", "github-copilot"]
-review_max_wait_seconds = 300
-review_poll_interval_seconds = 30
-review_continue_on_timeout = true
-ci_wait_enabled = true
-ci_max_wait_seconds = 1800
-ci_poll_interval_seconds = 30
-
-[prompt_templates]
-auto_create_plan = "Create an implementation plan at `{{plan_path}}`. Do not implement or commit. Include phases, tests, verification, risks, observability, and architecture fit.\n\nTask:\n{{task}}\n\nMode: {{mode}}\nVariant: {{variant}}\nAgent profile: {{agent_profile}}"
-auto_review_plan = "Review `{{plan_path}}` and edit it in place. Do not implement or commit. Check phases, risks, tests, observability, restartability, safety, and architecture fit.\n\nTask:\n{{task}}"
-auto_implement = "Implement this task in the current worktree. Stop after implementation; do not commit, push, create a pull request, or merge.\n\nTask:\n{{task}}"
-auto_fix_local_verify = "Fix the local verification failures, then stop without committing.\n\nOriginal task:\n{{task}}\n\nFailure context:\n{{context}}"
-auto_fix_review = "Resolve the review feedback, then stop without committing.\n\nOriginal task:\n{{task}}\n\nReview context:\n{{context}}"
-auto_fix_ci = "Fix the CI failure, then stop without committing.\n\nOriginal task:\n{{task}}\n\nCI context:\n{{context}}"
-review_fix = "Here are review comments on PR {pr_number}.\n\nIf they are applicable, fix them. Otherwise, say why not.\n\n---\n\n{comments}"
-ci_failure = "Here are CI failures on PR {pr_number}.\n\nFix the failing checks. Use the log tails below as the primary clues.\n\nPR: {url}\nBranch: {branch}\nHead SHA: {head_sha}\n\n---\n\n{failures}"
-repair_commit_review = "fix: cr"
-repair_commit_ci = "fix: ci"
-repair_commit_merge = "fix: merge"
 "#
 }
 
@@ -116,30 +87,6 @@ pub fn repo_config_template(include_worktree_columns: bool) -> String {
         text.push_str("\n[worktrees]\ncolumns = []\n");
     }
     text
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct Checks {
-    pub pre_pr: Vec<String>,
-    pub pre_push: Vec<String>,
-    pub review_fix: Vec<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AutoConfig {
-    pub merge: bool,
-    pub cleanup_after_merge: bool,
-    pub require_review_approval: bool,
-    pub push_initial: bool,
-    pub push_repairs: bool,
-    pub review_wait_enabled: bool,
-    pub review_reviewer_identities: Vec<String>,
-    pub review_max_wait_seconds: u64,
-    pub review_poll_interval_seconds: u64,
-    pub review_continue_on_timeout: bool,
-    pub ci_wait_enabled: bool,
-    pub ci_max_wait_seconds: u64,
-    pub ci_poll_interval_seconds: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -185,26 +132,6 @@ impl IconStyle {
         match self {
             Self::Unicode => "unicode",
             Self::NerdFont => "nerd-font",
-        }
-    }
-}
-
-impl Default for AutoConfig {
-    fn default() -> Self {
-        Self {
-            merge: false,
-            cleanup_after_merge: false,
-            require_review_approval: false,
-            push_initial: true,
-            push_repairs: false,
-            review_wait_enabled: true,
-            review_reviewer_identities: vec!["Copilot".to_string(), "github-copilot".to_string()],
-            review_max_wait_seconds: 300,
-            review_poll_interval_seconds: 30,
-            review_continue_on_timeout: true,
-            ci_wait_enabled: true,
-            ci_max_wait_seconds: 1800,
-            ci_poll_interval_seconds: 30,
         }
     }
 }
@@ -273,21 +200,17 @@ pub struct Config {
     pub config_errors: Vec<String>,
     pub default_agent: String,
     pub default_base: Option<String>,
-    pub plan_dir: String,
     pub review_packet_dir: String,
     pub worktree_command: String,
     pub opencode_port_base: u16,
     pub opencode_port_span: u16,
     pub opencode_shutdown_owned_servers: bool,
-    pub opencode_plan_plugin: bool,
     pub escape_key: EscapeKey,
     pub merge_method: MergeMethod,
     pub icon_style: IconStyle,
     pub icon_style_configured: bool,
-    pub auto: AutoConfig,
     pub layout: LayoutConfig,
     pub notifications: NotificationConfig,
-    pub checks: Checks,
     pub worktree_columns: Vec<String>,
     pub tools: BTreeMap<String, String>,
     pub(crate) remote_hosts: BTreeMap<String, RemoteHostConfig>,
@@ -304,18 +227,14 @@ struct RawConfig {
     harnesses: Option<BTreeMap<String, RawHarnessConfig>>,
     default_agent: Option<String>,
     default_base: Option<String>,
-    plan_dir: Option<String>,
     review_packet_dir: Option<String>,
     worktree_command: Option<String>,
     opencode_port_base: Option<u16>,
     opencode_port_span: Option<u16>,
     opencode_shutdown_owned_servers: Option<bool>,
-    opencode_plan_plugin: Option<bool>,
     escape_key: Option<String>,
     merge_method: Option<String>,
     ui: Option<RawUiConfig>,
-    checks: Option<RawChecks>,
-    auto: Option<RawAutoConfig>,
     layout: Option<RawLayoutConfig>,
     notifications: Option<RawNotificationConfig>,
     worktrees: Option<RawWorktrees>,
@@ -347,30 +266,6 @@ struct RawRemoteHostConfig {
 #[derive(Clone, Debug, Default, Deserialize)]
 struct RawUiConfig {
     icon_style: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-struct RawChecks {
-    pre_pr: Option<Vec<String>>,
-    pre_push: Option<Vec<String>>,
-    review_fix: Option<Vec<String>>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-struct RawAutoConfig {
-    merge: Option<bool>,
-    cleanup_after_merge: Option<bool>,
-    require_review_approval: Option<bool>,
-    push_initial: Option<bool>,
-    push_repairs: Option<bool>,
-    review_wait_enabled: Option<bool>,
-    review_reviewer_identities: Option<Vec<String>>,
-    review_max_wait_seconds: Option<u64>,
-    review_poll_interval_seconds: Option<u64>,
-    review_continue_on_timeout: Option<bool>,
-    ci_wait_enabled: Option<bool>,
-    ci_max_wait_seconds: Option<u64>,
-    ci_poll_interval_seconds: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -668,21 +563,17 @@ impl Config {
             config_errors: Vec::new(),
             default_agent: "opencode".to_string(),
             default_base: Some("main".to_string()),
-            plan_dir: "plans".to_string(),
             review_packet_dir: ".agent/review".to_string(),
             worktree_command: "wt".to_string(),
             opencode_port_base: 41_000,
             opencode_port_span: 1_000,
             opencode_shutdown_owned_servers: false,
-            opencode_plan_plugin: false,
             escape_key: EscapeKey::EscEsc,
             merge_method: MergeMethod::Squash,
             icon_style: IconStyle::Unicode,
             icon_style_configured: false,
-            auto: AutoConfig::default(),
             layout: LayoutConfig::default(),
             notifications: NotificationConfig::default(),
-            checks: Checks::default(),
             worktree_columns: Vec::new(),
             tools,
             remote_hosts: BTreeMap::new(),
@@ -761,9 +652,6 @@ impl Config {
         if let Some(value) = raw.default_base {
             self.default_base = Some(value);
         }
-        if let Some(value) = raw.plan_dir {
-            self.plan_dir = value;
-        }
         if let Some(value) = raw.review_packet_dir {
             self.review_packet_dir = value;
         }
@@ -779,9 +667,6 @@ impl Config {
         if let Some(shutdown) = raw.opencode_shutdown_owned_servers {
             self.opencode_shutdown_owned_servers = shutdown;
         }
-        if let Some(enabled) = raw.opencode_plan_plugin {
-            self.opencode_plan_plugin = enabled;
-        }
         if let Some(value) = raw
             .merge_method
             .and_then(|value| MergeMethod::parse(&value))
@@ -796,58 +681,6 @@ impl Config {
         {
             self.icon_style = style;
             self.icon_style_configured = true;
-        }
-        if let Some(checks) = raw.checks {
-            if let Some(values) = checks.pre_pr {
-                self.checks.pre_pr = values;
-            }
-            if let Some(values) = checks.pre_push {
-                self.checks.pre_push = values;
-            }
-            if let Some(values) = checks.review_fix {
-                self.checks.review_fix = values;
-            }
-        }
-        if let Some(auto) = raw.auto {
-            if let Some(enabled) = auto.merge {
-                self.auto.merge = enabled;
-            }
-            if let Some(enabled) = auto.cleanup_after_merge {
-                self.auto.cleanup_after_merge = enabled;
-            }
-            if let Some(enabled) = auto.require_review_approval {
-                self.auto.require_review_approval = enabled;
-            }
-            if let Some(enabled) = auto.push_initial {
-                self.auto.push_initial = enabled;
-            }
-            if let Some(enabled) = auto.push_repairs {
-                self.auto.push_repairs = enabled;
-            }
-            if let Some(enabled) = auto.review_wait_enabled {
-                self.auto.review_wait_enabled = enabled;
-            }
-            if let Some(values) = auto.review_reviewer_identities {
-                self.auto.review_reviewer_identities = values;
-            }
-            if let Some(seconds) = auto.review_max_wait_seconds {
-                self.auto.review_max_wait_seconds = seconds;
-            }
-            if let Some(seconds) = auto.review_poll_interval_seconds {
-                self.auto.review_poll_interval_seconds = seconds.max(1);
-            }
-            if let Some(value) = auto.review_continue_on_timeout {
-                self.auto.review_continue_on_timeout = value;
-            }
-            if let Some(enabled) = auto.ci_wait_enabled {
-                self.auto.ci_wait_enabled = enabled;
-            }
-            if let Some(seconds) = auto.ci_max_wait_seconds {
-                self.auto.ci_max_wait_seconds = seconds;
-            }
-            if let Some(seconds) = auto.ci_poll_interval_seconds {
-                self.auto.ci_poll_interval_seconds = seconds.max(1);
-            }
         }
         if let Some(layout) = raw.layout
             && let Some(width) = layout.sidebar_width
@@ -1319,7 +1152,6 @@ pub fn print_config(repo: &Repository, config: &Config) {
         "default_base = {}",
         config.default_base.as_deref().unwrap_or("")
     );
-    println!("plan_dir = {}", config.plan_dir);
     println!("review_packet_dir = {}", config.review_packet_dir);
     println!("worktree_command = {}", config.worktree_command);
     println!("opencode_port_base = {}", config.opencode_port_base);
@@ -1328,7 +1160,6 @@ pub fn print_config(repo: &Repository, config: &Config) {
         "opencode_shutdown_owned_servers = {}",
         config.opencode_shutdown_owned_servers
     );
-    println!("opencode_plan_plugin = {}", config.opencode_plan_plugin);
     println!("escape_key = {}", config.escape_key.label());
     println!("merge_method = {}", config.merge_method.label());
     println!("ui.icon_style = {}", config.icon_style.label());
@@ -1349,46 +1180,6 @@ pub fn print_config(repo: &Repository, config: &Config) {
             .sidebar_width
             .map(|width| width.to_string())
             .unwrap_or_default()
-    );
-    println!("auto.merge = {}", config.auto.merge);
-    println!(
-        "auto.cleanup_after_merge = {}",
-        config.auto.cleanup_after_merge
-    );
-    println!(
-        "auto.require_review_approval = {}",
-        config.auto.require_review_approval
-    );
-    println!("auto.push_initial = {}", config.auto.push_initial);
-    println!("auto.push_repairs = {}", config.auto.push_repairs);
-    println!(
-        "auto.review_wait_enabled = {}",
-        config.auto.review_wait_enabled
-    );
-    println!(
-        "auto.review_reviewer_identities = {:?}",
-        config.auto.review_reviewer_identities
-    );
-    println!(
-        "auto.review_max_wait_seconds = {}",
-        config.auto.review_max_wait_seconds
-    );
-    println!(
-        "auto.review_poll_interval_seconds = {}",
-        config.auto.review_poll_interval_seconds
-    );
-    println!(
-        "auto.review_continue_on_timeout = {}",
-        config.auto.review_continue_on_timeout
-    );
-    println!("auto.ci_wait_enabled = {}", config.auto.ci_wait_enabled);
-    println!(
-        "auto.ci_max_wait_seconds = {}",
-        config.auto.ci_max_wait_seconds
-    );
-    println!(
-        "auto.ci_poll_interval_seconds = {}",
-        config.auto.ci_poll_interval_seconds
     );
     println!("worktree_columns = {:?}", config.worktree_columns);
     println!(
@@ -1413,10 +1204,6 @@ pub fn print_config(repo: &Repository, config: &Config) {
             println!("{hostname}.credential_env = {environment}");
         }
     }
-    println!("[checks]");
-    println!("pre_pr = {:?}", config.checks.pre_pr);
-    println!("pre_push = {:?}", config.checks.pre_push);
-    println!("review_fix = {:?}", config.checks.review_fix);
     println!("[harnesses]");
     for (id, harness) in &config.harnesses {
         println!("{id}.adapter = {}", harness.adapter);
@@ -1490,7 +1277,7 @@ pub fn doctor(repo: &Repository, config: &mut Config) -> Result<(), String> {
                 "no reliable startup prompt transport is configured",
             ),
             (
-                "managed Plan/Auto Flow",
+                "managed workflows",
                 description.headless,
                 "no headless command is configured",
             ),
@@ -1537,12 +1324,7 @@ pub fn doctor(repo: &Repository, config: &mut Config) -> Result<(), String> {
     print_remote_doctor(repo, config);
 
     println!();
-    println!(
-        "checks: pre_pr={} pre_push={} review_fix={}",
-        config.checks.pre_pr.len(),
-        config.checks.pre_push.len(),
-        config.checks.review_fix.len()
-    );
+    print_workflow_doctor(repo);
 
     println!();
     match discover_sessions(repo, config) {
@@ -1559,6 +1341,219 @@ pub fn doctor(repo: &Repository, config: &mut Config) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn print_workflow_doctor(repo: &Repository) {
+    let global = crate::util::prism_config_dir();
+    if let Err(error) = crate::package::bootstrap_standard_pack(&global) {
+        println!("Standard Pack bootstrap error: {error}");
+    }
+    match crate::resource::discover(&global, Some(&repo.root.join(".prism"))) {
+        Ok(resources) => {
+            let workflows = resources
+                .iter()
+                .filter(|resource| resource.kind == crate::resource::ResourceKind::Workflow)
+                .collect::<Vec<_>>();
+            println!("workflow definitions: {}", workflows.len());
+            for resource in workflows {
+                match std::fs::read_to_string(&resource.path)
+                    .map_err(|error| error.to_string())
+                    .and_then(|source| {
+                        crate::WorkflowDefinition::parse(&source).map_err(|error| error.to_string())
+                    }) {
+                    Ok(definition) => {
+                        println!("  {}  valid  {}", definition.id, resource.path.display())
+                    }
+                    Err(error) => println!(
+                        "  {}  invalid: {}",
+                        resource.path.display(),
+                        crate::util::single_line(&error)
+                    ),
+                }
+            }
+            for resource in resources
+                .iter()
+                .filter(|resource| resource.kind == crate::resource::ResourceKind::Extension)
+            {
+                println!(
+                    "  extension {}  {}  {}",
+                    resource.identity,
+                    extension_working_state(&resource.path),
+                    resource.path.display()
+                );
+            }
+            println!(
+                "packages: {}  extensions: {}  skills: {}  templates: {}",
+                resources
+                    .iter()
+                    .filter(|item| item.kind == crate::resource::ResourceKind::Workflow)
+                    .filter_map(|item| item.path.ancestors().nth(2))
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len(),
+                resources
+                    .iter()
+                    .filter(|item| item.kind == crate::resource::ResourceKind::Extension)
+                    .count(),
+                resources
+                    .iter()
+                    .filter(|item| item.kind == crate::resource::ResourceKind::Skill)
+                    .count(),
+                resources
+                    .iter()
+                    .filter(|item| item.kind == crate::resource::ResourceKind::Template)
+                    .count(),
+            );
+        }
+        Err(error) => println!("workflow catalog error: {error}"),
+    }
+    for (label, path) in [
+        ("resource store", global.join("store")),
+        ("extension store", global.join("state/store")),
+    ] {
+        match crate::resource::ContentStore::new(path).audit() {
+            Ok(audit) => println!(
+                "{label}: {} blobs, {} references, {} orphaned, {} corrupt, {} dangling references, {} invalid entries",
+                audit.blobs,
+                audit.references,
+                audit.orphaned.len(),
+                audit.corrupt.len(),
+                audit.dangling.len(),
+                audit.invalid_entries.len()
+            ),
+            Err(error) => println!("{label} audit error: {error}"),
+        }
+    }
+    for (label, path) in [
+        ("global package lock", global.join("package.lock")),
+        (
+            "repository package lock",
+            repo.root.join(".prism/package.lock"),
+        ),
+    ] {
+        match std::fs::read_to_string(&path) {
+            Ok(source) => match crate::package::PackageLock::parse(&source) {
+                Ok(lock) => println!("{label}: valid ({} packages)", lock.packages.len()),
+                Err(error) => println!("{label}: invalid: {error}"),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                println!("{label}: not present")
+            }
+            Err(error) => println!("{label}: unreadable: {error}"),
+        }
+    }
+    let diagnostics = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())
+        .and_then(|runtime| {
+            runtime.block_on(async {
+                let operations = crate::WorkflowOperations::open_default()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let triggers = operations
+                    .list_triggers()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let diagnostics = operations
+                    .trigger_doctor(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .ok()
+                            .and_then(|value| i64::try_from(value.as_millis()).ok())
+                            .unwrap_or(0),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let health = operations
+                    .doctor_health()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok::<_, String>((triggers, diagnostics, health))
+            })
+        });
+    match diagnostics {
+        Ok((triggers, diagnostics, health)) => {
+            println!(
+                "Triggers: {} enabled / {} total",
+                triggers.iter().filter(|trigger| trigger.enabled).count(),
+                triggers.len()
+            );
+            for diagnostic in diagnostics {
+                println!(
+                    "  {}  {}: {}",
+                    diagnostic.trigger_id, diagnostic.severity, diagnostic.message
+                );
+            }
+            println!(
+                "workflow ledger: {} orphaned snapshots, {} quarantined workspaces, {} recovery-required runs, {} indeterminate effects, {} invalid child links, {} artifact integrity failures",
+                health.orphaned_definition_snapshots,
+                health.quarantined_workspaces,
+                health.recovery_required_runs,
+                health.indeterminate_effects,
+                health.invalid_child_links,
+                health.artifact_integrity_failures.len(),
+            );
+            for failure in health.artifact_integrity_failures {
+                println!(
+                    "  artifact {}: {}",
+                    failure.artifact_id,
+                    crate::util::single_line(&failure.reason)
+                );
+            }
+        }
+        Err(error) => println!("Trigger diagnostics unavailable: {error}"),
+    }
+}
+
+fn extension_working_state(path: &Path) -> &'static str {
+    if path.is_file() {
+        return "built";
+    }
+    let manifest = path.join("Cargo.toml");
+    let Ok(source) = std::fs::read_to_string(manifest) else {
+        return "unbuilt (no Cargo.toml)";
+    };
+    let Ok(value) = toml::from_str::<toml::Value>(&source) else {
+        return "unbuilt (invalid Cargo.toml)";
+    };
+    let Some(binary) = value
+        .get("package")
+        .and_then(|package| package.get("name"))
+        .and_then(toml::Value::as_str)
+    else {
+        return "unbuilt (no package name)";
+    };
+    let executable = path.join("target/release").join(binary);
+    let Ok(built) = std::fs::metadata(&executable).and_then(|metadata| metadata.modified()) else {
+        return "unbuilt";
+    };
+    let dirty = [
+        path.join("Cargo.toml"),
+        path.join("Cargo.lock"),
+        path.join("src"),
+    ]
+    .iter()
+    .any(|source| modified_after(source, built));
+    if dirty { "dirty/unbuilt" } else { "built" }
+}
+
+fn modified_after(path: &Path, threshold: std::time::SystemTime) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    if metadata.is_file() {
+        return metadata
+            .modified()
+            .is_ok_and(|modified| modified > threshold);
+    }
+    std::fs::read_dir(path).is_ok_and(|entries| {
+        entries
+            .filter_map(Result::ok)
+            .any(|entry| modified_after(&entry.path(), threshold))
+    })
 }
 
 fn harness_config_source(config: &Config) -> String {
@@ -1844,6 +1839,14 @@ fn save_user_default_agent(config: &Config, selected: &str) -> Result<(), String
 mod tests {
     use super::*;
 
+    fn test_unix_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u64::MAX as u128) as u64
+    }
+
     #[cfg(unix)]
     fn doctor_git_script(directory: &Path, remote: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
@@ -1902,7 +1905,7 @@ mod tests {
         let directory = std::env::temp_dir().join(format!(
             "prism-doctor-forgejo-{}-{}",
             std::process::id(),
-            crate::auto_flow::unix_ms()
+            test_unix_ms()
         ));
         fs::create_dir_all(&directory).unwrap();
         let git = doctor_git_script(&directory, "http://forge.test/acme/widget.git");
@@ -1941,7 +1944,7 @@ mod tests {
         let directory = std::env::temp_dir().join(format!(
             "prism-doctor-forgejo-unavailable-{}-{}",
             std::process::id(),
-            crate::auto_flow::unix_ms()
+            test_unix_ms()
         ));
         fs::create_dir_all(&directory).unwrap();
         let git = doctor_git_script(&directory, "ssh://git@forge.test/acme/widget.git");
@@ -1978,7 +1981,7 @@ mod tests {
         let directory = std::env::temp_dir().join(format!(
             "prism-doctor-gitlab-rebase-{}-{}",
             std::process::id(),
-            crate::auto_flow::unix_ms()
+            test_unix_ms()
         ));
         fs::create_dir_all(&directory).unwrap();
         let git = doctor_git_script(&directory, "git@gitlab.com:acme/widget.git");
@@ -2042,7 +2045,6 @@ mod tests {
         assert_eq!(config.opencode_port_base, 41_000);
         assert_eq!(config.opencode_port_span, 1_000);
         assert!(!config.opencode_shutdown_owned_servers);
-        assert!(!config.opencode_plan_plugin);
         assert!(config.is_default_branch("main"));
         assert_eq!(
             config.agent_command("opencode"),
@@ -2125,7 +2127,7 @@ mod tests {
         ));
         fs::write(
             &path,
-            "opencode_port_base = 42000\nopencode_port_span = 50\nopencode_shutdown_owned_servers = true\nopencode_plan_plugin = true\n",
+            "opencode_port_base = 42000\nopencode_port_span = 50\nopencode_shutdown_owned_servers = true\n",
         )
         .unwrap();
         let mut config = Config::defaults(PathBuf::from("/tmp/user.toml"), path.clone());
@@ -2135,7 +2137,6 @@ mod tests {
         assert_eq!(config.opencode_port_base, 42_000);
         assert_eq!(config.opencode_port_span, 50);
         assert!(config.opencode_shutdown_owned_servers);
-        assert!(config.opencode_plan_plugin);
 
         let _ = fs::remove_file(path);
     }
@@ -2185,9 +2186,6 @@ sidebar_width = 64
 [ui]
 icon_style = "nerd-font"
 
-[checks]
-pre_pr = ["cargo test", "printf \"done\""] # trailing comment
-
 [worktrees]
 columns = ["url", "ci.status"]
 
@@ -2220,7 +2218,6 @@ review = "fix\nreview"
         assert_eq!(config.icon_style, IconStyle::NerdFont);
         assert!(config.icon_style_configured);
         assert_eq!(config.layout.sidebar_width, Some(64));
-        assert_eq!(config.checks.pre_pr, vec!["cargo test", "printf \"done\""]);
         assert_eq!(config.worktree_columns, vec!["url", "ci.status"]);
         assert_eq!(config.tool("gh"), "/opt/tools/gh");
         assert_eq!(config.prompt_template("review"), Some("fix\nreview"));

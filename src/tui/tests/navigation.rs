@@ -4,15 +4,11 @@ use std::path::PathBuf;
 use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
-use crate::auto_flow::AutoRunStatus;
 use crate::remote::PrCache;
-use crate::view::{RepoMainView, WorktreeMainView};
+use crate::view::RepoMainView;
 
 use super::super::{OpenTmuxSessionTarget, PanelFocus, Tui, WorktreeListMode};
-use super::support::{
-    test_auto_run, test_plan_run, test_plan_run_with_steps, test_pr_summary, test_tui,
-    unique_temp_dir,
-};
+use super::support::{test_pr_summary, test_tui, unique_temp_dir};
 
 #[test]
 fn tui_defaults_to_repos_panel_focus() {
@@ -236,61 +232,6 @@ fn sidebar_navigation_leaves_main_focus() {
 }
 
 #[test]
-fn worktree_plan_dashboard_is_not_gated_by_horizontal_keys() {
-    let mut tui = test_tui();
-    tui.focused_panel = PanelFocus::Worktrees;
-    tui.select_worktree(1);
-    tui.remember_plan_run(test_plan_run("plan", "/repo-one/feature-one"));
-
-    assert_eq!(tui.worktree_main_view, WorktreeMainView::Details);
-    assert!(tui.current_plan_dashboard().is_some());
-
-    tui.move_left();
-
-    assert_eq!(tui.focused_panel, PanelFocus::Worktrees);
-    assert_eq!(tui.worktree_main_view, WorktreeMainView::Details);
-    assert!(tui.current_plan_dashboard().is_some());
-
-    tui.focus_main();
-    tui.move_right();
-
-    assert_eq!(tui.focused_panel, PanelFocus::Worktrees);
-    assert_eq!(tui.worktree_main_view, WorktreeMainView::Details);
-    assert!(tui.current_plan_dashboard().is_some());
-
-    tui.move_left();
-
-    assert_eq!(tui.focused_panel, PanelFocus::Worktrees);
-    assert_eq!(tui.worktree_main_view, WorktreeMainView::Details);
-    assert!(tui.current_plan_dashboard().is_some());
-}
-
-#[test]
-fn plan_runs_for_same_worktree_keep_independent_selection_history() {
-    let mut tui = test_tui();
-    tui.focused_panel = PanelFocus::Worktrees;
-    tui.select_worktree(1);
-    tui.worktree_main_view = WorktreeMainView::Plan;
-    let mut first = test_plan_run("plan-a", "/repo-one/feature-one");
-    first.run.updated_unix_ms = 10;
-    let mut second = test_plan_run("plan-b", "/repo-one/feature-one");
-    second.run.updated_unix_ms = 20;
-
-    tui.remember_plan_run(first);
-    tui.remember_plan_run(second);
-
-    let dashboard = tui.current_plan_dashboard().unwrap();
-    assert_eq!(dashboard.run.run.id, "plan-a");
-    assert_eq!(dashboard.runs.len(), 2);
-
-    assert!(tui.move_plan_run_selection(1));
-
-    let dashboard = tui.current_plan_dashboard().unwrap();
-    assert_eq!(dashboard.run.run.id, "plan-b");
-    assert_eq!(dashboard.runs.iter().filter(|run| run.selected).count(), 1);
-}
-
-#[test]
 fn open_tmux_session_target_blocks_status_enter() {
     let mut tui = test_tui();
     tui.focused_panel = PanelFocus::Status;
@@ -298,36 +239,6 @@ fn open_tmux_session_target_blocks_status_enter() {
     assert_eq!(
         tui.open_tmux_session_target(),
         OpenTmuxSessionTarget::Blocked("status has no Enter action")
-    );
-}
-
-#[test]
-fn open_tmux_session_target_blocks_status_enter_with_auto_run() {
-    let mut tui = test_tui();
-    tui.focused_panel = PanelFocus::Status;
-    tui.remember_auto_run(test_auto_run("auto", "/repo-one/feature-one", 20));
-
-    assert_eq!(
-        tui.open_tmux_session_target(),
-        OpenTmuxSessionTarget::Blocked("status has no Enter action")
-    );
-}
-
-#[test]
-fn historical_auto_run_does_not_replace_active_worktree_owner() {
-    let mut tui = test_tui();
-    let active = test_auto_run("active", "/repo-one/feature-one", 20);
-    let mut historical = test_auto_run("historical", "/repo-one/feature-one", 30);
-    historical.run.status = AutoRunStatus::Failed;
-
-    tui.remember_auto_run(active);
-    tui.remember_auto_run(historical);
-
-    assert_eq!(
-        tui.active_auto_runs
-            .get(std::path::Path::new("/repo-one/feature-one"))
-            .map(String::as_str),
-        Some("active")
     );
 }
 
@@ -363,20 +274,6 @@ fn open_tmux_session_target_opens_feature_worktree_agent() {
     assert_eq!(
         tui.open_tmux_session_target(),
         OpenTmuxSessionTarget::WorktreeAgent
-    );
-}
-
-#[test]
-fn open_tmux_session_target_opens_selected_plan_phase_from_main() {
-    let mut tui = test_tui();
-    tui.focused_panel = PanelFocus::Worktrees;
-    tui.select_worktree(1);
-    tui.focus_main();
-    tui.remember_plan_run(test_plan_run_with_steps("plan", "/repo-one/feature-one", 1));
-
-    assert_eq!(
-        tui.open_tmux_session_target(),
-        OpenTmuxSessionTarget::PlanPhaseAgent
     );
 }
 

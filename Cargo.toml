@@ -10,15 +10,28 @@ readme = "README.md"
 keywords = ["cli", "git", "terminal", "tmux", "worktree"]
 categories = ["command-line-utilities", "development-tools"]
 
+[workspace]
+members = [
+  ".",
+  "crates/prism-extension-protocol",
+  "crates/prism-extension-sdk",
+  "standard-pack/extension",
+]
+resolver = "3"
+
 [package.metadata.prism]
 supported-operating-systems = ["linux", "macos"]
 
 [dependencies]
 ansi-to-tui = { version = "8.0.1", default-features = false }
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
+chrono-tz = "0.10.4"
+cron = "0.15.0"
 crossterm = { version = "0.29.0", default-features = false, features = [
   "events",
 ] }
 libc = "0.2"
+prism-extension-protocol = { path = "crates/prism-extension-protocol" }
 httpdate = "1"
 ratatui = { version = "0.30.2", default-features = false, features = [
   "crossterm",

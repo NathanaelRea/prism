@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "platform process policy is shared by optional adapters"
+)]
+
 use std::cell::RefCell;
 use std::env;
 use std::error::Error;

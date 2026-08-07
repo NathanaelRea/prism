@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -20,9 +20,11 @@ use crate::persistence::control_plane::{
 use crate::persistence::effects::{EffectBroker, PrepareEffect};
 use crate::persistence::pools::WorkflowDatabase;
 use crate::persistence::run_ledger::{
-    AttemptLease, AttemptResult, Coordinator, MaterializedStep, RunLedger, StartRun,
+    AttemptLease, AttemptResult, Coordinator, RunLedger, StartRun,
 };
+use crate::persistence::triggers::TriggerStore;
 use crate::persistence::wakeups::WakeupStore;
+use crate::workflow::trigger::ProviderPollAdapter as _;
 
 static ATTEMPT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -55,13 +57,13 @@ pub trait EffectReconciler: Send + Sync + 'static {
 
 /// Async workflow implementation seam. Implementations receive cancellation and a bounded
 /// output sender; they never receive a database connection or transaction.
-pub trait StepImplementation: Send + Sync + 'static {
+pub(crate) trait StepImplementation: Send + Sync + 'static {
     fn execute<'a>(&'a self, context: ExecutionContext) -> StepFuture<'a>;
 }
 
 /// Execution target seam for local, remote, container, or future hosted execution. Targets own
 /// transport and target-local admission; implementations remain unaware of where they run.
-pub trait ExecutionTarget: Send + Sync + 'static {
+pub(crate) trait ExecutionTarget: Send + Sync + 'static {
     fn execute<'a>(
         &'a self,
         implementation: Arc<dyn StepImplementation>,
@@ -110,6 +112,83 @@ impl ExecutionClass {
 struct RegisteredImplementation {
     class: ExecutionClass,
     implementation: Arc<dyn StepImplementation>,
+}
+
+#[derive(Clone)]
+struct ExtensionImplementation {
+    id: String,
+    supervisor: Arc<crate::extension::ExtensionSupervisor>,
+}
+
+impl StepImplementation for ExtensionImplementation {
+    fn execute<'a>(&'a self, context: ExecutionContext) -> StepFuture<'a> {
+        Box::pin(async move {
+            let input = serde_json::from_str(context.input_json())
+                .map_err(|error| format!("invalid extension input: {error}"))?;
+            let artifacts =
+                serde_json::from_str::<serde_json::Value>(&context.input_revisions_json)
+                    .map_err(|error| format!("invalid extension Artifact bindings: {error}"))?
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .map(|(name, value)| {
+                        let revision = value
+                            .get("revision")
+                            .and_then(serde_json::Value::as_u64)
+                            .ok_or_else(|| format!("Artifact binding '{name}' has no revision"))?;
+                        Ok((
+                            name.clone(),
+                            prism_extension_protocol::ArtifactReference {
+                                id: value
+                                    .get("artifact_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .ok_or_else(|| format!("Artifact binding '{name}' has no ID"))?
+                                    .into(),
+                                revision,
+                                schema: value
+                                    .get("schema")
+                                    .and_then(serde_json::Value::as_str)
+                                    .ok_or_else(|| {
+                                        format!("Artifact binding '{name}' has no schema")
+                                    })?
+                                    .into(),
+                                digest: value
+                                    .get("digest")
+                                    .and_then(serde_json::Value::as_str)
+                                    .ok_or_else(|| {
+                                        format!("Artifact binding '{name}' has no digest")
+                                    })?
+                                    .into(),
+                            },
+                        ))
+                    })
+                    .collect::<Result<_, String>>()?;
+            let result = self
+                .supervisor
+                .execute(
+                    prism_extension_protocol::AttemptEnvelope {
+                        attempt_id: context.run_attempt_id.clone(),
+                        generation: u64::try_from(context.lease.fencing_token)
+                            .map_err(|_| "invalid Attempt fencing token".to_string())?,
+                        implementation_id: self.id.clone(),
+                        input,
+                        artifacts,
+                    },
+                    context.cancellation(),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            match result.outcome {
+                prism_extension_protocol::AttemptOutcome::Succeeded { outputs } => {
+                    Ok(outputs.to_string())
+                }
+                prism_extension_protocol::AttemptOutcome::Failed { error } => Err(error),
+                prism_extension_protocol::AttemptOutcome::Cancelled => {
+                    Err("extension attempt cancelled".into())
+                }
+            }
+        })
+    }
 }
 
 #[derive(Default)]
@@ -324,6 +403,7 @@ pub struct ExecutionContext {
     pub run_attempt_id: String,
     pub step_id: String,
     input_json: String,
+    input_revisions_json: String,
     output: mpsc::Sender<OutputMessage>,
     cancellation: watch::Receiver<bool>,
     control: AsyncCoordinator,
@@ -518,6 +598,7 @@ pub struct WorkflowWorker {
     implementations: HashMap<String, RegisteredImplementation>,
     targets: HashMap<String, Arc<dyn ExecutionTarget>>,
     reconcilers: HashMap<String, Arc<dyn EffectReconciler>>,
+    extension_clients: Vec<Arc<crate::extension::ExtensionSupervisor>>,
     execution: ExecutionControl,
 }
 
@@ -535,6 +616,7 @@ impl WorkflowWorker {
             implementations: HashMap::new(),
             targets: default_targets(),
             reconcilers: HashMap::new(),
+            extension_clients: Vec::new(),
             execution: ExecutionControl::new(),
         })
     }
@@ -551,6 +633,7 @@ impl WorkflowWorker {
             implementations: HashMap::new(),
             targets: default_targets(),
             reconcilers: HashMap::new(),
+            extension_clients: Vec::new(),
             execution: ExecutionControl::new(),
         })
     }
@@ -562,12 +645,30 @@ impl WorkflowWorker {
         )
     }
 
-    pub(crate) fn register_builtins(&mut self) -> Result<(), WorkerError> {
+    pub fn register_builtins(&mut self) -> Result<(), WorkerError> {
         self.register_as("command", ExecutionClass::Command, CommandImplementation)?;
         self.register_as("harness", ExecutionClass::Agent, HarnessImplementation)
     }
 
-    pub fn register(
+    /// Builds the production intent-first dispatcher for the Standard Extension. The supplied
+    /// backend resolves opaque references and performs the provider/Git/Worktrunk operation;
+    /// Prism owns durable intent, fencing, and result recording around it.
+    pub fn standard_host_dispatcher<B: crate::extension::ProtectedEffectBackend>(
+        &self,
+        backend: Arc<B>,
+        observational: Arc<dyn crate::extension::HostDispatcher>,
+    ) -> Arc<dyn crate::extension::HostDispatcher> {
+        Arc::new(crate::extension::BrokeredHostDispatcher::new(
+            Arc::new(crate::persistence::effects::WorkflowEffectLedger::new(
+                self.database.clone(),
+            )),
+            backend,
+            observational,
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register(
         &mut self,
         name: impl Into<String>,
         implementation: impl StepImplementation,
@@ -575,7 +676,7 @@ impl WorkflowWorker {
         self.register_as(name, ExecutionClass::Agent, implementation)
     }
 
-    pub fn register_as(
+    pub(crate) fn register_as(
         &mut self,
         name: impl Into<String>,
         class: ExecutionClass,
@@ -600,7 +701,8 @@ impl WorkflowWorker {
         Ok(())
     }
 
-    pub fn register_target(
+    #[cfg(test)]
+    pub(crate) fn register_target(
         &mut self,
         id: impl Into<String>,
         target: impl ExecutionTarget,
@@ -637,6 +739,52 @@ impl WorkflowWorker {
         Ok(())
     }
 
+    /// Register every implementation advertised by an executable extension. This process
+    /// protocol is the public implementation seam; registrations are applied atomically.
+    pub async fn register_extension(
+        &mut self,
+        executable: impl AsRef<Path>,
+        dispatcher: Arc<dyn crate::extension::HostDispatcher>,
+        limits: crate::extension::HostLimits,
+    ) -> Result<Arc<crate::extension::ExtensionSupervisor>, WorkerError> {
+        let supervisor =
+            crate::extension::ExtensionSupervisor::launch(executable, dispatcher, limits)
+                .await
+                .map_err(|error| WorkerError::Configuration(error.to_string()))?;
+        let client = supervisor.client().await;
+        for descriptor in &client.descriptor().implementations {
+            if self.implementations.contains_key(&descriptor.id) {
+                let _ = supervisor.shutdown().await;
+                return Err(WorkerError::Configuration(format!(
+                    "step implementation '{}' is already registered",
+                    descriptor.id
+                )));
+            }
+        }
+        for descriptor in &client.descriptor().implementations {
+            let class = match descriptor.class {
+                prism_extension_protocol::StepClass::Action => ExecutionClass::Command,
+                prism_extension_protocol::StepClass::WorkflowCall => ExecutionClass::Agent,
+                prism_extension_protocol::StepClass::Gate
+                | prism_extension_protocol::StepClass::Approval
+                | prism_extension_protocol::StepClass::Wait
+                | prism_extension_protocol::StepClass::Notification => ExecutionClass::Provider,
+            };
+            self.implementations.insert(
+                descriptor.id.clone(),
+                RegisteredImplementation {
+                    class,
+                    implementation: Arc::new(ExtensionImplementation {
+                        id: descriptor.id.clone(),
+                        supervisor: supervisor.clone(),
+                    }),
+                },
+            );
+        }
+        self.extension_clients.push(supervisor.clone());
+        Ok(supervisor)
+    }
+
     /// Runs until shutdown is requested or any critical task fails. All task failures are
     /// observed; a critical failure cancels active attempts and drains the worker.
     pub async fn run(self, mut shutdown: watch::Receiver<bool>) -> Result<(), WorkerError> {
@@ -646,12 +794,15 @@ impl WorkflowWorker {
         let effect_broker = EffectBroker::new(self.database.clone());
         let artifact_store = ArtifactStore::new(self.database.clone());
         let wakeups = WakeupStore::new(self.database.clone());
+        let triggers = TriggerStore::new(self.database.clone());
+        triggers.record_startup(&self.worker_id, unix_ms()).await?;
         let active = self.execution.active.clone();
         let registry = ExecutionRegistry {
             implementations: Arc::new(self.implementations),
             targets: Arc::new(self.targets),
         };
         let reconcilers = Arc::new(self.reconcilers);
+        let extension_clients = self.extension_clients.clone();
         let (dispatch_tx, dispatch_rx) = mpsc::channel(self.config.dispatch_capacity);
         let (output_tx, output_rx) = mpsc::channel(self.config.output_capacity);
         let (stop_tx, stop_rx) = watch::channel(false);
@@ -685,8 +836,11 @@ impl WorkflowWorker {
             stop_rx.clone(),
         ));
         tasks.spawn(wakeup_task(
-            wakeups,
-            run_ledger,
+            WakeupStores {
+                wakeups,
+                triggers,
+                ledger: run_ledger,
+            },
             effect_broker,
             reconcilers,
             coordinator.clone(),
@@ -726,6 +880,9 @@ impl WorkflowWorker {
                 return Err(error);
             }
         }
+        for extension in extension_clients {
+            let _ = extension.shutdown().await;
+        }
         self.database.close().await;
         result
     }
@@ -737,6 +894,7 @@ struct Dispatch {
     run_id: String,
     implementation: String,
     input_json: String,
+    input_revisions_json: String,
 }
 
 struct ActiveAttempt {
@@ -851,6 +1009,7 @@ async fn scheduler_task(
                         run_id: step.run_id,
                         implementation: step.implementation,
                         input_json: step.input_json,
+                        input_revisions_json: step.input_revisions_json,
                     }).await {
                         // A failed ephemeral handoff must not consume durable capacity until lease
                         // expiry. Release it explicitly; a concurrent expiry is already safe.
@@ -915,6 +1074,7 @@ async fn execution_task(
                                     run_attempt_id: item.lease.attempt_id.clone(),
                                     step_id: item.lease.step_id.clone(),
                                     input_json: item.input_json,
+                                    input_revisions_json: item.input_revisions_json,
                                     output: output.clone(),
                                     cancellation,
                                     control: stores.control,
@@ -996,33 +1156,15 @@ async fn lease_task(
     }
 }
 
-#[derive(Deserialize)]
-struct PersistedDefinition {
-    #[serde(default)]
-    steps: Vec<PersistedDefinitionStep>,
-}
-
-#[derive(Deserialize)]
-struct PersistedDefinitionStep {
-    key: String,
-    implementation: String,
-    #[serde(default = "local_target")]
-    target_id: String,
-    #[serde(default)]
-    input: serde_json::Value,
-    #[serde(default)]
-    dependencies: Vec<String>,
-    #[serde(default)]
-    resources: Vec<String>,
-}
-
 #[derive(Default, Deserialize)]
 struct PersistedTriggerConfig {
     repository: Option<String>,
+    #[serde(default = "empty_inputs")]
+    inputs: serde_json::Value,
 }
 
-fn local_target() -> String {
-    "local".into()
+fn empty_inputs() -> serde_json::Value {
+    serde_json::json!({})
 }
 
 async fn launch_due_trigger(
@@ -1031,15 +1173,6 @@ async fn launch_due_trigger(
     trigger: crate::persistence::wakeups::DueTrigger,
     now_unix_ms: i64,
 ) -> Result<(), WorkerError> {
-    let body = ledger
-        .definition_body(&trigger.definition_snapshot_id)
-        .await?;
-    let definition: PersistedDefinition = serde_json::from_str(&body).map_err(|error| {
-        WorkerError::Configuration(format!(
-            "definition snapshot '{}' is invalid: {error}",
-            trigger.definition_snapshot_id
-        ))
-    })?;
     let config: PersistedTriggerConfig =
         serde_json::from_str(&trigger.config_json).map_err(|error| {
             WorkerError::Configuration(format!(
@@ -1048,61 +1181,160 @@ async fn launch_due_trigger(
             ))
         })?;
     let run_id = format!("trigger:{}", trigger.id);
-    let step_id = |key: &str| format!("{run_id}:step:{key}");
-    let steps = definition
-        .steps
-        .into_iter()
-        .map(|step| MaterializedStep {
-            id: step_id(&step.key),
-            key: step.key,
-            implementation: step.implementation,
-            target_id: step.target_id,
-            input_json: step.input.to_string(),
-            dependencies: step.dependencies.iter().map(|key| step_id(key)).collect(),
-            resources: step.resources,
-        })
-        .collect();
     let idempotency_key = format!(
         "trigger:{}:{}",
         trigger.trigger_id, trigger.deduplication_key
     );
+    let input_json = trigger
+        .input_json
+        .clone()
+        .unwrap_or_else(|| config.inputs.to_string());
+    let repository = (trigger.trigger_kind != "provider_poll")
+        .then_some(config.repository.as_deref())
+        .flatten();
     let launched = ledger
-        .start_materialized(
-            StartRun {
-                run_id: &run_id,
-                definition_snapshot_id: &trigger.definition_snapshot_id,
-                repository: config.repository.as_deref(),
-                idempotency_key: &idempotency_key,
-                now_unix_ms,
-            },
-            steps,
-        )
+        .start(StartRun {
+            run_id: &run_id,
+            definition_snapshot_id: &trigger.definition_snapshot_id,
+            repository,
+            idempotency_key: &idempotency_key,
+            input_json: &input_json,
+            now_unix_ms,
+            paused: false,
+        })
         .await?;
     wakeups
-        .complete_trigger(&trigger.id, &launched, "{}", now_unix_ms)
+        .complete_trigger(
+            &trigger.id,
+            &launched,
+            &serde_json::json!({"last_due_unix_ms": trigger.due_unix_ms}).to_string(),
+            now_unix_ms,
+        )
         .await?;
     Ok(())
 }
 
+async fn poll_due_provider_trigger(
+    triggers: &TriggerStore,
+    trigger: &crate::persistence::wakeups::DueTrigger,
+    now_unix_ms: i64,
+) -> Result<(), WorkerError> {
+    let config: PersistedTriggerConfig =
+        serde_json::from_str(&trigger.config_json).map_err(|error| {
+            WorkerError::Configuration(format!(
+                "provider Trigger '{}' configuration is invalid: {error}",
+                trigger.trigger_id
+            ))
+        })?;
+    let repository = config.repository.ok_or_else(|| {
+        WorkerError::Configuration(format!(
+            "provider Trigger '{}' has no repository path",
+            trigger.trigger_id
+        ))
+    })?;
+    let schedule: crate::workflow::trigger::TriggerSchedule =
+        serde_json::from_str(&trigger.schedule_json).map_err(|error| {
+            WorkerError::Configuration(format!(
+                "provider Trigger '{}' schedule is invalid: {error}",
+                trigger.trigger_id
+            ))
+        })?;
+    let crate::workflow::trigger::TriggerSchedule::ProviderPoll { item_kind, .. } = schedule else {
+        return Err(WorkerError::Configuration(format!(
+            "Trigger '{}' is not a provider poll",
+            trigger.trigger_id
+        )));
+    };
+    let repository = crate::repo::Repository {
+        root: PathBuf::from(repository),
+    };
+    let adapter = crate::remote::dispatcher::RepositoryProviderPollAdapter::new(
+        repository.root.clone(),
+        crate::config::Config::load(&repository),
+        item_kind,
+    );
+    let checkpoint = trigger
+        .checkpoint_json
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|error| {
+            WorkerError::Configuration(format!("provider checkpoint is invalid: {error}"))
+        })?;
+    match adapter
+        .poll(crate::workflow::trigger::ProviderPollRequest {
+            checkpoint,
+            max_items: 1_000,
+        })
+        .await
+    {
+        Ok(batch) => {
+            triggers
+                .record_provider_page(&crate::workflow::trigger::ProviderPollPage {
+                    trigger_id: trigger.trigger_id.clone(),
+                    occurrence_id: trigger.id.clone(),
+                    items: batch.items,
+                    checkpoint: batch.checkpoint,
+                    observed_unix_ms: now_unix_ms,
+                })
+                .await?;
+            triggers
+                .complete_poll_occurrence(&trigger.id, now_unix_ms)
+                .await?;
+        }
+        Err(error) => {
+            let provider_retry_after = match &error {
+                crate::workflow::trigger::ProviderPollError::Retryable {
+                    retry_after_unix_ms,
+                    ..
+                } => *retry_after_unix_ms,
+                _ => None,
+            };
+            let retry_after = triggers
+                .record_poll_failure(
+                    &trigger.trigger_id,
+                    &error.to_string(),
+                    now_unix_ms,
+                    provider_retry_after,
+                )
+                .await?;
+            triggers
+                .defer_poll_occurrence(&trigger.id, retry_after, &error.to_string())
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 async fn wakeup_task(
-    wakeups: WakeupStore,
-    ledger: RunLedger,
+    stores: WakeupStores,
     effects: EffectBroker,
     reconcilers: Arc<HashMap<String, Arc<dyn EffectReconciler>>>,
     coordinator: AsyncCoordinator,
     config: WorkerConfig,
     mut stop: watch::Receiver<bool>,
 ) -> Result<(), WorkerError> {
+    let WakeupStores {
+        wakeups,
+        triggers,
+        ledger,
+    } = stores;
     let mut interval = tokio::time::interval(config.scheduler_interval);
     loop {
         tokio::select! {
             _ = interval.tick() => {
                 let now = unix_ms();
+                ledger.advance_children(now).await?;
+                triggers.materialize_due(now, config.scheduler_batch).await?;
                 let released = wakeups.release_due_gates(now, config.scheduler_batch).await?;
                 let due = wakeups.due_triggers(now, config.scheduler_batch).await?;
                 let due_count = due.len();
                 for trigger in due {
-                    launch_due_trigger(&wakeups, &ledger, trigger, now).await?;
+                    if trigger.trigger_kind == "provider_poll" && trigger.provider_item_id.is_none() {
+                        poll_due_provider_trigger(&triggers, &trigger, now).await?;
+                    } else {
+                        launch_due_trigger(&wakeups, &ledger, trigger, now).await?;
+                    }
                 }
                 let reconciliation = effects.reconciliation_required(config.scheduler_batch).await?;
                 let reconciliation_count = reconciliation.len();
@@ -1130,6 +1362,12 @@ async fn wakeup_task(
             changed = stop.changed() => if changed.is_err() || *stop.borrow() { return Ok(()); }
         }
     }
+}
+
+struct WakeupStores {
+    wakeups: WakeupStore,
+    triggers: TriggerStore,
+    ledger: RunLedger,
 }
 
 async fn output_task(
@@ -1441,7 +1679,9 @@ mod tests {
                             definition_snapshot_id: "definition",
                             repository: None,
                             idempotency_key: "run",
+                            input_json: "{}",
                             now_unix_ms: 2,
+                            paused: false,
                         },
                         vec![MaterializedStep {
                             id: "step".into(),
@@ -1573,12 +1813,13 @@ mod tests {
                     .await
                     .unwrap();
                 operations
-                    .launch_materialized(
+                    .launch_definition(
                         crate::LaunchWorkflow {
                             run_id: "run",
                             definition_snapshot_id: "definition",
                             repository: Some("repo"),
                             idempotency_key: "run",
+                            input_json: "{}",
                             now_unix_ms: 2,
                         },
                         (1..=2)
@@ -1698,12 +1939,13 @@ mod tests {
                     .await
                     .unwrap();
                 operations
-                    .launch_materialized(
+                    .launch_definition(
                         crate::LaunchWorkflow {
                             run_id: "run",
                             definition_snapshot_id: "definition",
                             repository: None,
                             idempotency_key: "run",
+                            input_json: "{}",
                             now_unix_ms: 2,
                         },
                         vec![crate::WorkflowStep {
@@ -1784,12 +2026,13 @@ mod tests {
                     .await
                     .unwrap();
                 operations
-                    .launch_materialized(
+                    .launch_definition(
                         crate::LaunchWorkflow {
                             run_id: "run",
                             definition_snapshot_id: "definition",
                             repository: None,
                             idempotency_key: "run",
+                            input_json: "{}",
                             now_unix_ms: 2,
                         },
                         vec![crate::WorkflowStep {
@@ -1903,12 +2146,13 @@ mod tests {
                     let run_id = format!("waiting-run-{index}");
                     let step_id = format!("waiting-step-{index}");
                     operations
-                        .launch_materialized(
+                        .launch_definition(
                             crate::LaunchWorkflow {
                                 run_id: &run_id,
                                 definition_snapshot_id: "definition",
                                 repository: None,
                                 idempotency_key: &run_id,
+                                input_json: "{}",
                                 now_unix_ms: 2,
                             },
                             vec![crate::WorkflowStep {
@@ -1941,12 +2185,13 @@ mod tests {
                     })
                     .collect();
                 operations
-                    .launch_materialized(
+                    .launch_definition(
                         crate::LaunchWorkflow {
                             run_id: "active-run",
                             definition_snapshot_id: "definition",
                             repository: Some("repo"),
                             idempotency_key: "active-run",
+                            input_json: "{}",
                             now_unix_ms: 3,
                         },
                         active_steps,
@@ -2111,12 +2356,13 @@ mod tests {
                     .await
                     .unwrap();
                 operations
-                    .launch_materialized(
+                    .launch_definition(
                         crate::LaunchWorkflow {
                             run_id: "run",
                             definition_snapshot_id: "definition",
                             repository: None,
                             idempotency_key: "run",
+                            input_json: "{}",
                             now_unix_ms: 2,
                         },
                         vec![crate::WorkflowStep {

@@ -14,14 +14,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
-use crate::execution;
 use crate::notification::{NotificationCoordinator, NotificationObservation, PendingNotification};
 use crate::platform::SupportedOs;
 use crate::process::DetachedProcessPolicy;
 use crate::repo::Repository;
 use crate::{observability, workspace};
 
-const PROTOCOL_VERSION: u32 = 1;
+// Version 2 is the generalized-workflow cutover epoch. A v1 response belongs to
+// a pre-cutover worker and must never be reused against the destructive schema.
+const PROTOCOL_VERSION: u32 = 2;
 const NOTIFICATION_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const NOTIFICATION_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 const DAEMON_TRANSITION_TIMEOUT: Duration = Duration::from_secs(3);
@@ -276,10 +277,6 @@ fn wait_for_existing_daemon(
     }
 }
 
-pub fn wake() -> Result<(), String> {
-    request("wake").map(|_| ())
-}
-
 #[cfg(target_os = "macos")]
 pub(crate) struct NotificationSubscription {
     stop: Arc<AtomicBool>,
@@ -422,18 +419,6 @@ fn request(command: &str) -> Result<String, String> {
     request_at(&validated_socket_path()?, command)
 }
 
-pub fn launch_bundled_plan(
-    launch: crate::workflow::bundled::BundledPlanLaunch,
-) -> Result<String, String> {
-    launch_bundled("bundled_plan_launch", launch)
-}
-
-pub fn launch_bundled_coding(
-    launch: crate::workflow::bundled::BundledCodingLaunch,
-) -> Result<String, String> {
-    launch_bundled("bundled_coding_launch", launch)
-}
-
 fn workflow_request(request_value: serde_json::Value) -> Result<serde_json::Value, String> {
     let response = request(&request_value.to_string())?;
     let response: serde_json::Value = serde_json::from_str(&response)
@@ -446,15 +431,6 @@ fn workflow_request(request_value: serde_json::Value) -> Result<serde_json::Valu
             .unwrap_or("workflow operation failed")
             .to_string())
     }
-}
-
-fn launch_bundled<T: serde::Serialize>(kind: &str, launch: T) -> Result<String, String> {
-    ensure_running()?;
-    let response = workflow_request(serde_json::json!({"type": kind, "launch": launch}))?;
-    response["run_id"]
-        .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| "workflow worker omitted run id".to_string())
 }
 
 /// Read the authoritative global run ledger through the worker projection API.
@@ -478,7 +454,7 @@ pub fn command_workflow(run_id: &str, command: crate::WorkflowCommand) -> Result
         "type": "workflow_command",
         "run_id": run_id,
         "command": command,
-        "now_unix_ms": execution::now_ms(),
+        "now_unix_ms": current_unix_ms(),
     }))?;
     Ok(())
 }
@@ -525,7 +501,7 @@ pub fn serve() -> Result<(), String> {
         .map_err(|error| format!("create Prism worker runtime: {error}"))?;
     async_runtime.block_on(async {
         let mut worker = crate::workflow::engine::WorkflowWorker::open_default(
-            execution::new_instance_id("workflow-worker"),
+            new_instance_id("workflow-worker"),
             crate::workflow::engine::WorkerConfig::default(),
         )
         .await
@@ -534,10 +510,6 @@ pub fn serve() -> Result<(), String> {
             .register_builtins()
             .map_err(|error| format!("register workflow implementations: {error}"))?;
         let operations = worker.operations();
-        crate::workflow::bundled::install(&operations)
-            .await
-            .map_err(|error| format!("install bundled workflow definitions: {error}"))?;
-        import_legacy_repositories(&operations).await?;
         let (shutdown, shutdown_receiver) = tokio::sync::watch::channel(false);
         let control_plane_failure = Arc::new(Mutex::new(None::<String>));
         let failure = Arc::clone(&control_plane_failure);
@@ -561,32 +533,6 @@ pub fn serve() -> Result<(), String> {
             .map_err(|error| format!("join workflow control plane: {error}"))?;
         socket_result
     })
-}
-
-async fn import_legacy_repositories(operations: &crate::WorkflowOperations) -> Result<(), String> {
-    const IMPORTER_REVISION: &str = "workflow-ledger-v1";
-    let now_unix_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
-        .unwrap_or(0);
-    for entry in crate::workspace::load_entries()? {
-        let repository = crate::repo::Repository { root: entry.root };
-        let source = repository.prism_dir().join("prism.db");
-        if !source.exists() {
-            continue;
-        }
-        operations
-            .import_legacy_repository(&source, IMPORTER_REVISION, now_unix_ms)
-            .await
-            .map_err(|error| {
-                format!(
-                    "import legacy workflow history from {} before worker startup: {error}",
-                    source.display()
-                )
-            })?;
-    }
-    Ok(())
 }
 
 fn serve_socket(
@@ -635,8 +581,7 @@ fn serve_socket(
             .map_err(|error| format!("remove stale worker socket: {error}"))?;
     }
 
-    let instance_id = execution::new_instance_id("daemon");
-    classify_abandoned(&instance_id)?;
+    let instance_id = new_instance_id("daemon");
     log_daemon_lifecycle("daemon_start", &instance_id);
     let listener = UnixListener::bind(socket.as_path()).map_err(|error| {
         format!(
@@ -780,12 +725,6 @@ enum WorkflowSocketRequest {
         run: SocketRun,
         steps: Vec<SocketStep>,
     },
-    BundledPlanLaunch {
-        launch: crate::workflow::bundled::BundledPlanLaunch,
-    },
-    BundledCodingLaunch {
-        launch: crate::workflow::bundled::BundledCodingLaunch,
-    },
     WorkflowList {
         repository: Option<String>,
         limit: usize,
@@ -843,11 +782,6 @@ enum WorkflowSocketRequest {
         gate_kind: String,
         due_unix_ms: i64,
         checkpoint_json: String,
-        now_unix_ms: i64,
-    },
-    WorkflowImportLegacy {
-        source_path: PathBuf,
-        importer_revision: String,
         now_unix_ms: i64,
     },
 }
@@ -928,12 +862,13 @@ fn workflow_socket_response(operations: &crate::WorkflowOperations, request: &st
                 .await
                 .map(|()| serde_json::json!({"ok": true})),
             WorkflowSocketRequest::WorkflowLaunch { run, steps } => operations
-                .launch_materialized(
+                .launch_definition(
                     crate::LaunchWorkflow {
                         run_id: &run.run_id,
                         definition_snapshot_id: &run.definition_snapshot_id,
                         repository: run.repository.as_deref(),
                         idempotency_key: &run.idempotency_key,
+                        input_json: "{}",
                         now_unix_ms: run.now_unix_ms,
                     },
                     steps
@@ -951,16 +886,6 @@ fn workflow_socket_response(operations: &crate::WorkflowOperations, request: &st
                 )
                 .await
                 .map(|run_id| serde_json::json!({"ok": true, "run_id": run_id})),
-            WorkflowSocketRequest::BundledPlanLaunch { launch } => {
-                crate::workflow::bundled::launch_plan(operations, launch)
-                    .await
-                    .map(|run_id| serde_json::json!({"ok": true, "run_id": run_id}))
-            }
-            WorkflowSocketRequest::BundledCodingLaunch { launch } => {
-                crate::workflow::bundled::launch_coding(operations, launch)
-                    .await
-                    .map(|run_id| serde_json::json!({"ok": true, "run_id": run_id}))
-            }
             WorkflowSocketRequest::WorkflowList { repository, limit } => operations
                 .list(repository.as_deref(), limit)
                 .await
@@ -1082,20 +1007,6 @@ fn workflow_socket_response(operations: &crate::WorkflowOperations, request: &st
                 )
                 .await
                 .map(|()| serde_json::json!({"ok": true})),
-            WorkflowSocketRequest::WorkflowImportLegacy {
-                source_path,
-                importer_revision,
-                now_unix_ms,
-            } => operations
-                .import_legacy_repository(&source_path, &importer_revision, now_unix_ms)
-                .await
-                .map(|summary| {
-                    serde_json::json!({
-                        "ok": true,
-                        "imported": summary.imported,
-                        "already_imported": summary.already_imported,
-                    })
-                }),
         }
     });
     match result {
@@ -1390,14 +1301,6 @@ fn current_unix_ms() -> i64 {
         .min(i64::MAX as u128) as i64
 }
 
-fn classify_abandoned(instance_id: &str) -> Result<(), String> {
-    for entry in workspace::discover_valid_entries(workspace::load_entries()?) {
-        observability::attach_run_repo(&entry.repo)?;
-        execution::mark_abandoned(&observability::db_path(&entry.repo), instance_id).map(|_| ())?;
-    }
-    Ok(())
-}
-
 fn log_daemon_lifecycle(action: &str, instance_id: &str) {
     let entries = match workspace::load_entries() {
         Ok(entries) => entries,
@@ -1418,18 +1321,20 @@ fn log_daemon_lifecycle(action: &str, instance_id: &str) {
 }
 
 fn log_worker_event(repo: &Repository, action: &str, message: &str, data_json: Option<&str>) {
-    let repo_path = repo.root.display().to_string();
-    let _ = execution::persistence::WorkflowStore::open(&observability::db_path(repo)).and_then(
-        |store| {
-            store.insert_worker_event(execution::persistence::WorkerEvent {
-                time: execution::now_ms(),
-                action,
-                repo: &repo_path,
-                message,
-                data_json,
-            })
-        },
-    );
+    let suffix = data_json.map_or_else(String::new, |data| format!(" {data}"));
+    if let Err(error) = observability::append_runtime_message(
+        repo,
+        &format!("info worker.{action} {message}{suffix}"),
+    ) {
+        eprintln!(
+            "Prism worker cannot persist lifecycle event for {}: {error}",
+            repo.root.display()
+        );
+    }
+}
+
+fn new_instance_id(prefix: &str) -> String {
+    format!("{prefix}-{}-{}", std::process::id(), current_unix_ms())
 }
 
 fn acquire_lock(path: &Path) -> Result<File, String> {
@@ -1861,6 +1766,16 @@ mod tests {
             wait_for_existing_daemon(Duration::ZERO, || Err("permission denied".to_string())),
             Err("permission denied".to_string())
         );
+    }
+
+    #[test]
+    fn pre_cutover_worker_protocol_is_rejected() {
+        let error = parse_health_response(
+            "ok 1 legacy-worker pid=123 state=running active=0 notifications=1",
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "incompatible Prism daemon protocol 1");
     }
 
     fn runtime_with_socket_path_len(byte_len: usize) -> PathBuf {

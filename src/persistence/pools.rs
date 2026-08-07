@@ -73,16 +73,143 @@ impl RepositoryDatabase {
 
 pub(super) async fn initialize_repository_database(path: &Path) -> Result<(), DatabaseError> {
     prepare_parent(path)?;
-    super::adoption::adopt_historical_repository_database(path, &REPOSITORY_MIGRATOR).await?;
+    prepare_repository_cutover(path).await?;
     migrate(path, &REPOSITORY_MIGRATOR).await?;
-    super::adoption::validate_canonical_repository_database(path, &REPOSITORY_MIGRATOR).await?;
     set_owner_only(path)
+}
+
+async fn prepare_repository_cutover(path: &Path) -> Result<(), DatabaseError> {
+    prepare_repository_cutover_with_worker_socket(path, &crate::worker::socket_path()).await
+}
+
+async fn prepare_repository_cutover_with_worker_socket(
+    path: &Path,
+    worker_socket: &Path,
+) -> Result<(), DatabaseError> {
+    if !path.exists()
+        || std::fs::metadata(path)
+            .map(|metadata| metadata.len() == 0)
+            .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    let mut connection = SqliteConnection::connect_with(&options(path, false, true)?)
+        .await
+        .map_err(|source| DatabaseError::Connect {
+            path: path.into(),
+            source,
+        })?;
+    let result = async {
+        let migration_table: i64 = sqlx::query_scalar(
+            "select count(*) from sqlite_master where type = 'table' and name = '_sqlx_migrations'",
+        )
+        .fetch_one(&mut connection)
+        .await
+        .map_err(DatabaseError::Query)?;
+        if migration_table == 0 {
+            let user_version = sqlx::query_scalar("pragma user_version")
+                .fetch_one(&mut connection)
+                .await
+                .map_err(DatabaseError::Query)?;
+            return Err(DatabaseError::UnknownHistoricalSchema {
+                path: path.into(),
+                user_version,
+            });
+        }
+        let cutover_applied: i64 = sqlx::query_scalar(
+            "select count(*) from _sqlx_migrations where version >= 2 and success = 1",
+        )
+        .fetch_one(&mut connection)
+        .await
+        .map_err(DatabaseError::Query)?;
+        if cutover_applied > 0 {
+            return Ok(());
+        }
+        if worker_socket.exists() {
+            return Err(DatabaseError::LegacyWorkerActive { path: path.into() });
+        }
+        refuse_active_legacy_processes(path, &mut connection).await?;
+        let protected: i64 = sqlx::query_scalar(include_str!(
+            "../../sql/database/workflow_cutover_drop_preflight.sql"
+        ))
+        .fetch_one(&mut connection)
+        .await
+        .map_err(DatabaseError::Query)?;
+        if protected > 0 {
+            return Err(DatabaseError::ProtectedLegacyExecution {
+                path: path.into(),
+                count: protected,
+            });
+        }
+        validate_integrity(&mut connection).await?;
+        let backup = path.with_extension("db.pre-workflow-cutover-backup");
+        if !backup.exists() {
+            sqlx::query("vacuum into ?")
+                .bind(backup.to_string_lossy().into_owned())
+                .execute(&mut connection)
+                .await
+                .map_err(|source| DatabaseError::Backup {
+                    path: path.into(),
+                    backup: backup.clone(),
+                    source: std::io::Error::other(source.to_string()),
+                })?;
+            set_owner_only(&backup)?;
+        }
+        Ok(())
+    }
+    .await;
+    close_connection(connection, result).await
+}
+
+async fn refuse_active_legacy_processes(
+    path: &Path,
+    connection: &mut SqliteConnection,
+) -> Result<(), DatabaseError> {
+    let processes: Vec<(i64, Option<i64>)> = sqlx::query_as(include_str!(
+        "../../sql/database/workflow_cutover_drop_processes.sql"
+    ))
+    .fetch_all(connection)
+    .await
+    .map_err(DatabaseError::Query)?;
+    for (stored_pid, stored_identity) in processes {
+        let pid = u32::try_from(stored_pid).map_err(|_| DatabaseError::InvalidValue {
+            field: "legacy process id",
+            value: stored_pid.to_string(),
+        })?;
+        let identity = stored_identity
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|_| DatabaseError::InvalidValue {
+                field: "legacy process identity",
+                value: stored_identity.unwrap_or_default().to_string(),
+            })?;
+        let observation = crate::process::observe_process(
+            crate::process::RecordedProcess::from_stored(pid, identity),
+        )
+        .map_err(|error| DatabaseError::LegacyProcessInspection {
+            path: path.into(),
+            pid,
+            details: error.to_string(),
+        })?;
+        if matches!(
+            observation,
+            crate::process::ProcessObservation::RunningSameProcess
+                | crate::process::ProcessObservation::RunningUnverifiable
+        ) {
+            return Err(DatabaseError::LegacyProcessActive {
+                path: path.into(),
+                pid,
+            });
+        }
+    }
+    Ok(())
 }
 
 impl WorkflowDatabase {
     pub(crate) async fn open(path: &Path) -> Result<Self, DatabaseError> {
         prepare_parent(path)?;
         reject_wrong_workflow_database(path).await?;
+        prepare_workflow_cutover(path).await?;
         migrate(path, &WORKFLOW_MIGRATOR).await?;
         set_owner_only(path)?;
         let (writer, readers) = open_pools(path).await?;
@@ -141,6 +268,60 @@ impl WorkflowDatabase {
         }
         Ok(())
     }
+}
+
+async fn prepare_workflow_cutover(path: &Path) -> Result<(), DatabaseError> {
+    prepare_workflow_cutover_with_worker_socket(path, &crate::worker::socket_path()).await
+}
+
+async fn prepare_workflow_cutover_with_worker_socket(
+    path: &Path,
+    worker_socket: &Path,
+) -> Result<(), DatabaseError> {
+    if !path.exists()
+        || std::fs::metadata(path)
+            .map(|metadata| metadata.len() == 0)
+            .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    let mut connection = SqliteConnection::connect_with(&options(path, false, true)?)
+        .await
+        .map_err(|source| DatabaseError::Connect {
+            path: path.into(),
+            source,
+        })?;
+    let result = async {
+        let cutover_applied: i64 = sqlx::query_scalar(
+            "select count(*) from _sqlx_migrations where version >= 3 and success = 1",
+        )
+        .fetch_one(&mut connection)
+        .await
+        .map_err(DatabaseError::Query)?;
+        if cutover_applied > 0 {
+            return Ok(());
+        }
+        if worker_socket.exists() {
+            return Err(DatabaseError::LegacyWorkerActive { path: path.into() });
+        }
+        validate_integrity(&mut connection).await?;
+        let backup = path.with_extension("db.pre-workflow-cutover-backup");
+        if !backup.exists() {
+            sqlx::query("vacuum into ?")
+                .bind(backup.to_string_lossy().into_owned())
+                .execute(&mut connection)
+                .await
+                .map_err(|source| DatabaseError::Backup {
+                    path: path.into(),
+                    backup: backup.clone(),
+                    source: std::io::Error::other(source.to_string()),
+                })?;
+            set_owner_only(&backup)?;
+        }
+        Ok(())
+    }
+    .await;
+    close_connection(connection, result).await
 }
 
 async fn open_pools(path: &Path) -> Result<(SqlitePool, SqlitePool), DatabaseError> {
@@ -325,7 +506,7 @@ async fn reject_wrong_workflow_database(path: &Path) -> Result<(), DatabaseError
             "select count(*) from sqlite_master where type = 'table' and name = 'workflow_database_identity'",
         ).fetch_one(&mut connection).await.map_err(DatabaseError::Query)?;
         let repository_marker: i64 = sqlx::query_scalar(
-            "select count(*) from sqlite_master where type = 'table' and name in ('workflow_execution','plan_run')",
+            "select count(*) from sqlite_master where type = 'table' and name = '_sqlx_migrations'",
         ).fetch_one(&mut connection).await.map_err(DatabaseError::Query)?;
         if workflow_identity == 0 && repository_marker > 0 {
             return Err(DatabaseError::WrongDatabase {
@@ -364,4 +545,212 @@ pub(super) async fn validate_integrity(
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod cutover_tests {
+    use super::*;
+
+    fn test_directory(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("prism-{label}-{}-{nonce}", std::process::id()))
+    }
+
+    async fn repository_at_baseline(root: &Path) -> PathBuf {
+        let migrations = root.join("migrations");
+        std::fs::create_dir_all(&migrations).unwrap();
+        std::fs::write(
+            migrations.join("0001_initial.sql"),
+            include_str!("../../migrations/repository/0001_initial.sql"),
+        )
+        .unwrap();
+        let database = root.join("repository.db");
+        let migrator = sqlx::migrate::Migrator::new(migrations.as_path())
+            .await
+            .unwrap();
+        migrate(&database, &migrator).await.unwrap();
+        database
+    }
+
+    async fn complete_cutover(root: &Path, database: &Path) -> Result<(), DatabaseError> {
+        prepare_repository_cutover_with_worker_socket(database, &root.join("missing-worker.sock"))
+            .await?;
+        migrate(database, &REPOSITORY_MIGRATOR).await?;
+        set_owner_only(database)
+    }
+
+    async fn workflow_at_pre_cutover_baseline(root: &Path) -> PathBuf {
+        let migrations = root.join("workflow-migrations");
+        std::fs::create_dir_all(&migrations).unwrap();
+        for (name, source) in [
+            (
+                "0001_workflow_ledger.sql",
+                include_str!("../../migrations/workflow/0001_workflow_ledger.sql"),
+            ),
+            (
+                "0002_async_control_plane.sql",
+                include_str!("../../migrations/workflow/0002_async_control_plane.sql"),
+            ),
+        ] {
+            std::fs::write(migrations.join(name), source).unwrap();
+        }
+        let database = root.join("workflow.db");
+        let migrator = sqlx::migrate::Migrator::new(migrations.as_path())
+            .await
+            .unwrap();
+        migrate(&database, &migrator).await.unwrap();
+        database
+    }
+
+    #[tokio::test]
+    async fn repository_cutover_backs_up_then_deletes_legacy_schema() {
+        let root = test_directory("repository-cutover");
+        let database = repository_at_baseline(&root).await;
+
+        complete_cutover(&root, &database).await.unwrap();
+
+        assert!(
+            database
+                .with_extension("db.pre-workflow-cutover-backup")
+                .exists()
+        );
+        let mut connection =
+            SqliteConnection::connect_with(&options(&database, false, false).unwrap())
+                .await
+                .unwrap();
+        let count: i64 = sqlx::query_scalar(include_str!(
+            "../../sql/database/workflow_cutover_drop_assert.sql"
+        ))
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+        connection.close().await.unwrap();
+        assert_eq!(count, 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn repository_cutover_refuses_protected_execution_without_backup() {
+        let root = test_directory("repository-cutover-protected");
+        let database = repository_at_baseline(&root).await;
+        let mut connection =
+            SqliteConnection::connect_with(&options(&database, false, false).unwrap())
+                .await
+                .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../sql/database/workflow_cutover_drop_seed_protected.sql"
+        ))
+        .execute(&mut connection)
+        .await
+        .unwrap();
+        connection.close().await.unwrap();
+
+        let error = complete_cutover(&root, &database).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            DatabaseError::ProtectedLegacyExecution { count: 1, .. }
+        ));
+        assert!(
+            !database
+                .with_extension("db.pre-workflow-cutover-backup")
+                .exists()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn repository_cutover_refuses_a_live_recorded_process() {
+        let root = test_directory("repository-cutover-process");
+        let database = repository_at_baseline(&root).await;
+        let mut connection =
+            SqliteConnection::connect_with(&options(&database, false, false).unwrap())
+                .await
+                .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../sql/database/workflow_cutover_drop_seed_process.sql"
+        ))
+        .execute(&mut connection)
+        .await
+        .unwrap();
+        sqlx::query(include_str!(
+            "../../sql/database/workflow_cutover_drop_seed_process_pid.sql"
+        ))
+        .bind(i64::from(std::process::id()))
+        .execute(&mut connection)
+        .await
+        .unwrap();
+        connection.close().await.unwrap();
+
+        let error = complete_cutover(&root, &database).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            DatabaseError::LegacyProcessActive { pid, .. } if pid == std::process::id()
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn repository_cutover_refuses_armed_or_reserved_mutation_without_backup() {
+        let root = test_directory("repository-cutover-mutation");
+        let database = repository_at_baseline(&root).await;
+        let mut connection =
+            SqliteConnection::connect_with(&options(&database, false, false).unwrap())
+                .await
+                .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../sql/database/workflow_cutover_drop_seed_mutation.sql"
+        ))
+        .execute(&mut connection)
+        .await
+        .unwrap();
+        connection.close().await.unwrap();
+
+        let error = complete_cutover(&root, &database).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            DatabaseError::ProtectedLegacyExecution { count: 2, .. }
+        ));
+        assert!(
+            !database
+                .with_extension("db.pre-workflow-cutover-backup")
+                .exists()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn workflow_cutover_backs_up_then_deletes_import_journal() {
+        let root = test_directory("workflow-cutover");
+        let database = workflow_at_pre_cutover_baseline(&root).await;
+
+        prepare_workflow_cutover_with_worker_socket(&database, &root.join("missing-worker.sock"))
+            .await
+            .unwrap();
+        migrate(&database, &WORKFLOW_MIGRATOR).await.unwrap();
+
+        assert!(
+            database
+                .with_extension("db.pre-workflow-cutover-backup")
+                .exists()
+        );
+        let mut connection =
+            SqliteConnection::connect_with(&options(&database, false, true).unwrap())
+                .await
+                .unwrap();
+        let count: i64 = sqlx::query_scalar(include_str!(
+            "../../sql/database/workflow_cutover_drop_import_assert.sql"
+        ))
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+        connection.close().await.unwrap();
+        assert_eq!(count, 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
