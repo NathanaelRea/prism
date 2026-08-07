@@ -49,6 +49,19 @@ fn remote_pr_choice_label(summary: &crate::remote::PrSummary) -> String {
     )
 }
 
+fn remote_push_mutation_target(
+    guard: &crate::remote::dispatcher::PushGuard,
+) -> crate::tui::RemoteMutationTarget {
+    crate::tui::RemoteMutationTarget::Push {
+        remote: guard.remote.clone(),
+        branch: guard.remote_branch.clone(),
+        expected_head_sha: guard.expected_head_sha.clone(),
+        repository_provider: Some(guard.repository.provider()),
+        repository_host: guard.repository.host().to_string(),
+        repository_project: guard.repository.project_path().to_string(),
+    }
+}
+
 pub(super) fn open_url_in_browser(url: &str) -> Result<(), String> {
     run_browser_opener(
         crate::platform::browser_candidates(crate::platform::current_os()),
@@ -164,6 +177,65 @@ impl Tui {
             &crate::util::timestamp_label(),
         );
         self.queue_pr_persistence(session_index, false, true);
+    }
+
+    pub(crate) fn push_selected_branch(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<(), String> {
+        let context = self
+            .selected_worktree_context()
+            .ok_or_else(|| "no worktree selected".to_string())?;
+        let selected = context.session_index;
+        let path = self.sessions[selected].path.clone();
+        let branch = self.sessions[selected].branch.clone();
+        if self.sessions[selected].is_default_branch(&context.config) {
+            return self.show_message("default branch is not treated as a PR branch");
+        }
+        if self.sessions[selected].is_detached() {
+            return self.show_message("cannot push a detached worktree");
+        }
+
+        let repo = context.repo;
+        let config = context.config;
+        let mut cache = self.sessions[selected].pr.clone();
+        let worktree = self.sessions[selected]
+            .identity_key(&self.repos[self.sessions[selected].repo_index].identity);
+        let generation = self
+            .worktree_generations
+            .get(&worktree)
+            .copied()
+            .unwrap_or_default();
+        let expected = crate::remote::dispatcher::prepare_push(&path, &config, &branch)?;
+        let mutation = remote_push_mutation_target(&expected);
+        let RemoteActionValue::Cache(cache) = self.run_remote_action(
+            raw,
+            crate::tui::RemoteActionRequest {
+                key: TuiJobKey::Worktree(worktree),
+                generation,
+                name: "prism-push-branch",
+                title: "Push Branch",
+                message: "Verifying and pushing selected branch",
+                abandon_cancelable: false,
+                mutation: Some(mutation),
+            },
+            move || {
+                let current = crate::remote::dispatcher::prepare_push(&path, &config, &branch)?;
+                if !crate::remote::dispatcher::same_push_target(&expected, &current) {
+                    return Err(
+                        "push remote, branch, or HEAD changed during push preparation".to_string(),
+                    );
+                }
+                crate::lifecycle::push_branch(&config, &path, &branch, current.set_upstream)?;
+                refresh_pr_cache(&repo, &branch, &mut cache, &path, &config, true)?;
+                Ok(RemoteActionValue::Cache(Box::new(cache)))
+            },
+        )?
+        else {
+            return Err("push returned an unexpected result".to_string());
+        };
+        self.apply_remote_cache_result(selected, *cache);
+        self.show_message("push complete")
     }
 
     pub(crate) fn resolve_review_comments(

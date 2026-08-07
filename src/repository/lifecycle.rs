@@ -2,7 +2,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::config::Config;
-use crate::process::{ProcessPolicy, run_capture, run_output_allow_failure, run_status};
+use crate::process::{
+    ProcessDescriptor, ProcessPolicy, run_capture, run_capture_named, run_output_allow_failure,
+    run_status,
+};
 use crate::repo::Repository;
 pub(crate) use crate::worktrunk::ApprovalStatus as WorktrunkApprovalStatus;
 
@@ -165,6 +168,28 @@ pub(crate) fn move_current_branch_to_worktree(
         repo,
         &format!("moved {branch} into Worktrunk worktree and switched checkout to {base}"),
     );
+    Ok(())
+}
+
+pub(crate) fn push_branch(
+    config: &Config,
+    path: &Path,
+    branch: &str,
+    set_upstream: bool,
+) -> Result<(), String> {
+    let args = if set_upstream {
+        vec!["push", "-u", "origin", branch]
+    } else {
+        vec!["push"]
+    };
+    run_capture_named(
+        Command::new(config.tool("git"))
+            .arg("-C")
+            .arg(path)
+            .args(args),
+        ProcessPolicy::NetworkQuery,
+        ProcessDescriptor::new("git.push"),
+    )?;
     Ok(())
 }
 

@@ -854,6 +854,42 @@ impl Tui {
                         self.show_error("select repository failed", &error)?;
                     }
                 }
+                Key::Push => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if self.git_action_enabled(GitAction::Push)
+                        && let Err(error) = self.push_selected_branch(runtime)
+                    {
+                        self.show_error("push failed", &error)?;
+                    }
+                }
+                Key::Merge => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if self.git_action_enabled(GitAction::Merge)
+                        && let Err(error) = self.launch_stabilization_workflow(runtime)
+                    {
+                        self.show_error("merge workflow failed", &error)?;
+                    }
+                }
+                Key::CiFix => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if self.git_action_enabled(GitAction::CiFix)
+                        && let Err(error) = self.launch_stabilization_workflow(runtime)
+                    {
+                        self.show_error("CI repair workflow failed", &error)?;
+                    }
+                }
+                Key::ReviewFix => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if self.git_action_enabled(GitAction::ReviewFix)
+                        && let Err(error) = self.launch_stabilization_workflow(runtime)
+                    {
+                        self.show_error("review repair workflow failed", &error)?;
+                    }
+                }
                 Key::ResolveAllComments => {
                     self.clear_leader_hint();
                     pending_g = false;

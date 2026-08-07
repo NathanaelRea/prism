@@ -127,7 +127,36 @@ impl Tui {
             .find(|candidate| candidate.definition.id == id)
             .ok_or_else(|| "fzf returned an unknown workflow identity".to_string())?;
 
-        let inputs = context_inputs(&candidate.definition, &context);
+        self.launch_workflow_candidate(runtime, candidate, &context)
+    }
+
+    pub(super) fn launch_stabilization_workflow(
+        &mut self,
+        runtime: &mut TerminalRuntime,
+    ) -> Result<(), String> {
+        let context = self.workflow_context();
+        let global = crate::util::prism_config_dir();
+        let local = self.repo.root.join(".prism");
+        let candidates =
+            runtime.suspend_for(|| manual_workflow_candidates(&global, &local, &context))?;
+        let candidate = candidates
+            .iter()
+            .find(|candidate| candidate.definition.id == "prism.standard/stabilize")
+            .ok_or_else(|| {
+                "prism.standard/stabilize is not installed or is incompatible with the selected worktree"
+                    .to_string()
+            })?;
+        self.launch_workflow_candidate(runtime, candidate, &context)
+    }
+
+    fn launch_workflow_candidate(
+        &mut self,
+        runtime: &mut TerminalRuntime,
+        candidate: &LaunchCandidate,
+        context: &BTreeMap<String, ContextValue>,
+    ) -> Result<(), String> {
+        let id = candidate.definition.id.clone();
+        let inputs = context_inputs(&candidate.definition, context);
         let executable = std::env::current_exe().map_err(|error| error.to_string())?;
         let snapshot =
             runtime.suspend_for(|| workflow_launch_snapshot(&executable, &self.repo.root, &id))?;

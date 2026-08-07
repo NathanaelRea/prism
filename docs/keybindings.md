@@ -17,7 +17,11 @@ Prism uses a lazygit-style panel model.
 - `Space Enter` opens tmux window 3: terminal.
 - `Ctrl-/` also opens tmux window 3 where the terminal reports that key combination distinctly; use `Space Enter` as the reliable alternative.
 - `Space g g` opens tmux window 2: lazygit.
+- `Space g P` pushes the selected task branch after verifying that its branch, head, and destination have not changed.
 - `Space g o` opens the selected change request in a browser.
+- `Space g M` launches the standard stabilization workflow, which rechecks the selected change request's gates before merging its exact head.
+- `Space g c` launches stabilization for a selected change request with CI repair support.
+- `Space g f` launches stabilization for a selected change request with review repair support.
 - `o` from the Worktrees panel opens the selected Worktree Session's Worktrunk-configured HTTP(S) development URL. It remains available when listening is false, unknown, or stale; the details view reports that state.
 - `Space g R` resolves all unresolved inline review conversations visible when the key is pressed while `0 Main` is focused.
 - Unavailable `Space g` actions are shown in dark gray and ignored. Remote actions require a known change request and provider capability; repair actions also require a headless-capable harness.

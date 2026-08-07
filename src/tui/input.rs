@@ -126,6 +126,10 @@ impl KeyInput {
             KeyCode::Char('a') if plain_char(event) => Key::Other,
             KeyCode::Char('o') if plain_char(event) => Key::OpenPr,
             KeyCode::Char('v') if plain_char(event) => Key::SubmitReview,
+            KeyCode::Char('P') if plain_char(event) => Key::Push,
+            KeyCode::Char('M') if plain_char(event) => Key::Merge,
+            KeyCode::Char('c') if plain_char(event) => Key::CiFix,
+            KeyCode::Char('f') if plain_char(event) => Key::ReviewFix,
             KeyCode::Char('R') if plain_char(event) => Key::ResolveAllComments,
             KeyCode::Char('p') if plain_char(event) => Key::PullDefault,
             _ => Key::Other,
@@ -190,6 +194,10 @@ pub enum Key {
     VisibilityDown,
     RepoShortcut(char),
     OpenRemotePrs,
+    Push,
+    Merge,
+    CiFix,
+    ReviewFix,
     ResolveAllComments,
     PullDefault,
     Create,
@@ -338,6 +346,21 @@ mod tests {
     }
 
     #[test]
+    fn key_input_handles_restored_git_actions() {
+        let mut input = KeyInput::default();
+        for (code, expected) in [
+            ('P', Key::Push),
+            ('M', Key::Merge),
+            ('c', Key::CiFix),
+            ('f', Key::ReviewFix),
+        ] {
+            assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
+            assert_eq!(map(&mut input, key(KeyCode::Char('g'))), Key::LeaderGit);
+            assert_eq!(map(&mut input, key(KeyCode::Char(code))), expected);
+        }
+    }
+
+    #[test]
     fn key_input_handles_review_resolution() {
         let mut input = KeyInput::default();
         assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
@@ -415,11 +438,11 @@ mod tests {
     }
 
     #[test]
-    fn key_input_omits_removed_direct_branch_actions() {
+    fn key_input_uses_lazygit_style_branch_actions() {
         let mut input = KeyInput::default();
         assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
         assert_eq!(map(&mut input, key(KeyCode::Char('g'))), Key::LeaderGit);
-        assert_eq!(map(&mut input, shift_key(KeyCode::Char('P'))), Key::Other);
+        assert_eq!(map(&mut input, shift_key(KeyCode::Char('P'))), Key::Push);
         assert_eq!(
             map(&mut input, shift_key(KeyCode::Char('M'))),
             Key::MigrateHarness
