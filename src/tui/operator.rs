@@ -418,9 +418,13 @@ fn workflow_control_request(
         _ => false,
     };
     if !available {
-        return Err(format!(
-            "{command} is unavailable for the selected Workflow Run"
-        ));
+        let message = match (command, dashboard.status.as_str()) {
+            ("cancel", "failed") => "can't cancel a failed Workflow Run".to_string(),
+            ("cancel", "done") => "can't cancel a completed Workflow Run".to_string(),
+            ("cancel", "aborted") => "can't cancel an already cancelled Workflow Run".to_string(),
+            _ => format!("{command} is unavailable for the selected Workflow Run"),
+        };
+        return Err(message);
     }
     let step = if matches!(command, "restart" | "skip") {
         Some(
@@ -777,6 +781,43 @@ mod tests {
                 .unwrap()
                 .step,
             Some("verify".into())
+        );
+    }
+
+    #[test]
+    fn cancel_unavailable_message_explains_terminal_run_status() {
+        let mut dashboard = view::WorkflowDashboard {
+            run_id: "run-1".into(),
+            status: "failed".into(),
+            current_step: None,
+            selected_step: None,
+            completed_steps: 1,
+            total_steps: 1,
+            run_position: 1,
+            run_count: 1,
+            parent_run_id: None,
+            children: Vec::new(),
+            detail: None,
+            can_pause: false,
+            can_resume: false,
+            can_cancel: false,
+            can_retry: true,
+            current_step_skippable: false,
+        };
+
+        assert_eq!(
+            workflow_control_request(&dashboard, "cancel").unwrap_err(),
+            "can't cancel a failed Workflow Run"
+        );
+        dashboard.status = "done".into();
+        assert_eq!(
+            workflow_control_request(&dashboard, "cancel").unwrap_err(),
+            "can't cancel a completed Workflow Run"
+        );
+        dashboard.status = "aborted".into();
+        assert_eq!(
+            workflow_control_request(&dashboard, "cancel").unwrap_err(),
+            "can't cancel an already cancelled Workflow Run"
         );
     }
 
