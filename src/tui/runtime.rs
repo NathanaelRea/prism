@@ -11,11 +11,11 @@ use crossterm::{
     },
     execute,
     terminal::{
-        disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
-        LeaveAlternateScreen,
+        Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+        enable_raw_mode,
     },
 };
-use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
+use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
 
 use crate::view;
 

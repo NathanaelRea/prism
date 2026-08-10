@@ -8,10 +8,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use wait_timeout::ChildExt;
 
-use crate::support::{fail, require, unique_name, SpikeResult, TempDir};
+use crate::support::{SpikeResult, TempDir, fail, require, unique_name};
 
 const PSMUX_VERSION: &str = "3.3.7";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);

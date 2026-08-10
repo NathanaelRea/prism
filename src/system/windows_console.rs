@@ -1,13 +1,13 @@
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
-use windows::core::BOOL;
 use windows::Win32::System::Console::{
-    SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT,
-    CTRL_SHUTDOWN_EVENT,
+    CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+    SetConsoleCtrlHandler,
 };
+use windows::core::BOOL;
 
 const CTRL_C: u8 = 1;
 const TERMINATE: u8 = 2;

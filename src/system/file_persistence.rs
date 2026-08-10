@@ -658,10 +658,10 @@ fn commit_staging(staging: &Path, target: &Path) -> io::Result<()> {
 #[cfg(windows)]
 fn commit_staging(staging: &Path, target: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
-    use windows::core::PCWSTR;
     use windows::Win32::Storage::FileSystem::{
-        MoveFileExW, ReplaceFileW, MOVEFILE_WRITE_THROUGH, REPLACE_FILE_FLAGS,
+        MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACE_FILE_FLAGS, ReplaceFileW,
     };
+    use windows::core::PCWSTR;
 
     fn wide(path: &Path) -> Vec<u16> {
         path.as_os_str()
@@ -853,7 +853,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn replacement_preserves_mode_and_final_symlink() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::os::unix::fs::{PermissionsExt, symlink};
 
         let dir = temp_dir("symlink");
         fs::create_dir_all(&dir).unwrap();
@@ -868,10 +868,12 @@ mod tests {
         })
         .unwrap();
 
-        assert!(fs::symlink_metadata(&link)
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(fs::read_to_string(&target).unwrap(), "value = 'new'\n");
         assert_eq!(
             fs::metadata(&target).unwrap().permissions().mode() & 0o777,
@@ -896,10 +898,12 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.stage(), Stage::ResolveFinalSymlink);
-        assert!(fs::symlink_metadata(&link)
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 

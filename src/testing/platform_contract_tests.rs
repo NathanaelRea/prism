@@ -1,6 +1,6 @@
 use crate::platform::{
-    browser_candidates, default_session_runtime, default_worktrunk_command,
-    desktop_notification_policy, CommandCandidate, DesktopNotificationPolicy, SupportedOs,
+    CommandCandidate, DesktopNotificationPolicy, SupportedOs, browser_candidates,
+    default_session_runtime, default_worktrunk_command, desktop_notification_policy,
 };
 
 #[test]
@@ -157,11 +157,13 @@ fn platform_contract_powershell_serialization_is_literal_and_injection_safe() {
         "BAD; Remove-Item C:\\data".to_string(),
         "value".to_string(),
     )]);
-    assert!(crate::terminal::shell_command_for(
-        SupportedOs::Windows,
-        &["agent.exe".to_string()],
-        &invalid_environment,
-        None,
-    )
-    .is_err());
+    assert!(
+        crate::terminal::shell_command_for(
+            SupportedOs::Windows,
+            &["agent.exe".to_string()],
+            &invalid_environment,
+            None,
+        )
+        .is_err()
+    );
 }

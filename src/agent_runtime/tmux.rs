@@ -3,10 +3,10 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
-use crate::opencode::{load_runtime, OpencodeRuntime};
+use crate::opencode::{OpencodeRuntime, load_runtime};
 use crate::process::{
-    run_capture_named, run_output_allow_failure_named, run_output_named, run_status_attached_named,
-    run_status_with_stdin_named, split_command_words, ProcessDescriptor, ProcessPolicy,
+    ProcessDescriptor, ProcessPolicy, run_capture_named, run_output_allow_failure_named,
+    run_output_named, run_status_attached_named, run_status_with_stdin_named, split_command_words,
 };
 use crate::repo::Repository;
 use crate::session::Session;
@@ -1212,17 +1212,16 @@ mod tests {
 
     use crate::agent::AgentState;
     use crate::config::Config;
-    use crate::opencode::{save_runtime, server_url, OpencodeRuntime};
+    use crate::opencode::{OpencodeRuntime, save_runtime, server_url};
     use crate::remote::PrCache;
     use crate::repo::Repository;
     use crate::session::Session;
 
     use super::{
-        attach_or_create_agent, attach_or_create_plan_mode, attach_or_create_window,
-        capture_agent_pane, ensure_agent_session, latest_agent_session_generation,
-        migrate_legacy_agent_sessions, pane_command_matches_agent,
-        pane_start_command_matches_agent, paste_agent_prompt, session_exists, TmuxAgentSession,
-        TmuxWindow,
+        TmuxAgentSession, TmuxWindow, attach_or_create_agent, attach_or_create_plan_mode,
+        attach_or_create_window, capture_agent_pane, ensure_agent_session,
+        latest_agent_session_generation, migrate_legacy_agent_sessions, pane_command_matches_agent,
+        pane_start_command_matches_agent, paste_agent_prompt, session_exists,
     };
 
     #[test]

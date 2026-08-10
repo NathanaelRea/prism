@@ -3,25 +3,25 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
 use interprocess::os::windows::security_descriptor::SecurityDescriptor;
-use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL, WIN32_ERROR};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree, WIN32_ERROR};
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
-    SetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
+    SDDL_REVISION_1, SE_FILE_OBJECT, SetSecurityInfo,
 };
 use windows::Win32::Security::{
-    EqualSid, GetAce, GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetTokenInformation,
-    TokenUser, ACCESS_ALLOWED_ACE, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
+    ACCESS_ALLOWED_ACE, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
+    GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetTokenInformation,
     OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
+    PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ALL_ACCESS,
-    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
     OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows::core::{PCWSTR, PWSTR};
 
 struct LocalAllocation(*mut core::ffi::c_void);
 
@@ -395,7 +395,7 @@ struct SidAllocation(LocalAllocation);
 
 impl SidAllocation {
     fn as_sid(&self) -> PSID {
-        PSID(self.0 .0)
+        PSID(self.0.0)
     }
 }
 

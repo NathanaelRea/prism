@@ -18,7 +18,8 @@ on:
       - "tests/**"
 
 concurrency:
-  group: windows-feasibility-${{ github.event.pull_request.number || github.ref }}
+  group: >-
+    windows-feasibility-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -26,13 +27,16 @@ jobs:
     name: Prism phases 1-7 native contracts
     runs-on: windows-2022
     timeout-minutes: 20
+    env:
+      SQLX_OFFLINE: "true"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.95"
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+      # Swatinem/rust-cache v2.9.1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
       - name: Check native Windows compile boundary
         shell: pwsh
         run: |
@@ -52,7 +56,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+      # Swatinem/rust-cache v2.9.1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
         with:
           workspaces: spikes/windows -> target
       - name: Format, lint, and build
@@ -88,4 +93,7 @@ jobs:
           path: windows-spike
       - name: Run ${{ matrix.spike }} contract
         shell: pwsh
-        run: scripts/windows-phase0-spikes.ps1 -Spike ${{ matrix.spike }} -Executable windows-spike/prism-windows-spikes.exe
+        run: |
+          scripts/windows-phase0-spikes.ps1 `
+            -Spike ${{ matrix.spike }} `
+            -Executable windows-spike/prism-windows-spikes.exe
