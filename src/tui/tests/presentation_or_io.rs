@@ -369,6 +369,21 @@ fn tmux_portal_resizes_once_for_unchanged_target_and_size() {
     tui.tmux_generations.insert(slot, 0);
 
     tui.poll_tmux_portal();
+    let started = Instant::now();
+    loop {
+        tui.route_tui_job_messages_with_budget(1, Instant::now());
+        if tui.jobs.queue_stats().latest_depth == 1 {
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(1));
+        std::thread::yield_now();
+    }
+
+    // Model a loaded TUI tick whose job-routing budget expires after consuming the terminal
+    // outcome but before routing its payload. The pending payload still owns this poll slot.
+    tui.tui_tick_active = true;
+    tui.poll_tmux_portal();
+    tui.tui_tick_active = false;
     wait_for_tmux_portal_job(&mut tui);
     tui.tmux_portal_last_polled
         .insert(key, Instant::now() - Duration::from_secs(1));

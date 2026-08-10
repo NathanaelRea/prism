@@ -590,6 +590,65 @@ mod tests {
     use crate::workflow::source::{TriggerCatalog, compile_workflow};
     use crate::workflow::step_trigger::TriggerSubject;
 
+    #[test]
+    fn durable_store_open_waits_for_a_transient_write_lock() {
+        let root = std::env::temp_dir().join(format!(
+            "prism-workflow-open-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = root.join("workflow.db");
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let store = DurableWorkflowRunStore::open(&path).await.unwrap();
+                store.close().await;
+
+                let mut blocker = sqlx::SqliteConnection::connect_with(
+                    &super::super::pools::options(&path, false, false).unwrap(),
+                )
+                .await
+                .unwrap();
+                sqlx::query("begin immediate")
+                    .execute(&mut blocker)
+                    .await
+                    .unwrap();
+                sqlx::query(
+                    "update workflow_database_identity set schema_epoch = schema_epoch where singleton = 1",
+                )
+                .execute(&mut blocker)
+                .await
+                .unwrap();
+
+                let mut reopening = Box::pin(DurableWorkflowRunStore::open(&path));
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(50), &mut reopening)
+                        .await
+                        .is_err(),
+                    "workflow open should remain pending while the SQLite lock is held"
+                );
+
+                sqlx::query("commit")
+                    .execute(&mut blocker)
+                    .await
+                    .unwrap();
+                blocker.close().await.unwrap();
+
+                let reopened = tokio::time::timeout(super::super::pools::WRITER_BUSY_TIMEOUT, reopening)
+                    .await
+                    .expect("workflow open should finish after the SQLite lock is released")
+                    .expect("workflow open should wait for a transient SQLite lock");
+                reopened.close().await;
+            });
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn durable_store_round_trips_compact_run_projection() {
         let root = std::env::temp_dir().join(format!(
