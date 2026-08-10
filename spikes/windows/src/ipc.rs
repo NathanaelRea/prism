@@ -31,6 +31,24 @@ fn listener(name: &str) -> SpikeResult<Listener> {
         .create_tokio()?)
 }
 
+async fn rebind_listener(name: &str) -> SpikeResult<Listener> {
+    let deadline = time::Instant::now() + Duration::from_secs(1);
+    loop {
+        match listener(name) {
+            Ok(listener) => return Ok(listener),
+            Err(error)
+                if error
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|error| error.kind() == io::ErrorKind::PermissionDenied)
+                    && time::Instant::now() < deadline =>
+            {
+                time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 async fn write_frame(stream: &Stream, payload: &[u8]) -> SpikeResult {
     require(
         payload.len() <= MAX_FRAME,
@@ -171,7 +189,7 @@ pub async fn run_spike() -> SpikeResult {
         Ok(_) => return fail("a second worker owner bound the same local-socket name"),
     }
     drop(first);
-    let server_listener = listener(&name)?;
+    let server_listener = rebind_listener(&name).await?;
 
     let server_token = token.clone();
     let server = tokio::spawn(async move {
@@ -208,7 +226,7 @@ pub async fn run_spike() -> SpikeResult {
         .await
         .map_err(|_| "worker IPC server did not shut down")??;
 
-    let rebound = listener(&name)?;
+    let rebound = rebind_listener(&name).await?;
     drop(rebound);
     println!("[worker IPC] PASS");
     Ok(())
