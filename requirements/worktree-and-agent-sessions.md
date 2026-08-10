@@ -52,9 +52,9 @@
 - **Invariant**: Agent completion is derived from the final assistant message's
   completion timestamp. A newer user prompt invalidates prior completion; errors
   supplement rather than redefine completion.
-- **Behavior**: Users can enter a selected Agent Action's corresponding native
-  session in tmux when its recorded Harness supports interactive resume and the
-  Workflow Definition explicitly permits continuation.
+- **Invariant**: Managed Workflow Agent invocations always use fresh headless
+  native sessions. Interactive Worktree Sessions remain separate and are never
+  resumed as Workflow Step context.
 
 ## Hiding And Deletion
 
@@ -67,11 +67,11 @@
   state and other risks. On confirmation, Prism removes active session
   associations, the worktree, branch when applicable, tmux session, and other
   Prism-owned runtime resources as one coherent operation.
-- **Invariant**: Deletion retires the Worktree Session identity and its run and
-  Artifact links without deleting Workflow Runs, attempts, Artifacts, or
-  decisions. A pending Attempt scoped to that exact incarnation cannot start; an
-  active scoped Attempt must reach a cancelled or recovery-required boundary
-  before physical deletion proceeds. Unrelated run branches can continue.
+- **Invariant**: Deletion retires the Worktree Session identity and its run links
+  without deleting Workflow Runs, lifecycle attempts, or Agent final text. A
+  pending Attempt scoped to that exact incarnation cannot start; an active
+  scoped Attempt must reach a cancelled or recovery-required boundary before
+  physical deletion proceeds. Unrelated run branches can continue.
 - **Invariant**: Reusing a deleted worktree path or branch name creates a fresh
   Worktree Session identity and cannot resurrect old Change Request, Workflow
   Run, or Agent Session state.

@@ -110,6 +110,7 @@ pub(crate) enum TuiJobPayload {
     OpencodePoll(OpencodePollResult),
     OpencodeEvent(OpencodeEventResult),
     RemoteAction(Box<RemoteActionDelivery>),
+    RemoteActionProgress { id: JobId, message: String },
 }
 
 impl Tui {
@@ -642,7 +643,7 @@ impl Tui {
         self.route_tui_job_payload(payload);
     }
 
-    pub(super) fn route_tui_job_payload(&self, payload: TuiJobPayload) {
+    pub(super) fn route_tui_job_payload(&mut self, payload: TuiJobPayload) {
         match payload {
             TuiJobPayload::SessionRefresh(result) => {
                 let _ = self.session_refresh_tx.send(result);
@@ -685,6 +686,15 @@ impl Tui {
             }
             TuiJobPayload::RemoteAction(result) => {
                 let _ = self.remote_action_tx.send(*result);
+            }
+            TuiJobPayload::RemoteActionProgress { id, message } => {
+                let _active_job = id;
+                if let Some(crate::view::DialogModel::Progress {
+                    message: displayed, ..
+                }) = &mut self.dialog
+                {
+                    *displayed = message;
+                }
             }
         }
     }

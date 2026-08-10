@@ -290,16 +290,6 @@ impl DesktopNotifier {
     }
 }
 
-#[cfg(target_os = "linux")]
-pub(crate) fn deliver_native_notification(title: &str, body: &str) -> Result<(), &'static str> {
-    notify_rust::Notification::new()
-        .summary(title)
-        .body(body)
-        .show()
-        .map(|_| ())
-        .map_err(|_| "backend")
-}
-
 #[cfg(target_os = "macos")]
 pub(crate) fn deliver_terminal_notification(title: &str, body: &str) -> Result<(), &'static str> {
     let mut terminal = std::fs::OpenOptions::new()

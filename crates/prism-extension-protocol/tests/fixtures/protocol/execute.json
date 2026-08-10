@@ -1,1 +1,0 @@
-{"type":"execute","id":"call-7","attempt":{"attempt_id":"attempt-1","generation":2,"implementation_id":"acme.test/echo","input":{"value":"hello"},"artifacts":{}}}

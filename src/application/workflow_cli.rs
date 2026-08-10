@@ -1,25 +1,12 @@
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::json;
 
-use crate::extension::{
-    DescriptorRegistry, ExtensionClient, ExtensionOperations, HostLimits, NoHostOperations,
-};
-use crate::package::{
-    PackageInstaller, PackageLock, PackageManifest, SourceLimits, SourceResolver, WorkingCopy,
-};
-use crate::resource::{DiscoveredResource, ResourceKind, ResourceScope, TrustStore, discover};
-use crate::workflow::definition::{
-    DefinitionAuthoringOperations, DefinitionCatalog, ExecutableResolution, LaunchMode,
-    WorkflowDefinition, diagnose_source,
-};
-use crate::{ApprovalDecision, LaunchWorkflow, WorkflowCommand, WorkflowOperations};
+use crate::resource::{DiscoveredResource, ResourceKind, ResourceScope, discover};
 
 const JSON_SCHEMA_VERSION: u32 = 1;
 
@@ -53,308 +40,6 @@ pub(crate) fn run_workflow(repo: Option<&Path>, arguments: &[String]) -> Result<
     )
 }
 
-pub(crate) fn run_extension(repo: Option<&Path>, arguments: &[String]) -> Result<(), String> {
-    finish_family(
-        "extension",
-        arguments,
-        block_on(run_extension_async(repo, arguments)),
-    )
-}
-
-pub(crate) fn run_package(repo: Option<&Path>, arguments: &[String]) -> Result<(), String> {
-    finish_family("package", arguments, run_package_inner(repo, arguments))
-}
-
-fn run_package_inner(repo: Option<&Path>, arguments: &[String]) -> Result<(), String> {
-    let context = ResourceContext::load(repo)?;
-    let (arguments, json_output) = split_json(arguments);
-    match arguments.first().map(String::as_str) {
-        Some("new") => {
-            let id = required(&arguments, 1, "package new requires <id>")?;
-            let destination = arguments
-                .get(2)
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(id));
-            if destination.exists() {
-                return Err(format!(
-                    "package destination {} already exists",
-                    destination.display()
-                ));
-            }
-            fs::create_dir_all(&destination).map_err(string_error)?;
-            fs::write(destination.join("prism-package.toml"), format!("schema_version = 1\nid = \"{id}\"\nversion = \"0.1.0\"\nresources = []\nextensions = []\ndependencies = []\n")).map_err(string_error)?;
-            output(
-                json_output,
-                "package.new",
-                &json!({"id": id, "path": destination}),
-                || format!("created {id} at {}", destination.display()),
-            )
-        }
-        Some("validate") => {
-            let path = PathBuf::from(required(&arguments, 1, "package validate requires <path>")?);
-            let manifest = manifest_at(&path)?;
-            output(
-                json_output,
-                "package.validation",
-                &json!({"valid": true, "package": manifest}),
-                || format!("valid: {} ({})", manifest.id, path.display()),
-            )
-        }
-        Some("install") => {
-            let source = required(&arguments, 1, "package install requires <source>")?;
-            let resolved =
-                SourceResolver::new(context.global.join("staging"), SourceLimits::default())
-                    .resolve(source)
-                    .map_err(|error| error.to_string())?;
-            let installed = PackageInstaller::new(
-                &context.global,
-                context.global.join("state"),
-                context.global.join("store"),
-            )
-            .install(&resolved, Some(target_triple()))
-            .map_err(|error| error.to_string())?;
-            output(
-                json_output,
-                "package.install",
-                &json!({"id": installed.package_id, "revision": installed.revision.to_string(), "path": installed.working_copy}),
-                || format!("installed {} {}", installed.package_id, installed.revision),
-            )
-        }
-        Some("list") => {
-            let lock = read_package_lock(&context.global)?;
-            output(json_output, "package.list", &lock.packages, || {
-                lock.packages
-                    .iter()
-                    .map(|package| format!("{}\t{}", package.id, package.revision))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-        }
-        Some("show") => {
-            let id = required(&arguments, 1, "package show requires <id>")?;
-            let root = context.global.join("packages").join(id);
-            let manifest = manifest_at(&root)?;
-            output(json_output, "package.show", &manifest, || {
-                fs::read_to_string(root.join("prism-package.toml")).unwrap_or_default()
-            })
-        }
-        Some("update") => {
-            let id = required(&arguments, 1, "package update requires <id> [source]")?;
-            let mut lock = read_package_lock(&context.global)?;
-            let locked = lock
-                .packages
-                .iter()
-                .find(|package| package.id == id)
-                .cloned()
-                .ok_or_else(|| format!("package {id} is not installed"))?;
-            let source = arguments
-                .get(2)
-                .map(String::as_str)
-                .unwrap_or(&locked.source);
-            if source.starts_with("embedded:") {
-                if id != "prism.standard" || arguments.get(2).is_some() {
-                    return Err(format!(
-                        "package {id} uses embedded source {source}; provide an explicit update source"
-                    ));
-                }
-                let updated = crate::package::bootstrap_standard_pack(&context.global)
-                    .map_err(|error| error.to_string())?;
-                return output(
-                    json_output,
-                    "package.update",
-                    &json!({"id":id,"updated":updated,"source":source}),
-                    || {
-                        if updated {
-                            "updated prism.standard from the bundled incoming revision".into()
-                        } else {
-                            "prism.standard is current or has preserved update conflicts".into()
-                        }
-                    },
-                );
-            }
-            let resolved =
-                SourceResolver::new(context.global.join("staging"), SourceLimits::default())
-                    .resolve(source)
-                    .map_err(|error| error.to_string())?;
-            let working = WorkingCopy::new(
-                context.global.join("packages").join(id),
-                context.global.join("state/package-bases").join(id),
-                context.global.join("state/package-updates").join(id),
-            );
-            let plan = working
-                .plan_update(&resolved.root)
-                .map_err(|error| error.to_string())?;
-            let conflicts = plan.has_conflicts();
-            working
-                .apply_update(&resolved.root, &plan, |candidate| {
-                    manifest_at(candidate).map(|_| ())
-                })
-                .map_err(|error| error.to_string())?;
-            if !conflicts {
-                let locked = lock
-                    .packages
-                    .iter_mut()
-                    .find(|package| package.id == id)
-                    .expect("installed package remains locked");
-                locked.source = resolved.origin;
-                locked.revision = resolved.revision;
-                locked.sha256 = resolved
-                    .digest
-                    .as_str()
-                    .trim_start_matches("sha256:")
-                    .into();
-                lock.validate().map_err(|error| error.to_string())?;
-                write_package_lock(&context.global, &lock)?;
-            }
-            output(
-                json_output,
-                "package.update",
-                &json!({"id": id, "conflicts": conflicts, "dirty": plan.dirty}),
-                || {
-                    if conflicts {
-                        format!("update for {id} has conflicts; local files were preserved")
-                    } else {
-                        format!("updated {id}")
-                    }
-                },
-            )
-        }
-        Some("remove") => {
-            let id = required(&arguments, 1, "package remove requires <id>")?;
-            PackageInstaller::new(
-                &context.global,
-                context.global.join("state"),
-                context.global.join("store"),
-            )
-            .remove(id)
-            .map_err(|error| error.to_string())?;
-            output(
-                json_output,
-                "package.remove",
-                &json!({"id": id, "removed": true}),
-                || format!("removed {id}"),
-            )
-        }
-        Some(other) => Err(format!("unknown package subcommand: {other}")),
-        None => Err("package requires a subcommand".into()),
-    }
-}
-
-async fn run_trigger_command(arguments: &[String], json_output: bool) -> Result<(), String> {
-    let operations = WorkflowOperations::open_default()
-        .await
-        .map_err(|error| error.to_string())?;
-    match arguments.first().map(String::as_str) {
-        Some("list") => {
-            let triggers = operations
-                .list_triggers()
-                .await
-                .map_err(|error| error.to_string())?;
-            output(json_output, "workflow.trigger.list", &triggers, || {
-                triggers
-                    .iter()
-                    .map(|trigger| {
-                        format!(
-                            "{}\t{}",
-                            trigger.id,
-                            if trigger.enabled {
-                                "enabled"
-                            } else {
-                                "disabled"
-                            }
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-        }
-        Some("show") => {
-            let id = required(arguments, 1, "workflow trigger show requires <id>")?;
-            let trigger = operations
-                .show_trigger(id)
-                .await
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| format!("unknown Trigger {id}"))?;
-            output(json_output, "workflow.trigger.show", &trigger, || {
-                serde_json::to_string_pretty(&trigger).unwrap_or_default()
-            })
-        }
-        Some(command @ ("enable" | "disable")) => {
-            let id = required(
-                arguments,
-                1,
-                "workflow trigger enable/disable requires <id>",
-            )?;
-            let enabled = command == "enable";
-            operations
-                .set_trigger_enabled(id, enabled, now_ms())
-                .await
-                .map_err(|error| error.to_string())?;
-            output(
-                json_output,
-                "workflow.trigger.control",
-                &json!({"id": id, "enabled": enabled}),
-                || format!("{id} {}", if enabled { "enabled" } else { "disabled" }),
-            )
-        }
-        Some("run-now") => {
-            let id = required(arguments, 1, "workflow trigger run-now requires <id>")?;
-            let now = now_ms();
-            let occurrence = format!("manual:{id}:{now}");
-            let created = operations
-                .run_trigger_now(id, &occurrence, now)
-                .await
-                .map_err(|error| error.to_string())?;
-            output(
-                json_output,
-                "workflow.trigger.run_now",
-                &json!({"id": id, "occurrence_id": occurrence, "created": created}),
-                || {
-                    format!(
-                        "{} {occurrence}",
-                        if created { "created" } else { "deduplicated" }
-                    )
-                },
-            )
-        }
-        Some("history") => {
-            let id = required(arguments, 1, "workflow trigger history requires <id>")?;
-            let history = operations
-                .trigger_history(id, 100)
-                .await
-                .map_err(|error| error.to_string())?;
-            output(json_output, "workflow.trigger.history", &history, || {
-                history
-                    .iter()
-                    .map(|item| format!("{}\t{:?}", item.id, item.status))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-        }
-        Some("doctor") => {
-            let diagnostics = operations
-                .trigger_doctor(now_ms())
-                .await
-                .map_err(|error| error.to_string())?;
-            output(json_output, "workflow.trigger.doctor", &diagnostics, || {
-                if diagnostics.is_empty() {
-                    "Triggers healthy".into()
-                } else {
-                    diagnostics
-                        .iter()
-                        .map(|item| {
-                            format!("{}\t{}\t{}", item.trigger_id, item.severity, item.message)
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                }
-            })
-        }
-        Some(other) => Err(format!("unknown workflow trigger subcommand: {other}")),
-        None => Err("workflow trigger requires a subcommand".into()),
-    }
-}
-
 pub(crate) fn run_skill(repo: Option<&Path>, arguments: &[String]) -> Result<(), String> {
     let result = ResourceContext::load(repo)
         .and_then(|context| run_copyable_resource(&context, arguments, ResourceKind::Skill));
@@ -369,316 +54,291 @@ pub(crate) fn run_template(repo: Option<&Path>, arguments: &[String]) -> Result<
 
 async fn run_workflow_async(repo: Option<&Path>, arguments: &[String]) -> Result<(), String> {
     let context = ResourceContext::load(repo)?;
+    crate::seed_editable_defaults(&context.global).map_err(|error| error.to_string())?;
     let (arguments, json_output) = split_json(arguments);
+    let repository_resources = context.repository_resources();
+    let repository_trusted = context.repository_resources_trusted()?;
+    let discover = || {
+        crate::PromptWorkflowCatalog::discover(
+            &context.global,
+            repository_resources.as_deref(),
+            repository_trusted,
+        )
+        .map_err(format_workflow_diagnostics)
+    };
     match arguments.first().map(String::as_str) {
-        Some("trigger") => run_trigger_command(&arguments[1..], json_output).await,
+        Some("trust-repository") => {
+            let repository = context.repository.as_ref().ok_or_else(|| {
+                "workflow trust-repository requires a repository; use --repo <path>".to_string()
+            })?;
+            let resources = repository_resources
+                .as_ref()
+                .expect("repository has resource root");
+            let revision = crate::repository_resource_revision(resources)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    "repository has no Workflow or Trigger resources to trust".to_string()
+                })?;
+            let apply = arguments.iter().any(|argument| argument == "--apply");
+            if apply {
+                crate::trust_repository_resources(&context.global, repository, resources)
+                    .map_err(|error| error.to_string())?;
+            }
+            output(
+                json_output,
+                "workflow.trust_repository",
+                &json!({"repository": repository, "revision": revision.to_string(), "applied": apply}),
+                || {
+                    if apply {
+                        format!("trusted repository Workflow resources at revision {revision}")
+                    } else {
+                        format!(
+                            "Preview trust for {} at revision {revision}.\nRun again with --apply to allow its full-trust Workflow and Trigger resources.",
+                            repository.display()
+                        )
+                    }
+                },
+            )
+        }
         Some("list") => {
-            let resources = resource_views(&context, ResourceKind::Workflow)?;
-            output(json_output, "workflow.list", &resources, || {
-                resources
+            let workflows = discover()?.list();
+            output(json_output, "workflow.list", &workflows, || {
+                workflows
                     .iter()
-                    .map(|item| format!("{}\t{}\t{}", item.id, item.scope, item.path.display()))
+                    .map(|workflow| {
+                        format!(
+                            "{}\t{:?}\t{}",
+                            workflow.name,
+                            workflow.scope,
+                            workflow.path.display()
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join("\n")
             })
         }
         Some("show") => {
-            let id = required(&arguments, 1, "workflow show requires <id>")?;
-            let resource = find_resource(&context, ResourceKind::Workflow, id)?;
-            let definition = parse_workflow(&resource.path)?;
-            output(
-                json_output,
-                "workflow.show",
-                &json!({"definition": definition, "path": resource.path, "scope": scope_name(resource.scope)}),
-                || fs::read_to_string(&resource.path).unwrap_or_default(),
-            )
+            let name = required(&arguments, 1, "workflow show requires <name>")?;
+            let catalog = discover()?;
+            let workflow = catalog
+                .get(name)
+                .ok_or_else(|| format!("unknown workflow '{name}'"))?;
+            output(json_output, "workflow.show", workflow, || {
+                workflow.source.clone()
+            })
+        }
+        Some("validate") => {
+            if let Some(target) = arguments.get(1) {
+                let path = prompt_workflow_path(&context, target)?;
+                let source = fs::read_to_string(&path).map_err(string_error)?;
+                let triggers = crate::StepTriggerCatalog::discover(
+                    &context.global,
+                    repository_resources.as_deref(),
+                    repository_trusted,
+                )
+                .map_err(|error| error.to_string())?;
+                match crate::compile_workflow(&path, &source, &triggers) {
+                    Ok(workflow) => output(
+                        json_output,
+                        "workflow.validation",
+                        &json!({"valid": true, "name": workflow.name, "path": path, "diagnostics": []}),
+                        || format!("valid: {} ({})", workflow.name, path.display()),
+                    ),
+                    Err(diagnostics) if json_output => output(
+                        true,
+                        "workflow.validation",
+                        &json!({"valid": false, "path": path, "diagnostics": diagnostics}),
+                        String::new,
+                    ),
+                    Err(diagnostics) => Err(format_workflow_diagnostics(diagnostics)),
+                }
+            } else {
+                let workflows = discover()?.list();
+                output(
+                    json_output,
+                    "workflow.validation",
+                    &json!({"valid": true, "workflows": workflows, "diagnostics": []}),
+                    || format!("valid: {} Workflow(s)", workflows.len()),
+                )
+            }
         }
         Some("new") => {
-            let id = required(&arguments, 1, "workflow new requires <id>")?;
-            let name = option_value(&arguments, "--name")
-                .unwrap_or_else(|| id.rsplit('/').next().unwrap_or(id));
-            let path = DefinitionAuthoringOperations::new(context.global.join("workflows"))
-                .create(id, name)
-                .map_err(|error| error.to_string())?;
+            let name = required(&arguments, 1, "workflow new requires <name>")?;
+            validate_prompt_workflow_name(name)?;
+            let destination = context
+                .global
+                .join("workflows")
+                .join(format!("{name}.toml"));
+            fs::create_dir_all(destination.parent().expect("Workflow parent"))
+                .map_err(string_error)?;
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+            }
+            use std::io::Write as _;
+            let mut file = options.open(&destination).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    format!("Workflow {} already exists", destination.display())
+                } else {
+                    error.to_string()
+                }
+            })?;
+            file.write_all(crate::PROMPT_WORKFLOW_TEMPLATE.as_bytes())
+                .map_err(string_error)?;
             output(
                 json_output,
                 "workflow.new",
-                &json!({"id": id, "path": path}),
-                || format!("created {id} at {}", path.display()),
-            )
-        }
-        Some("copy") => {
-            let source = required(&arguments, 1, "workflow copy requires <source-id> <new-id>")?;
-            let new_id = required(&arguments, 2, "workflow copy requires <source-id> <new-id>")?;
-            let source = find_resource(&context, ResourceKind::Workflow, source)?;
-            let name = option_value(&arguments, "--name")
-                .unwrap_or_else(|| new_id.rsplit('/').next().unwrap_or(new_id));
-            let path = DefinitionAuthoringOperations::new(context.global.join("workflows"))
-                .copy(&source.path, new_id, name)
-                .map_err(|error| error.to_string())?;
-            output(
-                json_output,
-                "workflow.copy",
-                &json!({"id": new_id, "path": path}),
-                || format!("copied {new_id} to {}", path.display()),
+                &json!({"name": name, "path": destination}),
+                || format!("created {name} at {}", destination.display()),
             )
         }
         Some("edit") => {
-            let id = required(&arguments, 1, "workflow edit requires <id>")?;
-            let resource = find_resource(&context, ResourceKind::Workflow, id)?;
-            edit(&resource.path)
+            let name = required(&arguments, 1, "workflow edit requires <name>")?;
+            let catalog = discover()?;
+            let workflow = catalog
+                .get(name)
+                .ok_or_else(|| format!("unknown workflow '{name}'"))?;
+            edit(&workflow.source_path)
         }
-        Some("validate") => {
-            let target = required(&arguments, 1, "workflow validate requires <id-or-path>")?;
-            let path = workflow_path(&context, target)?;
-            match fs::read_to_string(&path)
-                .map_err(string_error)
-                .and_then(|source| {
-                    diagnose_source(&path, &source).map_err(|diagnostics| {
-                        diagnostics
-                            .iter()
-                            .map(|item| format!("{}: {}", item.path.display(), item.message))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    })
-                }) {
-                Ok(definition) => output(
-                    json_output,
-                    "workflow.validation",
-                    &json!({"valid": true, "id": definition.id, "path": path, "diagnostics": []}),
-                    || format!("valid: {} ({})", definition.id, path.display()),
-                ),
-                Err(error) if json_output => output(
-                    true,
-                    "workflow.validation",
-                    &json!({"valid": false, "path": path, "diagnostics": [error]}),
-                    String::new,
-                ),
-                Err(error) => Err(error),
-            }
-        }
-        Some("preview") => {
-            let id = required(&arguments, 1, "workflow preview requires <id>")?;
-            let catalog = load_catalog(&context).await?;
-            let preview = catalog.preview(id).map_err(|error| error.to_string())?;
-            output(json_output, "workflow.preview", &preview, || {
-                serde_json::to_string_pretty(&preview).unwrap_or_default()
-            })
-        }
-        Some("run") => {
-            let id = required(&arguments, 1, "workflow run requires <id>")?;
-            let catalog = load_catalog(&context).await?;
-            let snapshot = catalog.compile(id).map_err(|error| error.to_string())?;
-            if !snapshot.definition.launch.contains(&LaunchMode::Manual) {
-                return Err(format!("workflow {id} does not allow manual launch"));
-            }
-            let inputs = typed_inputs(&arguments, &snapshot.definition.inputs, &snapshot.schemas)?;
-            let now = now_ms();
-            let key = option_value(&arguments, "--idempotency-key")
-                .map(str::to_owned)
-                .unwrap_or_else(|| format!("cli:{id}:{now}"));
-            let run_id = format!(
-                "workflow-{:016x}-{now}",
-                crate::util::stable_hash(Path::new(&key))
-            );
-            let input_json = serde_json::to_string(&inputs).map_err(string_error)?;
-            let repository = context
-                .repository
-                .as_ref()
-                .map(|path| path.to_string_lossy().into_owned());
-            // The worker owns snapshot registration, migration, durable launch, and wakeup. A
-            // standalone launch process must not open a competing Workflow ledger connection.
-            let launched = crate::worker::launch_workflow(
-                &catalog,
-                LaunchWorkflow {
-                    run_id: &run_id,
-                    definition_snapshot_id: &snapshot.digest,
-                    repository: repository.as_deref(),
-                    idempotency_key: &key,
-                    input_json: &input_json,
-                    now_unix_ms: now,
-                },
-            )?;
+        Some("copy-example") => {
+            let name = required(&arguments, 1, "workflow copy-example requires <name>")?;
+            let destination = crate::copy_workflow_example(&context.global, name)
+                .map_err(|error| error.to_string())?;
             output(
                 json_output,
-                "workflow.run",
-                &json!({"run_id": launched, "definition_id": id, "definition_snapshot_id": snapshot.digest}),
-                || format!("run_id = {launched}\nstatus = queued"),
+                "workflow.copy_example",
+                &json!({"name": name, "path": destination}),
+                || format!("copied {name} to {}", destination.display()),
             )
         }
-        Some("history") => {
-            let operations = WorkflowOperations::open_default()
-                .await
-                .map_err(|error| error.to_string())?;
-            let runs = operations
-                .list(
-                    context
-                        .repository
-                        .as_ref()
-                        .map(|path| path.to_string_lossy())
-                        .as_deref(),
-                    100,
+        Some("reset") => {
+            let name = required(&arguments, 1, "workflow reset requires <name>")?;
+            if name != "stabilize" {
+                return Err(format!("no bundled default named '{name}'"));
+            }
+            let destination = context.global.join("workflows/stabilize.toml");
+            let apply = arguments.iter().any(|argument| argument == "--apply");
+            if apply {
+                fs::create_dir_all(destination.parent().expect("Workflow parent"))
+                    .map_err(string_error)?;
+                fs::write(
+                    &destination,
+                    crate::workflow::source::DEFAULT_STABILIZE_SOURCE,
                 )
-                .await
-                .map_err(|error| error.to_string())?;
-            let selected = if let Some(id) = arguments.get(1) {
-                runs.into_iter()
-                    .filter(|run| run.id == *id || run.definition_name == *id)
-                    .collect()
-            } else {
-                runs
-            };
-            output(json_output, "workflow.history", &selected, || {
-                selected
-                    .iter()
-                    .map(|run| format!("{}\t{}\t{}", run.id, run.definition_name, run.status))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-        }
-        Some("migrate") => {
-            let target = required(&arguments, 1, "workflow migrate requires <id-or-path>")?;
-            let path = workflow_path(&context, target)?;
-            let authoring = DefinitionAuthoringOperations::new(context.global.join("workflows"));
-            let preview = authoring
-                .migration_preview(&path)
-                .map_err(|error| error.to_string())?;
-            let backup = if arguments.iter().any(|value| value == "--apply") {
-                authoring
-                    .apply_migration(&preview)
-                    .map_err(|error| error.to_string())?
-            } else {
-                None
-            };
+                .map_err(string_error)?;
+            }
             output(
                 json_output,
-                "workflow.migration",
-                &json!({"preview": preview, "applied": backup.is_some(), "backup": backup}),
+                "workflow.reset",
+                &json!({"name": name, "path": destination, "applied": apply, "source": crate::workflow::source::DEFAULT_STABILIZE_SOURCE}),
                 || {
-                    if preview.changed {
-                        format!(
-                            "{} -> {}{}",
-                            preview.from_version,
-                            preview.to_version,
-                            if backup.is_some() {
-                                " (applied)"
-                            } else {
-                                " (preview)"
-                            }
-                        )
+                    if apply {
+                        format!("reset {name} at {}", destination.display())
                     } else {
-                        "already current".into()
+                        format!(
+                            "Preview reset for {}:\n{}\nRun again with --apply to replace the file.",
+                            destination.display(),
+                            crate::workflow::source::DEFAULT_STABILIZE_SOURCE
+                        )
                     }
                 },
             )
         }
-        Some("updates") => {
-            let catalog = load_catalog(&context).await?;
+        Some("run") => {
+            let name = required(&arguments, 1, "workflow run requires <name>")?;
+            let catalog = discover()?;
+            let workflow = catalog
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("unknown workflow '{name}'"))?;
+            if workflow.steps.iter().any(|step| {
+                step.trigger
+                    .as_ref()
+                    .is_some_and(|trigger| trigger.executable.is_some())
+            }) {
+                eprintln!(
+                    "warning: this Workflow runs full-trust Trigger executables with your OS-user authority"
+                );
+            }
+            let repository_root = context.repository.as_ref().ok_or_else(|| {
+                "workflow run requires a repository; use --repo <path>".to_string()
+            })?;
+            let repository = crate::repo::Repository {
+                root: repository_root.clone(),
+            };
+            let config = crate::config::Config::load(&repository);
+            let mut workflow = workflow;
+            crate::resolve_workflow_agent_selection(&mut workflow, &config)
+                .map_err(format_workflow_diagnostics)?;
+            let worktree = option_value(&arguments, "--worktree")
+                .map(PathBuf::from)
+                .unwrap_or(std::env::current_dir().map_err(string_error)?);
+            let worktree = if worktree.exists() {
+                worktree.canonicalize().map_err(string_error)?
+            } else {
+                return Err(format!("worktree {} does not exist", worktree.display()));
+            };
+            let (change_request, change_request_head) =
+                prompt_change_request_subject(&repository, &config, &worktree);
+            let now = now_ms();
+            let run_id = format!(
+                "run-{:016x}-{now}",
+                crate::util::stable_hash(Path::new(&format!(
+                    "{}:{}:{}",
+                    workflow.digest,
+                    worktree.display(),
+                    now
+                )))
+            );
+            let subject = crate::TriggerSubject {
+                repository: repository_root.clone(),
+                worktree,
+                change_request,
+                change_request_head,
+            };
+            let launched = crate::worker::launch_prompt_workflow(&workflow, &run_id, &subject)?;
             output(
                 json_output,
-                "workflow.updates",
-                &catalog.updates(&BTreeMap::new()),
-                || {
-                    catalog
-                        .list()
-                        .iter()
-                        .map(|item| format!("{}\t{}", item.id, item.revision))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                },
+                "workflow.run",
+                &json!({"run_id": launched, "workflow": name, "status": "queued"}),
+                || format!("run_id = {launched}\nstatus = queued"),
             )
+        }
+        Some("history") => {
+            crate::worker::ensure_running()?;
+            let selected = if let Some(run_id) = arguments.get(1) {
+                vec![
+                    crate::worker::inspect_prompt_workflow(run_id)?
+                        .ok_or_else(|| format!("unknown Workflow Run {run_id}"))?,
+                ]
+            } else {
+                crate::worker::list_prompt_workflows(context.repository.as_deref(), 100)?
+            };
+            output(json_output, "workflow.history", &selected, || {
+                selected
+                    .iter()
+                    .map(|run| format!("{}\t{}\t{:?}", run.id, run.workflow_name, run.status))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
         }
         Some(command @ ("pause" | "resume" | "cancel" | "retry")) => {
             let run_id = required(&arguments, 1, "workflow control requires <run-id>")?;
-            let command = match command {
-                "pause" => WorkflowCommand::Pause,
-                "resume" => WorkflowCommand::Resume,
-                "cancel" => WorkflowCommand::Cancel,
-                _ => WorkflowCommand::Retry,
+            let command_value = match command {
+                "pause" => crate::worker::PromptWorkflowControl::Pause,
+                "resume" => crate::worker::PromptWorkflowControl::Resume,
+                "cancel" => crate::worker::PromptWorkflowControl::Cancel,
+                _ => crate::worker::PromptWorkflowControl::Retry,
             };
-            WorkflowOperations::open_default()
-                .await
-                .map_err(|error| error.to_string())?
-                .command(run_id, command, now_ms())
-                .await
-                .map_err(|error| error.to_string())?;
+            crate::worker::command_prompt_workflow(run_id, command_value)?;
             output(
                 json_output,
                 "workflow.control",
                 &json!({"run_id": run_id, "command": command}),
-                || format!("{command:?} requested for {run_id}"),
-            )
-        }
-        Some(command @ ("restart" | "skip")) => {
-            let run_id = required(
-                &arguments,
-                1,
-                "workflow restart|skip requires <run-id> <step>",
-            )?;
-            let step = required(
-                &arguments,
-                2,
-                "workflow restart|skip requires <run-id> <step>",
-            )?;
-            let operations = WorkflowOperations::open_default()
-                .await
-                .map_err(|error| error.to_string())?;
-            let projection = operations
-                .inspect(run_id)
-                .await
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| format!("unknown Workflow Run '{run_id}'"))?;
-            let selected = projection
-                .steps
-                .iter()
-                .find(|candidate| candidate.key == step)
-                .ok_or_else(|| format!("unknown Step '{step}' in Workflow Run '{run_id}'"))?;
-            if command == "skip" && !selected.skippable {
-                return Err(format!("Step '{step}' is not marked skippable"));
-            }
-            let invalidated = downstream_steps(&projection.steps, step);
-            let preview = arguments.iter().any(|value| value == "--preview");
-            if !preview {
-                if command == "restart" {
-                    operations.restart_from_step(run_id, step, now_ms()).await
-                } else {
-                    operations.skip_step(run_id, step, now_ms()).await
-                }
-                .map_err(|error| error.to_string())?;
-            }
-            output(
-                json_output,
-                "workflow.step_control",
-                &json!({"run_id": run_id, "step": step, "command": command, "preview": preview, "invalidated_steps": invalidated}),
-                || {
-                    format!(
-                        "{command} {} for {run_id} from {step}\ninvalidates: {}",
-                        if preview { "preview" } else { "requested" },
-                        invalidated.join(", ")
-                    )
-                },
-            )
-        }
-        Some(command @ ("approve" | "reject")) => {
-            let approval = required(&arguments, 1, "workflow approval requires <approval-id>")?;
-            let actor = option_value(&arguments, "--by").unwrap_or("cli");
-            let note = option_value(&arguments, "--note");
-            let decision = if command == "approve" {
-                ApprovalDecision::Approve
-            } else {
-                ApprovalDecision::Reject
-            };
-            WorkflowOperations::open_default()
-                .await
-                .map_err(|error| error.to_string())?
-                .decide_approval(approval, decision, actor, note, now_ms())
-                .await
-                .map_err(|error| error.to_string())?;
-            output(
-                json_output,
-                "workflow.approval",
-                &json!({"approval_id": approval, "decision": command, "decided_by": actor}),
-                || format!("{command}d {approval}"),
+                || format!("{command} requested for {run_id}"),
             )
         }
         Some(other) => Err(format!("unknown workflow subcommand: {other}")),
@@ -686,138 +346,77 @@ async fn run_workflow_async(repo: Option<&Path>, arguments: &[String]) -> Result
     }
 }
 
-async fn run_extension_async(repo: Option<&Path>, arguments: &[String]) -> Result<(), String> {
-    let context = ResourceContext::load(repo)?;
-    let (arguments, json_output) = split_json(arguments);
-    let operations = ExtensionOperations::new(
-        context.global.join("extensions"),
-        context.global.join("state"),
-    );
-    match arguments.first().map(String::as_str) {
-        Some("list") => {
-            let resources = resource_views(&context, ResourceKind::Extension)?;
-            output(json_output, "extension.list", &resources, || {
-                resources
-                    .iter()
-                    .map(|item| format!("{}\t{}", item.id, item.path.display()))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-        }
-        Some("show") => {
-            let id = required(&arguments, 1, "extension show requires <id>")?;
-            let resource = find_resource(&context, ResourceKind::Extension, id)?;
-            output(
-                json_output,
-                "extension.show",
-                &json!({"id": id, "path": resource.path, "scope": scope_name(resource.scope)}),
-                || resource.path.display().to_string(),
-            )
-        }
-        Some("new") => {
-            let id = required(&arguments, 1, "extension new requires <id>")?;
-            let path = operations.scaffold(id).map_err(|error| error.to_string())?;
-            output(
-                json_output,
-                "extension.new",
-                &json!({"id": id, "path": path}),
-                || format!("created {id} at {}", path.display()),
-            )
-        }
-        Some("edit") => {
-            let id = required(&arguments, 1, "extension edit requires <id>")?;
-            let resource = find_resource(&context, ResourceKind::Extension, id)?;
-            edit(&if resource.path.is_dir() {
-                resource.path.join("src/main.rs")
-            } else {
-                resource.path
-            })
-        }
-        Some("check") => {
-            let path = PathBuf::from(required(&arguments, 1, "extension check requires <path>")?);
-            operations.check(&path).map_err(|error| error.to_string())?;
-            output(
-                json_output,
-                "extension.check",
-                &json!({"path": path, "valid": true}),
-                || "extension check passed".into(),
-            )
-        }
-        Some("build") => {
-            let id = required(&arguments, 1, "extension build requires <id> [path]")?;
-            let path = arguments
-                .get(2)
-                .map(PathBuf::from)
-                .unwrap_or_else(|| context.global.join("extensions").join(id));
-            let (revision, executable) = operations
-                .build(id, &path)
-                .map_err(|error| error.to_string())?;
-            output(
-                json_output,
-                "extension.build",
-                &json!({"id": id, "revision": revision.to_string(), "executable": executable}),
-                || format!("built {id} {revision}"),
-            )
-        }
-        Some("reload") => {
-            let targets = extension_targets(&context, arguments.get(1), arguments.get(2))?;
-            let mut results = Vec::new();
-            for (id, path) in targets {
-                let client = operations
-                    .reload(&id, path, Arc::new(NoHostOperations), HostLimits::default())
-                    .await
-                    .map_err(|error| error.to_string())?;
-                results.push(json!({"id": id, "revision": client.revision(), "diagnostics": client.diagnostics()}));
-                client.shutdown().await.map_err(|error| error.to_string())?;
-            }
-            output(json_output, "extension.reload", &results, || {
-                format!("reloaded {} extension(s)", results.len())
-            })
-        }
-        Some("doctor") => {
-            let targets = extension_targets(&context, arguments.get(1), arguments.get(2))?;
-            let mut reports = Vec::new();
-            for (id, path) in targets {
-                let executable = if path.is_dir() {
-                    operations
-                        .build(&id, &path)
-                        .map_err(|error| error.to_string())?
-                        .1
-                } else {
-                    path
-                };
-                reports.push(
-                    operations
-                        .doctor(
-                            &id,
-                            executable,
-                            Arc::new(NoHostOperations),
-                            HostLimits::default(),
-                        )
-                        .await,
-                );
-            }
-            output(json_output, "extension.doctor", &reports, || {
-                reports
-                    .iter()
-                    .map(|report| {
-                        format!(
-                            "{}\t{}",
-                            report.extension_id,
-                            if report.healthy {
-                                "healthy"
-                            } else {
-                                "unhealthy"
-                            }
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-        }
-        Some(other) => Err(format!("unknown extension subcommand: {other}")),
-        None => Err("extension requires a subcommand".into()),
+fn format_workflow_diagnostics(diagnostics: Vec<crate::WorkflowDiagnostic>) -> String {
+    diagnostics
+        .into_iter()
+        .map(|diagnostic| {
+            let location = diagnostic.byte_start.map_or_else(
+                || diagnostic.path.display().to_string(),
+                |start| format!("{}:{start}", diagnostic.path.display()),
+            );
+            format!("{location}: {}", diagnostic.message)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn validate_prompt_workflow_name(name: &str) -> Result<(), String> {
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        Err("Workflow name must use letters, numbers, '.', '_' or '-'".into())
+    } else {
+        Ok(())
     }
+}
+
+fn prompt_workflow_path(context: &ResourceContext, target: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(target);
+    if path.is_file() {
+        return Ok(path);
+    }
+    let catalog = crate::PromptWorkflowCatalog::discover(
+        &context.global,
+        context.repository_resources().as_deref(),
+        context.repository_resources_trusted()?,
+    )
+    .map_err(format_workflow_diagnostics)?;
+    catalog
+        .get(target)
+        .map(|workflow| workflow.source_path.clone())
+        .ok_or_else(|| format!("unknown workflow '{target}'"))
+}
+
+fn prompt_change_request_subject(
+    repository: &crate::repo::Repository,
+    config: &crate::config::Config,
+    worktree: &Path,
+) -> (Option<String>, Option<String>) {
+    let Some(branch) = crate::git::current_branch_name(worktree, config)
+        .ok()
+        .flatten()
+    else {
+        return (None, None);
+    };
+    let cache = crate::remote::load_pr_cache(repository, &branch);
+    let Some(summary) = cache.summary() else {
+        return (None, None);
+    };
+    let Some(identity) = summary.change_request_identity.as_ref() else {
+        return (None, None);
+    };
+    (
+        Some(format!(
+            "{}:{}:{}:change_request:{}",
+            identity.provider().config_label(),
+            identity.canonical_host(),
+            identity.project_path(),
+            identity.native_id()
+        )),
+        (!summary.head_sha.is_empty()).then(|| summary.head_sha.clone()),
+    )
 }
 
 struct ResourceContext {
@@ -825,31 +424,9 @@ struct ResourceContext {
     repository: Option<PathBuf>,
 }
 
-fn extension_targets(
-    context: &ResourceContext,
-    id: Option<&String>,
-    explicit_path: Option<&String>,
-) -> Result<Vec<(String, PathBuf)>, String> {
-    if let Some(id) = id {
-        let path = if let Some(path) = explicit_path {
-            PathBuf::from(path)
-        } else {
-            find_resource(context, ResourceKind::Extension, id)?.path
-        };
-        return Ok(vec![(id.clone(), path)]);
-    }
-    resource_views(context, ResourceKind::Extension).map(|resources| {
-        resources
-            .into_iter()
-            .map(|resource| (resource.id, resource.path))
-            .collect()
-    })
-}
-
 impl ResourceContext {
     fn load(repo: Option<&Path>) -> Result<Self, String> {
         let global = crate::util::prism_config_dir();
-        crate::package::bootstrap_standard_pack(&global).map_err(|error| error.to_string())?;
         crate::resource::ensure_global_drop_in_directories(&global)
             .map_err(|error| error.to_string())?;
         let repository = match repo {
@@ -865,74 +442,20 @@ impl ResourceContext {
         self.repository.as_ref().map(|root| root.join(".prism"))
     }
 
+    fn repository_resources_trusted(&self) -> Result<bool, String> {
+        match (self.repository.as_deref(), self.repository_resources()) {
+            (Some(repository), Some(resources)) => {
+                crate::repository_resources_are_trusted(&self.global, repository, &resources)
+                    .map_err(|error| error.to_string())
+            }
+            _ => Ok(false),
+        }
+    }
+
     fn resources(&self) -> Result<Vec<DiscoveredResource>, String> {
         discover(&self.global, self.repository_resources().as_deref())
             .map_err(|error| error.to_string())
     }
-}
-
-async fn load_catalog(context: &ResourceContext) -> Result<DefinitionCatalog, String> {
-    let executable = standard_extension_executable(context);
-    let client = ExtensionClient::launch(
-        &executable,
-        Arc::new(NoHostOperations),
-        HostLimits::default(),
-    )
-    .await
-    .map_err(|error| {
-        format!(
-            "load Standard Extension descriptor from {}: {error}",
-            executable.display()
-        )
-    })?;
-    let mut registry = DescriptorRegistry::default();
-    registry
-        .register(client.descriptor())
-        .map_err(|error| error.to_string())?;
-    let executable_revisions = client
-        .descriptor()
-        .implementations
-        .iter()
-        .map(|implementation| {
-            (
-                implementation.id.clone(),
-                ExecutableResolution {
-                    revision: client.revision().to_string(),
-                    trusted: true,
-                },
-            )
-        })
-        .collect();
-    let _ = client.shutdown().await;
-    DefinitionCatalog::discover(
-        &context.global,
-        context.repository_resources().as_deref(),
-        &TrustStore::new(context.global.join("trust.json")),
-        registry,
-        executable_revisions,
-    )
-    .map_err(|error| error.to_string())
-}
-
-fn standard_extension_executable(context: &ResourceContext) -> PathBuf {
-    if let Some(path) = std::env::var_os("PRISM_STANDARD_EXTENSION") {
-        return PathBuf::from(path);
-    }
-    if let Ok(current) = std::env::current_exe() {
-        let direct = current.with_file_name("prism-standard-extension");
-        if direct.is_file() {
-            return direct;
-        }
-        if let Some(debug_root) = current.parent().and_then(Path::parent) {
-            let workspace = debug_root.join("prism-standard-extension");
-            if workspace.is_file() {
-                return workspace;
-            }
-        }
-    }
-    context
-        .global
-        .join("packages/prism.standard/extensions/prism-standard-extension")
 }
 
 fn run_copyable_resource(
@@ -1122,63 +645,6 @@ fn find_resource(
         .ok_or_else(|| format!("unknown {} {id}", kind_name(kind)))
 }
 
-fn workflow_path(context: &ResourceContext, value: &str) -> Result<PathBuf, String> {
-    let path = PathBuf::from(value);
-    if path.is_file() {
-        Ok(path)
-    } else {
-        Ok(find_resource(context, ResourceKind::Workflow, value)?.path)
-    }
-}
-
-fn parse_workflow(path: &Path) -> Result<WorkflowDefinition, String> {
-    WorkflowDefinition::parse(&fs::read_to_string(path).map_err(string_error)?)
-        .map_err(|error| error.to_string())
-}
-
-fn typed_inputs(
-    arguments: &[String],
-    ports: &BTreeMap<String, crate::PortDefinition>,
-    schemas: &BTreeMap<String, Value>,
-) -> Result<BTreeMap<String, Value>, String> {
-    let mut values = BTreeMap::new();
-    let mut index = 0;
-    while index < arguments.len() {
-        if arguments[index] == "--input" {
-            let input = arguments
-                .get(index + 1)
-                .ok_or_else(|| "--input requires <name>=<json>".to_string())?;
-            let (name, raw) = input
-                .split_once('=')
-                .ok_or_else(|| "--input requires <name>=<json>".to_string())?;
-            if !ports.contains_key(name) {
-                return Err(format!("workflow has no input named '{name}'"));
-            }
-            let value = serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.into()));
-            if let Some(schema) = schemas.get(&ports[name].schema) {
-                crate::workflow::schema::validate_value(&value, schema)
-                    .map_err(|error| format!("workflow input '{name}': {error}"))?;
-            }
-            values.insert(name.into(), value);
-            index += 2;
-        } else {
-            index += 1;
-        }
-    }
-    let missing = ports
-        .iter()
-        .filter(|(name, port)| port.required && !values.contains_key(*name))
-        .map(|(name, _)| name.clone())
-        .collect::<Vec<_>>();
-    if !missing.is_empty() {
-        return Err(format!(
-            "missing required workflow inputs: {}",
-            missing.join(", ")
-        ));
-    }
-    Ok(values)
-}
-
 fn edit(path: &Path) -> Result<(), String> {
     if !crate::terminal::stdin_is_tty() {
         return Err("interactive editing requires a TTY".into());
@@ -1195,39 +661,6 @@ fn edit(path: &Path) -> Result<(), String> {
     } else {
         Err(format!("editor exited with {status}"))
     }
-}
-
-fn manifest_at(path: &Path) -> Result<PackageManifest, String> {
-    let path = if path.is_dir() {
-        path.join("prism-package.toml")
-    } else {
-        path.into()
-    };
-    PackageManifest::parse(&fs::read_to_string(&path).map_err(string_error)?)
-        .map_err(|error| error.to_string())
-}
-
-fn read_package_lock(root: &Path) -> Result<PackageLock, String> {
-    let path = root.join("package.lock");
-    match fs::read_to_string(path) {
-        Ok(source) => PackageLock::parse(&source).map_err(|error| error.to_string()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            PackageLock::parse("schema_version = 1\npackages = []\n")
-                .map_err(|error| error.to_string())
-        }
-        Err(error) => Err(error.to_string()),
-    }
-}
-
-fn write_package_lock(root: &Path, lock: &PackageLock) -> Result<(), String> {
-    let path = root.join("package.lock");
-    let candidate = root.join(format!(".package-lock-cli-{}.tmp", std::process::id()));
-    fs::write(
-        &candidate,
-        toml::to_string_pretty(lock).map_err(string_error)?,
-    )
-    .map_err(string_error)?;
-    fs::rename(&candidate, &path).map_err(string_error)
 }
 
 fn split_json(arguments: &[String]) -> (Vec<String>, bool) {
@@ -1312,33 +745,9 @@ fn scope_name(scope: ResourceScope) -> &'static str {
 }
 fn kind_name(kind: ResourceKind) -> &'static str {
     match kind {
-        ResourceKind::Workflow => "workflow",
-        ResourceKind::Extension => "extension",
         ResourceKind::Skill => "skill",
         ResourceKind::Template => "template",
-        ResourceKind::ArtifactSchema => "artifact_schema",
-        ResourceKind::Trigger => "trigger",
-        ResourceKind::Notification => "notification",
     }
-}
-fn downstream_steps(steps: &[crate::WorkflowStepProjection], selected: &str) -> Vec<String> {
-    let mut invalidated = std::collections::BTreeSet::from([selected.to_string()]);
-    loop {
-        let before = invalidated.len();
-        for step in steps {
-            if step
-                .dependencies
-                .iter()
-                .any(|dependency| invalidated.contains(dependency))
-            {
-                invalidated.insert(step.key.clone());
-            }
-        }
-        if invalidated.len() == before {
-            break;
-        }
-    }
-    invalidated.into_iter().collect()
 }
 fn string_error(error: impl std::fmt::Display) -> String {
     error.to_string()
@@ -1349,53 +758,4 @@ fn now_ms() -> i64 {
         .ok()
         .and_then(|value| i64::try_from(value.as_millis()).ok())
         .unwrap_or(0)
-}
-fn target_triple() -> &'static str {
-    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        "x86_64-unknown-linux-gnu"
-    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        "aarch64-apple-darwin"
-    } else {
-        "x86_64-apple-darwin"
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn typed_inputs_reject_unknown_missing_and_wrong_schema_values() {
-        let ports = BTreeMap::from([(
-            "task".into(),
-            crate::PortDefinition {
-                schema: "acme.task/v1".into(),
-                required: true,
-                from_context: false,
-                from: None,
-            },
-        )]);
-        let schemas = BTreeMap::from([(
-            "acme.task/v1".into(),
-            json!({"type": "object", "required": ["title"]}),
-        )]);
-        assert!(typed_inputs(&[], &ports, &schemas).is_err());
-        assert!(typed_inputs(&["--input".into(), "unknown={}".into()], &ports, &schemas).is_err());
-        assert!(
-            typed_inputs(
-                &["--input".into(), "task=\"text\"".into()],
-                &ports,
-                &schemas
-            )
-            .is_err()
-        );
-        assert!(
-            typed_inputs(
-                &["--input".into(), "task={\"title\":\"work\"}".into()],
-                &ports,
-                &schemas
-            )
-            .is_ok()
-        );
-    }
 }

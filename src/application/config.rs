@@ -1345,198 +1345,34 @@ pub fn doctor(repo: &Repository, config: &mut Config) -> Result<(), String> {
 
 fn print_workflow_doctor(repo: &Repository) {
     let global = crate::util::prism_config_dir();
-    if let Err(error) = crate::package::bootstrap_standard_pack(&global) {
-        println!("Standard Pack bootstrap error: {error}");
-    }
-    match crate::resource::discover(&global, Some(&repo.root.join(".prism"))) {
-        Ok(resources) => {
-            let workflows = resources
-                .iter()
-                .filter(|resource| resource.kind == crate::resource::ResourceKind::Workflow)
-                .collect::<Vec<_>>();
+    let repository = repo.root.join(".prism");
+    let trusted =
+        crate::repository_resources_are_trusted(&global, &repo.root, &repository).unwrap_or(false);
+    match crate::PromptWorkflowCatalog::discover(&global, Some(&repository), trusted) {
+        Ok(catalog) => {
+            let workflows = catalog.list();
             println!("workflow definitions: {}", workflows.len());
-            for resource in workflows {
-                match std::fs::read_to_string(&resource.path)
-                    .map_err(|error| error.to_string())
-                    .and_then(|source| {
-                        crate::WorkflowDefinition::parse(&source).map_err(|error| error.to_string())
-                    }) {
-                    Ok(definition) => {
-                        println!("  {}  valid  {}", definition.id, resource.path.display())
-                    }
-                    Err(error) => println!(
-                        "  {}  invalid: {}",
-                        resource.path.display(),
-                        crate::util::single_line(&error)
-                    ),
-                }
-            }
-            for resource in resources
-                .iter()
-                .filter(|resource| resource.kind == crate::resource::ResourceKind::Extension)
-            {
+            for workflow in workflows {
                 println!(
-                    "  extension {}  {}  {}",
-                    resource.identity,
-                    extension_working_state(&resource.path),
-                    resource.path.display()
+                    "  {}  valid  {:?}  {}",
+                    workflow.name,
+                    workflow.scope,
+                    workflow.path.display()
                 );
             }
-            println!(
-                "packages: {}  extensions: {}  skills: {}  templates: {}",
-                resources
-                    .iter()
-                    .filter(|item| item.kind == crate::resource::ResourceKind::Workflow)
-                    .filter_map(|item| item.path.ancestors().nth(2))
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .len(),
-                resources
-                    .iter()
-                    .filter(|item| item.kind == crate::resource::ResourceKind::Extension)
-                    .count(),
-                resources
-                    .iter()
-                    .filter(|item| item.kind == crate::resource::ResourceKind::Skill)
-                    .count(),
-                resources
-                    .iter()
-                    .filter(|item| item.kind == crate::resource::ResourceKind::Template)
-                    .count(),
-            );
         }
-        Err(error) => println!("workflow catalog error: {error}"),
-    }
-    for (label, path) in [
-        ("resource store", global.join("store")),
-        ("extension store", global.join("state/store")),
-    ] {
-        match crate::resource::ContentStore::new(path).audit() {
-            Ok(audit) => println!(
-                "{label}: {} blobs, {} references, {} orphaned, {} corrupt, {} dangling references, {} invalid entries",
-                audit.blobs,
-                audit.references,
-                audit.orphaned.len(),
-                audit.corrupt.len(),
-                audit.dangling.len(),
-                audit.invalid_entries.len()
-            ),
-            Err(error) => println!("{label} audit error: {error}"),
-        }
-    }
-    for (label, path) in [
-        ("global package lock", global.join("package.lock")),
-        (
-            "repository package lock",
-            repo.root.join(".prism/package.lock"),
-        ),
-    ] {
-        match std::fs::read_to_string(&path) {
-            Ok(source) => match crate::package::PackageLock::parse(&source) {
-                Ok(lock) => println!("{label}: valid ({} packages)", lock.packages.len()),
-                Err(error) => println!("{label}: invalid: {error}"),
-            },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                println!("{label}: not present")
-            }
-            Err(error) => println!("{label}: unreadable: {error}"),
-        }
-    }
-    let diagnostics = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| error.to_string())
-        .and_then(|runtime| {
-            runtime.block_on(async {
-                let operations = crate::WorkflowOperations::open_default()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let triggers = operations
-                    .list_triggers()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let diagnostics = operations
-                    .trigger_doctor(
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .ok()
-                            .and_then(|value| i64::try_from(value.as_millis()).ok())
-                            .unwrap_or(0),
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let health = operations
-                    .doctor_health()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                Ok::<_, String>((triggers, diagnostics, health))
-            })
-        });
-    match diagnostics {
-        Ok((triggers, diagnostics, health)) => {
-            println!(
-                "Triggers: {} enabled / {} total",
-                triggers.iter().filter(|trigger| trigger.enabled).count(),
-                triggers.len()
-            );
+        Err(diagnostics) => {
+            println!("workflow catalog errors: {}", diagnostics.len());
             for diagnostic in diagnostics {
                 println!(
-                    "  {}  {}: {}",
-                    diagnostic.trigger_id, diagnostic.severity, diagnostic.message
-                );
-            }
-            println!(
-                "workflow ledger: {} orphaned snapshots, {} quarantined workspaces, {} recovery-required runs, {} indeterminate effects, {} invalid child links, {} artifact integrity failures",
-                health.orphaned_definition_snapshots,
-                health.quarantined_workspaces,
-                health.recovery_required_runs,
-                health.indeterminate_effects,
-                health.invalid_child_links,
-                health.artifact_integrity_failures.len(),
-            );
-            for failure in health.artifact_integrity_failures {
-                println!(
-                    "  artifact {}: {}",
-                    failure.artifact_id,
-                    crate::util::single_line(&failure.reason)
+                    "  {}  invalid: {}",
+                    diagnostic.path.display(),
+                    crate::util::single_line(&diagnostic.message)
                 );
             }
         }
-        Err(error) => println!("Trigger diagnostics unavailable: {error}"),
     }
 }
-
-fn extension_working_state(path: &Path) -> &'static str {
-    if path.is_file() {
-        return "built";
-    }
-    let manifest = path.join("Cargo.toml");
-    let Ok(source) = std::fs::read_to_string(manifest) else {
-        return "unbuilt (no Cargo.toml)";
-    };
-    let Ok(value) = toml::from_str::<toml::Value>(&source) else {
-        return "unbuilt (invalid Cargo.toml)";
-    };
-    let Some(binary) = value
-        .get("package")
-        .and_then(|package| package.get("name"))
-        .and_then(toml::Value::as_str)
-    else {
-        return "unbuilt (no package name)";
-    };
-    let executable = path.join("target/release").join(binary);
-    let Ok(built) = std::fs::metadata(&executable).and_then(|metadata| metadata.modified()) else {
-        return "unbuilt";
-    };
-    let dirty = [
-        path.join("Cargo.toml"),
-        path.join("Cargo.lock"),
-        path.join("src"),
-    ]
-    .iter()
-    .any(|source| modified_after(source, built));
-    if dirty { "dirty/unbuilt" } else { "built" }
-}
-
 fn modified_after(path: &Path, threshold: std::time::SystemTime) -> bool {
     let Ok(metadata) = std::fs::symlink_metadata(path) else {
         return false;

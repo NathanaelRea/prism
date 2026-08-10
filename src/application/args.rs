@@ -24,8 +24,6 @@ pub enum CommandKind {
     Config(ConfigCommand),
     Agent(AgentCommand),
     Workflow(Vec<String>),
-    Extension(Vec<String>),
-    Package(Vec<String>),
     Skill(Vec<String>),
     Template(Vec<String>),
     Debug(DebugCommand),
@@ -183,7 +181,7 @@ impl Args {
                     });
                     break;
                 }
-                family @ ("workflow" | "extension" | "package" | "skill" | "template") => {
+                family @ ("workflow" | "skill" | "template") => {
                     let arguments = iter
                         .map(|argument| argument.to_string_lossy().into_owned())
                         .collect::<Vec<_>>();
@@ -192,8 +190,6 @@ impl Args {
                     }
                     command = match family {
                         "workflow" => CommandKind::Workflow(arguments),
-                        "extension" => CommandKind::Extension(arguments),
-                        "package" => CommandKind::Package(arguments),
                         "skill" => CommandKind::Skill(arguments),
                         "template" => CommandKind::Template(arguments),
                         _ => unreachable!(),
@@ -392,7 +388,7 @@ impl Args {
 }
 
 pub fn help_text() -> &'static str {
-    "Usage:\n  prism [--repo <path>] [--debug] [--print-logs] [--log-level <level>]\n  prism [--repo <path>] workflow list|show|new|copy|edit|validate|preview|run|history|migrate|updates\n  prism [--repo <path>] workflow pause|resume|cancel|retry|approve|reject\n  prism [--repo <path>] extension list|show|new|edit|check|build|reload|doctor\n  prism [--repo <path>] package new|validate|install|list|show|update|remove\n  prism [--repo <path>] skill list|show|install|remove\n  prism [--repo <path>] template list|show|copy\n  prism [--repo <path>] list [--all] [--json]\n  prism [--repo <path>] status [<selector>] [--json]\n  prism [--repo <path>] pause|resume|stop [<workflow-selector>]\n  prism [--repo <path>] recover [<workflow-selector>]\n  prism daemon status [--json]\n  prism daemon start|stop\n  prism [--repo <path>] doctor\n  prism [--repo <path>] config [show|example|schema|paths]\n  prism [--repo <path>] agent ensure --branch <branch>\n  prism [--repo <path>] debug paths|info|logs|startup|integrity\n  prism [--repo <path>] debug record [--before <seconds>] [--after <seconds>]\n  prism [--repo <path>] debug --help\n  prism [--repo <path>] db\n  prism [--repo <path>] db path\n  prism [--repo <path>] db <read-only-sql>\n  prism [--repo <path>] db --help\n\nWorkflow JSON:\n  Stable --json responses use {schema_version, kind, data}.\n  workflow run accepts repeated --input name=json and --idempotency-key <key>.\n\nSelectors:\n  Use a workflow run id, repo:<name>, wt:<branch>, or an absolute repository/worktree path.\n\nDebugging:\n  Use `debug record` while Prism is running to capture its in-memory flight recorder,\n  `debug paths` to find Prism state, `debug logs` to tail the runtime log, and\n  `debug integrity` for read-only database checks. Use `db path` or\n  `db <read-only-sql>` to inspect persisted repo state.\n  Use `--print-logs --log-level trace` to print detailed subprocess logs."
+    "Usage:\n  prism [--repo <path>] [--debug] [--print-logs] [--log-level <level>]\n  prism [--repo <path>] workflow list|show|validate|new|edit|run|history\n  prism [--repo <path>] workflow pause|resume|cancel|retry <run-id>\n  prism workflow copy-example <name>\n  prism workflow reset <name> [--apply]\n  prism [--repo <path>] workflow trust-repository [--apply]\n  prism [--repo <path>] skill list|show|install|remove\n  prism [--repo <path>] template list|show|copy\n  prism [--repo <path>] list [--all] [--json]\n  prism [--repo <path>] status [<selector>] [--json]\n  prism [--repo <path>] pause|resume|stop [<workflow-selector>]\n  prism [--repo <path>] recover [<workflow-selector>]\n  prism daemon status [--json]\n  prism daemon start|stop\n  prism [--repo <path>] doctor\n  prism [--repo <path>] config [show|example|schema|paths]\n  prism [--repo <path>] agent ensure --branch <branch>\n  prism [--repo <path>] debug paths|info|logs|startup|integrity\n  prism [--repo <path>] debug record [--before <seconds>] [--after <seconds>]\n  prism [--repo <path>] debug --help\n  prism [--repo <path>] db\n  prism [--repo <path>] db path\n  prism [--repo <path>] db <read-only-sql>\n  prism [--repo <path>] db --help\n\nWorkflow JSON:\n  Stable --json responses use {schema_version, kind, data}.\n  Workflow prompts are authored in TOML and sent without structured input/result requirements.\n\nSelectors:\n  Use a workflow run id, repo:<name>, wt:<branch>, or an absolute repository/worktree path.\n\nDebugging:\n  Use `debug record` while Prism is running to capture its in-memory flight recorder,\n  `debug paths` to find Prism state, `debug logs` to tail the runtime log, and\n  `debug integrity` for read-only database checks. Use `db path` or\n  `db <read-only-sql>` to inspect persisted repo state.\n  Use `--print-logs --log-level trace` to print detailed subprocess logs."
 }
 
 pub fn debug_help_text() -> &'static str {

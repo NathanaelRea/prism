@@ -349,6 +349,31 @@ fn push_remote_action_cannot_be_abandoned_and_reconciles_after_generation_change
 }
 
 #[test]
+fn queued_remote_timing_updates_the_visible_progress_dialog() {
+    let temp = unique_temp_dir("prism-tui-remote-wait-progress-test");
+    fs::create_dir_all(&temp).unwrap();
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let session = test_session(0, &temp.display().to_string(), "feature");
+    let mut tui = Tui::new_single(repo, test_config(), vec![session]);
+    tui.dialog = Some(crate::view::DialogModel::Progress {
+        title: "Remote".into(),
+        message: "Starting".into(),
+    });
+
+    tui.route_tui_job_payload(TuiJobPayload::RemoteActionProgress {
+        id: 42,
+        message: "waiting for github.com request slot; position 2".into(),
+    });
+
+    assert!(matches!(
+        tui.dialog,
+        Some(crate::view::DialogModel::Progress { ref message, .. })
+            if message.contains("position 2")
+    ));
+    let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
 fn applying_remote_action_results_performs_no_provider_or_database_io() {
     let temp = unique_temp_dir("prism-tui-remote-action-result-test");
     fs::create_dir_all(&temp).unwrap();

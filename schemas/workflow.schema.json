@@ -1,141 +1,61 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://raw.githubusercontent.com/NathanaelRea/prism/main/schemas/workflow.schema.json",
-  "title": "Prism Workflow Definition",
+  "$id": "https://prism.local/schemas/workflow.schema.json",
+  "title": "Prism Prompt Workflow",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "name", "steps", "budgets"],
+  "required": ["step"],
   "properties": {
-    "schema_version": { "const": 1 },
-    "name": { "type": "string", "pattern": "^[a-z][a-z0-9_-]*$" },
-    "description": { "type": "string" },
-    "ordered": { "type": "boolean", "default": false },
-    "capabilities": { "type": "array", "items": { "$ref": "#/$defs/capability" }, "uniqueItems": true },
-    "inputs": { "type": "object", "additionalProperties": { "$ref": "#/$defs/port" } },
-    "outputs": { "type": "object", "additionalProperties": { "$ref": "#/$defs/port" } },
-    "budgets": { "$ref": "#/$defs/budgets" },
-    "admission_policy": { "$ref": "#/$defs/admission_policy" },
-    "triggers": { "type": "array", "items": { "$ref": "#/$defs/trigger" } },
-    "implementations": { "type": "array", "items": { "$ref": "#/$defs/implementation" } },
-    "steps": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/step" } }
-  },
-  "$defs": {
-    "capability": { "enum": ["repository_read", "workspace_read", "workspace_write", "process_execute", "network_read", "provider_read", "provider_write", "git_commit", "git_ref_mutation", "git_push", "merge", "worktrunk_lifecycle", "secret_use", "child_workflow_create"] },
-    "port": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["artifact_type"],
-      "properties": { "artifact_type": { "type": "string" }, "required": { "type": "boolean", "default": true } }
-    },
-    "binding": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["from", "artifact_type"],
-      "properties": { "from": { "type": "string" }, "artifact_type": { "type": "string" } }
-    },
-    "admission_policy": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["id", "revision"],
-      "properties": {
-        "id": { "type": "string" },
-        "revision": { "type": "string" },
-        "capabilities": { "type": "array", "items": { "$ref": "#/$defs/capability" }, "uniqueItems": true }
-      }
-    },
-    "pinned_workflow": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["qualified_name", "revision", "digest"],
-      "properties": {
-        "qualified_name": { "type": "string" },
-        "revision": { "type": "string" },
-        "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
-        "capabilities": { "type": "array", "items": { "$ref": "#/$defs/capability" }, "uniqueItems": true }
-      }
-    },
-    "settings": {
+    "defaults": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "prompt": { "type": "string" },
-        "harness": { "type": "string" },
-        "model": { "type": "string" },
-        "command": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
-        "timeout_ms": { "type": "integer", "minimum": 1 },
-        "retry": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["max_attempts", "backoff_ms"],
-          "properties": {
-            "max_attempts": { "type": "integer", "minimum": 1 },
-            "backoff_ms": { "type": "integer", "minimum": 0 }
-          }
-        },
-        "continuation": { "enum": ["reject", "supported"] }
-      }
-    },
-    "budgets": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["max_attempts", "max_fan_out", "max_child_depth", "max_mutations"],
-      "properties": {
-        "max_attempts": { "type": "integer", "minimum": 1 },
-        "max_fan_out": { "type": "integer", "minimum": 1 },
-        "max_child_depth": { "type": "integer", "minimum": 0 },
-        "max_mutations": { "type": "integer", "minimum": 0 }
-      }
-    },
-    "implementation": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["id", "adapter", "class", "effect", "target", "settings"],
-      "properties": {
-        "id": { "type": "string" },
-        "adapter": { "const": "command" },
-        "class": { "const": "action" },
-        "capabilities": { "type": "array", "items": { "$ref": "#/$defs/capability" }, "uniqueItems": true },
-        "inputs": { "type": "object", "additionalProperties": { "$ref": "#/$defs/port" } },
-        "outputs": { "type": "object", "additionalProperties": { "$ref": "#/$defs/port" } },
-        "effect": { "enum": ["read_only", "workspace_mutation"] },
-        "target": { "enum": ["any", "local"] },
-        "settings": { "$ref": "#/$defs/settings" }
-      }
-    },
-    "trigger": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["id", "definition_selector", "admission_purpose", "kind", "overlap", "max_fan_out"],
-      "properties": {
-        "id": { "type": "string", "pattern": "^[a-z][a-z0-9_-]*$" },
-        "enabled": { "type": "boolean", "default": false },
-        "definition_selector": { "type": "string" },
-        "admission_purpose": { "type": "string" },
-        "kind": { "enum": ["manual", "schedule", "provider_event"] },
-        "expression": { "type": "string" },
-        "timezone": { "type": "string" },
-        "missed": { "enum": ["skip", "latest", "all_bounded"] },
-        "repository": { "type": "string" },
-        "event": { "type": "string" },
-        "overlap": { "enum": ["coalesce", "supersede", "queue", "parallel"] },
-        "max_fan_out": { "type": "integer", "minimum": 1 }
+        "harness": { "type": "string", "minLength": 1 },
+        "model": { "type": "string", "minLength": 1 },
+        "variant": { "type": "string", "minLength": 1 },
+        "max_agent_runs": { "type": "integer", "minimum": 1 }
       }
     },
     "step": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["id", "class", "implementation"],
-      "properties": {
-        "id": { "type": "string", "pattern": "^[a-z][a-z0-9_-]*$" },
-        "class": { "enum": ["action", "gate", "approval", "wait", "notification", "workflow_call"] },
-        "implementation": { "type": "string" },
-        "depends_on": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
-        "condition": { "type": "string" },
-        "capabilities": { "type": "array", "items": { "$ref": "#/$defs/capability" }, "uniqueItems": true },
-        "inputs": { "type": "object", "additionalProperties": { "$ref": "#/$defs/binding" } },
-        "outputs": { "type": "object", "additionalProperties": { "$ref": "#/$defs/port" } },
-        "settings": { "$ref": "#/$defs/settings" },
-        "child_workflow": { "$ref": "#/$defs/pinned_workflow" }
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._-]+$"
+          },
+          "trigger": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._-]+$"
+          },
+          "depends_on": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9._-]+$"
+            }
+          },
+          "context": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9._-]+$"
+            }
+          },
+          "harness": { "type": "string", "minLength": 1 },
+          "model": { "type": "string", "minLength": 1 },
+          "variant": { "type": "string", "minLength": 1 },
+          "prompt": { "type": "string", "minLength": 1 }
+        },
+        "anyOf": [
+          { "required": ["prompt"] },
+          { "required": ["trigger"] }
+        ]
       }
     }
   }

@@ -182,8 +182,6 @@ impl Tui {
             main_focused: self.main_focused,
             main_scroll: self.main_scroll,
             repo_main_view: self.repo_main_view,
-            worktree_main_view: self.worktree_main_view,
-            workflow_graph_expanded: self.workflow_graph_expanded,
             worktree_list_mode: self.worktree_list_mode,
             mode_label: "normal",
             status_message: self.status_message.as_deref(),
@@ -234,32 +232,12 @@ impl Tui {
             .iter()
             .position(|candidate| candidate.identity.run_id == workflow.identity.run_id)
             .map_or(0, |index| index + 1);
-        let children = self
-            .workspace_repositories
-            .values()
-            .flat_map(|repository| &repository.workflows)
-            .filter(|candidate| {
-                candidate
-                    .owner
-                    .as_ref()
-                    .is_some_and(|owner| owner.run_id == workflow.identity.run_id)
-            })
-            .map(|candidate| candidate.identity.run_id.clone())
-            .collect();
         let detail = self
             .workspace_repositories
             .values()
             .flat_map(|repository| &repository.workflow_details)
             .find(|detail| detail.id == workflow.identity.run_id)
             .cloned();
-        let current_step_skippable = workflow.current_step.as_ref().is_some_and(|current| {
-            detail.as_ref().is_some_and(|detail| {
-                detail
-                    .steps
-                    .iter()
-                    .any(|step| step.key == current.label && step.skippable)
-            })
-        });
         let current_step = workflow
             .current_step
             .as_ref()
@@ -284,14 +262,11 @@ impl Tui {
             total_steps: workflow.progress.total,
             run_position,
             run_count: candidates.len(),
-            parent_run_id: workflow.owner.as_ref().map(|owner| owner.run_id.clone()),
-            children,
             detail,
             can_pause: workflow.available_controls.pause,
             can_resume: workflow.available_controls.resume,
             can_cancel: workflow.available_controls.stop,
             can_retry: workflow.available_controls.recover,
-            current_step_skippable,
         })
     }
 
@@ -323,7 +298,6 @@ impl Tui {
             .as_ref()
             .map(|step| step.label.clone());
         self.workflow_step_selection_manual = false;
-        self.workflow_parent_stack.clear();
         self.main_scroll = 0;
     }
 
@@ -337,13 +311,11 @@ impl Tui {
     }
 
     pub(super) fn move_workflow_step_selection(&mut self, direction: isize) -> bool {
-        if self.focused_panel != PanelFocus::Worktrees
-            || self.worktree_main_view != view::WorktreeMainView::Workflow
-        {
+        if self.focused_panel != PanelFocus::Worktrees {
             return false;
         }
         let Some(dashboard) = self.current_workflow_dashboard() else {
-            return true;
+            return false;
         };
         let Some(run) = dashboard.detail else {
             return true;
@@ -362,79 +334,8 @@ impl Tui {
         true
     }
 
-    pub(super) fn toggle_workflow_graph(&mut self) {
-        if self.main_focused
-            && self.focused_panel == PanelFocus::Worktrees
-            && self.worktree_main_view == view::WorktreeMainView::Workflow
-        {
-            self.workflow_graph_expanded = !self.workflow_graph_expanded;
-            self.main_scroll = 0;
-        }
-    }
-
     pub(super) fn handle_workflow_enter(&mut self) -> bool {
-        if !self.main_focused
-            || self.focused_panel != PanelFocus::Worktrees
-            || self.worktree_main_view != view::WorktreeMainView::Workflow
-        {
-            return false;
-        }
-        self.open_selected_workflow_child();
-        true
-    }
-
-    pub(super) fn open_selected_workflow_child(&mut self) -> bool {
-        if !self.main_focused
-            || self.focused_panel != PanelFocus::Worktrees
-            || self.worktree_main_view != view::WorktreeMainView::Workflow
-        {
-            return false;
-        }
-        let Some(dashboard) = self.current_workflow_dashboard() else {
-            return false;
-        };
-        let Some(run) = dashboard.detail else {
-            return false;
-        };
-        let Some(selected) = dashboard.selected_step else {
-            return false;
-        };
-        let Some(step) = run.steps.iter().find(|step| step.key == selected) else {
-            return false;
-        };
-        let Some(child) = run
-            .children
-            .iter()
-            .rev()
-            .find(|child| child.step_id == step.id)
-        else {
-            return false;
-        };
-        self.workflow_parent_stack.push(dashboard.run_id);
-        self.selected_workflow_run = Some(child.run_id.clone());
-        self.selected_workflow_step = None;
-        self.workflow_step_selection_manual = false;
-        self.main_scroll = 0;
-        self.follow_current_workflow_step();
-        true
-    }
-
-    pub(super) fn return_to_parent_workflow(&mut self) -> bool {
-        if !self.main_focused
-            || self.focused_panel != PanelFocus::Worktrees
-            || self.worktree_main_view != view::WorktreeMainView::Workflow
-        {
-            return false;
-        }
-        let Some(parent) = self.workflow_parent_stack.pop() else {
-            return false;
-        };
-        self.selected_workflow_run = Some(parent);
-        self.selected_workflow_step = None;
-        self.workflow_step_selection_manual = false;
-        self.main_scroll = 0;
-        self.follow_current_workflow_step();
-        true
+        false
     }
 
     pub(super) fn tmux_portal_model(&self) -> Option<view::TmuxPortalModel<'_>> {

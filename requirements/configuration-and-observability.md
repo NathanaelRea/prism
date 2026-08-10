@@ -13,10 +13,10 @@
 - **Invariant**: Effective repository configuration applies built-in defaults,
   then global settings, then repository settings. Unspecified repository values
   inherit their effective global values.
-- **Invariant**: Workflow Definitions, Step Implementations, packages, Triggers,
-  and Admission Policies use explicit qualified references and composition. The
-  ordinary settings precedence above never deep-merges, shadows, or silently
-  replaces one of those resources.
+- **Invariant**: Workflow and Trigger files use filename identity and explicit
+  discovery precedence: trusted repository resources override user resources,
+  which override installed package resources. Ordinary settings precedence does
+  not deep-merge one of these files.
 - **Behavior**: Initial terminal presentation setup explains and offers Nerd Font
   icons or a Unicode fallback. It does not claim to detect font support
   automatically.
@@ -45,10 +45,10 @@
 - **Behavior**: `prism doctor` reports tool availability and versions; GitHub
   and GitLab CLI authentication; Forgejo credential-source availability; the
   resolved remote host/provider, capabilities, and server version when
-  discoverable; configured checks; selected harness capabilities; and discovered
-  worktrees; enabled Triggers; Workflow Definition validation; trusted
-  repository-definition revisions; and compatible local Execution Targets,
-  without printing credential values.
+  discoverable; selected harness capabilities; discovered worktrees; Workflow
+  and Trigger validation; trusted repository-resource revisions; active run
+  recovery boundaries; and remote coordinator health, without printing
+  credential values.
 - **Behavior**: Startup rejects Worktrunk versions below 0.58.0. Diagnostics
   report the detected Worktrunk version and minimum; observation failures use a
   bounded safe summary rather than raw command output or development URLs.
@@ -71,36 +71,22 @@
 
 ## Workflow Authoring
 
-- **Customization**: Global workflow sources live under the user's Prism
-  configuration. A repository can additionally provide workflow sources from
-  its documented Prism configuration location after the user trusts their exact
-  revision and capability envelope.
+- **Customization**: Global Workflow and Trigger files live under
+  `$XDG_CONFIG_HOME/prism/{workflows,triggers}`. A trusted repository can add
+  files under `.prism/{workflows,triggers}`.
 - **Behavior**: Validation and resolved-preview commands work without launching
-  a run. They report graph, type, condition, reference, capability, trust,
-  Trigger, target confinement, and Execution Target errors with source
-  locations.
-- **Invariant**: Reloading source files can update enabled Triggers and future
-  runs, but cannot change a persisted Definition Snapshot or reinterpret a
-  queued, active, waiting, paused, or historical run.
-- **Behavior**: An explicitly edited Trigger selector takes effect for later
-  occurrences only after successful validation. Namespace collisions, floating
-  definition updates, and source reloads never retarget an occurrence or run
-  that Prism has already recorded.
-- **Customization**: Repositories can define named verification command sets and
-  compose them into Action and Gate implementations. Commands run in the
-  declared repository or worktree scope, stop according to explicit policy, and
-  emit typed verification Artifacts.
-- **Behavior**: Standard Pack workflows provide useful local-verification and
-  merge-conflict Step Implementations, but no command-set name such as pre-push,
-  pre-PR, or review-fix has hard-coded orchestration meaning.
-- **Behavior**: An empty verification implementation is reported explicitly and
-  follows the resolved Gate policy; absence is not silently represented as a
-  passing check.
-- **Invariant**: Secret values are resolved only for a Step Attempt whose
-  recorded capability grant permits that secret and whose trusted Execution
-  Target enforces its scope. Configuration, preview, validation, Definition
-  Snapshots, and diagnostics expose secret handles and required scope but never
-  their values.
+  a run. They report TOML, unknown-field, graph, reference, context-ancestry,
+  Trigger, executable, and Agent-selection errors with source locations.
+- **Invariant**: Hot reload affects future runs only. It cannot change an
+  immutable run snapshot or reinterpret a queued, active, waiting, paused, or
+  historical run.
+- **Behavior**: A workflow authoring command creates a prompt-first template,
+  never overwrites an existing file, and validates before start. Example copying
+  shows the destination and requires explicit confirmation.
+- **Invariant**: Trigger executables are full-trust user code. Repository
+  executables require repository trust, and active runs use retained exact bytes.
+  Secret values and environment contents are never shown in source previews,
+  snapshots, or diagnostics.
 
 ## Command Line And Database
 
@@ -108,10 +94,10 @@
   resolves its root, and supplies repository context to repository-scoped
   commands. Repository-independent help and diagnostics remain available when no
   repository can be resolved.
-- **Behavior**: Workflow CLI commands can list definitions, validate and preview
-  a resolved definition, start a run with typed inputs, inspect status and
-  history, control execution, and answer an Approval Request without requiring
-  the TUI.
+- **Behavior**: Workflow CLI commands can list prompt Workflows with provenance,
+  validate and preview the compiled DAG, start a run for an explicit repository,
+  worktree and optional Change Request, inspect status and Attempts, and pause,
+  resume, cancel, or retry without requiring the TUI.
 - **Behavior**: Bare `prism db` initializes and migrates the selected database,
   then opens writable interactive access through `sqlite3`; `prism db path`
   prints its path; `prism db <query>` uses built-in read-only SQLite support and

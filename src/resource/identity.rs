@@ -59,21 +59,13 @@ pub enum ResourceScope {
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ResourceKind {
-    Workflow,
-    Extension,
-    ArtifactSchema,
     Skill,
     Template,
-    Trigger,
-    Notification,
 }
 
 impl ResourceKind {
     fn directory(self) -> &'static str {
         match self {
-            Self::Workflow => "workflows",
-            Self::Extension => "extensions",
-            Self::ArtifactSchema | Self::Trigger | Self::Notification => "packages",
             Self::Skill => "skills",
             Self::Template => "templates",
         }
@@ -159,7 +151,7 @@ struct IdentityHeader {
 /// Loose resources placed here are discovered directly; they do not need a package manifest or
 /// installation record.
 pub fn ensure_global_drop_in_directories(global_root: &Path) -> Result<(), ResourceError> {
-    for directory in ["workflows", "extensions", "skills", "templates"] {
+    for directory in ["workflows", "triggers", "skills", "templates"] {
         fs::create_dir_all(global_root.join(directory))?;
     }
     Ok(())
@@ -193,22 +185,25 @@ fn discover_scope(
     scope: ResourceScope,
     output: &mut Vec<DiscoveredResource>,
 ) -> Result<(), ResourceError> {
-    for kind in [
-        ResourceKind::Workflow,
-        ResourceKind::Skill,
-        ResourceKind::Template,
-    ] {
+    for kind in [ResourceKind::Skill, ResourceKind::Template] {
         let directory = root.join(kind.directory());
         if !directory.is_dir() {
             continue;
         }
         visit_files(&directory, &mut |path| {
             let source = fs::read_to_string(path).map_err(ResourceError::Io)?;
-            let header: IdentityHeader =
+            let value: toml::Value =
                 toml::from_str(&source).map_err(|error| ResourceError::InvalidSource {
                     path: path.to_owned(),
                     message: error.to_string(),
                 })?;
+            let header: IdentityHeader =
+                value
+                    .try_into()
+                    .map_err(|error| ResourceError::InvalidSource {
+                        path: path.to_owned(),
+                        message: error.to_string(),
+                    })?;
             output.push(DiscoveredResource {
                 identity: QualifiedIdentity::new(header.id)?,
                 kind,
@@ -217,129 +212,6 @@ fn discover_scope(
             });
             Ok(())
         })?;
-    }
-    discover_loose_extensions(root, scope, output)?;
-    discover_packages(root, scope, output)?;
-    Ok(())
-}
-
-fn discover_loose_extensions(
-    root: &Path,
-    scope: ResourceScope,
-    output: &mut Vec<DiscoveredResource>,
-) -> Result<(), ResourceError> {
-    let directory = root.join(ResourceKind::Extension.directory());
-    if !directory.is_dir() {
-        return Ok(());
-    }
-    let mut manifests = Vec::new();
-    visit_files(&directory, &mut |path| {
-        if path
-            .file_name()
-            .is_some_and(|name| name == "prism-extension.toml")
-        {
-            manifests.push(path.to_path_buf());
-        }
-        Ok(())
-    })?;
-    for path in manifests {
-        let source = fs::read_to_string(&path)?;
-        let header: IdentityHeader =
-            toml::from_str(&source).map_err(|error| ResourceError::InvalidSource {
-                path: path.clone(),
-                message: error.to_string(),
-            })?;
-        output.push(DiscoveredResource {
-            identity: QualifiedIdentity::new(header.id)?,
-            kind: ResourceKind::Extension,
-            scope,
-            path: path
-                .parent()
-                .expect("extension manifest has a parent")
-                .to_path_buf(),
-        });
-    }
-    Ok(())
-}
-
-#[derive(Deserialize)]
-struct DiscoveryManifest {
-    resources: Vec<DiscoveryManifestResource>,
-}
-
-#[derive(Deserialize)]
-struct DiscoveryManifestResource {
-    id: String,
-    kind: String,
-    path: String,
-}
-
-fn discover_packages(
-    root: &Path,
-    scope: ResourceScope,
-    output: &mut Vec<DiscoveredResource>,
-) -> Result<(), ResourceError> {
-    let packages = root.join("packages");
-    if !packages.is_dir() {
-        return Ok(());
-    }
-    let mut entries = fs::read_dir(packages)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    for entry in entries {
-        if !entry.file_type()?.is_dir() || entry.file_name().to_string_lossy().starts_with('.') {
-            continue;
-        }
-        let manifest_path = entry.path().join("prism-package.toml");
-        if !manifest_path.is_file() {
-            continue;
-        }
-        let source = fs::read_to_string(&manifest_path)?;
-        let manifest: DiscoveryManifest =
-            toml::from_str(&source).map_err(|error| ResourceError::InvalidSource {
-                path: manifest_path.clone(),
-                message: error.to_string(),
-            })?;
-        for resource in manifest.resources {
-            let relative = Path::new(&resource.path);
-            if relative.is_absolute()
-                || relative
-                    .components()
-                    .any(|component| !matches!(component, std::path::Component::Normal(_)))
-            {
-                return Err(ResourceError::InvalidSource {
-                    path: manifest_path.clone(),
-                    message: format!("unsafe resource path {}", resource.path),
-                });
-            }
-            let path = entry.path().join(relative);
-            if !path.is_file() {
-                return Err(ResourceError::InvalidSource {
-                    path,
-                    message: "manifest resource does not exist".into(),
-                });
-            }
-            let kind = match resource.kind.as_str() {
-                "workflow" => ResourceKind::Workflow,
-                "extension" => ResourceKind::Extension,
-                "artifact_schema" => ResourceKind::ArtifactSchema,
-                "skill" => ResourceKind::Skill,
-                "template" => ResourceKind::Template,
-                "trigger" => ResourceKind::Trigger,
-                "notification" => ResourceKind::Notification,
-                value => {
-                    return Err(ResourceError::InvalidSource {
-                        path: manifest_path.clone(),
-                        message: format!("unknown resource kind {value}"),
-                    });
-                }
-            };
-            output.push(DiscoveredResource {
-                identity: QualifiedIdentity::new(resource.id)?,
-                kind,
-                scope,
-                path,
-            });
-        }
     }
     Ok(())
 }
@@ -385,7 +257,7 @@ mod tests {
 
         ensure_global_drop_in_directories(&global).unwrap();
 
-        for directory in ["workflows", "extensions", "skills", "templates"] {
+        for directory in ["workflows", "triggers", "skills", "templates"] {
             assert!(global.join(directory).is_dir());
         }
         fs::remove_dir_all(global).unwrap();
@@ -395,11 +267,11 @@ mod tests {
     fn scope_does_not_shadow_identity() {
         let global = temp("global");
         let repository = temp("repo");
-        fs::create_dir(global.join("workflows")).unwrap();
-        fs::create_dir(repository.join("workflows")).unwrap();
-        fs::write(global.join("workflows/a.toml"), "id='acme.release/publish'").unwrap();
+        fs::create_dir(global.join("skills")).unwrap();
+        fs::create_dir(repository.join("skills")).unwrap();
+        fs::write(global.join("skills/a.toml"), "id='acme.release/publish'").unwrap();
         fs::write(
-            repository.join("workflows/a.toml"),
+            repository.join("skills/a.toml"),
             "id='acme.release/publish'",
         )
         .unwrap();

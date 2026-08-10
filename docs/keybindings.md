@@ -19,27 +19,17 @@ Prism uses a lazygit-style panel model.
 - `Space g g` opens tmux window 2: lazygit.
 - `Space g P` pushes the selected task branch after verifying that its branch, head, and destination have not changed.
 - `Space g o` opens the selected change request in a browser.
-- `Space g M` launches the standard stabilization workflow, which rechecks the selected change request's gates before merging its exact head.
-- `Space g c` launches stabilization for a selected change request with CI repair support.
-- `Space g f` launches stabilization for a selected change request with review repair support.
+- `Space g M`, `Space g c`, and `Space g f` launch the editable `stabilize` Workflow for the selected Change Request. Stabilization repairs conflicts, review feedback, and CI as needed, then stops at ready-to-merge without merging or cleaning up.
 - `o` from the Worktrees panel opens the selected Worktree Session's Worktrunk-configured HTTP(S) development URL. It remains available when listening is false, unknown, or stale; the details view reports that state.
 - `Space g R` resolves all unresolved inline review conversations visible when the key is pressed while `0 Main` is focused.
 - Unavailable `Space g` actions are shown in dark gray and ignored. Remote actions require a known change request and provider capability; repair actions also require a headless-capable harness.
-- `W` opens `fzf` with manual Workflow Definitions compatible with the selected Repository,
-  Worktree Session, or Change Request. The picker searches qualified ID, name, description, tags,
-  and Step implementation metadata, then Prism collects any missing typed inputs before launch.
-- `{` / `}` selects the previous/next Workflow Run linked to the current Worktree Session for
-  independent parent, child, and iteration inspection.
-- `Space W` opens workflow management for Workflow Definitions, Triggers, packages, extensions,
-  skills, and templates. These destinations use the same operations as their CLI command families.
+- `W` and `Space W` open one flat `fzf` picker of hot-discovered prompt Workflows for the selected Worktree Session. `Enter` runs the selected Workflow and `Ctrl-E` edits its source. The picker shows source scope and path.
+- `{` / `}` selects the previous/next Workflow Run linked to the current Worktree Session.
 - `Space c` opens the unified configuration tree for global and repository settings, tracked
   repositories/keybindings, Worktrunk configuration, worktree columns, and Harness selection.
 - `>` / `<` raises/lowers the selected worktree priority.
 - `u` pauses or resumes the selected Workflow Run.
-- `f` retries the selected failed Workflow Step as a new Attempt against the same input revisions.
-- `B` restarts from the selected Step after previewing downstream invalidation.
-- `s` is offered only for a Step whose Definition explicitly marks it skippable and previews the
-  downstream invalidation before applying it.
+- `f` retries the selected failed Workflow Step as a new Attempt without restoring consumed Agent budget.
 - `p` or `Space g p` pulls the selected repository's default branch from the Repos or Worktrees panel.
 - `Space 1` through `Space 9` jump to configured repositories.
 - `r` opens the repository order dialog from the Repos panel. Use `Space` to mark repositories for removal, `J`/`K` to move them down/up, and `Enter` to save. Removals require a second confirmation.

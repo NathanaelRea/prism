@@ -55,7 +55,6 @@ export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-1}"
 export CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-always}"
 
 run scripts/check-workflow-cutover.sh
-run scripts/check-standard-pack-publication.sh
 
 isolated_tmux_dir="$(mktemp -d "${TMPDIR:-/tmp}/prism-check-tmux.XXXXXX")"
 sqlx_database="$(mktemp "${TMPDIR:-/tmp}/prism-check-sqlx.XXXXXX.db")"
@@ -65,18 +64,18 @@ export TMUX_TMPDIR="$isolated_tmux_dir"
 
 run cargo fmt --check
 run cargo sqlx migrate run --source migrations/repository --database-url "sqlite://$sqlx_database"
-run cargo sqlx migrate run --source migrations/workflow --database-url "sqlite://$workflow_database"
+run cargo sqlx migrate run --source migrations/prompt-workflow --database-url "sqlite://$workflow_database"
 repository_legacy_count="$(sqlite3 "$sqlx_database" "select count(*) from sqlite_master where name in ('auto_run','auto_step_run','plan_run','plan_step_run','workflow_execution')")"
-workflow_import_count="$(sqlite3 "$workflow_database" "select count(*) from sqlite_master where name = 'import_journal'")"
-if [ "$repository_legacy_count" -ne 0 ] || [ "$workflow_import_count" -ne 0 ]; then
-  printf 'fresh databases retain legacy workflow schema objects\n' >&2
+prompt_run_count="$(sqlite3 "$workflow_database" "select count(*) from sqlite_master where name = 'workflow_run'")"
+if [ "$repository_legacy_count" -ne 0 ] || [ "$prompt_run_count" -ne 1 ]; then
+  printf 'fresh databases do not match the prompt-first Workflow cutover\n' >&2
   exit 1
 fi
 
 if [ "${PRISM_CHECK_SQLX_METADATA:-0}" = 1 ]; then
   # Checked queries compile against the compatible union; migration tests
   # validate each real database independently.
-  for migration in migrations/workflow/*.sql; do
+  for migration in migrations/prompt-workflow/*.sql; do
     run sqlite3 "$sqlx_database" ".read $migration"
   done
   run env CARGO_TARGET_DIR="$repo_root/target/full-check-sqlx" \

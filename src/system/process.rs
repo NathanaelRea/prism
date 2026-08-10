@@ -290,7 +290,7 @@ fn probe_process_group(pid: u32) -> io::Result<bool> {
     )
 }
 
-fn send_process_group_signal(pid: u32, signal: libc::c_int) -> io::Result<bool> {
+pub(crate) fn send_process_group_signal(pid: u32, signal: libc::c_int) -> io::Result<bool> {
     let result = unsafe { libc::kill(-native_pid(pid)?, signal) };
     if result == 0 {
         return Ok(true);

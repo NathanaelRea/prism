@@ -72,12 +72,6 @@ pub fn run() -> Result<(), String> {
         CommandKind::Workflow(arguments) => {
             crate::application::workflow_cli::run_workflow(args.repo.as_deref(), &arguments)
         }
-        CommandKind::Extension(arguments) => {
-            crate::application::workflow_cli::run_extension(args.repo.as_deref(), &arguments)
-        }
-        CommandKind::Package(arguments) => {
-            crate::application::workflow_cli::run_package(args.repo.as_deref(), &arguments)
-        }
         CommandKind::Skill(arguments) => {
             crate::application::workflow_cli::run_skill(args.repo.as_deref(), &arguments)
         }
@@ -556,9 +550,6 @@ fn print_subject(snapshot: &WorkspaceSnapshot, subject: &Subject) {
                 workflow.progress.completed,
                 workflow.progress.total
             );
-            if let Some(owner) = &workflow.owner {
-                println!("owner = {}", owner.display_id);
-            }
             if let Some(step) = &workflow.current_step {
                 println!("step = {} ({})", step.label, step.state.label());
             }
@@ -840,18 +831,6 @@ fn discover_workspace_sessions(repos: &[ManagedRepo]) -> Result<Vec<session::Ses
     Ok(all)
 }
 
-fn control_plane_debug_metrics() -> Result<Vec<crate::ControlPlaneMetric>, String> {
-    crate::async_runtime::block_on(async {
-        crate::WorkflowOperations::open_default()
-            .await
-            .map_err(|error| error.to_string())?
-            .control_plane_metrics()
-            .await
-            .map_err(|error| error.to_string())
-    })
-    .map_err(|error| format!("run workflow debug operation: {error}"))?
-}
-
 fn run_debug_command(
     command: DebugCommand,
     repo: &Repository,
@@ -952,22 +931,16 @@ fn run_debug_command(
                 }
                 Err(error) => println!("wal_checkpoint_passive_error = {error}"),
             }
-            match control_plane_debug_metrics() {
-                Ok(metrics) => {
-                    println!(
-                        "workflow_database = {}",
-                        crate::util::prism_config_dir()
-                            .join("workflow.db")
-                            .display()
-                    );
-                    for metric in metrics {
-                        println!(
-                            "control_plane.{} = {} time_unix_ms={} labels={}",
-                            metric.name, metric.value, metric.time_unix_ms, metric.labels_json
-                        );
-                    }
-                }
-                Err(error) => println!("control_plane_error = {error}"),
+            println!(
+                "workflow_database = {}",
+                crate::PromptWorkflowService::database_path().display()
+            );
+            match crate::worker::probe_health() {
+                Ok(health) => println!(
+                    "workflow_worker = {:?} active={}",
+                    health.state, health.active
+                ),
+                Err(error) => println!("workflow_worker_error = {error}"),
             }
             Ok(())
         }

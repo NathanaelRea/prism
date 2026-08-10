@@ -5,7 +5,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 
 use crate::remote::{PrCache, PrSummary};
 use crate::session::WorktreeRepositoryKey;
-use crate::tui_jobs::JobId;
+use crate::tui_jobs::{JobContext, JobId};
 use crate::tui_runtime::{RuntimeEvent, TerminalRuntime};
 use crate::view;
 
@@ -580,7 +580,11 @@ impl Tui {
         action: F,
     ) -> Result<RemoteActionValue, String>
     where
-        F: FnOnce() -> Result<RemoteActionValue, String> + Send + 'static,
+        F: FnOnce(
+                JobContext<TuiJobKind, TuiJobKey, TuiJobPayload>,
+            ) -> Result<RemoteActionValue, String>
+            + Send
+            + 'static,
     {
         if request
             .mutation
@@ -616,7 +620,7 @@ impl Tui {
                 Ok(Some(TuiJobPayload::RemoteAction(Box::new(
                     RemoteActionDelivery {
                         id: context.id(),
-                        result: action(),
+                        result: action(context),
                     },
                 ))))
             },
@@ -628,6 +632,7 @@ impl Tui {
         }
         loop {
             self.tick_tui_action_jobs();
+            self.draw(runtime)?;
             while let Ok(delivery) = self.remote_action_rx.try_recv() {
                 if delivery.id == id {
                     let result = delivery.result;

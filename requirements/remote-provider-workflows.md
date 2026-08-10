@@ -1,158 +1,136 @@
 # Remote Provider Workflows
 
-## Issue Intake And Triage
+## Provider Observations
 
-- **Behavior**: Provider Adapters can expose canonical Provider Item identity,
-  title, body, lifecycle, author and repository relationship, labels and their
-  provenance, assignees, timestamps, native revisions, and event checkpoints
-  when the provider supports those facts. Prism derives a stable Observation
-  Revision digest over every externally controlled field available to Trigger
-  selection, admission, conditions, prompts, or effects unless a native revision
-  is proven to change for that complete field set.
-- **Invariant**: Pull or merge requests returned by an issue-shaped provider API
-  retain their Change Request identity and are never admitted as Issues merely
-  because they share an endpoint or response shape.
-- **Behavior**: Provider capabilities independently declare issue discovery,
-  event observation, labels, assignment, comments, and lifecycle mutation.
-  Missing capability is visible to Workflow validation and Gate evaluation and
-  is not treated as an empty result.
-- **Invariant**: Issue observations distinguish never loaded, current, stale,
-  partial, failed, confirmed absent, and present. Refresh failure preserves the
-  prior observation and cannot create a false Trigger occurrence or authorize a
-  mutation.
-- **Behavior**: Scheduled or event-backed Triggers can select Issues through
-  deterministic provider facts and start provider-neutral triage workflows.
-  Each run records canonical Issue identity and exact Observation Revision;
-  mutation and implementation additionally record its Admission Decision.
-- **Invariant**: Issue classification and security analysis receive externally
-  authored content as delimited untrusted data. Their output is an Artifact and
-  retains that provenance; it never expands the run's Admission Policy, provider
-  token scope, or execution capabilities.
-- **Behavior**: Label, assignment, comment, and close Actions show their intended
-  mutation, use exact provider identity, and reconcile an uncertain result
-  before retry. A child workflow starts through a Workflow Call rather than a
-  provider mutation Action. Bulk triage remains bounded and auditable per
-  affected Issue.
+- **Behavior**: Provider Adapters normalize GitHub Change Requests, GitLab merge
+  requests, and Forgejo pull requests while retaining canonical host, project,
+  native identity, exact head SHA, and provider-native facts.
+- **Invariant**: Every observation has an Observation Revision that changes for
+  every provider-controlled field available to display or Workflow Triggers. A
+  provider-native revision is used only when it has that property; otherwise
+  Prism computes a composite digest.
+- **Behavior**: Change-request observations distinguish never loaded, current,
+  stale, partial, failed, confirmed absent, and present. A failed refresh retains
+  stale display state but cannot satisfy a Trigger or authorize mutation.
+- **Invariant**: Unsupported provider capabilities remain distinct from empty,
+  failed, stale, or unknown evidence. GitLab and Forgejo gaps are reported and
+  never treated as satisfied.
+- **Behavior**: Review observations expose actionable unresolved provider review
+  bodies and inline threads with stable native thread IDs. Generic top-level
+  comments are not actionable review feedback by default.
+- **Behavior**: CI observations distinguish required and optional checks and bind
+  their state to the exact current head. Queued, pending, passing, failing,
+  unavailable, and unsupported are distinct.
+- **Behavior**: Policy observations include required reviews, required checks,
+  conversation resolution, strict up-to-date requirements, merge queues,
+  mergeability, and branch relation when supported.
 
-## Change-Request State
+## Shared Remote Request Coordinator
 
-- **Behavior**: Prism discovers GitHub pull requests, GitLab merge requests, and
-  Forgejo pull requests created either through Prism or
-  externally and caches their summary, review, check, comment, merge, and refresh
-  state for responsive rendering after startup.
-- **Behavior**: A repository without a known or explicitly configured hosting
-  adapter does not trigger issue, change-request, CI, or review queries. Unknown
-  hosts are never probed and cached display state is retained as stale.
-- **Behavior**: The main panel hides the entire change-request section when none
-  exists. When present, display number and title precede state, next action, merge, review, CI, and
-  related gate facts.
-- **Behavior**: Change-request state and next action use the same aligned key/value treatment
-  as gate rows. Internal guard terms, base/head noise, and redundant section
-  labels are omitted.
-- **Behavior**: Review comments render as compact selectable rows that distinguish
-  resolved state and root/inline origin; opening a row shows full detail.
-- **Invariant**: Prism does not invent review severity when a provider supplies no
-  reliable severity field.
+- **Constraint**: One module owned by the per-user Prism Worker coordinates all
+  Prism-owned provider observations and mutations, including TUI refreshes,
+  interactive actions, Trigger checks, and Trigger post-Step mutations.
+- **Behavior**: Callers request normalized operations shaped as observation with
+  freshness/priority or mutation with priority. Provider adapters translate
+  provider-specific data; callers do not manage rate-limit headers, retry loops,
+  cache coalescing, or poll timers.
+- **Invariant**: A lane is keyed by canonical provider host and credential
+  profile. Initially each lane allows one in-flight provider operation and a
+  configurable minimum delay between starts across all repositories and runs.
+- **Invariant**: Lane cooldowns survive Worker restart. `Retry-After` and
+  provider reset facts move the durable next-start time; retryable failures use
+  bounded exponential backoff with jitter.
+- **Behavior**: Equivalent observations coalesce by operation key, exact subject
+  revision, and freshness. All Workflow Steps and TUI subscribers interested in
+  one operation wake from its single result.
+- **Behavior**: Priority is interactive mutation, active Workflow hook, active
+  Workflow observation, then background refresh. Aging prevents starvation.
+- **Invariant**: Queue length, response bytes, pages, retries, and accepted
+  observation age are bounded. Queue pressure is visible and cannot be mistaken
+  for an empty result.
+- **Behavior**: A queued or temporarily unavailable observation becomes Trigger
+  `Wait` with an actionable summary and earliest wake, such as `waiting for
+  GitHub request slot` or `checks running; poll in 20s`. It does not consume an
+  Agent slot.
+- **Constraint**: For CLI-backed adapters Prism paces each logical adapter
+  operation but cannot inspect requests made internally by the CLI. Direct HTTP
+  adapters acquire permission for every actual HTTP request. Agent-issued
+  provider commands and arbitrary custom-Trigger network calls are outside this
+  coordinator.
+
+## Triggered Stabilization
+
+- **Invariant**: Trigger observations bind the exact selected Change Request and
+  exact head. A mismatched, stale, partial, failed, unavailable, or unknown head
+  cannot be reported as satisfied.
+- **Behavior**: `merge_conflict` is satisfied when the current head is up to date
+  and mergeable, waits for retryable unknown state, and runs when behind or
+  conflicting. Its prepare hook fetches the configured base with structured Git
+  arguments and starts a merge in the selected worktree. Expected conflicts are
+  prepared Agent state.
+- **Behavior**: `needs_review` runs when actionable unresolved review threads
+  exist, waits while required review is pending or unavailable, and is satisfied
+  when review policy passes. Prepare persists exact unresolved thread IDs and
+  observation revision; finalize resolves only that captured set after Agent
+  success.
+- **Behavior**: `ci_failure` runs for failed required checks, waits for pending or
+  temporarily unavailable required checks, and is satisfied only when required
+  checks pass on the exact current head. Optional failures remain visible but do
+  not replace required-check facts.
+- **Behavior**: `ready_to_merge` is check-only. It is satisfied only when fresh
+  exact-head CI, review, provider policy, mergeability, and branch-relation facts
+  all permit merge. Legitimate external progress waits; unsupported or
+  non-retryable states Prism cannot safely classify fail.
+- **Invariant**: Stabilization does not merge, delete a branch, or clean a
+  worktree. It stops at ready-to-merge.
+- **Invariant**: Review text and CI logs are untrusted data. Trigger prepared
+  state is not inserted into the Agent prompt, and Agent output does not grant
+  provider mutation authority.
 
 ## Change-Request Actions
 
-- **Behavior**: A push/change-request action pushes the selected branch and
-  creates a pull or merge request when none exists. If both `origin` and `upstream` are valid targets,
-  Prism asks which target to use.
-- **Invariant**: Push and merge actions revalidate the selected repository,
-  branch, remote, expected head, target branch, and required gates immediately
-  before mutation. Unknown or stale policy blocks automatic merge.
-- **Behavior**: Push, change-request creation, repair, and merge Actions depend on
-  the named verification and policy Gates declared by their resolved Workflow
-  Definition. Manual merge is refused for a dirty worktree and runs its
-  configured safety Gates.
-- **Behavior**: Board commands for push, change-request creation, and manual merge
-  launch named Standard Pack Workflow Definitions that compose child definitions
-  and public Step Implementations, so their safety Gates, attempts, effects, and
-  recovery use the same history and control model as triggered work.
-- **Invariant**: Automatic merge uses a provider-enforced exact-head precondition
-  and authoritative repository policy when available. If the provider cannot
-  close the race between observation and mutation, the merge fails closed or
-  requires an Approval Request that describes the residual risk.
-- **Behavior**: Users can open the selected change request in a browser.
-- **Default**: Merge uses squash unless configured otherwise.
-- **Customization**: Merge strategy and whether repository policy requires an
-  approving review are configurable. Review is not required by default.
-- **Behavior**: After the provider confirms a merge, Prism offers explicit local
-  worktree/session cleanup with Yes as the prompt default. Automatic cleanup
-  remains disabled by default, and remote-branch deletion is not part of this
-  cleanup requirement.
-
-## Repair And Stabilization
-
-- **Behavior**: Change-request stabilization observes local Git state, cached provider state,
-  repository policy, and the requested goal. Its independent review, CI,
-  mergeability, merge-relation, and policy Gates can identify one most useful
-  current blocker without converting those facts into one ordered checklist.
-- **Behavior**: Actionable review feedback consists of provider review bodies and
-  inline review threads. Generic top-level summaries are context, not requested
-  changes, by default.
-- **Invariant**: Review text, comments, and CI logs are untrusted input. Prism
-  clearly delimits them from its instructions and never grants filesystem,
-  command, push, thread-resolution, or merge authority based on their contents.
-- **Behavior**: Review-repair prompts include actionable inline feedback with
-  file/line context; CI-repair prompts include change-request identity, failing action facts,
-  and a useful bounded failure-log tail.
-- **Invariant**: Starting a review or CI repair creates exactly one Agent Action
-  attempt through its recorded Harness and delivers the prompt only to that
-  attempt or its explicitly selected continuation session.
-- **Behavior**: Prism records exactly which review threads informed a managed
-  repair. After the guarded repair commit is pushed, it may resolve only those
-  threads.
-- **Invariant**: A pending repair push is guarded by its repair commit and
-  observed branch state. An externally satisfied push is recognized; a diverged
-  branch invalidates the pending push and causes replanning rather than a blind
-  push.
-- **Behavior**: Repository policy observation includes required approving
-  reviews, required checks, conversation resolution, strict up-to-date rules,
-  and merge-queue requirements. Required-check failures block readiness;
-  optional-check failures remain visible without replacing required-check facts.
+- **Behavior**: The board can push a selected branch, create a Change Request,
+  open it in a browser, and request an explicit merge action independently of
+  stabilization.
+- **Invariant**: Push and merge revalidate repository, branch, remote, expected
+  head, target branch, and required provider policy immediately before mutation.
+  Unknown or stale policy fails closed.
+- **Behavior**: Merge uses squash by default and provider-enforced exact-head
+  protection when available. If the provider cannot close the observation/
+  mutation race, Prism refuses or requires an explicit risk decision.
+- **Behavior**: After provider-confirmed merge, local worktree cleanup remains an
+  explicit separate action. Automatic cleanup and remote branch deletion are not
+  part of stabilization.
 
 ## Provider Exceptions
 
 ### GitHub
 
-- **Constraint**: `gh` remains the credential and transport broker. Merge uses
-  `--match-head-commit`. Summary and policy pagination limitations are reported
-  as incomplete or unknown evidence rather than false facts.
+- **Constraint**: `gh` remains the credential and CLI transport broker where
+  used. Merge uses `--match-head-commit`. Pagination or policy limitations are
+  reported as incomplete evidence.
 
 ### GitLab
 
-- **Constraint**: `glab` is required only for GitLab repositories. Global merge-request
-  IDs remain mutation identity while project-local IIDs remain display labels.
-  Pipeline evidence is selected for the exact source SHA; hidden tier or policy
-  evidence remains unknown and blocks automatic merge.
+- **Constraint**: `glab` is required only for GitLab repositories. Global merge
+  request IDs remain mutation identity; project-local IIDs are display labels.
+  Pipeline evidence is selected for exact source SHA, and unavailable tier or
+  policy evidence remains unknown.
 
 ### Forgejo And Codeberg
 
-- **Constraint**: HTTPS uses certificate-validating platform TLS transport.
-  Tokens come only from a configured environment-variable name. Guarded merge
-  sends `head_commit_id`. Conversation resolution and merge queues are unsupported
-  and unavailable in the UI and managed repair paths.
+- **Constraint**: HTTPS uses certificate-validating platform TLS. Tokens come
+  only from configured environment-variable names. Guarded merge sends
+  `head_commit_id`. Unsupported conversation resolution and merge queues remain
+  visible capability gaps.
+- **Invariant**: Codeberg is a built-in Forgejo Host Profile, not a separate
+  provider protocol.
 
-### Codeberg
+## Verification
 
-- **Invariant**: Codeberg is a built-in Forgejo host profile, not a separate
-  protocol. Version, paging limits, Actions, and log availability are runtime
-  observations.
-
-## Compatibility And Rollout
-
-- **Quality**: Provider contract fixtures run without network access and retain
-  no credentials or private response data.
-- **Quality**: Scheduled or manually dispatched compatibility jobs exercise
-  pinned local GitLab and Forgejo API versions separately from normal CI. A
-  missing required tool, Docker daemon, or image is reported as an explicit
-  skip; an incompatible started service fails its job.
-- **Invariant**: Public-host drift probes for GitHub.com, GitLab.com, and
-  Codeberg are unauthenticated and read-only. They never create, update, resolve,
-  merge, or delete public data and never emit response bodies or headers.
-- **Quality**: Drift records contain only fixed host/provider identity, safe
-  version/schema/capability metadata, outcome, bounded response byte count,
-  latency, and observation time. Network unavailability is distinct from
-  reachable schema drift.
+- **Quality**: Provider fixtures run without credentials or network access and
+  cover exact-head review, CI, policy, mergeability, branch relation, retry, and
+  unsupported capability states.
+- **Quality**: Compatibility jobs test pinned GitLab and Forgejo APIs separately
+  from normal CI. Public-host drift probes are unauthenticated, read-only, and
+  never emit response bodies, credentials, or mutation requests.

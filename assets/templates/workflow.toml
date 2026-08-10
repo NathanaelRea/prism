@@ -1,0 +1,11 @@
+# Prism prompt-first Workflow
+[defaults]
+# harness = "pi"
+# model = "provider/model"
+# variant = "medium"
+# max_agent_runs = 10
+
+[[step]]
+prompt = """
+Describe the work for a fresh Agent Session.
+"""

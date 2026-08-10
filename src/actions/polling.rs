@@ -137,16 +137,30 @@ impl Tui {
                     move |_| {
                         let adapter = crate::remote::dispatcher::capabilities(&path, &config);
                         let github_remote_configured = adapter.is_ok();
-                        let summaries = if github_remote_configured {
-                            let _ = refresh_repo_policy_cache(
-                                &crate::repo::Repository { root: path.clone() },
-                                &path,
-                                &config,
-                            );
-                            fetch_pr_summary_index(&path, &config)
-                        } else {
-                            Err(adapter.as_ref().unwrap_err().clone())
-                        };
+                        let summaries: Result<Vec<crate::remote::PrSummary>, String> =
+                            if github_remote_configured {
+                                let payload =
+                                    crate::workflow::standard_remote::TuiRemoteListPayload {
+                                        repository: path.clone(),
+                                        worktree: path.clone(),
+                                    };
+                                let _ = crate::worker::observe_remote::<bool>(
+                                    &path,
+                                    &path,
+                                    "tui.repository_policy",
+                                    &path.to_string_lossy(),
+                                    &payload,
+                                );
+                                crate::worker::observe_remote(
+                                    &path,
+                                    &path,
+                                    "tui.change_requests",
+                                    &path.to_string_lossy(),
+                                    payload,
+                                )
+                            } else {
+                                Err(adapter.as_ref().unwrap_err().clone())
+                            };
                         let capabilities = if summaries.is_ok() {
                             crate::remote::dispatcher::capabilities(&path, &config)
                                 .ok()
@@ -169,10 +183,22 @@ impl Tui {
                         let remote_branch_heads = reconciliation_refs
                             .into_iter()
                             .filter_map(|(remote, branch)| {
-                                remote_branch_head(&path, &config, &remote, &branch)
-                                    .ok()
-                                    .flatten()
-                                    .map(|head| ((remote, branch), head))
+                                let subject = format!("{}:{remote}:{branch}", path.display());
+                                crate::worker::observe_remote::<Option<String>>(
+                                    &path,
+                                    &path,
+                                    "tui.remote_branch_head",
+                                    &subject,
+                                    crate::workflow::standard_remote::TuiRemoteBranchHeadPayload {
+                                        repository: path.clone(),
+                                        worktree: path.clone(),
+                                        remote: remote.clone(),
+                                        branch: branch.clone(),
+                                    },
+                                )
+                                .ok()
+                                .flatten()
+                                .map(|head| ((remote, branch), head))
                             })
                             .collect();
                         Ok(Some(TuiJobPayload::PrPoll(PrPollResult::Summary {
@@ -207,6 +233,7 @@ impl Tui {
                 .unwrap_or_default();
             let key = pr_poll_key(&managed.identity, generation, session);
             let config = managed.config.clone();
+            let repository = managed.repo.root.clone();
             let details_pollable = pr_details_pollable(session, &config);
             let session = &mut self.sessions[index];
             if !session.hidden && details_pollable && !self.pr_polls_in_flight.contains(&key) {
@@ -222,7 +249,19 @@ impl Tui {
                     Some(TUI_ACTION_JOB_TIMEOUT),
                     format!("prism-pr-details-{index}"),
                     move |_| {
-                        refresh_pr_details_cache_state(&branch, &mut cache, &path, &config);
+                        let snapshot = crate::worker::observe_remote(
+                            &repository,
+                            &path,
+                            "tui.change_request_cache",
+                            &format!("{}:{}:details", path.display(), branch),
+                            crate::workflow::standard_remote::TuiRemoteCachePayload {
+                                repository: repository.clone(),
+                                worktree: path.clone(),
+                                branch,
+                                force_details: true,
+                            },
+                        )?;
+                        cache.apply_worker_snapshot(snapshot);
                         Ok(Some(TuiJobPayload::PrPoll(PrPollResult::Details {
                             key: job_key,
                             cache: Box::new(cache),
@@ -800,15 +839,6 @@ impl Tui {
         }
         changed
     }
-}
-
-fn remote_branch_head(
-    path: &Path,
-    config: &crate::config::Config,
-    remote: &str,
-    branch: &str,
-) -> Result<Option<String>, String> {
-    crate::git::push_remote_branch_head_sha(path, remote, branch, config)
 }
 
 fn wt_poll_due(

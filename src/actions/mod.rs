@@ -16,13 +16,6 @@ use crate::opencode::{self, OpencodeStatus, load_runtime};
 use crate::process::{
     ProcessPolicy, command_exists, parse_command_words, run_output_allow_failure,
 };
-use crate::remote::dispatcher::{
-    fetch_change_request_branch as fetch_pull_request_branch,
-    list_change_requests as fetch_pr_summary_index,
-    refresh_change_request_cache as refresh_pr_cache,
-    refresh_change_request_details_state as refresh_pr_details_cache_state,
-    refresh_repository_policy as refresh_repo_policy_cache,
-};
 use crate::remote::{
     PR_SUMMARY_POLL_INTERVAL, PrCache, apply_pr_details_poll_result, apply_pr_summary_poll_result,
     persist_pr_cache_snapshot, pr_cache_comment_count, pr_cache_render_signature,

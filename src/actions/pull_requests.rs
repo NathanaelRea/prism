@@ -1,5 +1,18 @@
 use super::*;
 
+type RemoteJobContext = crate::tui_jobs::JobContext<TuiJobKind, TuiJobKey, TuiJobPayload>;
+
+fn report_remote_wait(
+    context: &RemoteJobContext,
+    wait: crate::remote::request_coordinator::RemoteWait,
+) {
+    let _ = context.send(TuiJobPayload::RemoteActionProgress {
+        id: context.id(),
+        message: wait.summary.clone(),
+    });
+}
+
+#[cfg(test)]
 pub(super) fn apply_bulk_review_resolution(
     confirmed: bool,
     thread_ids: &[String],
@@ -219,15 +232,27 @@ impl Tui {
                 abandon_cancelable: false,
                 mutation: Some(mutation),
             },
-            move || {
-                let current = crate::remote::dispatcher::prepare_push(&path, &config, &branch)?;
-                if !crate::remote::dispatcher::same_push_target(&expected, &current) {
-                    return Err(
-                        "push remote, branch, or HEAD changed during push preparation".to_string(),
-                    );
-                }
-                crate::lifecycle::push_branch(&config, &path, &branch, current.set_upstream)?;
-                refresh_pr_cache(&repo, &branch, &mut cache, &path, &config, true)?;
+            move |context| {
+                let progress = context.clone();
+                let cancellation = context.clone();
+                let snapshot = crate::worker::mutate_remote_with_progress(
+                    &repo.root,
+                    &path,
+                    &format!("push:{}:{}", branch, expected.expected_head_sha),
+                    "tui.push_branch",
+                    &format!("{}:{}", path.display(), branch),
+                    crate::workflow::standard_remote::TuiRemotePushPayload {
+                        repository: repo.root.clone(),
+                        worktree: path.clone(),
+                        branch,
+                        expected,
+                    },
+                    crate::worker::RemoteRequestProgress::new(
+                        move |wait| report_remote_wait(&progress, wait),
+                        move || cancellation.is_canceled(),
+                    ),
+                )?;
+                cache.apply_worker_snapshot(snapshot);
                 Ok(RemoteActionValue::Cache(Box::new(cache)))
             },
         )?
@@ -261,7 +286,6 @@ impl Tui {
         }
 
         let repo = context.repo;
-        let config = context.config;
         let branch = self.sessions[context.session_index].branch.clone();
         let mut cache = self.sessions[context.session_index].pr.clone();
         let worktree = self.sessions[context.session_index]
@@ -288,13 +312,43 @@ impl Tui {
                     thread_ids: thread_ids.clone(),
                 }),
             },
-            move || {
-                let count = apply_bulk_review_resolution(true, &thread_ids, |thread_id| {
-                    crate::remote::dispatcher::resolve_review_thread(
-                        &path, &config, &summary, thread_id,
-                    )
-                })?;
-                refresh_pr_cache(&repo, &branch, &mut cache, &path, &config, true)?;
+            move |context| {
+                let mutation_progress = context.clone();
+                let mutation_cancellation = context.clone();
+                let count = crate::worker::mutate_remote_with_progress(
+                    &repo.root,
+                    &path,
+                    &format!("resolve:{}:{}", summary.number, summary.head_sha),
+                    "tui.resolve_review_threads",
+                    &format!("{}#{}", path.display(), summary.number),
+                    crate::workflow::standard_remote::TuiRemoteResolvePayload {
+                        repository: repo.root.clone(),
+                        worktree: path.clone(),
+                        summary,
+                        thread_ids,
+                    },
+                    crate::worker::RemoteRequestProgress::new(
+                        move |wait| report_remote_wait(&mutation_progress, wait),
+                        move || mutation_cancellation.is_canceled(),
+                    ),
+                )?;
+                let observation_progress = context.clone();
+                let observation_cancellation = context;
+                let snapshot = crate::worker::observe_remote_with_progress(
+                    &repo.root,
+                    &path,
+                    "tui.change_request_cache",
+                    &format!("{}:{}:details", path.display(), branch),
+                    crate::workflow::standard_remote::TuiRemoteCachePayload {
+                        repository: repo.root.clone(),
+                        worktree: path.clone(),
+                        branch,
+                        force_details: true,
+                    },
+                    move |wait| report_remote_wait(&observation_progress, wait),
+                    move || observation_cancellation.is_canceled(),
+                )?;
+                cache.apply_worker_snapshot(snapshot);
                 Ok(RemoteActionValue::Resolved {
                     cache: Box::new(cache),
                     count,
@@ -319,7 +373,6 @@ impl Tui {
             .selected_repo_context()
             .ok_or_else(|| "no selected repository".to_string())?;
         let path = context.repo.root.clone();
-        let config = context.config.clone();
         let RemoteActionValue::ChangeRequests(mut prs) = self.run_remote_action(
             raw,
             crate::tui::RemoteActionRequest {
@@ -331,7 +384,23 @@ impl Tui {
                 abandon_cancelable: true,
                 mutation: None,
             },
-            move || fetch_pr_summary_index(&path, &config).map(RemoteActionValue::ChangeRequests),
+            move |context| {
+                let progress = context.clone();
+                let cancellation = context;
+                crate::worker::observe_remote_with_progress(
+                    &path,
+                    &path,
+                    "tui.change_requests",
+                    &path.to_string_lossy(),
+                    crate::workflow::standard_remote::TuiRemoteListPayload {
+                        repository: path.clone(),
+                        worktree: path.clone(),
+                    },
+                    move |wait| report_remote_wait(&progress, wait),
+                    move || cancellation.is_canceled(),
+                )
+                .map(RemoteActionValue::ChangeRequests)
+            },
         )?
         else {
             return Err("remote list returned an unexpected result".to_string());
@@ -411,7 +480,6 @@ impl Tui {
 
         let branch = remote_pr_worktree_branch(&summary.head_ref);
         let path = context.repo.root.clone();
-        let config = context.config.clone();
         let job_summary = summary.clone();
         let job_branch = branch.clone();
         let RemoteActionValue::Complete = self.run_remote_action(
@@ -425,8 +493,26 @@ impl Tui {
                 abandon_cancelable: true,
                 mutation: None,
             },
-            move || {
-                fetch_pull_request_branch(&path, &config, &job_summary, &job_branch)?;
+            move |context| {
+                let progress = context.clone();
+                let cancellation = context;
+                crate::worker::mutate_remote_with_progress::<bool, _, _>(
+                    &path,
+                    &path,
+                    &format!("fetch:{}:{}", job_summary.number, job_summary.head_sha),
+                    "tui.fetch_change_request",
+                    &format!("{}#{}", path.display(), job_summary.number),
+                    crate::workflow::standard_remote::TuiRemoteFetchPayload {
+                        repository: path.clone(),
+                        worktree: path.clone(),
+                        branch: job_branch,
+                        summary: job_summary,
+                    },
+                    crate::worker::RemoteRequestProgress::new(
+                        move |wait| report_remote_wait(&progress, wait),
+                        move || cancellation.is_canceled(),
+                    ),
+                )?;
                 Ok(RemoteActionValue::Complete)
             },
         )?
@@ -605,7 +691,6 @@ impl Tui {
         }
 
         let path = context.repo.root.clone();
-        let config = context.config.clone();
         let body = body.trim().to_string();
         let selected_summary = summary.clone();
         let prior_review_ids = self
@@ -643,13 +728,31 @@ impl Tui {
                     prior_review_ids,
                 }),
             },
-            move || {
-                crate::remote::dispatcher::submit_review(
+            move |context| {
+                let progress = context.clone();
+                let cancellation = context;
+                crate::worker::mutate_remote_with_progress::<serde_json::Value, _, _>(
                     &path,
-                    &config,
-                    &selected_summary,
-                    kind,
-                    body,
+                    &path,
+                    &format!(
+                        "review:{}:{}:{}",
+                        selected_summary.number,
+                        selected_summary.head_sha,
+                        crate::workflow::prompt_worker::now_unix_ms()
+                    ),
+                    "tui.submit_review",
+                    &format!("{}#{}", path.display(), selected_summary.number),
+                    crate::workflow::standard_remote::TuiRemoteReviewPayload {
+                        repository: path.clone(),
+                        worktree: path.clone(),
+                        summary: selected_summary,
+                        kind,
+                        body,
+                    },
+                    crate::worker::RemoteRequestProgress::new(
+                        move |wait| report_remote_wait(&progress, wait),
+                        move || cancellation.is_canceled(),
+                    ),
                 )?;
                 Ok(RemoteActionValue::Complete)
             },
@@ -678,7 +781,6 @@ impl Tui {
         }
         if !self.sessions[selected].pr.has_summary() {
             let repo = context.repo.clone();
-            let config = context.config.clone();
             let branch = self.sessions[selected].branch.clone();
             let path = self.sessions[selected].path.clone();
             let mut cache = self.sessions[selected].pr.clone();
@@ -700,8 +802,24 @@ impl Tui {
                     abandon_cancelable: true,
                     mutation: None,
                 },
-                move || {
-                    refresh_pr_cache(&repo, &branch, &mut cache, &path, &config, false)?;
+                move |context| {
+                    let progress = context.clone();
+                    let cancellation = context;
+                    let snapshot = crate::worker::observe_remote_with_progress(
+                        &repo.root,
+                        &path,
+                        "tui.change_request_cache",
+                        &format!("{}:{}:summary", path.display(), branch),
+                        crate::workflow::standard_remote::TuiRemoteCachePayload {
+                            repository: repo.root.clone(),
+                            worktree: path.clone(),
+                            branch,
+                            force_details: false,
+                        },
+                        move |wait| report_remote_wait(&progress, wait),
+                        move || cancellation.is_canceled(),
+                    )?;
+                    cache.apply_worker_snapshot(snapshot);
                     Ok(RemoteActionValue::Cache(Box::new(cache)))
                 },
             )?

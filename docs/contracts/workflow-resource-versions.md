@@ -1,44 +1,42 @@
-# Workflow And Extension Contract Versions
+# Workflow And Trigger Contract Versions
 
-This document fixes the public contract versions targeted by the generalized
-workflow cutover. The schemas and runtime support are implemented in later
-phases; changing the versions recorded here requires an explicit contract
-revision and updated golden fixtures.
+This document fixes the public contract versions for trigger-driven prompt Workflows.
+Breaking wire or stable-JSON changes require an explicit version increase.
 
-| Contract | Initial version | Compatibility rule |
+| Contract | Current version | Compatibility rule |
 | --- | --- | --- |
-| Workflow Definition TOML | `schema_version = 2` | Reject unknown versions. Source migration is explicit, previewable, backed up, and never imports Plan/Auto state. |
-| Package manifest TOML | `schema_version = 1` | Reject unknown versions before resolving or activating resources. |
-| Scope lockfile TOML | `schema_version = 1` | Reject unknown versions. Every dependency uses an exact source revision and digest; no semver or floating resolution is allowed in a retained lock. |
-| Extension JSON Lines protocol | `protocol_major = 1`, `protocol_minor = 1` | Reject a different major. A peer may use a minor-version feature only when both peers negotiated its named feature; unknown optional features and fields are ignored within configured bounds. Unknown required messages fail the affected call. |
-| CLI stable JSON envelope | `schema_version = 1` | Every stable `--json` response is an object with `schema_version`, `kind`, and `data`. Consumers must ignore unknown fields, and Prism must not change the meaning or type of an existing field within version 1. Breaking changes require a new schema version. |
+| Prompt Workflow TOML | unversioned | The filename stem is identity. Unknown fields and unsupported Agent selections are errors. Active runs retain the exact source and compiled snapshot. |
+| External Trigger phase protocol | `protocol_version = 1` | Each invocation accepts exactly one request on stdin and returns exactly one response on stdout. Unknown versions, phases, and response shapes fail the phase. |
+| CLI stable JSON envelope | `schema_version = 1` | Every stable `--json` response is an object with `schema_version`, `kind`, and `data`. Consumers ignore unknown fields; breaking meaning or type changes require a new version. |
 
-## Canonical Identity And Revisions
+## Workflow Revisions
 
-Workflow and package resource IDs are qualified (`owner.package/resource`). Scope
-is metadata and never participates in identity or implicit shadowing. A revision
-is SHA-256 over canonical source plus resolved dependency and build metadata. A
-Definition Snapshot records the exact Workflow Definition, package closure,
-Artifact schemas, prompts/templates, and extension executable digests resolved
-once at launch.
+A Workflow revision is SHA-256 over its source plus resolved Steps, dependencies,
+context selections, Agent harness/model/variant selections, and Trigger revisions.
+The compiled run snapshot retains that exact content. Repository and user source
+paths are provenance only and do not change an active run after launch.
 
-Canonicalization is contract-specific and will be frozen with golden byte
-fixtures when each parser is implemented. Until then, implementations must not
-mint a revision under these versions from an ad hoc serialization.
+External Trigger executable bytes are retained by content digest. Editing a
+Workflow or Trigger affects future runs only. Repository resources require trust
+for the exact current resource revision before discovery or execution.
 
-## Extension Framing
+## Trigger Framing
 
-Each protocol frame is one UTF-8 JSON object followed by `\n`. The first exchange
-is `hello` / `hello_ack`; `describe` follows successful negotiation. Every
-execution and host-operation request has a unique correlation ID. Frame, field,
-output, Artifact, render, concurrency, and timeout limits are checked before
-unbounded allocation. Stdout is protocol-only; stderr is bounded diagnostic
-output.
+A Trigger is a full-trust shebang executable. Prism starts one bounded process
+for each `should_run_step`, `pre_step_run`, or `post_step_run` phase, writes one
+UTF-8 JSON request followed by `\n`, closes stdin, and reads one bounded JSON
+response. Stdout is protocol-only and stderr is bounded diagnostic output.
+
+The optional source comment
+`# prism-trigger: check-only, repeatable-prepare, repeatable-finalize` declares
+properties Prism must know before execution. `check-only` permits a promptless
+Step; the repeatability directives permit restart reconciliation for the named
+hook. Undeclared custom hooks are treated as uncertain after interruption. The
+small TypeScript wrapper and executable example live under `trigger-sdk/typescript`;
+using them is optional and does not make Node a Prism runtime dependency.
 
 ## Stable JSON Kinds
 
-Version 1 reserves kinds for workflow, extension, package, skill, and template
-list/show operations; workflow validation, preview, run, and history; and
-extension/package diagnostics. Each command defines its own typed `data` value
-without changing the common envelope. Error output uses the same version and a
-kind ending in `.error` when `--json` was accepted.
+Version 1 includes Workflow list/show/validation/run/history/control,
+copy-example, reset, and repository-trust results. Error output uses the same
+envelope with a kind ending in `.error` whenever `--json` was accepted.

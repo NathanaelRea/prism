@@ -11,12 +11,7 @@ keywords = ["cli", "git", "terminal", "tmux", "worktree"]
 categories = ["command-line-utilities", "development-tools"]
 
 [workspace]
-members = [
-  ".",
-  "crates/prism-extension-protocol",
-  "crates/prism-extension-sdk",
-  "standard-pack/extension",
-]
+members = ["."]
 resolver = "3"
 
 [profile.test]
@@ -34,7 +29,6 @@ crossterm = { version = "0.29.0", default-features = false, features = [
   "events",
 ] }
 libc = "0.2"
-prism-extension-protocol = { path = "crates/prism-extension-protocol" }
 httpdate = "1"
 ratatui = { version = "0.30.2", default-features = false, features = [
   "crossterm",
@@ -56,13 +50,3 @@ toml_edit = "0.24"
 tokio = { version = "1", default-features = false, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 ureq = { version = "3.3", default-features = false, features = ["native-tls"] }
 url = "2.5"
-
-
-[[bench]]
-name = "workflow_control_plane"
-harness = false
-
-[target.'cfg(target_os = "linux")'.dependencies]
-notify-rust = { version = "4.18", default-features = false, features = [
-  "d_vendored",
-] }

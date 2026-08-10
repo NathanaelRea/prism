@@ -21,8 +21,8 @@
   branch into a Worktrunk worktree. It does not make this offer non-interactively
   and refuses to move a dirty checkout.
 - **Default**: Presentation-driven provider polling for an inactive repository
-  is reduced to no more often than once every 60 seconds. Enabled Triggers use
-  their own visible schedules and rate-limit policy.
+  is reduced to no more often than once every 60 seconds. TUI refreshes and
+  Workflow Trigger observations use the same Worker-owned remote coordinator.
 - **Behavior**: Users can pull the selected repository's configured Default
   Branch. Before creating a Worktree Session, Prism detects when that branch is
   behind its remote and offers to update it; declining does not block creation.
@@ -33,24 +33,18 @@
 
 ## Workflow And Intake Views
 
-- **Behavior**: Repository context exposes available Workflow Definitions,
-  enabled Triggers, quarantined Provider Items, pending Approval Requests,
-  active runs, and recent outcomes without requiring each item to have a
-  Worktree Session.
-- **Behavior**: Users can inspect a discovered Issue, its exact Observation
-  Revision, classification Artifacts, Admission Policy result, and proposed
-  mutations before admitting capabilities within its intake run or starting a
-  child implementation run.
-- **Behavior**: Intake can be filtered by repository, provider, workflow,
-  admission state, labels, actor relationship, age, and current run state.
-  Refresh and filtering preserve stable provider-item and run selections.
-- **Behavior**: Workflow Run detail renders the resolved dependency graph,
-  current blockers, Gate evidence, attempts, child runs, Artifacts, and pending
-  decisions. Parallel branches remain distinguishable from retries and ordered
-  chains.
-- **Behavior**: A global input-required view makes pending Approval Requests,
-  quarantined items, failed runs, and recovery-required attempts discoverable
-  across tracked repositories.
+- **Behavior**: Repository context exposes discovered prompt Workflows and their
+  provenance, active and waiting runs, Agent-run budgets, and recent outcomes
+  without requiring each run to have an interactive Agent Session.
+- **Behavior**: Workflow Run detail renders the compiled dependency graph, each
+  Step's Trigger summary and lifecycle phase, durable wake time, Attempt history,
+  fresh Agent Session identity/final text, and concise events. Parallel branches
+  remain distinguishable from repeated evaluation cycles and retries.
+- **Behavior**: Waiting and input-required surfaces explain provider queue waits,
+  pending CI/review facts, budget exhaustion, failures, and recovery-required
+  effects across tracked repositories.
+- **Behavior**: Source list and detail views expose whether a Workflow comes from
+  installed, user, or trusted repository scope and can open the editable file.
 - **Invariant**: Provider Items, Workflow Runs, Worktree Sessions, and Change
   Requests retain separate identities in navigation. Opening or admitting one
   can create or link another, but does not collapse their histories.

@@ -4,7 +4,6 @@ use crate::config::{Config, IconStyle};
 use crate::git::{RepositoryCheckout, inspect_repository_checkout, worktree_dirty};
 use crate::harness::{BUILTIN_HARNESS_IDS, harness_label};
 use crate::lifecycle::move_current_branch_to_worktree;
-use crate::package::bootstrap_standard_pack;
 use crate::process::command_exists;
 use crate::repo::Repository;
 use crate::terminal::stdin_is_tty;
@@ -17,9 +16,9 @@ pub(crate) fn ensure_user_owned_resources(config: &Config) -> Result<bool, Strin
             config.user_path.display()
         )
     })?;
-    let bootstrapped = bootstrap_standard_pack(root).map_err(|error| error.to_string())?;
+    let defaults_seeded = crate::seed_editable_defaults(root).map_err(|error| error.to_string())?;
     crate::resource::ensure_global_drop_in_directories(root).map_err(|error| error.to_string())?;
-    Ok(bootstrapped)
+    Ok(defaults_seeded)
 }
 
 #[derive(Debug, PartialEq, Eq)]

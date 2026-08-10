@@ -351,7 +351,7 @@ impl Tui {
                     abandon_cancelable: false,
                     mutation: None,
                 },
-                move || {
+                move |_| {
                     crate::worktrunk::create_user_config(&repo, &config)
                         .map_err(|error| error.to_string())?;
                     Ok(RemoteActionValue::Complete)
@@ -395,7 +395,7 @@ impl Tui {
                 abandon_cancelable: true,
                 mutation: None,
             },
-            move || {
+            move |_| {
                 crate::worktrunk::discover_user_config(&repo, &config)
                     .map(RemoteActionValue::WorktrunkUserConfig)
                     .map_err(|error| error.to_string())

@@ -28,7 +28,7 @@ key = "1"
 
 Repository-specific Prism config lives under the repository destination in `Space c`. Common settings include `default_base`, layout width, worktree columns, merge method, tools, and prompt templates. Harness selection and definitions are global-only.
 
-Per-repository Prism state also lives under that repository config directory, not inside the project repository. The state database is named `prism.db` and stores worktree session metadata, harness runtime records, change-request cache data, and observability records. Generalized Workflow Runs are stored in the user-scoped workflow database.
+Per-repository Prism state also lives under that repository config directory, not inside the project repository. The state database is named `prism.db` and stores worktree session metadata, harness runtime records, change-request cache data, and observability records. Prompt Workflow Runs are stored durably in the user-scoped `workflow.db` owned by the Prism Worker.
 
 Use the tracked repositories/keybindings destination under `Space c` to edit repository order, keys, and tracked repositories.
 
@@ -67,7 +67,7 @@ provider = "forgejo"
 credential_env = "FORGEJO_TOKEN" # variable name only, never the token
 
 [prompt_templates]
-# Workflow-specific prompts live in installed Workflow Definitions and templates.
+# Workflow prompts live directly in editable prompt-first Workflow TOML files.
 ```
 
 The `#:schema` line is an optional TOML comment. Prism ignores it, while Taplo-compatible TOML language servers can use it for completions, descriptions, enum values, and type validation.
@@ -115,29 +115,23 @@ and doctor/debug troubleshooting.
 
 ## Workflow health and retention
 
-`prism workflow validate`, `prism workflow preview`, and `prism workflow history --json` expose
-definition and run diagnostics through the public operation seam. `prism doctor` audits both
-immutable content stores without mutating them, validates global and repository package locks,
-verifies retained Artifact sizes and SHA-256 digests, and reports lineage and child-link
-integrity, orphaned blobs and Definition Snapshots, quarantined workspaces, overdue Triggers,
-recovery-required runs, and indeterminate protected effects. Orphans are reported for deliberate
-operator review; they are not collected while a retained run, package update base, or executable
-pin may need them. Doctor output uses the stable `{ schema_version, kind, data }` JSON envelope
-where supported.
-`prism debug info` prints the corresponding passive coordinator facts
-and `prism debug paths` prints the global workflow database location.
+`prism workflow validate` checks prompt-first source, graph structure, Trigger
+resolution, and explicit Agent selections. `prism workflow history --json`
+reports durable runs and lifecycle Attempts through the stable JSON envelope.
+`prism doctor` reports discovered Workflow provenance and validation failures.
+`prism debug paths` prints the user-wide Workflow database and Worker locations.
 
-At worker startup Prism conservatively removes expired bounded Attempt output,
-noisy duplicate events, terminal notification deliveries, and unreferenced
-provider observations. Immutable snapshots, Artifacts, lineage, approvals,
-effects, and Trigger-to-Run links are retained. Content-store collection removes only blobs with
-no reference or explicit protected revision; doctor reports candidates before any collection.
+The Worker retains immutable Workflow snapshots, pinned external Trigger bytes,
+prepared state, fresh Agent Session identity/final text, lifecycle events, and
+durable remote-lane cooldowns. An incompatible pre-cutover Workflow database is
+backed up once and replaced; generalized source in the user Workflow directory
+is archived rather than reinterpreted.
 
-Release builders publish the editable Standard Pack with
-`scripts/publish-standard-pack.sh <target-triple> [prebuilt-extension] [output-dir]`. Supported
-Linux/macOS targets are validated explicitly, archives use normalized metadata and lexical entry
-order, and every archive is accompanied by a SHA-256 checksum. The publication contract is part
-of `scripts/full-check.sh`.
+Repository `.prism/workflows` and `.prism/triggers` resources are ignored until
+their exact combined revision is trusted. Preview with
+`prism --repo <path> workflow trust-repository`; apply explicitly with `--apply`.
+Any resource edit invalidates that trust. External Triggers execute with the
+user's full OS authority and are not sandboxed.
 
 ## Desktop notifications
 

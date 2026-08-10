@@ -84,11 +84,9 @@ fn help_prints_usage_without_repo() {
 fn workflow_and_resource_lists_use_stable_json_envelopes() {
     let temp = TempDir::new("workflow-resource-json");
     for (family, expected_kind, minimum) in [
-        ("workflow", "workflow.list", 5),
-        ("extension", "extension.list", 1),
-        ("package", "package.list", 1),
-        ("skill", "skill.list", 4),
-        ("template", "template.list", 3),
+        ("workflow", "workflow.list", 1),
+        ("skill", "skill.list", 0),
+        ("template", "template.list", 0),
     ] {
         let output = run([family, "list", "--json"], temp.path(), temp.path());
         assert!(output.status.success(), "{family}: {}", stderr(&output));
@@ -97,6 +95,59 @@ fn workflow_and_resource_lists_use_stable_json_envelopes() {
         assert_eq!(value["kind"], expected_kind);
         assert!(value["data"].as_array().unwrap().len() >= minimum);
     }
+}
+
+#[test]
+fn repository_workflows_require_explicit_revision_trust() {
+    let temp = TempDir::new("workflow-repository-trust");
+    let repo = temp.path().join("repo");
+    let config_home = temp.path().join("xdg");
+    init_repo(&repo);
+    fs::create_dir_all(repo.join(".prism/workflows")).unwrap();
+    let source = repo.join(".prism/workflows/repository-review.toml");
+    fs::write(&source, "[[step]]\nprompt='review'\n").unwrap();
+
+    let before = run(["workflow", "list", "--json"], &repo, &config_home);
+    assert!(before.status.success(), "{}", stderr(&before));
+    let before: serde_json::Value = serde_json::from_str(&stdout(&before)).unwrap();
+    assert!(
+        !before["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"] == "repository-review")
+    );
+
+    let preview = run(["workflow", "trust-repository"], &repo, &config_home);
+    assert!(preview.status.success(), "{}", stderr(&preview));
+    assert!(stdout(&preview).contains("Preview trust"));
+
+    let apply = run(
+        ["workflow", "trust-repository", "--apply"],
+        &repo,
+        &config_home,
+    );
+    assert!(apply.status.success(), "{}", stderr(&apply));
+    let trusted = run(["workflow", "list", "--json"], &repo, &config_home);
+    let trusted: serde_json::Value = serde_json::from_str(&stdout(&trusted)).unwrap();
+    assert!(
+        trusted["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"] == "repository-review")
+    );
+
+    fs::write(&source, "[[step]]\nprompt='changed'\n").unwrap();
+    let changed = run(["workflow", "list", "--json"], &repo, &config_home);
+    let changed: serde_json::Value = serde_json::from_str(&stdout(&changed)).unwrap();
+    assert!(
+        !changed["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"] == "repository-review")
+    );
 }
 
 #[test]
@@ -117,34 +168,6 @@ fn workflow_json_errors_keep_the_versioned_envelope() {
             .unwrap()
             .contains("unknown workflow")
     );
-}
-
-#[test]
-fn pi_skill_install_and_remove_preserve_unrelated_files() {
-    let temp = TempDir::new("pi-skill-lifecycle");
-    let unrelated = temp.path().join(".pi/agent/skills/unrelated/SKILL.md");
-    fs::create_dir_all(unrelated.parent().unwrap()).unwrap();
-    fs::write(&unrelated, "user owned").unwrap();
-
-    let install = run(
-        ["skill", "install", "prism.standard/workflow-authoring"],
-        temp.path(),
-        temp.path(),
-    );
-    assert!(install.status.success(), "{}", stderr(&install));
-    let installed = temp
-        .path()
-        .join(".pi/agent/skills/prism-standard-workflow-authoring/SKILL.md");
-    assert!(installed.is_file());
-
-    let remove = run(
-        ["skill", "remove", "prism.standard/workflow-authoring"],
-        temp.path(),
-        temp.path(),
-    );
-    assert!(remove.status.success(), "{}", stderr(&remove));
-    assert!(!installed.exists());
-    assert_eq!(fs::read_to_string(unrelated).unwrap(), "user owned");
 }
 
 #[test]

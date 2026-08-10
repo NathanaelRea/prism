@@ -42,7 +42,7 @@ pub struct RepositorySnapshot {
     pub shortcut: Option<char>,
     pub worktrees: Vec<WorktreeSnapshot>,
     pub workflows: Vec<WorkflowSnapshot>,
-    pub workflow_details: Vec<crate::WorkflowProjection>,
+    pub workflow_details: Vec<crate::WorkflowRunState>,
     pub totals: RepositoryTotals,
 }
 
@@ -158,7 +158,6 @@ pub enum ObservationProvenance {
 #[derive(Clone, Debug, Serialize)]
 pub struct WorkflowSnapshot {
     pub identity: WorkflowIdentity,
-    pub owner: Option<WorkflowIdentity>,
     pub worktree: WorktreeIdentity,
     pub lifecycle: WorkflowLifecycle,
     pub pause_requested: bool,
@@ -228,7 +227,10 @@ pub struct StepSummary {
 pub enum WorkflowLifecycle {
     Queued,
     Running,
+    Waiting,
+    NeedsInput,
     Paused,
+    RecoveryRequired,
     Done,
     Failed,
     Aborted,
@@ -239,7 +241,10 @@ impl WorkflowLifecycle {
         match self {
             Self::Queued => "queued",
             Self::Running => "running",
+            Self::Waiting => "waiting",
+            Self::NeedsInput => "input required",
             Self::Paused => "paused",
+            Self::RecoveryRequired => "recovery required",
             Self::Done => "done",
             Self::Failed => "failed",
             Self::Aborted => "aborted",
@@ -285,25 +290,9 @@ pub enum StepState {
     Done,
     Failed,
     Aborted,
-    Skipped,
-    Unknown,
 }
 
 impl StepState {
-    fn parse(value: Option<String>) -> Self {
-        match value.as_deref() {
-            Some("queued" | "runnable") => Self::Queued,
-            Some("starting") => Self::Starting,
-            Some("running" | "claimed") => Self::Running,
-            Some("waiting") => Self::Waiting,
-            Some("done" | "succeeded") => Self::Done,
-            Some("failed") => Self::Failed,
-            Some("aborted" | "cancelled") => Self::Aborted,
-            Some("skipped") => Self::Skipped,
-            _ => Self::Unknown,
-        }
-    }
-
     pub fn label(self) -> &'static str {
         match self {
             Self::Queued => "queued",
@@ -313,8 +302,6 @@ impl StepState {
             Self::Done => "done",
             Self::Failed => "failed",
             Self::Aborted => "aborted",
-            Self::Skipped => "skipped",
-            Self::Unknown => "unknown",
         }
     }
 }
@@ -604,24 +591,13 @@ impl WorkspaceState {
         })?;
         let target =
             self.resolve_workflow(&snapshot, request.selector.as_deref(), request.action)?;
-        if let Some(owner) = &target.owner {
-            return Err(format!(
-                "child run {} is owned by {}; control {} instead",
-                target.identity.display_id, owner.display_id, owner.display_id
-            ));
-        }
-        if request.action == ControlAction::Recover
-            && target.dispatch.state != Some(DispatchState::RecoveryPending)
-        {
-            return Err("workflow does not require recovery".to_string());
-        }
         let command = match request.action {
-            ControlAction::Pause => crate::WorkflowCommand::Pause,
-            ControlAction::Resume => crate::WorkflowCommand::Resume,
-            ControlAction::Stop => crate::WorkflowCommand::Cancel,
-            ControlAction::Recover => crate::WorkflowCommand::Retry,
+            ControlAction::Pause => worker::PromptWorkflowControl::Pause,
+            ControlAction::Resume => worker::PromptWorkflowControl::Resume,
+            ControlAction::Stop => worker::PromptWorkflowControl::Cancel,
+            ControlAction::Recover => worker::PromptWorkflowControl::Retry,
         };
-        worker::command_workflow(&target.identity.run_id, command)?;
+        worker::command_prompt_workflow(&target.identity.run_id, command)?;
         Ok(ControlReceipt {
             workflow: target.identity.clone(),
             state: match request.action {
@@ -641,11 +617,14 @@ impl WorkspaceState {
         for decision in decisions {
             self.source_for_identity(&decision.workflow)?;
             if decision.restart {
-                worker::command_workflow(&decision.workflow.run_id, crate::WorkflowCommand::Retry)?;
-            } else {
-                worker::command_workflow(
+                worker::command_prompt_workflow(
                     &decision.workflow.run_id,
-                    crate::WorkflowCommand::Cancel,
+                    worker::PromptWorkflowControl::Retry,
+                )?;
+            } else {
+                worker::command_prompt_workflow(
+                    &decision.workflow.run_id,
+                    worker::PromptWorkflowControl::Cancel,
                 )?;
             }
         }
@@ -714,13 +693,11 @@ impl WorkspaceState {
     }
 }
 
-fn select_ledger_run_summaries(
-    runs: Vec<crate::WorkflowProjection>,
-) -> Vec<crate::WorkflowProjection> {
+fn select_ledger_run_summaries(runs: Vec<crate::WorkflowRunState>) -> Vec<crate::WorkflowRunState> {
     let mut terminal = 0;
     runs.into_iter()
         .filter(|run| {
-            if run.completed_unix_ms.is_none() {
+            if !run.status.terminal() {
                 true
             } else if terminal < RECENT_TERMINAL_WORKFLOWS {
                 terminal += 1;
@@ -732,59 +709,33 @@ fn select_ledger_run_summaries(
         .collect()
 }
 
-fn hydrate_ledger_workflows(
-    runs: Vec<crate::WorkflowProjection>,
-    inspect: impl FnOnce(&[String]) -> Result<Vec<crate::WorkflowProjection>, String>,
-) -> Result<Vec<crate::WorkflowProjection>, String> {
-    let selected = select_ledger_run_summaries(runs);
-    let ids = selected
-        .iter()
-        .map(|run| run.id.clone())
-        .collect::<Vec<_>>();
-    let mut details = inspect(&ids)?
-        .into_iter()
-        .map(|run| (run.id.clone(), run))
-        .collect::<BTreeMap<_, _>>();
-    Ok(selected
-        .into_iter()
-        .map(|summary| details.remove(&summary.id).unwrap_or(summary))
-        .collect())
-}
-
-fn list_ledger_workflows(sources: &[RepoSource]) -> Result<Vec<crate::WorkflowProjection>, String> {
-    let repositories = sources
-        .iter()
-        .map(|source| source.repo.root.display().to_string())
-        .collect::<Vec<_>>();
-    let from_worker = repositories
-        .iter()
-        .try_fold(Vec::new(), |mut runs, repository| {
-            let summaries = worker::list_workflows(Some(Path::new(repository)), 256)?;
-            runs.extend(hydrate_ledger_workflows(
-                summaries,
-                worker::inspect_workflows,
-            )?);
-            Ok::<_, String>(runs)
-        });
+fn list_ledger_workflows(sources: &[RepoSource]) -> Result<Vec<crate::WorkflowRunState>, String> {
+    let from_worker = sources.iter().try_fold(Vec::new(), |mut runs, source| {
+        runs.extend(select_ledger_run_summaries(worker::list_prompt_workflows(
+            Some(&source.repo.root),
+            256,
+        )?));
+        Ok::<_, String>(runs)
+    });
     match from_worker {
         Ok(runs) => Ok(runs),
-        Err(_) if !crate::util::prism_config_dir().join("workflow.db").exists() => Ok(Vec::new()),
+        Err(_) if !crate::PromptWorkflowService::database_path().exists() => Ok(Vec::new()),
         Err(socket_error) => crate::async_runtime::block_on(async {
-            let operations = crate::WorkflowOperations::open_default().await?;
+            let store = crate::DurableWorkflowRunStore::open(
+                &crate::PromptWorkflowService::database_path(),
+            )
+            .await?;
             let mut runs = Vec::new();
-            for repository in repositories {
-                let summaries =
-                    select_ledger_run_summaries(operations.list(Some(&repository), 256).await?);
-                for id in summaries.into_iter().map(|run| run.id) {
-                    if let Some(run) = operations.inspect(&id).await? {
-                        runs.push(run);
-                    }
-                }
+            for source in sources {
+                runs.extend(select_ledger_run_summaries(
+                    store.list_runs(Some(&source.repo.root), 256).await?,
+                ));
             }
-            Ok::<_, crate::WorkflowOperationError>(runs)
+            store.close().await;
+            Ok::<_, crate::WorkflowKernelError>(runs)
         })
-        .map_err(|error| format!("access workflow ledger runtime: {error}"))?
-        .map_err(|error| format!("{socket_error}; direct workflow ledger read failed: {error}")),
+        .map_err(|error| format!("access prompt Workflow runtime: {error}"))?
+        .map_err(|error| format!("{socket_error}; direct Workflow read failed: {error}")),
     }
 }
 
@@ -799,7 +750,7 @@ fn inspect_repository(
     source: &RepoSource,
     request: InspectRequest,
     observed: i64,
-    ledger_runs: &[crate::WorkflowProjection],
+    ledger_runs: &[crate::WorkflowRunState],
 ) -> Result<(RepositorySnapshot, Vec<Diagnostic>), String> {
     let config = Config::load(&source.repo);
     let inventory = lifecycle::list_worktrees(&source.repo, &config)?;
@@ -825,11 +776,7 @@ fn inspect_repository(
     let mut workflows = load_ledger_workflows(ledger_runs, &source.repo.root)?;
     let workflow_details = ledger_runs
         .iter()
-        .filter(|run| {
-            run.repository
-                .as_deref()
-                .is_some_and(|repository| paths_equal(Path::new(repository), &source.repo.root))
-        })
+        .filter(|run| paths_equal(&run.subject.repository, &source.repo.root))
         .cloned()
         .collect::<Vec<_>>();
     if !request.include_terminal {
@@ -913,8 +860,12 @@ fn inspect_repository(
     let workflow_attention = workflows
         .iter()
         .filter(|workflow| {
-            workflow.lifecycle == WorkflowLifecycle::Failed
-                || workflow.dispatch.state == Some(DispatchState::RecoveryPending)
+            matches!(
+                workflow.lifecycle,
+                WorkflowLifecycle::Failed
+                    | WorkflowLifecycle::NeedsInput
+                    | WorkflowLifecycle::RecoveryRequired
+            ) || workflow.dispatch.state == Some(DispatchState::RecoveryPending)
                 || workflow.pause_requested
         })
         .count();
@@ -1100,47 +1051,60 @@ fn ci_state(value: &str) -> CiState {
 }
 
 fn load_ledger_workflows(
-    runs: &[crate::WorkflowProjection],
+    runs: &[crate::WorkflowRunState],
     repo_root: &Path,
 ) -> Result<Vec<WorkflowSnapshot>, String> {
     runs.iter()
-        .filter(|run| {
-            run.repository
-                .as_deref()
-                .is_some_and(|repository| paths_equal(Path::new(repository), repo_root))
-        })
+        .filter(|run| paths_equal(&run.subject.repository, repo_root))
         .map(|run| {
-            let lifecycle = ledger_lifecycle(&run.status)?;
-            let dispatch_state = match run.status.as_str() {
-                "waiting" | "runnable" => Some(DispatchState::Queued),
-                "running" => Some(DispatchState::Claimed),
-                "paused" => Some(DispatchState::Paused),
-                "recovery_required" => Some(DispatchState::RecoveryPending),
-                "succeeded" | "failed" | "cancelled" => Some(DispatchState::Terminal),
-                _ => None,
+            let lifecycle = ledger_lifecycle(run.status);
+            let dispatch_state = match run.status {
+                crate::PromptWorkflowRunStatus::Queued
+                | crate::PromptWorkflowRunStatus::Waiting
+                | crate::PromptWorkflowRunStatus::NeedsInput => Some(DispatchState::Queued),
+                crate::PromptWorkflowRunStatus::Running => Some(DispatchState::Claimed),
+                crate::PromptWorkflowRunStatus::Paused => Some(DispatchState::Paused),
+                crate::PromptWorkflowRunStatus::RecoveryRequired => {
+                    Some(DispatchState::RecoveryPending)
+                }
+                crate::PromptWorkflowRunStatus::Succeeded
+                | crate::PromptWorkflowRunStatus::Failed
+                | crate::PromptWorkflowRunStatus::Cancelled => Some(DispatchState::Terminal),
             };
             let current_step = run
                 .steps
                 .iter()
-                .find(|step| matches!(step.status.as_str(), "claimed" | "runnable" | "waiting"))
+                .find(|step| {
+                    matches!(
+                        step.phase,
+                        crate::PromptStepPhase::Checking
+                            | crate::PromptStepPhase::Preparing
+                            | crate::PromptStepPhase::Prepared
+                            | crate::PromptStepPhase::RunningAgent
+                            | crate::PromptStepPhase::AgentSucceeded
+                            | crate::PromptStepPhase::Finalizing
+                            | crate::PromptStepPhase::Waiting
+                            | crate::PromptStepPhase::Failed
+                            | crate::PromptStepPhase::RecoveryRequired
+                    )
+                })
                 .or_else(|| run.steps.last());
-            let worktree = run
+            let worker_id = run
                 .steps
                 .iter()
-                .find_map(|step| {
-                    let input = serde_json::from_str::<serde_json::Value>(&step.input_json).ok()?;
-                    workflow_worktree_path(&input)
-                })
-                .unwrap_or_else(|| repo_root.to_path_buf());
-            let worker_id = run
-                .attempts
-                .iter()
-                .find(|attempt| attempt.status == "claimed")
-                .map(|attempt| attempt.worker_id.clone());
+                .flat_map(|step| &step.attempts)
+                .rev()
+                .find_map(|attempt| attempt.phase_owner.clone());
             let completed = run
                 .steps
                 .iter()
-                .filter(|step| step.status == "succeeded")
+                .filter(|step| {
+                    step.unconditional_completed
+                        || matches!(
+                            step.phase,
+                            crate::PromptStepPhase::Satisfied | crate::PromptStepPhase::Completed
+                        )
+                })
                 .count();
             Ok(WorkflowSnapshot {
                 identity: WorkflowIdentity {
@@ -1148,13 +1112,8 @@ fn load_ledger_workflows(
                     run_id: run.id.clone(),
                     display_id: String::new(),
                 },
-                owner: run.parent_run_id.as_ref().map(|run_id| WorkflowIdentity {
-                    repository: absolute_path(repo_root),
-                    run_id: run_id.clone(),
-                    display_id: run_id.clone(),
-                }),
                 worktree: WorktreeIdentity {
-                    path: absolute_path(&worktree),
+                    path: absolute_path(&run.subject.worktree),
                     display: String::new(),
                 },
                 lifecycle,
@@ -1170,7 +1129,7 @@ fn load_ledger_workflows(
                 },
                 current_step: current_step.map(|step| StepSummary {
                     label: step.key.clone(),
-                    state: StepState::parse(Some(step.status.clone())),
+                    state: prompt_step_state(step.phase),
                 }),
                 progress: Progress {
                     completed,
@@ -1183,32 +1142,35 @@ fn load_ledger_workflows(
         .collect()
 }
 
-fn workflow_worktree_path(input: &serde_json::Value) -> Option<PathBuf> {
-    input
-        .get("cwd")
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| {
-            input
-                .pointer("/worktree/path")
-                .and_then(serde_json::Value::as_str)
-        })
-        .or_else(|| {
-            input
-                .pointer("/candidate/worktree/path")
-                .and_then(serde_json::Value::as_str)
-        })
-        .map(PathBuf::from)
+fn ledger_lifecycle(status: crate::PromptWorkflowRunStatus) -> WorkflowLifecycle {
+    match status {
+        crate::PromptWorkflowRunStatus::Queued => WorkflowLifecycle::Queued,
+        crate::PromptWorkflowRunStatus::Running => WorkflowLifecycle::Running,
+        crate::PromptWorkflowRunStatus::Waiting => WorkflowLifecycle::Waiting,
+        crate::PromptWorkflowRunStatus::NeedsInput => WorkflowLifecycle::NeedsInput,
+        crate::PromptWorkflowRunStatus::Paused => WorkflowLifecycle::Paused,
+        crate::PromptWorkflowRunStatus::Succeeded => WorkflowLifecycle::Done,
+        crate::PromptWorkflowRunStatus::Failed => WorkflowLifecycle::Failed,
+        crate::PromptWorkflowRunStatus::RecoveryRequired => WorkflowLifecycle::RecoveryRequired,
+        crate::PromptWorkflowRunStatus::Cancelled => WorkflowLifecycle::Aborted,
+    }
 }
 
-fn ledger_lifecycle(status: &str) -> Result<WorkflowLifecycle, String> {
-    match status {
-        "waiting" | "runnable" => Ok(WorkflowLifecycle::Queued),
-        "running" => Ok(WorkflowLifecycle::Running),
-        "paused" => Ok(WorkflowLifecycle::Paused),
-        "succeeded" => Ok(WorkflowLifecycle::Done),
-        "failed" | "recovery_required" => Ok(WorkflowLifecycle::Failed),
-        "cancelled" => Ok(WorkflowLifecycle::Aborted),
-        other => Err(format!("unknown global workflow lifecycle: {other}")),
+fn prompt_step_state(phase: crate::PromptStepPhase) -> StepState {
+    match phase {
+        crate::PromptStepPhase::Pending => StepState::Queued,
+        crate::PromptStepPhase::Checking
+        | crate::PromptStepPhase::Preparing
+        | crate::PromptStepPhase::Prepared
+        | crate::PromptStepPhase::AgentSucceeded
+        | crate::PromptStepPhase::Finalizing => StepState::Starting,
+        crate::PromptStepPhase::RunningAgent => StepState::Running,
+        crate::PromptStepPhase::Waiting => StepState::Waiting,
+        crate::PromptStepPhase::Satisfied | crate::PromptStepPhase::Completed => StepState::Done,
+        crate::PromptStepPhase::Failed | crate::PromptStepPhase::RecoveryRequired => {
+            StepState::Failed
+        }
+        crate::PromptStepPhase::Cancelled => StepState::Aborted,
     }
 }
 
@@ -1234,7 +1196,9 @@ fn controls_for(
                 || dispatch == Some(DispatchState::Paused))
             && dispatch != Some(DispatchState::RecoveryPending),
         stop: ownerless && !terminal,
-        recover: ownerless && dispatch == Some(DispatchState::RecoveryPending),
+        recover: ownerless
+            && (dispatch == Some(DispatchState::RecoveryPending)
+                || lifecycle == WorkflowLifecycle::Failed),
     }
 }
 
@@ -1271,23 +1235,6 @@ fn assign_display_ids(repositories: &mut [RepositorySnapshot]) {
                         .display_id
                         .clone_from(&workflow.identity.display_id);
                 }
-            }
-        }
-        let display_ids = repository
-            .workflows
-            .iter()
-            .map(|workflow| {
-                (
-                    workflow.identity.run_id.clone(),
-                    workflow.identity.display_id.clone(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        for workflow in &mut repository.workflows {
-            if let Some(owner) = &mut workflow.owner
-                && let Some(display_id) = display_ids.get(&owner.run_id)
-            {
-                owner.display_id.clone_from(display_id);
             }
         }
     }
@@ -1350,7 +1297,7 @@ fn eligible_refs<'a>(
         .collect::<Vec<_>>();
     match candidates.as_slice() {
         [workflow] => Ok(*workflow),
-        [] => Err("no eligible owner workflow found".to_string()),
+        [] => Err("no eligible workflow found".to_string()),
         _ => Err(format!("ambiguous workflow target; matches {}", {
             let mut display_ids = candidates
                 .iter()
@@ -1420,71 +1367,4 @@ fn paths_equal(left: &Path, right: &Path) -> bool {
 }
 fn path_contains(root: &Path, selected: &Path) -> bool {
     selected.is_absolute() && absolute_path(selected).starts_with(absolute_path(root))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{hydrate_ledger_workflows, load_ledger_workflows, workflow_worktree_path};
-
-    fn workflow_projection(id: &str, steps: serde_json::Value) -> crate::WorkflowProjection {
-        serde_json::from_value(serde_json::json!({
-            "id": id,
-            "definition_name": "stabilize",
-            "status": "waiting",
-            "repository": "/repo",
-            "created_unix_ms": 1,
-            "updated_unix_ms": 2,
-            "completed_unix_ms": null,
-            "steps": steps,
-            "attempts": [],
-            "artifacts": [],
-            "approvals": [],
-            "effects": [],
-            "gates": [],
-            "events": []
-        }))
-        .unwrap()
-    }
-
-    #[test]
-    fn list_summaries_are_hydrated_before_worktree_association() {
-        let summary = workflow_projection("run-1", serde_json::json!([]));
-        let detail = workflow_projection(
-            "run-1",
-            serde_json::json!([{
-                "id": "cleanup-id",
-                "key": "cleanup",
-                "implementation": "prism.standard/cleanup",
-                "target_id": "local",
-                "status": "waiting",
-                "input_json": "{\"worktree\":{\"path\":\"/repo/feature\"}}"
-            }]),
-        );
-
-        let hydrated = hydrate_ledger_workflows(vec![summary], |ids| {
-            assert_eq!(ids, ["run-1"]);
-            Ok(vec![detail])
-        })
-        .unwrap();
-        let workflows = load_ledger_workflows(&hydrated, std::path::Path::new("/repo")).unwrap();
-
-        assert_eq!(
-            workflows[0].worktree.path,
-            std::path::Path::new("/repo/feature")
-        );
-    }
-
-    #[test]
-    fn workflow_worktree_path_reads_resolved_standard_workflow_inputs() {
-        for input in [
-            serde_json::json!({"worktree":{"path":"/repo/feature"}}),
-            serde_json::json!({"candidate":{"worktree":{"path":"/repo/feature"}}}),
-            serde_json::json!({"cwd":"/repo/feature"}),
-        ] {
-            assert_eq!(
-                workflow_worktree_path(&input).unwrap(),
-                std::path::PathBuf::from("/repo/feature")
-            );
-        }
-    }
 }

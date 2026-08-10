@@ -1,0 +1,13 @@
+#!/usr/bin/env -S npx tsx
+// prism-trigger: check-only
+import { runTrigger } from "../src/index.ts";
+
+await runTrigger({
+  async shouldRunStep(context) {
+    // Replace this example predicate with an observational check. Do not mutate here.
+    const configured = Boolean(context.subject.repository);
+    return configured
+      ? { decision: "satisfied", summary: "repository context is available" }
+      : { decision: "fail", reason: "repository context is missing" };
+  },
+});

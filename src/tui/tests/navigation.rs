@@ -5,34 +5,16 @@ use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
 use crate::remote::PrCache;
-use crate::view::{RepoMainView, WorktreeMainView};
+use crate::view::RepoMainView;
 
 use super::super::{OpenTmuxSessionTarget, PanelFocus, Tui, WorktreeListMode};
-use super::support::{test_change_request_identity, test_pr_summary, test_tui, unique_temp_dir};
+use super::support::{test_pr_summary, test_tui, unique_temp_dir};
 
 #[test]
 fn tui_defaults_to_repos_panel_focus() {
     let tui = test_tui();
 
     assert_eq!(tui.focused_panel, PanelFocus::Repos);
-}
-
-#[test]
-fn workflow_context_uses_selected_worktree_pr_before_repository_poll_finishes() {
-    let mut tui = test_tui();
-    tui.focus_worktrees();
-    tui.select_worktree(1);
-    let mut summary = test_pr_summary(false);
-    summary.change_request_identity = Some(test_change_request_identity(
-        crate::remote::ProviderKind::GitHub,
-    ));
-    tui.sessions[1].pr = PrCache::observed(summary, None);
-    assert!(tui.repos[0].pr_summaries.is_empty());
-
-    let context = tui.workflow_context();
-
-    assert!(context.contains_key("worktree"));
-    assert!(context.contains_key("change_request"));
 }
 
 #[test]
@@ -177,47 +159,6 @@ fn horizontal_keys_switch_repo_view_without_changing_focus() {
 
     assert_eq!(tui.focused_panel, PanelFocus::Worktrees);
     assert_eq!(tui.repo_main_view, RepoMainView::ChangeRequests);
-}
-
-#[test]
-fn bracket_views_are_focus_sensitive_in_worktree_context() {
-    let mut tui = test_tui();
-    tui.focus_worktrees();
-    tui.switch_worktree_list_mode(WorktreeListMode::Global);
-
-    tui.focus_main();
-    tui.switch_worktree_main_view(1);
-
-    assert_eq!(tui.worktree_main_view, WorktreeMainView::Workflow);
-    assert_eq!(tui.worktree_list_mode, WorktreeListMode::Global);
-
-    tui.focus_worktrees();
-    tui.switch_worktree_list_mode(WorktreeListMode::Repo);
-
-    assert_eq!(tui.worktree_main_view, WorktreeMainView::Workflow);
-    assert_eq!(tui.worktree_list_mode, WorktreeListMode::Repo);
-}
-
-#[test]
-fn workflow_view_captures_enter_even_when_selected_step_has_no_child() {
-    let mut tui = test_tui();
-    tui.focus_worktrees();
-    tui.worktree_main_view = WorktreeMainView::Workflow;
-    tui.focus_main();
-
-    assert!(tui.handle_workflow_enter());
-}
-
-#[test]
-fn workflow_view_mode_is_retained_when_worktree_selection_changes() {
-    let mut tui = test_tui();
-    tui.worktree_main_view = WorktreeMainView::Workflow;
-    tui.workflow_graph_expanded = true;
-
-    tui.select_worktree(1);
-
-    assert_eq!(tui.worktree_main_view, WorktreeMainView::Workflow);
-    assert!(tui.workflow_graph_expanded);
 }
 
 #[test]

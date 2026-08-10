@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted
+Superseded by ADR 0006, Trigger-Driven Prompt Workflows.
 
 ## Context
 

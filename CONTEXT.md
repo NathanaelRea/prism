@@ -40,9 +40,9 @@ and path. Branch names and paths may be reused after deletion, but the new
 worktree is a new session and cannot inherit the old session's active state.
 
 Prism may attach metadata to a session, including prompt summary, agent state,
-logs, hidden markers, change-request cache data, and links to Workflow Runs and
-Artifacts. A run can link zero, one, or many Worktree Session incarnations;
-deleting one retires the link without making that session the owner of history.
+logs, hidden markers, change-request cache data, and links to Workflow Runs. A
+run is bound to one selected worktree for mutation while it is active; deleting
+that worktree retires the link without making the session the owner of history.
 
 Each Worktree Session records the Harness used by its tmux Agent Session. A
 global Harness change does not silently reinterpret an existing worktree;
@@ -141,151 +141,99 @@ bases. GitHub.com, GitLab.com, and Codeberg have built-in profiles. Every other
 host requires explicit configuration before Prism probes it or consults a
 credential source.
 
-### Workflow Definition
+### Workflow
 
-A Workflow Definition is a named, versioned declaration of how Prism should take
-typed inputs through Steps to declared outcomes. It defines dependencies,
-conditions, policies, and required capabilities. An ordered list is shorthand
-for a dependency chain; explicit dependencies can form an acyclic graph.
+A Workflow is a prompt-first TOML file whose filename stem is its default
+identity. It declares optional Agent defaults and an acyclic graph of Agent
+Steps. A plain `[[step]]` list is linear; explicit `id` and `depends_on` values
+create roots, branches, and joins.
 
-Starter planning and end-to-end coding workflows are ordinary Workflow
-Definitions copied from the Standard Pack. They are user-owned after setup and
-use the same execution and history model as any other definition.
+Workflow source has no required schema version, qualified package ID, launch
+mode, capability list, typed port, Step class, implementation ID, or
+`skippable` declaration. First setup copies editable defaults into the user's
+workflow directory once. Installed and trusted repository packages may also
+provide files through the same conventional `workflows/` layout.
 
-A Workflow Definition declares whether it can be launched manually, called as a
-child, used by a Trigger, or some combination. Reusable orchestration is a child
-Workflow Definition with explicit typed input and output bindings; Prism has no
-separate Workflow Component concept. The generalized source contract begins at
-Workflow Definition schema version 2; source migration is explicit and never
-imports Plan Mode or Auto Flow state.
+### Step Trigger
 
-### Step Implementation
+A Step Trigger is a reusable lifecycle adapter attached to one Agent Step. Its
+observational check returns Run, Satisfied, Wait, or Fail. Optional prepare and
+finalize hooks run immediately before and after a successful Agent and can
+perform mutations. Persisted prepared state remains opaque and never becomes
+prompt text.
 
-A Step Implementation is the reusable behavior selected by one Step within its
-kernel-owned primitive class. Implementations can provide Agent, command, Git,
-provider, Gate, input/rendering, Trigger-adapter, and notification behavior.
-
-Step Implementations run as versioned extension executables. Extensions have the
-user's full OS authority; capability declarations disclose and audit expected
-behavior but are not a sandbox. Standard Implementations use Prism's brokered
-host operations for protected effects. A third-party extension can bypass those
-operations, so its direct effects are explicitly unbrokered and do not receive
-Prism's intent, fencing, or reconciliation guarantees.
+Built-in and fake Triggers use the same in-process interface. External Triggers
+are full-trust shebang executables invoked once per phase through a small
+versioned process protocol. They have the user's OS authority; content-addressed
+retention stabilizes active runs but is not a sandbox.
 
 ### Prism Package
 
-A Prism Package is an installable, versioned collection of Workflow Definitions,
-extensions, Artifact schemas, skills, and templates. Packages can be installed
-globally or for a trusted repository from a local path, URL, Git source, or
-GitHub source. Installed files are editable user-owned working copies, while
-Workflow Runs retain immutable content-addressed package and executable revisions.
+A Prism Package may distribute Workflows and Triggers using conventional
+`workflows/` and `triggers/` directories, plus unrelated Prism resources. The
+Workflow kernel does not resolve package closures, typed Artifact schemas,
+implementation descriptors, or capability envelopes. Active runs pin the exact
+Workflow source and external Trigger executable bytes they use.
 
-Package updates compare the previous upstream revision, the local working copy,
-and the incoming revision. They never silently overwrite or resurrect user
-customizations. Package manifests and scope lockfiles begin at schema version 1;
-locks contain only exact sources, revisions, and digests.
+### Trigger And Launcher
 
-### Trigger
+Trigger is the short form of Step Trigger: it decides whether one existing
+Workflow Step should run and owns that Step's optional prepare/finalize hooks.
+Waiting in a Trigger does not occupy an Agent slot.
 
-A Trigger is a durable rule that creates Workflow Runs from manual input, a
-schedule, or a provider event. It binds a Workflow Definition, inputs,
-parameters, and an Admission Policy. Waiting for a Trigger does not create a
-running Step.
+A Launcher creates Workflow Runs from a schedule, provider event, or other
+automatic source. Launchers are a separate future module; run creation is never
+a Step Trigger responsibility.
 
 ### Workflow Run
 
-A Workflow Run is one durable execution of a fully resolved Workflow Definition.
-It owns its initial inputs, Definition Snapshot, Steps, attempts, Artifacts,
-decisions, child-run lineage, and aggregate outcome.
+A Workflow Run is one durable execution of a compiled Workflow snapshot. It owns
+its exact repository, Worktree Session and Change Request association, repeated
+evaluation cycle, Agent-run budget, lifecycle attempts, Trigger decisions and
+wakes, Agent sessions/final text, controls, and aggregate outcome.
 
-A Definition Snapshot is the immutable resolved definition used by one run. It
-pins the complete package, dependency, schema, prompt/template, and extension
-executable closure. Changing or deleting editable source does not reinterpret the
-run or its history.
+The immutable snapshot pins source bytes, dependencies, prompts,
+harness/model/variant choices, context selections, and external Trigger
+executable revisions. Editing or deleting source changes future runs only.
 
 ### Workflow Step
 
-A Workflow Step is one declared node in a Workflow Definition. Its primitive
-class is Action, Gate, Approval, Wait, Notification, or Workflow Call, and its
-dependencies and conditions determine when it can run.
+A Workflow Step is one Agent prompt node with an optional Trigger. A Step without
+a Trigger runs once; a triggered Step can run repeatedly as fresh observations
+start new evaluation cycles. A check-only triggered Step has no Agent prompt.
 
-A Step Attempt is one auditable execution of a Step against exact input
-revisions. Retries create new attempts rather than replacing prior evidence or
-output.
+A Step Attempt records checking, preparing, Agent, and finalizing boundaries,
+persisted prepared state, fresh Agent Session identity, final text, timing, and
+terminal reason. Retry appends an Attempt and never erases history or restores
+consumed Agent budget.
 
-### Artifact
+### Prepared State
 
-An Artifact is an immutable, typed, revisioned input or output of a Workflow Run.
-Issues, Plans, Worktree Sessions, Commits, Change Requests, review reports, and
-observations can be represented as Artifacts while retaining their own canonical
-identities. Artifact lineage records which Step Attempt produced and consumed a
-revision.
+Prepared State is opaque Trigger-owned data persisted after a successful
+pre-Step hook and before Agent start. It lets the Worker resume at a known phase
+boundary and lets a finalize hook mutate only the exact provider or repository
+subjects captured during prepare. It is not prompt context or Agent authority.
 
-Artifact provenance records trust and sensitivity inherited from all sources.
-Deriving, summarizing, or reviewing an Artifact does not make untrusted input
-authoritative.
+### Remote Request Coordinator
 
-### Plan
-
-A Plan is an Artifact with human-readable instructions and a validated manifest
-of bounded phases, stable phase identities, dependencies, and declared inputs.
-Plan phases can parameterize child Workflow Runs but do not alter a running
-parent definition.
-
-### Gate
-
-A Gate is a read-only Workflow Step that decides whether exact evidence for an
-exact subject revision satisfies a policy. CI, provider review, mergeability,
-merge conflicts, local verification, and security policy are independent Gates;
-their dependencies come from the Workflow Definition rather than an inherent
-checklist order.
-
-A Gate cannot repair code, push, label, merge, or clean up. Those effects belong
-to Action Steps that visibly depend on the required Gate result.
-
-### Approval
-
-An Approval Step creates an Approval Request for Artifact acceptance, capability
-authorization, human attestation, or an exact mutation. An Approval Decision is
-the durable response bound to the exact inputs and evidence presented; resuming
-a paused run is not approval.
-
-### Admission Policy
-
-An Admission Policy decides whether an externally sourced item may cross from
-read-only intake into code execution or meaningful mutation. It grants authority
-only from named provider-authenticated facts and trusted local policy;
-agent-produced risk or security analysis is evidence, not authority to admit
-itself.
-
-An Admission Decision records one policy evaluation against an exact Observation
-Revision and capability envelope. A child receiving that external content has
-its own decision or delegated admission authority no broader than its parent's.
-
-An Authority Grant is the recorded basis for a run's capabilities. It can come
-from an Admission Decision, a capability-authorizing Approval Decision, or a
-trusted manual Invocation Grant; delegation to a child can only narrow it.
-
-### Execution Target
-
-An Execution Target is a worker environment capable of executing particular
-Step Implementations and capabilities. Local processes are the initial targets;
-target identity and workflow history do not assume that execution always occurs
-in the coordinator's process or at one local path.
-
-An Execution Workspace is a target-affine checkout with its own target-neutral
-identity, repository identity, and exact base revision. It may link a Worktree
-Session incarnation but remains a leased workflow resource, not the identity of
-the Workflow Run using it.
+The Remote Request Coordinator is the Worker-owned queue through which every
+Prism-owned provider observation and mutation passes. It owns per-host and
+credential-profile pacing, durable cooldowns, retries, coalescing, fairness,
+and bounded evidence freshness. Agent and full-trust custom-Trigger traffic is
+outside this boundary.
 
 ### Prism Worker
 
 The Prism Worker is one on-demand per-user daemon and local coordinator. It
-discovers tracked repository databases, evaluates Triggers and Workflow Runs,
-claims runnable Step Attempts transactionally, renews their leases, assigns them
-to compatible Execution Targets, and supervises their durable outcomes. Closing
-the TUI does not stop it. It is not a login service and does not automatically
-restart interrupted work after the daemon or machine stops.
+hot-discovers Workflow and Trigger files, evaluates repeated DAG cycles, claims
+lifecycle phases with leases/fencing, supervises fresh Agent processes, preserves
+durable wakes, and serializes mutations to one worktree. Closing the TUI does
+not stop it.
+
+The Worker also owns one Remote Request Coordinator used by TUI refreshes,
+interactive provider actions, and Workflow Triggers. Provider lanes, cooldowns,
+backoff, coalesced observations, and subscriber wakes are user-wide rather than
+per process.
 
 The Prism Worker also observes interactive Agent Sessions and owns desktop
 notification transition state, durable delivery intent, supersession, expiry,
@@ -293,19 +241,12 @@ and retry policy. Platform delivery remains behind adapters: Linux uses the
 desktop notification service, while macOS forwards semantic notifications to
 an active TUI terminal subscription.
 
-Managed executor database connections install claim-bound SQLite guards. The
-guards reject run, Step, Artifact, event, and process writes unless the
-connection still owns the current unexpired fencing token. Executor loops also
-revalidate ownership before harness, verification, Git, provider, and cleanup
-effects. Resume and retry requests made while an executor is releasing persist a
-requeue intent so runnable work cannot be stranded by the release race.
-
 ### Change Request Stabilization
 
-Change Request Stabilization is the composition of observation, Gate, repair,
-and guarded Action Steps used to move a Change Request toward a declared goal.
-Review, CI, policy, mergeability, and merge-relation evidence remain independent,
-even when a Starter child workflow presents one most useful current blocker.
+Change Request Stabilization is the default linear Workflow of merge-conflict,
+review, CI, and final ready-to-merge Triggers. Repeated graph evaluation lets an
+earlier blocker react while a later Trigger waits. Stabilization stops at fresh
+exact-head provider readiness; it does not merge or clean up the worktree.
 
 Actionable review feedback means feedback submitted through provider review
 mechanisms, such as review bodies and inline review-thread comments. Top-level
@@ -325,8 +266,8 @@ that the branch can be moved, and refuses to move a dirty checkout.
 
 - Use the terms above in code, docs, and reviews.
 - Keep product behavior centered on repositories, provider items, Worktree
-  Sessions, Agent Sessions, Workflow Runs, Artifacts, and cached Change Request
-  state.
+  Sessions, Agent Sessions, prompt Workflow Runs, lifecycle Attempts, and cached
+  Change Request state.
 - Prefer changes that preserve local state outside project repositories unless a
   feature explicitly needs repository-owned files.
 - Treat default-branch behavior as a product boundary: task branch workflows

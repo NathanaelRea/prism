@@ -1,0 +1,29 @@
+[defaults]
+harness = "pi"
+variant = "medium"
+
+[[step]]
+id = "correctness-review"
+depends_on = []
+model = "openai/gpt-5.6-sol"
+prompt = """
+Review the current changes for correctness. Report specific findings and do not edit files.
+"""
+
+[[step]]
+id = "maintainability-review"
+depends_on = []
+model = "anthropic/claude-opus-4-6"
+prompt = """
+Review the current changes for maintainability. Report specific findings and do not edit files.
+"""
+
+[[step]]
+id = "implement"
+depends_on = ["correctness-review", "maintainability-review"]
+context = ["correctness-review", "maintainability-review"]
+model = "openai/gpt-5.6-sol"
+variant = "high"
+prompt = """
+Address the applicable review findings, then run the relevant checks.
+"""
