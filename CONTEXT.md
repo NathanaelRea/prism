@@ -150,8 +150,12 @@ create roots, branches, and joins.
 
 Workflow source has no required schema version, qualified package ID, launch
 mode, capability list, typed port, Step class, implementation ID, or
-`skippable` declaration. First setup copies editable defaults into the user's
-workflow directory once. Installed and trusted repository packages may also
+`skippable` declaration. It may declare typed file, string, boolean, number, and
+enum inputs with optional defaults. Canonical values are substituted into Agent
+turns; files use normalized worktree-relative paths and are never read into a
+prompt implicitly. First setup copies
+editable defaults into the user's workflow directory once. Installed and trusted
+repository packages may also
 provide files through the same conventional `workflows/` layout.
 
 ### Step Trigger
@@ -190,22 +194,25 @@ a Step Trigger responsibility.
 A Workflow Run is one durable execution of a compiled Workflow snapshot. It owns
 its exact repository, Worktree Session and Change Request association, repeated
 evaluation cycle, Agent-run budget, lifecycle attempts, Trigger decisions and
-wakes, Agent sessions/final text, controls, and aggregate outcome.
+wakes, Agent sessions and completed turns, controls, and aggregate outcome.
 
-The immutable snapshot pins source bytes, dependencies, prompts,
-harness/model/variant choices, context selections, and external Trigger
-executable revisions. Editing or deleting source changes future runs only.
+The immutable snapshot pins source bytes, dependencies, typed input declarations
+and canonical bound values, initial prompts and follow-ups, harness/model/variant
+choices, context selections, and external Trigger executable revisions. Editing
+or deleting source changes future runs only.
 
 ### Workflow Step
 
-A Workflow Step is one Agent prompt node with an optional Trigger. A Step without
-a Trigger runs once; a triggered Step can run repeatedly as fresh observations
-start new evaluation cycles. A check-only triggered Step has no Agent prompt.
+A Workflow Step is one Agent lifecycle node with an initial prompt, optional
+authored follow-ups, and an optional Trigger. A Step without a Trigger runs once;
+a triggered Step can run repeatedly as fresh observations start new evaluation
+cycles. A check-only triggered Step has no Agent prompt.
 
 A Step Attempt records checking, preparing, Agent, and finalizing boundaries,
-persisted prepared state, fresh Agent Session identity, final text, timing, and
-terminal reason. Retry appends an Attempt and never erases history or restores
-consumed Agent budget.
+persisted prepared state, one fresh Agent Session identity, each completed turn,
+final text, timing, and terminal reason. Follow-ups resume only that Attempt's
+session. Retry appends an Attempt and never erases history or restores consumed
+Agent budget.
 
 ### Prepared State
 
@@ -226,9 +233,9 @@ outside this boundary.
 
 The Prism Worker is one on-demand per-user daemon and local coordinator. It
 hot-discovers Workflow and Trigger files, evaluates repeated DAG cycles, claims
-lifecycle phases with leases/fencing, supervises fresh Agent processes, preserves
-durable wakes, and serializes mutations to one worktree. Closing the TUI does
-not stop it.
+lifecycle phases with leases/fencing, supervises fresh Agent Sessions and their
+authored follow-up turns, preserves durable wakes, and serializes mutations to
+one worktree. Closing the TUI does not stop it.
 
 The Worker also owns one Remote Request Coordinator used by TUI refreshes,
 interactive provider actions, and Workflow Triggers. Provider lanes, cooldowns,

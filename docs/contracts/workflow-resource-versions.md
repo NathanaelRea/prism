@@ -11,8 +11,10 @@ Breaking wire or stable-JSON changes require an explicit version increase.
 
 ## Workflow Revisions
 
-A Workflow revision is SHA-256 over its source plus resolved Steps, dependencies,
-context selections, Agent harness/model/variant selections, and Trigger revisions.
+A Workflow revision is SHA-256 over its source plus resolved Steps, typed input
+declarations and canonical bound values, initial prompts, ordered follow-ups,
+dependencies, context selections, Agent harness/model/variant selections, and
+Trigger revisions.
 The compiled run snapshot retains that exact content. Repository and user source
 paths are provenance only and do not change an active run after launch.
 

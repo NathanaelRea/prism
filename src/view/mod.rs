@@ -108,6 +108,7 @@ pub(crate) enum DialogModel {
         title: String,
         fields: Vec<FormField>,
         selected: usize,
+        dropdown: Option<FormDropdown>,
         error: Option<String>,
     },
     Choice {
@@ -133,11 +134,38 @@ pub(crate) struct DialogLine {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FormField {
-    pub section: String,
     pub name: String,
     pub value: String,
-    pub requirement: String,
-    pub kind: String,
+    pub description: Option<String>,
+    pub constraint: Option<String>,
+    pub required: bool,
+    pub kind: FormFieldKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FormFieldKind {
+    String,
+    Bool,
+    Number,
+    Enum { options: Vec<String> },
+    File { glob: String },
+}
+
+impl FormFieldKind {
+    pub fn label(&self) -> String {
+        match self {
+            Self::String => "string".into(),
+            Self::Bool => "bool".into(),
+            Self::Number => "number".into(),
+            Self::Enum { .. } => "enum".into(),
+            Self::File { glob } => format!("file: {glob}"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FormDropdown {
+    pub selected: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

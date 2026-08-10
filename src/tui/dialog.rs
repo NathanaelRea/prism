@@ -1,4 +1,7 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write as _;
+use std::path::Path;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -85,6 +88,133 @@ pub(super) fn choice_list(title: &str, choices: &[(&str, &str)]) -> view::Choice
             .map(|(key, label)| view::KeyChoice::new(*key, *label))
             .collect(),
     }
+}
+
+fn toggle_bool_field(value: &mut String) {
+    *value = if value == "true" { "false" } else { "true" }.into();
+}
+
+fn selected_option(options: &[String], value: &str) -> usize {
+    options
+        .iter()
+        .position(|option| option == value)
+        .unwrap_or(0)
+}
+
+fn cycle_enum_field(value: &mut String, options: &[String], forward: bool) {
+    if options.is_empty() {
+        return;
+    }
+    if !options.iter().any(|option| option == value) {
+        *value = options[0].clone();
+        return;
+    }
+    let selected = selected_option(options, value);
+    let next = if forward {
+        (selected + 1).min(options.len() - 1)
+    } else {
+        selected.saturating_sub(1)
+    };
+    *value = options[next].clone();
+}
+
+fn validate_workflow_form(
+    workflow: &crate::CompiledWorkflow,
+    worktree: &Path,
+    fields: &mut [view::FormField],
+) -> Result<BTreeMap<String, String>, (usize, String)> {
+    let mut supplied = BTreeMap::new();
+    for (index, field) in fields.iter_mut().enumerate() {
+        let input = workflow
+            .inputs
+            .get(&field.name)
+            .expect("Workflow form fields come from the compiled input map");
+        let raw = if field.value.is_empty() {
+            let Some(default) = input.default_value() else {
+                return Err((
+                    index,
+                    format!("Workflow input '{}' is required", field.name),
+                ));
+            };
+            default
+        } else {
+            field.value.clone()
+        };
+        match crate::validate_workflow_input(worktree, input, &raw) {
+            Ok(value) => {
+                field.value = value.clone();
+                supplied.insert(field.name.clone(), value);
+            }
+            Err(problem) => {
+                return Err((index, format!("Workflow input '{}': {problem}", field.name)));
+            }
+        }
+    }
+    crate::bind_workflow_inputs(workflow, worktree, &supplied)
+        .map(|bound| bound.input_values)
+        .map_err(|problem| (0, problem.to_string()))
+}
+
+fn pick_workflow_file(
+    fzf: &str,
+    name: &str,
+    worktree: &Path,
+    workflow: &crate::CompiledWorkflow,
+) -> Result<Option<String>, String> {
+    let input = workflow
+        .inputs
+        .get(name)
+        .ok_or_else(|| format!("unknown Workflow input '{name}'"))?;
+    let candidates = crate::workflow_file_input_candidates(worktree, input)
+        .map_err(|error| error.to_string())?;
+    let glob = input.file_glob().unwrap_or_default();
+    if candidates.is_empty() {
+        return Err(format!(
+            "no files match '{glob}' under {}",
+            worktree.display()
+        ));
+    }
+    let mut child = Command::new(fzf)
+        .args([
+            &format!("--prompt={name}> "),
+            &format!("--header=Select a file matching {glob}"),
+            "--height=80%",
+            "--reverse",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("start fzf '{fzf}' for Workflow input '{name}': {error}"))?;
+    {
+        let stdin = child.stdin.as_mut().expect("fzf stdin is piped");
+        for candidate in candidates {
+            writeln!(stdin, "{candidate}")
+                .map_err(|error| format!("write Workflow input candidates: {error}"))?;
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("wait for Workflow input picker: {error}"))?;
+    if output
+        .status
+        .code()
+        .is_some_and(|code| matches!(code, 1 | 130))
+    {
+        return Ok(None);
+    }
+    if !output.status.success() {
+        return Err(format!(
+            "Workflow input picker exited with {}",
+            output.status
+        ));
+    }
+    let selected = String::from_utf8(output.stdout)
+        .map_err(|error| format!("Workflow input picker returned invalid UTF-8: {error}"))?;
+    let selected = selected.trim_end_matches(['\r', '\n']);
+    if selected.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(selected.to_string()))
 }
 
 impl Tui {
@@ -337,6 +467,265 @@ impl Tui {
                 input: input.clone(),
             });
             self.draw(runtime)?;
+        }
+    }
+
+    pub(crate) fn prompt_workflow_input_form(
+        &mut self,
+        runtime: &mut TerminalRuntime,
+        workflow: &crate::CompiledWorkflow,
+        worktree: &Path,
+        fzf: &str,
+    ) -> Result<Option<BTreeMap<String, String>>, String> {
+        if workflow.inputs.is_empty() {
+            return Ok(Some(BTreeMap::new()));
+        }
+        let mut fields = workflow
+            .inputs
+            .iter()
+            .map(|(name, input)| view::FormField {
+                name: name.clone(),
+                value: input.default_value().unwrap_or_default(),
+                description: input.description().map(str::to_string),
+                constraint: match input {
+                    crate::CompiledWorkflowInput::String {
+                        min_length,
+                        max_length,
+                        ..
+                    } => match (min_length, max_length) {
+                        (Some(min), Some(max)) => Some(format!("{min}–{max} chars")),
+                        (Some(min), None) => Some(format!("at least {min} chars")),
+                        (None, Some(max)) => Some(format!("at most {max} chars")),
+                        (None, None) => None,
+                    },
+                    crate::CompiledWorkflowInput::Number { min, max, .. } => match (min, max) {
+                        (Some(min), Some(max)) => Some(format!("{min}–{max}")),
+                        (Some(min), None) => Some(format!("at least {min}")),
+                        (None, Some(max)) => Some(format!("at most {max}")),
+                        (None, None) => None,
+                    },
+                    crate::CompiledWorkflowInput::Enum { options, .. } => {
+                        Some(format!("{} options", options.len()))
+                    }
+                    _ => None,
+                },
+                required: input.is_required(),
+                kind: match input {
+                    crate::CompiledWorkflowInput::File { glob, .. } => {
+                        view::FormFieldKind::File { glob: glob.clone() }
+                    }
+                    crate::CompiledWorkflowInput::String { .. } => view::FormFieldKind::String,
+                    crate::CompiledWorkflowInput::Bool { .. } => view::FormFieldKind::Bool,
+                    crate::CompiledWorkflowInput::Number { .. } => view::FormFieldKind::Number,
+                    crate::CompiledWorkflowInput::Enum { options, .. } => {
+                        view::FormFieldKind::Enum {
+                            options: options.clone(),
+                        }
+                    }
+                },
+            })
+            .collect::<Vec<_>>();
+        let mut selected = 0usize;
+        let mut dropdown = None;
+        let mut error = None;
+        loop {
+            self.dialog = Some(view::DialogModel::Form {
+                title: format!("Run {}", workflow.name),
+                fields: fields.clone(),
+                selected,
+                dropdown,
+                error: error.clone(),
+            });
+            self.draw(runtime)?;
+            if self.tick_tui_action_jobs().any() {
+                self.draw(runtime)?;
+            }
+            let Some(event) = runtime.poll_event(Duration::from_millis(100))? else {
+                continue;
+            };
+            let RuntimeEvent::Key(event) = event else {
+                continue;
+            };
+            if event.kind != KeyEventKind::Press {
+                continue;
+            }
+            error = None;
+
+            if let Some(mut menu) = dropdown {
+                let Some(view::FormField {
+                    kind: view::FormFieldKind::Enum { options },
+                    ..
+                }) = fields.get_mut(selected)
+                else {
+                    dropdown = None;
+                    continue;
+                };
+                match event.code {
+                    KeyCode::Esc => dropdown = None,
+                    KeyCode::Enter if plain_key(event) => {
+                        if let Some(value) = options.get(menu.selected) {
+                            fields[selected].value = value.clone();
+                        }
+                        dropdown = None;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') if plain_key(event) => {
+                        menu.selected = menu.selected.saturating_sub(1);
+                        dropdown = Some(menu);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') if plain_key(event) => {
+                        menu.selected = menu
+                            .selected
+                            .saturating_add(1)
+                            .min(options.len().saturating_sub(1));
+                        dropdown = Some(menu);
+                    }
+                    KeyCode::Home if plain_key(event) => {
+                        menu.selected = 0;
+                        dropdown = Some(menu);
+                    }
+                    KeyCode::End if plain_key(event) => {
+                        menu.selected = options.len().saturating_sub(1);
+                        dropdown = Some(menu);
+                    }
+                    KeyCode::Char('c') if ctrl_key(event) => {
+                        self.dialog = None;
+                        self.draw(runtime)?;
+                        return Ok(None);
+                    }
+                    _ => dropdown = Some(menu),
+                }
+                continue;
+            }
+
+            let field_kind = fields.get(selected).map(|field| field.kind.clone());
+            match event.code {
+                KeyCode::Esc | KeyCode::Char('c')
+                    if event.code == KeyCode::Esc || ctrl_key(event) =>
+                {
+                    self.dialog = None;
+                    self.draw(runtime)?;
+                    return Ok(None);
+                }
+                KeyCode::Tab | KeyCode::Down if plain_key(event) => {
+                    selected = selected.saturating_add(1).min(fields.len());
+                }
+                KeyCode::BackTab | KeyCode::Up if plain_key(event) => {
+                    selected = selected.saturating_sub(1);
+                }
+                KeyCode::Enter if plain_key(event) && selected == fields.len() => {
+                    match validate_workflow_form(workflow, worktree, &mut fields) {
+                        Ok(values) => {
+                            self.dialog = None;
+                            self.draw(runtime)?;
+                            return Ok(Some(values));
+                        }
+                        Err((field, problem)) => {
+                            selected = field;
+                            error = Some(problem);
+                        }
+                    }
+                }
+                KeyCode::Enter if plain_key(event) => match field_kind {
+                    Some(view::FormFieldKind::String | view::FormFieldKind::Number) => {
+                        selected = selected.saturating_add(1).min(fields.len());
+                    }
+                    Some(view::FormFieldKind::Bool) => {
+                        toggle_bool_field(&mut fields[selected].value);
+                    }
+                    Some(view::FormFieldKind::Enum { ref options }) => {
+                        dropdown = Some(view::FormDropdown {
+                            selected: selected_option(options, &fields[selected].value),
+                        });
+                    }
+                    Some(view::FormFieldKind::File { .. }) => {
+                        let picked = runtime.suspend_for(|| {
+                            Ok(pick_workflow_file(
+                                fzf,
+                                &fields[selected].name,
+                                worktree,
+                                workflow,
+                            ))
+                        })?;
+                        match picked {
+                            Ok(Some(value)) => fields[selected].value = value,
+                            Ok(None) => {}
+                            Err(problem) => error = Some(problem),
+                        }
+                    }
+                    None => {}
+                },
+                KeyCode::Char(' ') if plain_key(event) => match field_kind {
+                    Some(view::FormFieldKind::Bool) => {
+                        toggle_bool_field(&mut fields[selected].value);
+                    }
+                    Some(view::FormFieldKind::Enum { ref options }) => {
+                        dropdown = Some(view::FormDropdown {
+                            selected: selected_option(options, &fields[selected].value),
+                        });
+                    }
+                    Some(view::FormFieldKind::File { .. }) => {
+                        let picked = runtime.suspend_for(|| {
+                            Ok(pick_workflow_file(
+                                fzf,
+                                &fields[selected].name,
+                                worktree,
+                                workflow,
+                            ))
+                        })?;
+                        match picked {
+                            Ok(Some(value)) => fields[selected].value = value,
+                            Ok(None) => {}
+                            Err(problem) => error = Some(problem),
+                        }
+                    }
+                    Some(view::FormFieldKind::String) => fields[selected].value.push(' '),
+                    _ => {}
+                },
+                KeyCode::Left | KeyCode::Right if plain_key(event) => match field_kind {
+                    Some(view::FormFieldKind::Bool) => {
+                        fields[selected].value = if event.code == KeyCode::Left {
+                            "false".into()
+                        } else {
+                            "true".into()
+                        };
+                    }
+                    Some(view::FormFieldKind::Enum { ref options }) => {
+                        cycle_enum_field(
+                            &mut fields[selected].value,
+                            options,
+                            event.code == KeyCode::Right,
+                        );
+                    }
+                    _ => {}
+                },
+                KeyCode::Backspace if plain_key(event) => {
+                    if let Some(field) = fields.get_mut(selected) {
+                        match field.kind {
+                            view::FormFieldKind::String | view::FormFieldKind::Number => {
+                                field.value.pop();
+                            }
+                            view::FormFieldKind::File { .. } => field.value.clear(),
+                            _ => {}
+                        }
+                    }
+                }
+                KeyCode::Delete if plain_key(event) => {
+                    if let Some(field) = fields.get_mut(selected) {
+                        field.value.clear();
+                    }
+                }
+                KeyCode::Char(ch) if plain_key(event) && !ch.is_control() => {
+                    if let Some(field) = fields.get_mut(selected)
+                        && matches!(
+                            field.kind,
+                            view::FormFieldKind::String | view::FormFieldKind::Number
+                        )
+                    {
+                        field.value.push(ch);
+                    }
+                }
+                _ => {}
+            }
         }
     }
 

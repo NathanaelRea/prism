@@ -52,15 +52,17 @@ pub use workflow::kernel::{
 };
 pub use workflow::prompt_worker::{PromptWorkflowService, now_unix_ms as workflow_now_unix_ms};
 pub use workflow::source::{
-    CompiledWorkflow, CompiledWorkflowStep, DEFAULT_MAX_AGENT_RUNS, DiscoveredWorkflow,
-    MULTI_MODEL_REVIEW_EXAMPLE, PROMPT_WORKFLOW_TEMPLATE, ResolvedAgent,
+    CompiledWorkflow, CompiledWorkflowInput, CompiledWorkflowStep, DEFAULT_MAX_AGENT_RUNS,
+    DiscoveredWorkflow, MULTI_MODEL_REVIEW_EXAMPLE, PROMPT_WORKFLOW_TEMPLATE, ResolvedAgent,
     TriggerCatalog as StepTriggerCatalog, TriggerRevision,
-    WorkflowCatalog as PromptWorkflowCatalog, WorkflowDefaults, WorkflowDiagnostic, WorkflowScope,
-    WorkflowSource, WorkflowSourceError, WorkflowStepSource, archive_legacy_workflow_sources,
+    WorkflowCatalog as PromptWorkflowCatalog, WorkflowDefaults, WorkflowDiagnostic,
+    WorkflowInputDefault, WorkflowInputSource, WorkflowInputType, WorkflowScope, WorkflowSource,
+    WorkflowSourceError, WorkflowStepSource, archive_legacy_workflow_sources, bind_workflow_inputs,
     compile_workflow, copy_example as copy_workflow_example, prompt_workflow_schema,
     repository_resource_revision, repository_resources_are_trusted,
     resolve_workflow_agent_selection, seed_editable_defaults, trust_repository_resources,
-    validate_workflow_agent_selection,
+    validate_workflow_agent_selection, validate_workflow_file_input, validate_workflow_input,
+    workflow_file_input_candidates,
 };
 pub use workflow::standard_remote::{PrismProviderExecutor, ProductionStandardTriggerRemote};
 pub use workflow::standard_triggers::{

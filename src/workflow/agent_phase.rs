@@ -41,8 +41,12 @@ pub struct AgentRequest {
     pub harness: Option<String>,
     pub model: Option<String>,
     pub variant: Option<String>,
-    /// The authored prompt, with only explicitly selected predecessor context appended.
+    /// One authored turn. Only the initial turn may have selected predecessor context appended.
     pub prompt: String,
+    /// Existing native session for an authored follow-up turn. `None` starts a fresh session.
+    pub resume_session_id: Option<String>,
+    /// Require the fresh turn to report a native session that can accept a follow-up.
+    pub require_resumable_session: bool,
     pub cancellation: AgentCancellation,
 }
 
@@ -90,19 +94,28 @@ impl AgentExecutor for HarnessAgentExecutor {
                 .harness_config(harness_id)
                 .map_err(AgentExecutionError::Configuration)?;
             let harness = crate::harness::Harness::new(harness_id, &harness_config);
-            let invocation = harness
-                .headless_with_model(
+            let selection = crate::harness::AgentSelection {
+                model: request.model.as_deref(),
+                variant: request.variant.as_deref(),
+            };
+            let invocation = if let Some(session_id) = request.resume_session_id.as_deref() {
+                harness.headless_resume_with_model(
+                    &request.prompt,
+                    &request.worktree,
+                    session_id,
+                    selection,
+                )
+            } else {
+                harness.headless_with_model(
                     &request.prompt,
                     &request.worktree,
                     &format!("{} · {}", request.run_id, request.step_key),
                     None,
-                    crate::harness::AgentSelection {
-                        model: request.model.as_deref(),
-                        variant: request.variant.as_deref(),
-                    },
+                    selection,
                     false,
                 )
-                .map_err(AgentExecutionError::Configuration)?;
+            }
+            .map_err(AgentExecutionError::Configuration)?;
             execute_invocation(
                 invocation,
                 request,
@@ -234,10 +247,28 @@ async fn execute_invocation(
     let final_text = final_text.ok_or_else(|| {
         AgentExecutionError::Protocol("successful Agent produced no final message".into())
     })?;
+    if request.require_resumable_session
+        && request.resume_session_id.is_none()
+        && native_session.is_none()
+    {
+        return Err(AgentExecutionError::Protocol(format!(
+            "{adapter} did not report the native Agent Session required for follow-ups"
+        )));
+    }
+    if let (Some(expected), Some(observed)) = (
+        request.resume_session_id.as_deref(),
+        native_session.as_deref(),
+    ) && expected != observed
+    {
+        return Err(AgentExecutionError::Protocol(format!(
+            "follow-up resumed Agent Session {expected}, but {adapter} reported {observed}"
+        )));
+    }
+    let resumed_session = request.resume_session_id.clone();
     Ok(AgentOutcome {
         status: AgentOutcomeStatus::Succeeded,
         process_id,
-        session_id: native_session.unwrap_or_else(|| {
+        session_id: native_session.or(resumed_session).unwrap_or_else(|| {
             format!(
                 "{}:{}:{}",
                 adapter,
@@ -476,6 +507,66 @@ mod tests {
             ),
             "Implement\n\n--- Context from review-a ---\nfinding one\n\n--- Context from review-b ---\nfinding two"
         );
+    }
+
+    #[tokio::test]
+    async fn followup_requires_and_reuses_a_native_session_identity() {
+        fn invocation() -> crate::harness::Invocation {
+            crate::harness::Invocation {
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "printf '%s\\n' '{\"result\":\"done\"}'".into(),
+                ],
+                environment: std::collections::BTreeMap::new(),
+                stdin: None,
+                prompt_file: None,
+                structured_events: true,
+                attach: false,
+            }
+        }
+
+        let request = AgentRequest {
+            run_id: "run".into(),
+            step_key: "step".into(),
+            attempt_id: "attempt".into(),
+            repository: "/repo".into(),
+            worktree: "/tmp".into(),
+            harness: Some("pi".into()),
+            model: None,
+            variant: None,
+            prompt: "follow up".into(),
+            resume_session_id: Some("native-session".into()),
+            require_resumable_session: false,
+            cancellation: AgentCancellation::default(),
+        };
+        let outcome = execute_invocation(
+            invocation(),
+            request.clone(),
+            "pi".into(),
+            Duration::from_secs(5),
+            1024,
+            1024,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.session_id, "native-session");
+
+        let error = execute_invocation(
+            invocation(),
+            AgentRequest {
+                resume_session_id: None,
+                require_resumable_session: true,
+                ..request
+            },
+            "pi".into(),
+            Duration::from_secs(5),
+            1024,
+            1024,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("required for follow-ups"));
     }
 
     #[test]

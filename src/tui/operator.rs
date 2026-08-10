@@ -92,6 +92,19 @@ impl Tui {
             .and_then(|index| self.sessions.get(index))
             .map(|session| session.path.clone())
             .unwrap_or_else(|| self.repo.root.clone());
+        let input_values = if action == "run" {
+            let workflow = catalog
+                .get(&name)
+                .ok_or_else(|| format!("selected Workflow '{name}' disappeared"))?;
+            let Some(values) =
+                self.prompt_workflow_input_form(runtime, workflow, &worktree, &fzf)?
+            else {
+                return Ok(());
+            };
+            values
+        } else {
+            Default::default()
+        };
         let status = runtime.suspend_for(|| {
             let mut command = Command::new(executable);
             command
@@ -100,6 +113,9 @@ impl Tui {
                 .args(["workflow", &action, &name]);
             if action == "run" {
                 command.arg("--worktree").arg(&worktree);
+                for (input_name, value) in &input_values {
+                    command.arg("--input").arg(format!("{input_name}={value}"));
+                }
             }
             command
                 .status()

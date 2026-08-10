@@ -1,6 +1,8 @@
+use std::collections::BTreeMap;
 use std::fs;
+use std::io::{IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -273,14 +275,22 @@ async fn run_workflow_async(repo: Option<&Path>, arguments: &[String]) -> Result
             let mut workflow = workflow;
             crate::resolve_workflow_agent_selection(&mut workflow, &config)
                 .map_err(format_workflow_diagnostics)?;
-            let worktree = option_value(&arguments, "--worktree")
-                .map(PathBuf::from)
+            let launch_arguments = parse_workflow_run_arguments(&arguments[2..])?;
+            let worktree = launch_arguments
+                .worktree
                 .unwrap_or(std::env::current_dir().map_err(string_error)?);
             let worktree = if worktree.exists() {
                 worktree.canonicalize().map_err(string_error)?
             } else {
                 return Err(format!("worktree {} does not exist", worktree.display()));
             };
+            let workflow = bind_launch_inputs(
+                &workflow,
+                launch_arguments.inputs,
+                &worktree,
+                &config,
+                json_output,
+            )?;
             let (change_request, change_request_head) =
                 prompt_change_request_subject(&repository, &config, &worktree);
             let now = now_ms();
@@ -303,7 +313,7 @@ async fn run_workflow_async(repo: Option<&Path>, arguments: &[String]) -> Result
             output(
                 json_output,
                 "workflow.run",
-                &json!({"run_id": launched, "workflow": name, "status": "queued"}),
+                &json!({"run_id": launched, "workflow": name, "inputs": workflow.input_values, "status": "queued"}),
                 || format!("run_id = {launched}\nstatus = queued"),
             )
         }
@@ -663,6 +673,178 @@ fn edit(path: &Path) -> Result<(), String> {
     }
 }
 
+#[derive(Debug, Default)]
+struct WorkflowRunArguments {
+    worktree: Option<PathBuf>,
+    inputs: BTreeMap<String, String>,
+}
+
+fn parse_workflow_run_arguments(arguments: &[String]) -> Result<WorkflowRunArguments, String> {
+    let mut parsed = WorkflowRunArguments::default();
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--worktree" => {
+                let value = arguments
+                    .get(index + 1)
+                    .ok_or_else(|| "--worktree requires a path".to_string())?;
+                if parsed.worktree.replace(PathBuf::from(value)).is_some() {
+                    return Err("--worktree may be specified only once".into());
+                }
+                index += 2;
+            }
+            "--input" => {
+                let assignment = arguments
+                    .get(index + 1)
+                    .ok_or_else(|| "--input requires <name>=<value>".to_string())?;
+                let (name, value) = assignment
+                    .split_once('=')
+                    .ok_or_else(|| "--input requires <name>=<value>".to_string())?;
+                if name.is_empty() || value.is_empty() {
+                    return Err("--input requires non-empty <name>=<value>".into());
+                }
+                if parsed.inputs.insert(name.into(), value.into()).is_some() {
+                    return Err(format!(
+                        "Workflow input '{name}' was provided more than once"
+                    ));
+                }
+                index += 2;
+            }
+            argument => return Err(format!("unknown workflow run argument: {argument}")),
+        }
+    }
+    Ok(parsed)
+}
+
+fn bind_launch_inputs(
+    workflow: &crate::CompiledWorkflow,
+    mut supplied: BTreeMap<String, String>,
+    worktree: &Path,
+    config: &crate::config::Config,
+    json_output: bool,
+) -> Result<crate::CompiledWorkflow, String> {
+    for (name, input) in &workflow.inputs {
+        if supplied.contains_key(name) || input.default_value().is_some() {
+            continue;
+        }
+        if json_output || !std::io::stdin().is_terminal() {
+            return Err(format!(
+                "missing required Workflow input '{name}' ({type_name}); pass --input {name}=<value>",
+                type_name = input.type_name()
+            ));
+        }
+        let value = select_workflow_input(&config.tool("fzf"), name, worktree, input)?;
+        supplied.insert(name.clone(), value);
+    }
+    crate::bind_workflow_inputs(workflow, worktree, &supplied).map_err(|error| error.to_string())
+}
+
+fn select_workflow_input(
+    fzf: &str,
+    name: &str,
+    worktree: &Path,
+    input: &crate::CompiledWorkflowInput,
+) -> Result<String, String> {
+    match input {
+        crate::CompiledWorkflowInput::File { glob, .. } => {
+            let candidates = crate::workflow_file_input_candidates(worktree, input)
+                .map_err(|error| error.to_string())?;
+            if candidates.is_empty() {
+                return Err(format!(
+                    "Workflow input '{name}' found no files matching '{glob}' under {}",
+                    worktree.display()
+                ));
+            }
+            select_fzf_value(
+                fzf,
+                name,
+                &format!("Select a file matching {glob}"),
+                &candidates,
+            )
+        }
+        crate::CompiledWorkflowInput::Enum { options, .. } => {
+            select_fzf_value(fzf, name, "Select one option", options)
+        }
+        crate::CompiledWorkflowInput::Bool { .. } => select_fzf_value(
+            fzf,
+            name,
+            "Select true or false",
+            &["true".into(), "false".into()],
+        ),
+        crate::CompiledWorkflowInput::String { .. } => {
+            prompt_typed_workflow_input(name, "text", worktree, input)
+        }
+        crate::CompiledWorkflowInput::Number { .. } => {
+            prompt_typed_workflow_input(name, "number", worktree, input)
+        }
+    }
+}
+
+fn select_fzf_value(
+    fzf: &str,
+    name: &str,
+    header: &str,
+    candidates: &[String],
+) -> Result<String, String> {
+    let mut child = Command::new(fzf)
+        .args([
+            &format!("--prompt={name}> "),
+            &format!("--header={header}"),
+            "--height=80%",
+            "--reverse",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("start fzf '{fzf}' for Workflow input '{name}': {error}"))?;
+    {
+        let stdin = child.stdin.as_mut().expect("fzf stdin is piped");
+        for candidate in candidates {
+            writeln!(stdin, "{candidate}")
+                .map_err(|error| format!("write Workflow input candidates: {error}"))?;
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("wait for Workflow input picker: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("Workflow input '{name}' selection cancelled"));
+    }
+    let selected = String::from_utf8(output.stdout)
+        .map_err(|error| format!("Workflow input picker returned invalid UTF-8: {error}"))?;
+    let selected = selected.trim_end_matches(['\r', '\n']);
+    if selected.is_empty() {
+        return Err(format!("Workflow input '{name}' selection was empty"));
+    }
+    Ok(selected.to_string())
+}
+
+fn prompt_typed_workflow_input(
+    name: &str,
+    type_name: &str,
+    worktree: &Path,
+    input: &crate::CompiledWorkflowInput,
+) -> Result<String, String> {
+    loop {
+        eprint!("Workflow input {name} ({type_name}): ");
+        std::io::stderr()
+            .flush()
+            .map_err(|error| format!("flush Workflow input prompt: {error}"))?;
+        let mut value = String::new();
+        std::io::stdin()
+            .read_line(&mut value)
+            .map_err(|error| format!("read Workflow input '{name}': {error}"))?;
+        if value.is_empty() {
+            return Err(format!("Workflow input '{name}' reached end of input"));
+        }
+        let value = value.trim_end_matches(['\r', '\n']);
+        match crate::validate_workflow_input(worktree, input, value) {
+            Ok(value) => return Ok(value),
+            Err(problem) => eprintln!("Invalid value for {name}: {problem}"),
+        }
+    }
+}
+
 fn split_json(arguments: &[String]) -> (Vec<String>, bool) {
     (
         arguments
@@ -758,4 +940,41 @@ fn now_ms() -> i64 {
         .ok()
         .and_then(|value| i64::try_from(value.as_millis()).ok())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workflow_run_arguments_accept_repeatable_named_inputs() {
+        let arguments = [
+            "--input",
+            "plan=plan-workflows.md",
+            "--worktree",
+            "/repo/wt",
+            "--input",
+            "publish=false",
+        ]
+        .map(str::to_string);
+        let parsed = parse_workflow_run_arguments(&arguments).unwrap();
+        assert_eq!(parsed.worktree, Some(PathBuf::from("/repo/wt")));
+        assert_eq!(parsed.inputs["plan"], "plan-workflows.md");
+        assert_eq!(parsed.inputs["publish"], "false");
+    }
+
+    #[test]
+    fn workflow_run_arguments_reject_duplicates_and_unknown_flags() {
+        let duplicate = ["--input", "plan=a.md", "--input", "plan=b.md"].map(str::to_string);
+        assert!(
+            parse_workflow_run_arguments(&duplicate)
+                .unwrap_err()
+                .contains("more than once")
+        );
+        assert!(
+            parse_workflow_run_arguments(&["--unknown".to_string()])
+                .unwrap_err()
+                .contains("unknown")
+        );
+    }
 }

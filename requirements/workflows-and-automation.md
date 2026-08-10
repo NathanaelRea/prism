@@ -17,22 +17,33 @@
   invalid context ancestry, unresolved Triggers, unsupported explicit Agent
   overrides, and unknown source fields. Diagnostics identify source locations.
 - **Invariant**: Starting a run persists an immutable snapshot of source bytes,
-  compiled dependencies, prompts, harness/model/variant selection, context
-  selection, and external Trigger executable digests. Edits affect future runs
-  only.
+  compiled dependencies, typed input declarations, canonical bound input values,
+  bound prompts, harness/model/variant selection, context selection, and external
+  Trigger executable digests. Edits affect future runs only.
 
 ## Steps And Triggers
 
-- **Behavior**: A Workflow Step is one Agent prompt with an optional Trigger.
-  Harness, model, and variant can be inherited from Workflow defaults or
-  overridden by the Step.
-- **Invariant**: Every Agent lifecycle starts a fresh Agent Session. The ordinary
-  Workflow path never resumes or shares a native session between Steps or
-  repeated runs of one Step.
-- **Invariant**: Prism sends authored prompt text unchanged unless `context`
-  explicitly selects predecessor final messages. Selected messages are appended
-  as labeled plain-text sections; Prism adds no serialized evidence blob,
-  provider state, Trigger state, or required JSON-output instruction.
+- **Customization**: `[inputs.<name>]` declares a `file`, `string`, `bool`,
+  `number`, or `enum` input. Omitting `type` while declaring a relative `glob` is
+  shorthand for `file`. String lengths, numeric ranges, and enum options may be
+  constrained. An optional typed `default` makes explicit launch input
+  unnecessary; otherwise the input is required.
+- **Invariant**: Agent turns reference canonical input text as `{{name}}`.
+  Booleans render as `true`/`false`, numbers as finite JSON numbers, enum values
+  must exactly match an authored option, and files render as normalized
+  worktree-relative paths. Prism never inserts file contents implicitly.
+- **Behavior**: A Workflow Step has one initial Agent prompt, optional authored
+  `followups`, and an optional Trigger. Harness, model, and variant can be
+  inherited from Workflow defaults or overridden by the Step.
+- **Invariant**: Every Agent lifecycle starts a fresh Agent Session. Authored
+  follow-ups resume only that lifecycle's session; sessions are never shared
+  between Steps or repeated lifecycle attempts.
+- **Invariant**: Prism sends authored prompt text unchanged except for declared
+  declared `{{input}}` substitution and `context` explicitly selecting predecessor
+  final messages. Selected messages are appended as labeled plain-text sections
+  to the initial prompt only; follow-ups otherwise remain unchanged. Prism adds
+  no serialized evidence blob, provider state, Trigger state, or required
+  JSON-output instruction.
 - **Behavior**: A Trigger decision is `Run`, `Satisfied`, `Wait`, or `Fail`. Every
   decision carries a bounded human-readable summary; `Wait` also carries the
   earliest wake time.
@@ -40,9 +51,9 @@
   `post_step_run` may mutate and receive stable run, Step, and attempt identity.
   Prepared state is persisted before Agent start, remains opaque to Workflow
   source, and is never included in the prompt.
-- **Invariant**: `post_step_run` runs only after a successful Agent settlement
-  and receives status, session identity, and final text. Agent success does not
-  require an application JSON shape.
+- **Invariant**: `post_step_run` runs only after every authored Agent turn settles
+  successfully and receives the shared session identity and final turn text.
+  Agent success does not require an application JSON shape.
 - **Behavior**: A Step without a Trigger runs once after dependencies are
   satisfied. A triggered Step may run again after later observations invalidate
   the current cycle.
@@ -72,26 +83,30 @@
   observations can never be assembled into false success.
 - **Behavior**: `Wait` persists the reason and wake time without occupying an
   Agent slot. TUI closure and worker restart do not lose the wake.
-- **Invariant**: Every Agent start, including a failed start or manual retry,
-  consumes the run's persisted `max_agent_runs` budget. Trigger checks, queue
-  waits, and hook-only checks do not. Exhaustion produces `needs_input`.
+- **Invariant**: Every fresh Agent lifecycle start, including a failed start or
+  manual retry, consumes one persisted `max_agent_runs` budget unit. Authored
+  follow-up turns in that lifecycle do not consume another unit. Trigger checks,
+  queue waits, and hook-only checks do not. Exhaustion produces `needs_input`.
 
 ## Persistence, Recovery, And Control
 
 - **Constraint**: One on-demand per-user Prism Worker owns Workflow scheduling
   independently of the TUI.
-- **Invariant**: The compact ledger persists Workflow snapshots, pinned Trigger
-  revisions, runs and Agent budgets, compiled Steps and edges, Trigger
-  decisions/summaries/wakes, lifecycle attempts/phases, prepared state, Agent
-  process/session/final text, and concise events.
+- **Invariant**: The compact ledger persists Workflow snapshots, bound launch
+  input values, pinned Trigger revisions, runs and Agent budgets, compiled Steps
+  and edges, Trigger
+  decisions/summaries/wakes, lifecycle attempts/phases, prepared state, every
+  completed Agent turn and session identity, final text, and concise events.
 - **Invariant**: Claimed phases use renewable leases and monotonically increasing
   fencing. A stale owner cannot commit a phase result or begin another effect.
 - **Invariant**: A worktree mutation claim serializes Agents and mutating hooks.
   A lost claim with uncertain effects becomes `recovery_required` until safely
   reconciled.
 - **Behavior**: A crash after prepared state is persisted resumes at the Agent
-  phase. A repeatable standard prepare/finalize hook may reconcile and resume;
-  an uncertain custom hook is not blindly repeated.
+  phase. A crash between persisted Agent turns resumes the next follow-up in the
+  same native session; an interrupted turn is recovery-required rather than
+  blindly repeated. A repeatable standard prepare/finalize hook may reconcile
+  and resume; an uncertain custom hook is not blindly repeated.
 - **Behavior**: Runs expose queued, running, waiting, needs-input, paused,
   succeeded, failed, cancelled, and recovery-required outcomes. One visible Step
   row exposes checking, preparing, running Agent, finalizing, and waiting phases.
@@ -114,6 +129,14 @@
   conventional directories.
 - **Behavior**: Repository resources take precedence over user resources with
   the same filename identity. List and edit surfaces show source provenance.
+- **Behavior**: Repeatable `workflow run --input name=value` arguments bind
+  inputs explicitly. Non-interactive launches apply defaults and fail when a
+  required value is absent. Direct interactive CLI launches use line entry for
+  strings/numbers and `fzf` for files, enums, and booleans.
+- **Behavior**: TUI launches present one form with authored descriptions,
+  required/default status, inline string/number editing, boolean toggles, enum
+  dropdowns, and `fzf` file selection. The form validates every value before
+  launch and retains entered values when reporting an error.
 - **Invariant**: Repository-owned executable resources are not used before
   repository trust. Active runs retain content-addressed source and executable
   bytes.

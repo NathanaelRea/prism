@@ -798,6 +798,47 @@ fn renders_footer_status_message_and_leader_overlay() {
 }
 
 #[test]
+fn workflow_input_form_renders_types_defaults_and_enum_dropdown() {
+    let config = test_config();
+    let sessions = vec![test_session("feature", AgentState::Idle)];
+    let mut model = test_model(&config, &sessions, PanelFocus::Status, None, None);
+    model.dialog = Some(DialogModel::Form {
+        title: "Run release".into(),
+        fields: vec![
+            FormField {
+                name: "title".into(),
+                value: "Release 1".into(),
+                description: Some("Short release title".into()),
+                constraint: Some("3–80 chars".into()),
+                required: true,
+                kind: FormFieldKind::String,
+            },
+            FormField {
+                name: "mode".into(),
+                value: "safe".into(),
+                description: None,
+                constraint: Some("2 options".into()),
+                required: false,
+                kind: FormFieldKind::Enum {
+                    options: vec!["safe".into(), "fast".into()],
+                },
+            },
+        ],
+        selected: 1,
+        dropdown: Some(FormDropdown { selected: 1 }),
+        error: Some("count must be a number".into()),
+    });
+
+    let rendered = render_to_string(&model, 100, 30);
+    assert!(rendered.contains("Run release"));
+    assert!(rendered.contains("title [required] (string: 3–80 chars): Release 1"));
+    assert!(rendered.contains("mode [default] (enum: 2 options): safe"));
+    assert!(rendered.contains("▶ fast"));
+    assert!(rendered.contains("Error: count must be a number"));
+    assert!(rendered.contains("Enter choose"));
+}
+
+#[test]
 fn renders_dialog_overlays() {
     let config = test_config();
     let sessions = vec![test_session("feature", AgentState::Idle)];

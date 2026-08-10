@@ -95,6 +95,12 @@ pub struct WorkflowAttemptState {
     pub status: AttemptStatus,
     pub phase: StepPhase,
     pub prepared_state: Option<PreparedState>,
+    /// Completed authored turns in this attempt, in submission order.
+    #[serde(default)]
+    pub agent_turns: Vec<AgentOutcome>,
+    /// A persisted turn start without a matching outcome is deliberately uncertain.
+    #[serde(default)]
+    pub agent_turn_in_flight: Option<u32>,
     pub agent_outcome: Option<AgentOutcome>,
     pub error: Option<String>,
     pub started_unix_ms: i64,
@@ -239,6 +245,16 @@ impl WorkflowScheduler {
         if command.run_id.trim().is_empty() {
             return Err(WorkflowKernelError::Invalid(
                 "run id must not be empty".into(),
+            ));
+        }
+        if command
+            .workflow
+            .inputs
+            .keys()
+            .ne(command.workflow.input_values.keys())
+        {
+            return Err(WorkflowKernelError::Invalid(
+                "Workflow launch inputs were not fully bound".into(),
             ));
         }
         self.store.retain_workflow(command.workflow).await?;
@@ -572,42 +588,74 @@ impl WorkflowScheduler {
         attempt_index: usize,
         now_unix_ms: i64,
     ) -> Result<SchedulerProgress, WorkflowKernelError> {
-        if run.agent_runs_consumed >= run.max_agent_runs {
-            run.status = WorkflowRunStatus::NeedsInput;
-            run.steps[step_index].summary = Some(format!(
-                "Agent run budget exhausted ({}/{})",
-                run.agent_runs_consumed, run.max_agent_runs
-            ));
-            push_attempt_event(
-                run,
-                step_index,
-                attempt_index,
-                now_unix_ms,
-                "agent_budget_exhausted",
-                "needs input",
-            );
-            self.store.save_run(run).await?;
-            return Ok(SchedulerProgress::NeedsInput);
-        }
         let step = &workflow.steps[step_index];
         let authored = step.prompt.as_deref().ok_or_else(|| {
             WorkflowKernelError::Invalid(format!("Step {} has no Agent prompt", step.key))
         })?;
         let contexts = selected_context(workflow, run, step)?;
-        let prompt = prompt_with_context(authored, &contexts);
-        run.agent_runs_consumed += 1;
-        run.steps[step_index].attempts[attempt_index].phase = StepPhase::RunningAgent;
-        run.steps[step_index].phase = StepPhase::RunningAgent;
-        claim_attempt_phase(run, step_index, attempt_index, &self.worker_id, now_unix_ms);
-        push_attempt_event(
-            run,
-            step_index,
-            attempt_index,
-            now_unix_ms,
-            "agent_started",
-            "fresh Agent Session",
-        );
+        let mut prompts = Vec::with_capacity(step.followups.len() + 1);
+        prompts.push(prompt_with_context(authored, &contexts));
+        prompts.extend(step.followups.iter().cloned());
+
+        let resuming_turns =
+            run.steps[step_index].attempts[attempt_index].phase == StepPhase::RunningAgent;
+        if resuming_turns {
+            if run.steps[step_index].attempts[attempt_index]
+                .agent_turn_in_flight
+                .is_some()
+            {
+                recovery_required(
+                    run,
+                    step_index,
+                    attempt_index,
+                    now_unix_ms,
+                    "Agent turn outcome requires reconciliation",
+                );
+                self.store.save_run(run).await?;
+                return Ok(SchedulerProgress::RecoveryRequired);
+            }
+            claim_attempt_phase(run, step_index, attempt_index, &self.worker_id, now_unix_ms);
+            push_attempt_event(
+                run,
+                step_index,
+                attempt_index,
+                now_unix_ms,
+                "agent_session_resumed",
+                "resuming persisted Agent follow-ups",
+            );
+        } else {
+            if run.agent_runs_consumed >= run.max_agent_runs {
+                run.status = WorkflowRunStatus::NeedsInput;
+                run.steps[step_index].summary = Some(format!(
+                    "Agent run budget exhausted ({}/{})",
+                    run.agent_runs_consumed, run.max_agent_runs
+                ));
+                push_attempt_event(
+                    run,
+                    step_index,
+                    attempt_index,
+                    now_unix_ms,
+                    "agent_budget_exhausted",
+                    "needs input",
+                );
+                self.store.save_run(run).await?;
+                return Ok(SchedulerProgress::NeedsInput);
+            }
+            run.agent_runs_consumed += 1;
+            run.steps[step_index].attempts[attempt_index].phase = StepPhase::RunningAgent;
+            run.steps[step_index].phase = StepPhase::RunningAgent;
+            claim_attempt_phase(run, step_index, attempt_index, &self.worker_id, now_unix_ms);
+            push_attempt_event(
+                run,
+                step_index,
+                attempt_index,
+                now_unix_ms,
+                "agent_started",
+                "fresh Agent Session",
+            );
+        }
         self.store.save_run(run).await?;
+
         let attempt_id = run.steps[step_index].attempts[attempt_index].id.clone();
         let _worktree_claim = self
             .worktree_lock(&run.subject.worktree)
@@ -619,50 +667,136 @@ impl WorkflowScheduler {
             .lock()
             .await
             .insert(run.id.clone(), cancellation.clone());
-        let agent_future = self.agents.execute(AgentRequest {
-            run_id: run.id.clone(),
-            step_key: step.key.clone(),
-            attempt_id,
-            repository: run.subject.repository.clone(),
-            worktree: run.subject.worktree.clone(),
-            harness: step.agent.harness.clone(),
-            model: step.agent.model.clone(),
-            variant: step.agent.variant.clone(),
-            prompt,
-            cancellation: cancellation.clone(),
-        });
-        let execution = self
-            .supervise_phase(
+        let mut turn_started_unix_ms = now_unix_ms;
+
+        loop {
+            let turn_index = run.steps[step_index].attempts[attempt_index]
+                .agent_turns
+                .len();
+            if turn_index == prompts.len() {
+                break;
+            }
+            let turn_number = u32::try_from(turn_index + 1).map_err(|_| {
+                WorkflowKernelError::Invalid("Agent follow-up count exceeds u32".into())
+            })?;
+            let total_turns = prompts.len();
+            let resume_session_id = run.steps[step_index].attempts[attempt_index]
+                .agent_turns
+                .last()
+                .map(|outcome| outcome.session_id.clone());
+            run.steps[step_index].attempts[attempt_index].agent_turn_in_flight = Some(turn_number);
+            run.steps[step_index].summary = Some(format!(
+                "running Agent turn {}/{}",
+                turn_index + 1,
+                total_turns
+            ));
+            push_attempt_event(
                 run,
                 step_index,
                 attempt_index,
-                now_unix_ms,
-                &cancellation,
-                agent_future,
-            )
-            .await;
-        self.active_phases.lock().await.remove(&run.id);
-        let (outcome, completed_unix_ms) = execution?;
-        let outcome = match outcome {
-            Ok(outcome) => outcome,
-            Err(AgentExecutionError::Cancelled) => {
-                cancel_run(run, completed_unix_ms);
-                self.store.save_run(run).await?;
-                return Ok(SchedulerProgress::Cancelled);
-            }
-            Err(error) => {
+                turn_started_unix_ms,
+                "agent_turn_started",
+                &format!("turn {}/{}", turn_index + 1, total_turns),
+            );
+            self.store.save_run(run).await?;
+
+            let agent_future = self.agents.execute(AgentRequest {
+                run_id: run.id.clone(),
+                step_key: step.key.clone(),
+                attempt_id: attempt_id.clone(),
+                repository: run.subject.repository.clone(),
+                worktree: run.subject.worktree.clone(),
+                harness: step.agent.harness.clone(),
+                model: step.agent.model.clone(),
+                variant: step.agent.variant.clone(),
+                prompt: prompts[turn_index].clone(),
+                resume_session_id: resume_session_id.clone(),
+                require_resumable_session: total_turns > 1 && turn_index == 0,
+                cancellation: cancellation.clone(),
+            });
+            let execution = self
+                .supervise_phase(
+                    run,
+                    step_index,
+                    attempt_index,
+                    turn_started_unix_ms,
+                    &cancellation,
+                    agent_future,
+                )
+                .await;
+            let (outcome, completed_unix_ms) = match execution {
+                Ok(execution) => execution,
+                Err(error) => {
+                    self.active_phases.lock().await.remove(&run.id);
+                    return Err(error);
+                }
+            };
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(AgentExecutionError::Cancelled) => {
+                    self.active_phases.lock().await.remove(&run.id);
+                    run.steps[step_index].attempts[attempt_index].agent_turn_in_flight = None;
+                    cancel_run(run, completed_unix_ms);
+                    self.store.save_run(run).await?;
+                    return Ok(SchedulerProgress::Cancelled);
+                }
+                Err(error) => {
+                    self.active_phases.lock().await.remove(&run.id);
+                    run.steps[step_index].attempts[attempt_index].agent_turn_in_flight = None;
+                    fail_attempt(
+                        run,
+                        step_index,
+                        attempt_index,
+                        completed_unix_ms,
+                        error.to_string(),
+                    );
+                    self.store.save_run(run).await?;
+                    return Ok(SchedulerProgress::Failed);
+                }
+            };
+            if let Some(expected) = resume_session_id.as_deref()
+                && outcome.session_id != expected
+            {
+                self.active_phases.lock().await.remove(&run.id);
+                run.steps[step_index].attempts[attempt_index].agent_turn_in_flight = None;
                 fail_attempt(
                     run,
                     step_index,
                     attempt_index,
                     completed_unix_ms,
-                    error.to_string(),
+                    format!(
+                        "Agent follow-up resumed session {expected}, but reported {}",
+                        outcome.session_id
+                    ),
                 );
                 self.store.save_run(run).await?;
                 return Ok(SchedulerProgress::Failed);
             }
-        };
+            run.steps[step_index].attempts[attempt_index]
+                .agent_turns
+                .push(outcome);
+            run.steps[step_index].attempts[attempt_index].agent_turn_in_flight = None;
+            push_attempt_event(
+                run,
+                step_index,
+                attempt_index,
+                completed_unix_ms,
+                "agent_turn_succeeded",
+                &format!("turn {}/{}", turn_index + 1, total_turns),
+            );
+            self.store.save_run(run).await?;
+            turn_started_unix_ms = completed_unix_ms;
+        }
+
+        self.active_phases.lock().await.remove(&run.id);
         drop(_worktree_claim);
+        let outcome = run.steps[step_index].attempts[attempt_index]
+            .agent_turns
+            .last()
+            .cloned()
+            .ok_or_else(|| {
+                WorkflowKernelError::Invalid("Agent produced no completed turns".into())
+            })?;
         run.steps[step_index].attempts[attempt_index].agent_outcome = Some(outcome);
         release_attempt_phase(run, step_index, attempt_index);
         run.steps[step_index].attempts[attempt_index].phase = StepPhase::AgentSucceeded;
@@ -671,13 +805,19 @@ impl WorkflowScheduler {
             run,
             step_index,
             attempt_index,
-            completed_unix_ms,
+            turn_started_unix_ms,
             "agent_succeeded",
-            "final Agent text persisted",
+            "final Agent turn persisted",
         );
         self.store.save_run(run).await?;
-        self.finalize_attempt(workflow, run, step_index, attempt_index, completed_unix_ms)
-            .await
+        self.finalize_attempt(
+            workflow,
+            run,
+            step_index,
+            attempt_index,
+            turn_started_unix_ms,
+        )
+        .await
     }
 
     async fn finalize_attempt(
@@ -915,15 +1055,8 @@ impl WorkflowScheduler {
                 }
             }
             StepPhase::RunningAgent => {
-                recovery_required(
-                    run,
-                    step_index,
-                    attempt_index,
-                    now_unix_ms,
-                    "Agent process outcome requires reconciliation",
-                );
-                self.store.save_run(run).await?;
-                Ok(SchedulerProgress::RecoveryRequired)
+                self.run_agent(workflow, run, step_index, attempt_index, now_unix_ms)
+                    .await
             }
             _ => Err(WorkflowKernelError::Invalid(format!(
                 "active Attempt {} has non-resumable phase {phase:?}",
@@ -1086,6 +1219,8 @@ fn begin_attempt(
         status: AttemptStatus::Active,
         phase: StepPhase::Preparing,
         prepared_state: None,
+        agent_turns: Vec::new(),
+        agent_turn_in_flight: None,
         agent_outcome: None,
         error: None,
         started_unix_ms: now,
@@ -1533,6 +1668,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn launch_requires_all_declared_inputs_to_be_bound() {
+        let workflow = workflow("[inputs.plan]\nglob='*.md'\n[[step]]\nprompt='review {{plan}}'\n");
+        let store = Arc::new(MemoryWorkflowRunStore::default());
+        let scheduler = WorkflowScheduler::new(
+            store,
+            TriggerRegistry::default(),
+            Arc::new(RecordingAgentExecutor::default()),
+        );
+        let error = scheduler
+            .start(StartPromptWorkflow {
+                run_id: "run",
+                workflow: &workflow,
+                subject: subject(),
+                now_unix_ms: 1,
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not fully bound"));
+    }
+
+    #[tokio::test]
     async fn waits_reruns_trigger_and_completes_only_after_full_cycle() {
         let workflow = workflow(
             "[[step]]\nid='repair'\ntrigger='needs_review'\nprompt='fix'\n[[step]]\ntrigger='ready_to_merge'\n",
@@ -1681,6 +1837,127 @@ mod tests {
             .filter_map(|attempt| attempt.agent_outcome.map(|outcome| outcome.session_id))
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(sessions.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn followups_share_one_session_and_one_agent_budget_unit() {
+        let workflow =
+            workflow("[[step]]\nprompt='audit'\nfollowups=['implement gaps','verify']\n");
+        let store = Arc::new(MemoryWorkflowRunStore::default());
+        let agents = Arc::new(RecordingAgentExecutor::default());
+        agents.push_outcome(outcome("shared", "found one gap"));
+        agents.push_outcome(outcome("shared", "implemented"));
+        agents.push_outcome(outcome("shared", "verified"));
+        let scheduler =
+            WorkflowScheduler::new(store.clone(), TriggerRegistry::default(), agents.clone());
+        scheduler
+            .start(StartPromptWorkflow {
+                run_id: "run",
+                workflow: &workflow,
+                subject: subject(),
+                now_unix_ms: 1,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            scheduler.tick("run", 2).await.unwrap(),
+            SchedulerProgress::Advanced
+        );
+        let requests = agents.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].prompt, "audit");
+        assert_eq!(requests[0].resume_session_id, None);
+        assert!(requests[0].require_resumable_session);
+        assert_eq!(requests[1].prompt, "implement gaps");
+        assert_eq!(requests[1].resume_session_id.as_deref(), Some("shared"));
+        assert_eq!(requests[2].prompt, "verify");
+        assert_eq!(requests[2].resume_session_id.as_deref(), Some("shared"));
+
+        let run = store.load_run("run").await.unwrap().unwrap();
+        let attempt = &run.steps[0].attempts[0];
+        assert_eq!(run.agent_runs_consumed, 1);
+        assert_eq!(attempt.agent_turns.len(), 3);
+        assert_eq!(
+            attempt.agent_outcome.as_ref().unwrap().final_text,
+            "verified"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_between_followups_resumes_without_repeating_a_completed_turn() {
+        let workflow = workflow("[[step]]\nprompt='audit'\nfollowups=['implement gaps']\n");
+        let store = Arc::new(MemoryWorkflowRunStore::default());
+        let agents = Arc::new(RecordingAgentExecutor::default());
+        agents.push_outcome(outcome("shared", "implemented"));
+        let scheduler =
+            WorkflowScheduler::new(store.clone(), TriggerRegistry::default(), agents.clone());
+        scheduler
+            .start(StartPromptWorkflow {
+                run_id: "run",
+                workflow: &workflow,
+                subject: subject(),
+                now_unix_ms: 1,
+            })
+            .await
+            .unwrap();
+
+        let mut crashed = store.load_run("run").await.unwrap().unwrap();
+        let attempt_index = begin_attempt(&mut crashed, 0, 2).unwrap();
+        let attempt = &mut crashed.steps[0].attempts[attempt_index];
+        attempt.prepared_state = Some(PreparedState::default());
+        attempt.phase = StepPhase::RunningAgent;
+        attempt.agent_turns.push(outcome("shared", "found one gap"));
+        crashed.steps[0].phase = StepPhase::RunningAgent;
+        crashed.agent_runs_consumed = 1;
+        store.save_run(&mut crashed).await.unwrap();
+
+        assert_eq!(
+            scheduler.tick("run", 3).await.unwrap(),
+            SchedulerProgress::Advanced
+        );
+        let requests = agents.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].prompt, "implement gaps");
+        assert_eq!(requests[0].resume_session_id.as_deref(), Some("shared"));
+        let run = store.load_run("run").await.unwrap().unwrap();
+        assert_eq!(run.agent_runs_consumed, 1);
+        assert_eq!(run.steps[0].attempts[0].agent_turns.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn interrupted_followup_requires_reconciliation_instead_of_repeating() {
+        let workflow = workflow("[[step]]\nprompt='audit'\nfollowups=['implement gaps']\n");
+        let store = Arc::new(MemoryWorkflowRunStore::default());
+        let scheduler = WorkflowScheduler::new(
+            store.clone(),
+            TriggerRegistry::default(),
+            Arc::new(RecordingAgentExecutor::default()),
+        );
+        scheduler
+            .start(StartPromptWorkflow {
+                run_id: "run",
+                workflow: &workflow,
+                subject: subject(),
+                now_unix_ms: 1,
+            })
+            .await
+            .unwrap();
+        let mut crashed = store.load_run("run").await.unwrap().unwrap();
+        let attempt_index = begin_attempt(&mut crashed, 0, 2).unwrap();
+        let attempt = &mut crashed.steps[0].attempts[attempt_index];
+        attempt.prepared_state = Some(PreparedState::default());
+        attempt.phase = StepPhase::RunningAgent;
+        attempt.agent_turns.push(outcome("shared", "found one gap"));
+        attempt.agent_turn_in_flight = Some(2);
+        crashed.steps[0].phase = StepPhase::RunningAgent;
+        crashed.agent_runs_consumed = 1;
+        store.save_run(&mut crashed).await.unwrap();
+
+        assert_eq!(
+            scheduler.tick("run", 3).await.unwrap(),
+            SchedulerProgress::RecoveryRequired
+        );
     }
 
     #[tokio::test]

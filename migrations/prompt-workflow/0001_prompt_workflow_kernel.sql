@@ -2,10 +2,10 @@
 create table if not exists workflow_database_identity (
   singleton integer primary key check(singleton=1),
   kind text not null check(kind='workflow'),
-  schema_epoch integer not null check(schema_epoch=3)
+  schema_epoch integer not null check(schema_epoch=4)
 );
 insert into workflow_database_identity(singleton, kind, schema_epoch)
-values(1, 'workflow', 3)
+values(1, 'workflow', 4)
 on conflict(singleton) do update set kind=excluded.kind, schema_epoch=excluded.schema_epoch;
 
 create table if not exists workflow_snapshot (
@@ -73,6 +73,7 @@ create table if not exists step_lifecycle_attempt (
   agent_process_id integer,
   agent_session_id text,
   agent_final_text text,
+  agent_turn_in_flight integer check(agent_turn_in_flight > 0),
   error text,
   started_unix_ms integer not null,
   finished_unix_ms integer,
@@ -81,6 +82,15 @@ create table if not exists step_lifecycle_attempt (
   lease_expires_unix_ms integer,
   foreign key(run_id, step_index) references workflow_step(run_id, step_index) on delete cascade,
   unique(run_id, step_index, attempt_number)
+);
+
+create table if not exists agent_turn (
+  attempt_id text not null references step_lifecycle_attempt(id) on delete cascade,
+  turn_number integer not null check(turn_number > 0),
+  process_id integer,
+  session_id text not null,
+  final_text text not null,
+  primary key(attempt_id, turn_number)
 );
 
 create table if not exists workflow_run_event (

@@ -23,7 +23,7 @@ Prism uses a lazygit-style panel model.
 - `o` from the Worktrees panel opens the selected Worktree Session's Worktrunk-configured HTTP(S) development URL. It remains available when listening is false, unknown, or stale; the details view reports that state.
 - `Space g R` resolves all unresolved inline review conversations visible when the key is pressed while `0 Main` is focused.
 - Unavailable `Space g` actions are shown in dark gray and ignored. Remote actions require a known change request and provider capability; repair actions also require a headless-capable harness.
-- `W` and `Space W` open one flat `fzf` picker of hot-discovered prompt Workflows for the selected Worktree Session. `Enter` runs the selected Workflow and `Ctrl-E` edits its source. The picker shows source scope and path.
+- `W` and `Space W` open one flat `fzf` picker of hot-discovered prompt Workflows for the selected Worktree Session. `Enter` opens the typed input form, then runs the selected Workflow; `Ctrl-E` edits its source. The picker shows source scope and path. In the form, `Tab`/arrow keys move, text and numbers edit inline, Space/left/right toggles booleans, enum fields open a dropdown, and file fields open `fzf`.
 - `{` / `}` selects the previous/next Workflow Run linked to the current Worktree Session.
 - `Space c` opens the unified configuration tree for global and repository settings, tracked
   repositories/keybindings, Worktrunk configuration, worktree columns, and Harness selection.

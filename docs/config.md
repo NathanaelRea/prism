@@ -115,17 +115,56 @@ and doctor/debug troubleshooting.
 
 ## Workflow health and retention
 
-`prism workflow validate` checks prompt-first source, graph structure, Trigger
-resolution, and explicit Agent selections. `prism workflow history --json`
+`prism workflow validate` checks prompt-first source, graph structure, declared
+`{{input}}` placeholders, Trigger resolution, explicit Agent selections, and
+headless continuation support for Steps with `followups`. Inputs are typed and
+use their canonical text form when substituted into prompts:
+
+```toml
+[inputs.plan]
+description = "Plan to implement"
+glob = "*.md" # file; `type = "file"` is optional for this shorthand
+
+[inputs.title]
+type = "string"
+min_length = 3
+max_length = 80
+
+[inputs.publish]
+type = "bool"
+default = false
+
+[inputs.attempts]
+type = "number"
+min = 1
+max = 5
+default = 2
+
+[inputs.mode]
+type = "enum"
+options = ["safe", "fast"]
+default = "safe"
+```
+
+An input without `default` is required. Defaults are applied in interactive and
+non-interactive launches. Launch values can be supplied as repeatable
+`--input name=value` arguments. The TUI presents one validated form: text and
+number fields edit inline, booleans toggle, enums use a dropdown, and file fields
+open `fzf` over matching worktree files. Direct interactive CLI launches use
+line input for strings/numbers and `fzf` for files, enums, and booleans. File
+values become normalized worktree-relative paths; Prism never inserts file
+contents implicitly. `prism workflow history --json`
 reports durable runs and lifecycle Attempts through the stable JSON envelope.
 `prism doctor` reports discovered Workflow provenance and validation failures.
 `prism debug paths` prints the user-wide Workflow database and Worker locations.
 
-The Worker retains immutable Workflow snapshots, pinned external Trigger bytes,
-prepared state, fresh Agent Session identity/final text, lifecycle events, and
-durable remote-lane cooldowns. An incompatible pre-cutover Workflow database is
-backed up once and replaced; generalized source in the user Workflow directory
-is archived rather than reinterpreted.
+The Worker retains immutable Workflow snapshots, typed declarations and
+canonical bound input values, pinned external Trigger bytes, prepared state,
+fresh Agent Session identity, every
+completed authored turn, lifecycle events, and durable remote-lane cooldowns. An
+incompatible pre-cutover Workflow database is backed up once and replaced;
+generalized source in the user Workflow directory is archived rather than
+reinterpreted.
 
 Repository `.prism/workflows` and `.prism/triggers` resources are ignored until
 their exact combined revision is trusted. Preview with

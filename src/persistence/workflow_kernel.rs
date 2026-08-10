@@ -8,15 +8,15 @@ use crate::workflow::kernel::{
 };
 use crate::workflow::source::CompiledWorkflow;
 
-const SCHEMA_EPOCH: i64 = 3;
+const SCHEMA_EPOCH: i64 = 4;
 const SCHEMA: &str = r#"
 create table if not exists workflow_database_identity (
   singleton integer primary key check(singleton=1),
   kind text not null check(kind='workflow'),
-  schema_epoch integer not null check(schema_epoch=3)
+  schema_epoch integer not null check(schema_epoch=4)
 );
 insert into workflow_database_identity(singleton, kind, schema_epoch)
-values(1, 'workflow', 3)
+values(1, 'workflow', 4)
 on conflict(singleton) do update set kind=excluded.kind, schema_epoch=excluded.schema_epoch;
 
 create table if not exists workflow_snapshot (
@@ -84,6 +84,7 @@ create table if not exists step_lifecycle_attempt (
   agent_process_id integer,
   agent_session_id text,
   agent_final_text text,
+  agent_turn_in_flight integer check(agent_turn_in_flight > 0),
   error text,
   started_unix_ms integer not null,
   finished_unix_ms integer,
@@ -92,6 +93,15 @@ create table if not exists step_lifecycle_attempt (
   lease_expires_unix_ms integer,
   foreign key(run_id, step_index) references workflow_step(run_id, step_index) on delete cascade,
   unique(run_id, step_index, attempt_number)
+);
+
+create table if not exists agent_turn (
+  attempt_id text not null references step_lifecycle_attempt(id) on delete cascade,
+  turn_number integer not null check(turn_number > 0),
+  process_id integer,
+  session_id text not null,
+  final_text text not null,
+  primary key(attempt_id, turn_number)
 );
 
 create table if not exists workflow_run_event (
@@ -496,7 +506,7 @@ async fn insert_projection(
                 .map(serde_json::to_string)
                 .transpose()
                 .map_err(|error| WorkflowKernelError::Persistence(error.to_string()))?;
-            sqlx::query("insert into step_lifecycle_attempt(id, run_id, step_index, attempt_number, status, phase, prepared_state_json, agent_status, agent_process_id, agent_session_id, agent_final_text, error, started_unix_ms, finished_unix_ms, fencing_token, phase_owner, lease_expires_unix_ms) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            sqlx::query("insert into step_lifecycle_attempt(id, run_id, step_index, attempt_number, status, phase, prepared_state_json, agent_status, agent_process_id, agent_session_id, agent_final_text, agent_turn_in_flight, error, started_unix_ms, finished_unix_ms, fencing_token, phase_owner, lease_expires_unix_ms) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
                 .bind(&attempt.id)
                 .bind(&run.id)
                 .bind(index)
@@ -508,6 +518,7 @@ async fn insert_projection(
                 .bind(attempt.agent_outcome.as_ref().and_then(|outcome| outcome.process_id).map(i64::from))
                 .bind(attempt.agent_outcome.as_ref().map(|outcome| &outcome.session_id))
                 .bind(attempt.agent_outcome.as_ref().map(|outcome| &outcome.final_text))
+                .bind(attempt.agent_turn_in_flight.map(i64::from))
                 .bind(&attempt.error)
                 .bind(attempt.started_unix_ms)
                 .bind(attempt.finished_unix_ms)
@@ -517,6 +528,20 @@ async fn insert_projection(
                 .execute(&mut **transaction)
                 .await
                 .map_err(persistence)?;
+            for (turn_index, turn) in attempt.agent_turns.iter().enumerate() {
+                let turn_number = i64::try_from(turn_index + 1).map_err(|_| {
+                    WorkflowKernelError::Persistence("Agent turn index overflow".into())
+                })?;
+                sqlx::query("insert into agent_turn(attempt_id, turn_number, process_id, session_id, final_text) values(?,?,?,?,?)")
+                    .bind(&attempt.id)
+                    .bind(turn_number)
+                    .bind(turn.process_id.map(i64::from))
+                    .bind(&turn.session_id)
+                    .bind(&turn.final_text)
+                    .execute(&mut **transaction)
+                    .await
+                    .map_err(persistence)?;
+            }
         }
     }
     for event in &run.events {
@@ -621,6 +646,79 @@ mod tests {
         store.create_run(&run).await.unwrap();
         assert_eq!(store.load_run("run").await.unwrap(), Some(run));
         store.close().await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn durable_projection_records_each_completed_agent_turn() {
+        use crate::workflow::agent_phase::RecordingAgentExecutor;
+        use crate::workflow::kernel::{SchedulerProgress, StartPromptWorkflow, WorkflowScheduler};
+        use crate::workflow::step_trigger::{AgentOutcome, AgentOutcomeStatus, TriggerRegistry};
+        use std::sync::Arc;
+
+        let root = std::env::temp_dir().join(format!(
+            "prism-prompt-turns-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Arc::new(
+            DurableWorkflowRunStore::open(&root.join("workflow.db"))
+                .await
+                .unwrap(),
+        );
+        let workflow = compile_workflow(
+            Path::new("followups.toml"),
+            "[[step]]\nprompt='audit'\nfollowups=['implement gaps']\n",
+            &TriggerCatalog::builtins(),
+        )
+        .unwrap();
+        let agents = Arc::new(RecordingAgentExecutor::default());
+        for text in ["found a gap", "implemented"] {
+            agents.push_outcome(AgentOutcome {
+                status: AgentOutcomeStatus::Succeeded,
+                process_id: Some(42),
+                session_id: "shared".into(),
+                final_text: text.into(),
+            });
+        }
+        let scheduler = WorkflowScheduler::new(store.clone(), TriggerRegistry::default(), agents);
+        scheduler
+            .start(StartPromptWorkflow {
+                run_id: "run",
+                workflow: &workflow,
+                subject: TriggerSubject {
+                    repository: "/repo".into(),
+                    worktree: "/repo/wt".into(),
+                    change_request: None,
+                    change_request_head: None,
+                },
+                now_unix_ms: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            scheduler.tick("run", 2).await.unwrap(),
+            SchedulerProgress::Advanced
+        );
+        let turns = sqlx::query_as::<_, (i64, String, String)>(
+            "select turn_number, session_id, final_text from agent_turn order by turn_number",
+        )
+        .fetch_all(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            turns,
+            vec![
+                (1, "shared".into(), "found a gap".into()),
+                (2, "shared".into(), "implemented".into()),
+            ]
+        );
+        drop(scheduler);
+        Arc::try_unwrap(store).ok().unwrap().close().await;
         std::fs::remove_dir_all(root).unwrap();
     }
 

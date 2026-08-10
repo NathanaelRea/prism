@@ -708,6 +708,82 @@ impl<'a> Harness<'a> {
         )
     }
 
+    /// Build one managed follow-up turn in an existing native Agent Session.
+    pub fn headless_resume_with_model(
+        &self,
+        prompt: &str,
+        cwd: &Path,
+        session_id: &str,
+        selection: AgentSelection<'_>,
+    ) -> Result<Invocation, String> {
+        if session_id.trim().is_empty() {
+            return Err("Agent Session ID must not be empty".to_string());
+        }
+        if self.config.adapter == "generic" {
+            return Err(format!(
+                "generic harness '{}' does not support managed headless session continuation",
+                self.id
+            ));
+        }
+        let AgentSelection { model, variant } = selection;
+        let mut argv = self.builtin_prefix();
+        match self.config.adapter.as_str() {
+            "opencode" => {
+                argv.push("run".to_string());
+                append_agent_selection(&mut argv, "opencode", model, variant);
+                argv.extend([
+                    "--format".to_string(),
+                    "json".to_string(),
+                    "--dir".to_string(),
+                    cwd.display().to_string(),
+                    "--session".to_string(),
+                    session_id.to_string(),
+                    prompt.to_string(),
+                ]);
+            }
+            "codex" => {
+                argv.extend([
+                    "exec".to_string(),
+                    "resume".to_string(),
+                    "--json".to_string(),
+                ]);
+                append_agent_selection(&mut argv, "codex", model, variant);
+                argv.extend([session_id.to_string(), prompt.to_string()]);
+            }
+            "claude" => {
+                argv.extend([
+                    "--print".to_string(),
+                    "--output-format".to_string(),
+                    "stream-json".to_string(),
+                    "--verbose".to_string(),
+                    "--resume".to_string(),
+                    session_id.to_string(),
+                ]);
+                append_agent_selection(&mut argv, "claude", model, variant);
+                argv.push(prompt.to_string());
+            }
+            "pi" => {
+                argv.extend([
+                    "--mode".to_string(),
+                    "json".to_string(),
+                    "--session".to_string(),
+                    session_id.to_string(),
+                ]);
+                append_agent_selection(&mut argv, "pi", model, variant);
+                argv.extend(["--print".to_string(), prompt.to_string()]);
+            }
+            _ => unreachable!("validated built-in adapter"),
+        }
+        Ok(Invocation {
+            argv,
+            environment: self.config.environment.clone(),
+            stdin: None,
+            prompt_file: None,
+            structured_events: true,
+            attach: true,
+        })
+    }
+
     fn builtin_prefix(&self) -> Vec<String> {
         let mut argv = self.config.interactive_command.clone();
         argv.extend(self.config.arguments.clone());
@@ -1057,6 +1133,89 @@ mod tests {
                 )
                 .unwrap_err()
                 .contains("does not declare")
+        );
+    }
+
+    #[test]
+    fn built_in_adapters_own_headless_followup_syntax() {
+        let cases = [
+            (
+                "opencode",
+                vec![
+                    "opencode",
+                    "run",
+                    "--format",
+                    "json",
+                    "--dir",
+                    "/tmp",
+                    "--session",
+                    "session-1",
+                    "follow up",
+                ],
+            ),
+            (
+                "codex",
+                vec![
+                    "codex",
+                    "exec",
+                    "resume",
+                    "--json",
+                    "session-1",
+                    "follow up",
+                ],
+            ),
+            (
+                "claude",
+                vec![
+                    "claude",
+                    "--print",
+                    "--output-format",
+                    "stream-json",
+                    "--verbose",
+                    "--resume",
+                    "session-1",
+                    "follow up",
+                ],
+            ),
+            (
+                "pi",
+                vec![
+                    "pi",
+                    "--mode",
+                    "json",
+                    "--session",
+                    "session-1",
+                    "--print",
+                    "follow up",
+                ],
+            ),
+        ];
+        for (adapter, expected) in cases {
+            let config = builtin(adapter);
+            let invocation = Harness::new(adapter, &config)
+                .headless_resume_with_model(
+                    "follow up",
+                    Path::new("/tmp"),
+                    "session-1",
+                    AgentSelection::default(),
+                )
+                .unwrap();
+            assert_eq!(invocation.argv, expected, "{adapter}");
+            assert!(invocation.structured_events);
+            assert!(invocation.attach);
+        }
+
+        let config = generic(vec!["agent", "run", "{prompt}"], PromptTransport::Argument);
+        assert!(
+            Harness::new("generic", &config)
+                .headless_resume_with_model(
+                    "follow up",
+                    Path::new("/tmp"),
+                    "session-1",
+                    AgentSelection::default(),
+                )
+                .unwrap_err()
+                .contains("does not support")
         );
     }
 
