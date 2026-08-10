@@ -1,0 +1,92 @@
+# ADR 0005: Native Windows Mechanisms
+
+## Status
+
+Accepted
+
+Supersedes ADR 0004's decision that the supported operating-system set is permanently closed to Linux and macOS. This ADR does not advertise Windows support: the existing build rejection and package metadata remain correct until the later porting phases and required native gates are complete.
+
+## Context
+
+Prism intends to support native `x86_64-pc-windows-msvc` without WSL, Cygwin, or MSYS2. Its Unix implementations own process-tree supervision, local IPC, best-effort recorder datagrams, file locks and identity, atomic persistence, private runtime paths, and the tmux command boundary. A successful cross-compile cannot establish the Windows behavior these contracts require.
+
+Phase 0 therefore keeps a standalone native spike crate under `spikes/windows`. Keeping it outside the root package allows the Windows mechanisms to execute while Prism still intentionally rejects an incomplete Windows build. `.github/workflows/windows-feasibility.yml` runs the crate on `windows-2022`; `scripts/windows-phase0-spikes.ps1` is the equivalent local entry point.
+
+The spikes use real process and crash boundaries rather than mocks. psmux is downloaded as an x64 archive at version 3.3.7 with SHA-256 `60ff7b236f64184921cef3c1ff2611aa5a36fcc7ed8e2a58e968b8ded57f6028`.
+
+## Decision
+
+Windows backends will remain in their capability-owning modules. Prism will not add a broad `Platform` trait.
+
+### Process supervision and identity
+
+Use `process-wrap` 9.1.0's Tokio `JobObject` backend. Spawn the root suspended, assign it to the Job Object before it runs, and combine it with `CREATE_NEW_PROCESS_GROUP` and kill-on-drop. Graceful cancellation may deliver `CTRL_BREAK_EVENT` to a compatible console process group for a bounded interval. Escalation terminates the Job Object and waits for its completion; it is the deterministic no-orphan guarantee.
+
+Use direct `windows` APIs for observations: `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE)`, `GetProcessTimes`, and a nonblocking handle wait. Persist the process creation time with the PID and reject a live PID whose creation time differs. The spike also places a child-owned Job Object inside Prism's outer job and proves outer cancellation removes the nested descendants.
+
+`command-group` is not selected because `process-wrap` exposes the stronger lifecycle needed here: assignment-before-resume, whole-job wait, explicit forced termination, and kill-on-drop. Console control delivery remains conditional; it never replaces forced Job Object cleanup.
+
+### Worker IPC and ownership
+
+Use `interprocess` 2.4.3 Tokio local sockets. They map to Unix sockets on existing hosts and named pipes on Windows while retaining Prism's external framed protocol. Windows listeners receive a protected DACL granting full access only to the current user and LocalSystem. Every connection must also authenticate with a cryptographically random per-run secret before parsing a request or subscription frame.
+
+Use an adjacent, permanent `fs4` lock file for single-owner election. Endpoint names are disposable; lock-file paths are not. Rebinding a name after listener drop and concurrent request/response and subscriber clients are native spike contracts.
+
+### Flight recorder transport
+
+Use nonblocking IPv4 loopback UDP datagrams on Windows with a random per-run secret in every packet, a fixed protocol version, and a 4 KiB event limit. Producers perform one nonblocking send and explicitly drop oversize or backpressured telemetry. Receivers bind only to `127.0.0.1`, use a fixed-size receive buffer, and reject packets with an invalid secret or version.
+
+Do not use `interprocess` message-mode named pipes for the recorder. In 2.4.3, Tokio message reading is disabled because Mio does not expose the `ERROR_MORE_DATA` behavior needed to preserve message boundaries. Byte-stream local sockets would require independent framing and subscriber lifecycle semantics and would not preserve the recorder's deliberately lossy datagram contract.
+
+The secret, not an unguessable UDP port, is the authentication boundary. Recorder loss remains non-fatal and bounded as it is on Unix.
+
+### Session runtime
+
+Keep the external command boundary and use psmux on Windows. Version 3.3.7 is the phase 0 compatibility pin. The spike proves detached session creation and rename, UTF-8 capture, Unicode buffer load/paste, command-based resize acceptance, real ConPTY attachment, terminal-driven resize, detach, kill, and namespace-scoped cleanup from a Rust parent.
+
+psmux 3.3.7 intentionally accepts `resize-window` as a no-op because the attached terminal owns its dimensions. Prism must not treat a successful Windows `resize-window` exit as evidence that the dimensions changed. Windows attach drives size through ConPTY, and detached capture observes psmux's actual reported dimensions. This is an explicit session-runtime policy difference to cover in the later command contract suite, not a stderr-string heuristic.
+
+`portable-pty-psmux` 0.9.6 is used only by the disposable spike to create a real ConPTY client on a headless runner. Its ConPTY flags match psmux's terminal expectations; upstream `portable-pty` 0.9.0 sets `PSEUDOCONSOLE_INHERIT_CURSOR` and blocks headless startup waiting for a cursor-position reply. The fork is not selected as a Prism production dependency; Prism continues to execute psmux as an external process.
+
+### Persistence, identity, and locking
+
+Stage replacement bytes adjacent to the target, flush the staging file, atomically commit with `ReplaceFileW`, and flush the resulting target handle. Use `file-id` 0.2.3's volume/file identity and retain identity checks across replacement. The spike proves that the path changes identity and contains the new bytes while a pre-commit open handle continues to observe the old bytes.
+
+Use `fs4` 1.1.0 for nonblocking cross-process file locks. The spike proves exclusivity and release after process death. Replacing a lock file can create a new lock domain even while an old handle remains locked, so lock files are permanent adjacent coordination objects and must never be atomically replaced.
+
+Windows does not provide a directly equivalent, documented parent-directory `fsync` contract. `ReplaceFileW` plus file-handle flushing is the selected starting mechanism; phase 4 must define the exact power-loss guarantee, sharing flags, reparse-point checks, and fault-injection expectations before this backend enters production.
+
+### Private runtime ACLs
+
+Create runtime directories and files with, or immediately apply, a protected DACL containing exactly allow entries for the current user and LocalSystem. Do not grant Builtin Users, Authenticated Users, Interactive Users, or Everyone. Verify the applied descriptor through Windows security APIs rather than inferring privacy from a path under the user profile.
+
+The same DACL construction is used for named-pipe listeners. Phase 4 will additionally own inheritance, owner validation, reparse-point rejection, and recovery when an existing path has an unsafe descriptor.
+
+## Verification
+
+On native x86-64 Windows with PowerShell 7:
+
+```powershell
+scripts/windows-phase0-spikes.ps1
+```
+
+The script verifies the pinned psmux archive, formatting, Clippy with warnings denied, and all seven runtime spikes. The pull-request feasibility workflow runs only this isolated contract crate; it is not the complete Windows Prism gate described by phase 7.
+
+Linux can compile-check the mechanisms after installing the MSVC standard library target, but this is only an early type signal:
+
+```sh
+rustup target add x86_64-pc-windows-msvc
+cargo check --locked --manifest-path spikes/windows/Cargo.toml --target x86_64-pc-windows-msvc
+cargo clippy --locked --manifest-path spikes/windows/Cargo.toml --target x86_64-pc-windows-msvc -- -D warnings
+```
+
+## Consequences
+
+- Later phases have concrete Windows mechanisms and executable contracts rather than placeholder `cfg(windows)` branches.
+- Linux and macOS production behavior and dependencies are unchanged in phase 0.
+- Windows remains unsupported until the root crate compiles, all capability backends land, native Prism and psmux/OpenCode smoke tests are required, and release artifacts are produced.
+- Job Objects provide deterministic forced cleanup; graceful console events are best effort and bounded.
+- Worker IPC and recorder telemetry intentionally use different transports because their delivery contracts differ.
+- psmux's terminal-owned sizing is a known contract difference that subsequent adapter and TUI work must preserve explicitly.
+- File replacement and lock ownership must use separate permanent paths.
+- Power-loss durability and hostile existing-path recovery remain phase 4 work; they are not silently claimed by the phase 0 spike.

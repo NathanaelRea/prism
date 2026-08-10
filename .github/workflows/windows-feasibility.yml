@@ -1,0 +1,62 @@
+name: Windows feasibility
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/windows-feasibility.yml"
+      - "docs/adr/0005-native-windows-mechanisms.md"
+      - "scripts/windows-phase0-spikes.ps1"
+      - "spikes/windows/**"
+
+concurrency:
+  group: windows-feasibility-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build native spike executable
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        with:
+          workspaces: spikes/windows -> target
+      - name: Format, lint, and build
+        shell: pwsh
+        run: scripts/windows-phase0-spikes.ps1 -CheckOnly
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prism-windows-spike
+          path: spikes/windows/target/debug/prism-windows-spikes.exe
+          if-no-files-found: error
+          retention-days: 1
+
+  contracts:
+    name: Contract (${{ matrix.spike }})
+    needs: build
+    runs-on: windows-2022
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        spike:
+          - acl
+          - process
+          - worker-ipc
+          - recorder
+          - persistence
+          - psmux
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: prism-windows-spike
+          path: windows-spike
+      - name: Run ${{ matrix.spike }} contract
+        shell: pwsh
+        run: scripts/windows-phase0-spikes.ps1 -Spike ${{ matrix.spike }} -Executable windows-spike/prism-windows-spikes.exe

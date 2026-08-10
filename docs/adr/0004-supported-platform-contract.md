@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted
+Superseded by [ADR 0005](0005-native-windows-mechanisms.md). The Linux/macOS-only support declaration remains the transitional product contract until the native Windows port and required gates are complete.
 
 ## Context
 
