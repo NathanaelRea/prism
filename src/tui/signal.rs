@@ -8,6 +8,7 @@ pub(crate) enum ShutdownSignal {
 }
 
 impl ShutdownSignal {
+    #[cfg(any(unix, test))]
     const fn code(self) -> u8 {
         match self {
             Self::Sigint => 1,
@@ -33,8 +34,16 @@ pub(crate) struct ShutdownNotification {
 
 impl ShutdownNotification {
     pub(crate) fn install() -> Result<Self, String> {
+        #[cfg(unix)]
         let canceled = Arc::new(AtomicBool::new(false));
+        #[cfg(unix)]
         let signal = Arc::new(AtomicU8::new(0));
+        #[cfg(windows)]
+        let canceled = crate::system::windows_console::cancellation()
+            .map_err(|error| format!("install shutdown notification: {error}"))?;
+        #[cfg(windows)]
+        let signal = crate::system::windows_console::signal_code()
+            .map_err(|error| format!("install shutdown notification: {error}"))?;
         #[cfg(unix)]
         let registrations = {
             let mut registrations = Vec::new();
@@ -80,7 +89,12 @@ impl ShutdownNotification {
     }
 
     pub(crate) fn signal(&self) -> Option<ShutdownSignal> {
-        ShutdownSignal::from_code(self.signal.load(Ordering::Acquire))
+        let code = self.signal.load(Ordering::Acquire);
+        #[cfg(windows)]
+        if crate::system::windows_console::is_interrupt(code) {
+            return Some(ShutdownSignal::Sigint);
+        }
+        ShutdownSignal::from_code(code)
     }
 
     #[cfg(test)]

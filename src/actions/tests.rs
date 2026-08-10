@@ -26,9 +26,12 @@ use super::{
     remote_pr_worktree_branch, run_browser_opener, status_label_with_behind,
     unresolved_review_thread_ids, validate_push_target_after_checks, worktree_column_choices,
 };
+#[cfg(windows)]
+use crate::test_support::PermissionsExt;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -124,6 +127,7 @@ fn review_resolution_checks_that_the_pushed_commit_is_observed() {
     assert!(ensure_review_resolution_head(&summary, "new-head").is_ok());
 }
 
+#[cfg(unix)]
 #[test]
 fn browser_opener_invokes_first_available_candidate() {
     let temp = unique_temp_dir("prism-browser-opener-test");
@@ -298,6 +302,7 @@ fn remote_pr_picker_uses_stable_keys_and_preserves_branch_names() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn review_fix_refreshes_pr_details_before_sending_prompt() {
     let temp = unique_temp_dir("prism-review-fix-refresh-test");
@@ -449,6 +454,7 @@ esac
     let _ = fs::remove_dir_all(temp);
 }
 
+#[cfg(unix)]
 #[test]
 fn phase_1_external_guarded_push_satisfaction_resolves_exact_threads_and_replans_from_refreshed_details()
  {
@@ -654,6 +660,7 @@ esac
     let _ = fs::remove_dir_all(temp);
 }
 
+#[cfg(unix)]
 #[test]
 fn partial_thread_resolution_persists_remainder_and_retries_after_reopen() {
     let temp = unique_temp_dir("prism-partial-thread-resolution-restart-test");
@@ -859,6 +866,7 @@ esac
     let _ = fs::remove_dir_all(temp);
 }
 
+#[cfg(unix)]
 #[test]
 fn phase_1_failed_details_refresh_does_not_start_repair_from_stale_thread_ids() {
     let temp = unique_temp_dir("prism-phase-1-stale-review-authorization-test");
@@ -909,6 +917,7 @@ fn phase_1_failed_details_refresh_does_not_start_repair_from_stale_thread_ids() 
     let _ = fs::remove_dir_all(temp);
 }
 
+#[cfg(unix)]
 #[test]
 fn ci_fix_sends_prompt_to_agent_session() {
     let temp = unique_temp_dir("prism-ci-fix-send-test");
@@ -1335,6 +1344,7 @@ fn opencode_prompt_submission_clears_done_status_immediately() {
     let _ = fs::remove_dir_all(temp);
 }
 
+#[cfg(unix)]
 #[test]
 fn automatic_pr_polling_does_not_block_input_loop() {
     let temp = unique_temp_dir("prism-pr-poll-test");
@@ -1374,6 +1384,7 @@ exit 1
     let _ = fs::remove_dir_all(temp);
 }
 
+#[cfg(unix)]
 #[test]
 fn idle_pr_polling_does_not_launch_git_for_worktree_sessions() {
     let temp = unique_temp_dir("prism-idle-pr-poll-test");
@@ -1412,6 +1423,7 @@ fn idle_pr_polling_does_not_launch_git_for_worktree_sessions() {
     let _ = fs::remove_dir_all(temp);
 }
 
+#[cfg(unix)]
 #[test]
 fn delete_session_does_not_block_input_loop() {
     let temp = unique_temp_dir("prism-delete-nonblocking-test");
@@ -1583,6 +1595,7 @@ fn completed_delete_schedules_inventory_refresh_without_tui_thread_io() {
     let _ = fs::remove_dir_all(temp);
 }
 
+#[cfg(unix)]
 #[test]
 fn failed_async_delete_restores_hidden_worktree() {
     let temp = unique_temp_dir("prism-delete-restore-test");
@@ -1673,6 +1686,7 @@ exit 0
     let _ = fs::remove_dir_all(temp);
 }
 
+#[cfg(unix)]
 #[test]
 fn phase_1_branch_delete_failure_reconciles_without_vanished_worktree_path() {
     let temp = unique_temp_dir("prism-phase-1-delete-reconcile-test");
@@ -1767,6 +1781,7 @@ exit 0
     let _ = fs::remove_dir_all(temp);
 }
 
+#[cfg(unix)]
 #[test]
 fn unavailable_remote_preserves_stale_live_and_persisted_display_state() {
     let temp = unique_temp_dir("prism-phase-1-removed-remote-poll-test");
@@ -1823,6 +1838,7 @@ fn unavailable_remote_preserves_stale_live_and_persisted_display_state() {
     let _ = fs::remove_dir_all(temp);
 }
 
+#[cfg(unix)]
 #[test]
 fn missing_github_remote_clears_hidden_non_pollable_pr_cache_state() {
     let temp = unique_temp_dir("prism-removed-remote-hidden-cache-test");
@@ -1888,6 +1904,7 @@ fn default_branch_starts_only_repository_level_remote_polling() {
     let _ = fs::remove_dir_all(temp);
 }
 
+#[cfg(unix)]
 #[test]
 fn tmux_agent_warmup_does_not_block_startup() {
     let temp = unique_temp_dir("prism-tmux-warmup-test");
@@ -1976,6 +1993,7 @@ exit 0
     let _ = fs::remove_dir_all(temp);
 }
 
+#[cfg(unix)]
 #[test]
 fn attach_waits_for_selected_tmux_warmup() {
     let temp = unique_temp_dir("prism-tmux-attach-wait-test");
@@ -2049,6 +2067,7 @@ exit 0
     let _ = fs::remove_dir_all(temp);
 }
 
+#[cfg(unix)]
 #[test]
 fn prompt_paste_targets_tmux_agent_session() {
     let temp = unique_temp_dir("prism-tmux-prompt-paste-test");
@@ -2416,6 +2435,7 @@ fn default_branch_result_is_rejected_after_default_branch_config_changes() {
     let _ = fs::remove_dir_all(temp);
 }
 
+#[cfg(unix)]
 #[test]
 fn attach_creates_session_when_pre_attach_resize_finds_it_missing() {
     let temp = unique_temp_dir("prism-tmux-missing-before-attach-test");
@@ -2488,6 +2508,7 @@ exit 0
     let _ = fs::remove_dir_all(temp);
 }
 
+#[cfg(unix)]
 #[test]
 fn attach_schedules_delayed_rewarm_after_return() {
     let temp = unique_temp_dir("prism-tmux-delayed-rewarm-test");

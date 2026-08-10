@@ -1,11 +1,10 @@
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,44 +18,19 @@ use crate::notification::{NotificationCoordinator, NotificationObservation, Pend
 use crate::platform::SupportedOs;
 use crate::process::DetachedProcessPolicy;
 use crate::repo::Repository;
+use crate::workflow::worker_ipc::{self, WorkerEndpoint, WorkerStream};
 use crate::{observability, workspace};
 
 const PROTOCOL_VERSION: u32 = 1;
 const NOTIFICATION_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const NOTIFICATION_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 const DAEMON_TRANSITION_TIMEOUT: Duration = Duration::from_secs(3);
-const SOCKET_PATH_BUDGET: usize = 103;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct WorkerSocketPath(PathBuf);
-
-impl WorkerSocketPath {
-    fn for_runtime(runtime: &Path) -> Result<Self, String> {
-        let path = runtime.join("worker.sock");
-        let bytes = socket_path_bytes(&path);
-        if bytes.contains(&0) {
-            return Err(format!(
-                "Prism worker runtime directory {} produces a socket path containing a NUL byte; set PRISM_RUNTIME_DIR to a shorter valid private directory",
-                runtime.display()
-            ));
-        }
-        if bytes.len() > SOCKET_PATH_BUDGET {
-            return Err(format!(
-                "Prism worker runtime directory {} produces a {}-byte socket path, exceeding the supported maximum of {SOCKET_PATH_BUDGET} bytes; set PRISM_RUNTIME_DIR to a shorter private directory such as /tmp/prism-$UID",
-                runtime.display(),
-                bytes.len()
-            ));
-        }
-        Ok(Self(path))
-    }
-
-    fn as_path(&self) -> &Path {
-        &self.0
-    }
-}
-
-fn socket_path_bytes(path: &Path) -> &[u8] {
-    path.as_os_str().as_bytes()
+const fn notification_backend_available() -> bool {
+    !matches!(
+        crate::platform::desktop_notification_policy(crate::platform::current_os()),
+        crate::platform::DesktopNotificationPolicy::Unavailable
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -94,29 +68,18 @@ pub fn probe_health() -> Result<DaemonHealth, String> {
     probe_health_at(&validated_socket_path()?)
 }
 
-fn probe_health_at(path: &WorkerSocketPath) -> Result<DaemonHealth, String> {
-    let stream = match UnixStream::connect(path.as_path()) {
+fn probe_health_at(endpoint: &WorkerEndpoint) -> Result<DaemonHealth, String> {
+    let stream = match endpoint.connect() {
         Ok(stream) => stream,
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
-            ) =>
-        {
+        Err(error) if worker_ipc::endpoint_unavailable(&error) => {
             return Ok(DaemonHealth::stopped());
         }
         Err(error) => return Err(format!("connect to Prism worker: {error}")),
     };
-    let response = match request_on_stream_raw(stream, "health") {
+    let secret = worker_ipc::read_secret(endpoint)?;
+    let response = match request_on_stream_raw(stream, &authenticated_command(&secret, "health")) {
         Ok(response) => response,
-        Err((_, error))
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::BrokenPipe
-                    | std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::NotConnected
-            ) =>
-        {
+        Err((_, error)) if worker_ipc::connection_closed(&error) => {
             return Ok(DaemonHealth::stopped());
         }
         Err(error) => return Err(format_request_error(error)),
@@ -189,7 +152,7 @@ pub fn ensure_running() -> Result<(), String> {
     }
     if wait_for_existing_daemon(DAEMON_TRANSITION_TIMEOUT, || probe_health_at(&socket))? {
         let health = probe_health_at(&socket)?;
-        if health.notifications {
+        if health.notifications || !notification_backend_available() {
             return Ok(());
         }
         let shutdown_health = parse_health_response(&request_at(&socket, "shutdown")?)?;
@@ -319,22 +282,24 @@ impl Drop for NotificationSubscription {
 }
 
 #[cfg(target_os = "macos")]
-fn notification_subscription_loop(socket: &WorkerSocketPath, stop: &AtomicBool) {
+fn notification_subscription_loop(socket: &WorkerEndpoint, stop: &AtomicBool) {
     notification_subscription_loop_with_delivery(socket, stop, |title, body| {
         crate::desktop_notification::deliver_terminal_notification(title, body)
     });
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 fn notification_subscription_loop_with_delivery(
-    socket: &WorkerSocketPath,
+    socket: &WorkerEndpoint,
     stop: &AtomicBool,
     mut deliver: impl FnMut(&str, &str) -> Result<(), &'static str>,
 ) {
     while !stop.load(Ordering::Acquire) {
-        if let Ok(mut stream) = UnixStream::connect(socket.as_path()) {
-            let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
-            if stream.write_all(b"subscribe-notifications\n").is_ok() {
+        if let Ok(mut stream) = socket.connect() {
+            let _ = worker_ipc::set_read_timeout(&stream, Duration::from_millis(250));
+            let secret = worker_ipc::read_secret(socket).unwrap_or_default();
+            let request = authenticated_command(&secret, "subscribe-notifications");
+            if stream.write_all(format!("{request}\n").as_bytes()).is_ok() {
                 let mut reader = BufReader::new(stream);
                 loop {
                     if stop.load(Ordering::Acquire) {
@@ -403,13 +368,14 @@ pub fn shutdown() -> Result<(), String> {
     wait_for_socket_to_close(&socket, DAEMON_TRANSITION_TIMEOUT)
 }
 
-fn wait_for_socket_to_close(path: &WorkerSocketPath, timeout: Duration) -> Result<(), String> {
+fn wait_for_socket_to_close(endpoint: &WorkerEndpoint, timeout: Duration) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     loop {
-        match fs::symlink_metadata(path.as_path()) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(format!("inspect Prism worker socket: {error}")),
-            Ok(_) => {}
+        if !endpoint
+            .address_exists()
+            .map_err(|error| format!("inspect Prism worker endpoint: {error}"))?
+        {
+            return Ok(());
         }
         if Instant::now() >= deadline {
             return Err("timed out waiting for Prism worker daemon to stop".to_string());
@@ -483,23 +449,32 @@ pub fn command_workflow(run_id: &str, command: crate::WorkflowCommand) -> Result
     Ok(())
 }
 
-fn request_at(path: &WorkerSocketPath, command: &str) -> Result<String, String> {
-    let stream = UnixStream::connect(path.as_path())
+fn request_at(endpoint: &WorkerEndpoint, command: &str) -> Result<String, String> {
+    let stream = endpoint
+        .connect()
         .map_err(|error| format!("connect to Prism worker: {error}"))?;
-    request_on_stream(stream, command)
+    let secret = worker_ipc::read_secret(endpoint)?;
+    request_on_stream(stream, &authenticated_command(&secret, command))
 }
 
-fn request_on_stream(stream: UnixStream, command: &str) -> Result<String, String> {
+fn authenticated_command(secret: &str, command: &str) -> String {
+    format!("auth {secret} {command}")
+}
+
+fn authenticate_command<'a>(secret: &str, command: &'a str) -> Option<&'a str> {
+    command.strip_prefix(&format!("auth {secret} "))
+}
+
+fn request_on_stream(stream: WorkerStream, command: &str) -> Result<String, String> {
     request_on_stream_raw(stream, command).map_err(format_request_error)
 }
 
 fn request_on_stream_raw(
-    mut stream: UnixStream,
+    mut stream: WorkerStream,
     command: &str,
 ) -> Result<String, (&'static str, std::io::Error)> {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(1)))
-        .map_err(|error| ("configure Prism worker socket", error))?;
+    worker_ipc::set_read_timeout(&stream, Duration::from_secs(1))
+        .map_err(|error| ("configure Prism worker endpoint", error))?;
     stream
         .write_all(format!("{command}\n").as_bytes())
         .map_err(|error| ("write Prism worker request", error))?;
@@ -594,64 +569,37 @@ fn serve_socket(
     operations: &crate::WorkflowOperations,
 ) -> Result<(), String> {
     let runtime = runtime_dir();
-    let socket = WorkerSocketPath::for_runtime(&runtime)?;
-    if let Ok(metadata) = fs::symlink_metadata(&runtime) {
-        if metadata.file_type().is_symlink() {
-            return Err(format!(
-                "Prism worker runtime directory is a symlink: {}",
-                runtime.display()
-            ));
-        }
-        if metadata.uid() != unsafe { libc::geteuid() } {
-            return Err(format!(
-                "Prism worker runtime directory is owned by another user: {}",
-                runtime.display()
-            ));
-        }
-    }
-    fs::create_dir_all(&runtime).map_err(|error| format!("create worker runtime dir: {error}"))?;
-    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))
-        .map_err(|error| format!("secure worker runtime dir: {error}"))?;
+    let endpoint = WorkerEndpoint::for_runtime(&runtime)?;
+    worker_ipc::prepare_runtime(&runtime)?;
     let _lock = acquire_lock(&runtime.join("worker.lock"))?;
-    if socket.as_path().exists() {
-        match UnixStream::connect(socket.as_path()) {
-            Ok(_) => {
-                return Err(
-                    "a live Prism worker endpoint already owns the runtime socket".to_string(),
-                );
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
-                ) => {}
-            Err(error) => {
-                return Err(format!(
-                    "cannot safely classify existing Prism worker socket: {error}"
-                ));
-            }
+    match endpoint.connect() {
+        Ok(_) => {
+            return Err("a live Prism worker endpoint already owns the runtime".to_string());
         }
-        fs::remove_file(socket.as_path())
-            .map_err(|error| format!("remove stale worker socket: {error}"))?;
+        Err(error) if worker_ipc::endpoint_unavailable(&error) => {}
+        Err(error) => {
+            return Err(format!(
+                "cannot safely classify existing Prism worker endpoint: {error}"
+            ));
+        }
     }
+    endpoint
+        .remove_stale_address()
+        .map_err(|error| format!("remove stale worker endpoint: {error}"))?;
+    let secret = worker_ipc::create_secret(&endpoint)?;
 
     let instance_id = execution::new_instance_id("daemon");
     classify_abandoned(&instance_id)?;
     log_daemon_lifecycle("daemon_start", &instance_id);
-    let listener = UnixListener::bind(socket.as_path()).map_err(|error| {
-        format!(
-            "bind Prism worker socket {}: {error}",
-            socket.as_path().display()
-        )
-    })?;
-    fs::set_permissions(socket.as_path(), fs::Permissions::from_mode(0o600))
-        .map_err(|error| format!("secure Prism worker socket: {error}"))?;
-    listener
-        .set_nonblocking(true)
+    let listener = endpoint
+        .bind()
+        .map_err(|error| format!("bind Prism worker endpoint {}: {error}", endpoint.display()))?;
+    worker_ipc::secure_listener(&endpoint)?;
+    worker_ipc::set_listener_nonblocking(&listener)
         .map_err(|error| format!("configure Prism worker listener: {error}"))?;
 
     let active = Arc::new(Mutex::new(BTreeSet::<PathBuf>::new()));
-    let notification_subscriber = Arc::new(Mutex::new(Vec::<UnixStream>::new()));
+    let notification_subscriber = Arc::new(Mutex::new(Vec::<WorkerStream>::new()));
     let notification_stop = Arc::new(AtomicBool::new(false));
     let observer_stop = Arc::clone(&notification_stop);
     let observer_subscriber = Arc::clone(&notification_subscriber);
@@ -669,10 +617,11 @@ fn serve_socket(
             notification_stop.store(true, Ordering::Release);
             return Err(format!("workflow control plane failed: {error}"));
         }
-        match listener.accept() {
-            Ok((mut stream, _)) => {
+        match worker_ipc::accept(&listener) {
+            Ok(mut stream) => {
                 if respond(
                     &mut stream,
+                    &secret,
                     &instance_id,
                     &active,
                     &notification_subscriber,
@@ -698,14 +647,19 @@ fn serve_socket(
     }
     notification_stop.store(true, Ordering::Release);
     log_daemon_lifecycle("daemon_stop", &instance_id);
-    fs::remove_file(socket.as_path()).map_err(|error| format!("remove worker socket: {error}"))
+    endpoint
+        .remove_stale_address()
+        .map_err(|error| format!("remove worker endpoint: {error}"))?;
+    let _ = fs::remove_file(endpoint.secret_path());
+    Ok(())
 }
 
 fn respond(
-    stream: &mut UnixStream,
+    stream: &mut WorkerStream,
+    secret: &str,
     instance_id: &str,
     active: &Arc<Mutex<BTreeSet<PathBuf>>>,
-    notification_subscriber: &Arc<Mutex<Vec<UnixStream>>>,
+    notification_subscriber: &Arc<Mutex<Vec<WorkerStream>>>,
     operations: Option<&crate::WorkflowOperations>,
     draining: bool,
 ) -> bool {
@@ -719,6 +673,10 @@ fn respond(
         return false;
     }
     let command = command.trim();
+    let Some(command) = authenticate_command(secret, command) else {
+        let _ = stream.write_all(b"error authentication-failed\n");
+        return false;
+    };
     let active = active
         .lock()
         .map(|active| active.len())
@@ -737,18 +695,20 @@ fn respond(
     } else {
         match command {
             "health" | "wake" => format!(
-                "ok {PROTOCOL_VERSION} {instance_id} pid={} state={} active={active} notifications=1\n",
+                "ok {PROTOCOL_VERSION} {instance_id} pid={} state={} active={active} notifications={}\n",
                 std::process::id(),
-                if draining { "draining" } else { "running" }
+                if draining { "draining" } else { "running" },
+                u8::from(notification_backend_available()),
             ),
             "shutdown" => format!(
-                "ok {PROTOCOL_VERSION} {instance_id} pid={} state=draining active={active} notifications=1\n",
-                std::process::id()
+                "ok {PROTOCOL_VERSION} {instance_id} pid={} state=draining active={active} notifications={}\n",
+                std::process::id(),
+                u8::from(notification_backend_available()),
             ),
-            "subscribe-notifications" if !draining => match stream.try_clone() {
+            "subscribe-notifications" if !draining => match worker_ipc::try_clone_stream(stream) {
                 Ok(subscriber) => {
-                    let _ = subscriber.set_read_timeout(Some(Duration::from_secs(1)));
-                    let _ = subscriber.set_write_timeout(Some(Duration::from_secs(1)));
+                    let _ = worker_ipc::set_read_timeout(&subscriber, Duration::from_secs(1));
+                    let _ = worker_ipc::set_write_timeout(&subscriber, Duration::from_secs(1));
                     new_notification_subscriber = Some(subscriber);
                     format!("ok {PROTOCOL_VERSION} subscribed\n")
                 }
@@ -1111,7 +1071,7 @@ fn workflow_socket_response(operations: &crate::WorkflowOperations, request: &st
     }
 }
 
-fn notification_loop(stop: Arc<AtomicBool>, subscriber: Arc<Mutex<Vec<UnixStream>>>) {
+fn notification_loop(stop: Arc<AtomicBool>, subscriber: Arc<Mutex<Vec<WorkerStream>>>) {
     while !stop.load(Ordering::Acquire) {
         if let Err(error) = observe_and_deliver_notifications(&subscriber) {
             eprintln!("Prism notification observer failed: {error}");
@@ -1124,7 +1084,7 @@ fn notification_loop(stop: Arc<AtomicBool>, subscriber: Arc<Mutex<Vec<UnixStream
 }
 
 fn observe_and_deliver_notifications(
-    subscriber: &Arc<Mutex<Vec<UnixStream>>>,
+    subscriber: &Arc<Mutex<Vec<WorkerStream>>>,
 ) -> Result<(), String> {
     let entries = workspace::load_entries()?;
     for entry in workspace::discover_valid_entries(entries) {
@@ -1274,7 +1234,7 @@ fn resolve_observed_state(
 
 fn dispatch_pending_notifications(
     coordinator: &NotificationCoordinator,
-    subscriber: &Arc<Mutex<Vec<UnixStream>>>,
+    subscriber: &Arc<Mutex<Vec<WorkerStream>>>,
     now_unix_ms: i64,
 ) -> Result<(), String> {
     coordinator.expire_pending(now_unix_ms)?;
@@ -1311,6 +1271,7 @@ fn dispatch_pending_notifications(
     }
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 enum DeliveryOutcome {
     Accepted,
     Retry(&'static str),
@@ -1321,7 +1282,7 @@ enum DeliveryOutcome {
 #[cfg(target_os = "linux")]
 fn deliver_worker_notification(
     notification: &PendingNotification,
-    _subscriber: &Arc<Mutex<Vec<UnixStream>>>,
+    _subscriber: &Arc<Mutex<Vec<WorkerStream>>>,
 ) -> DeliveryOutcome {
     match crate::desktop_notification::deliver_native_notification(
         &notification.title,
@@ -1332,10 +1293,20 @@ fn deliver_worker_notification(
     }
 }
 
+#[cfg(windows)]
+fn deliver_worker_notification(
+    _notification: &PendingNotification,
+    _subscriber: &Arc<Mutex<Vec<WorkerStream>>>,
+) -> DeliveryOutcome {
+    // Native Windows toast attribution is a phase 6 capability. Notification absence is
+    // explicitly non-fatal and pending rows are consumed instead of causing daemon churn.
+    DeliveryOutcome::Accepted
+}
+
 #[cfg(target_os = "macos")]
 fn deliver_worker_notification(
     notification: &PendingNotification,
-    subscriber: &Arc<Mutex<Vec<UnixStream>>>,
+    subscriber: &Arc<Mutex<Vec<WorkerStream>>>,
 ) -> DeliveryOutcome {
     let message = serde_json::json!({
         "id": notification.id,
@@ -1369,7 +1340,7 @@ fn deliver_worker_notification(
 }
 
 #[cfg(target_os = "macos")]
-fn read_notification_ack(stream: &mut UnixStream) -> Result<String, std::io::Error> {
+fn read_notification_ack(stream: &mut WorkerStream) -> Result<String, std::io::Error> {
     let mut response = Vec::new();
     let mut byte = [0_u8; 1];
     while response.len() < 128 {
@@ -1433,23 +1404,25 @@ fn log_worker_event(repo: &Repository, action: &str, message: &str, data_json: O
 }
 
 fn acquire_lock(path: &Path) -> Result<File, String> {
-    let file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true).truncate(false);
+    #[cfg(unix)]
+    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    let file = options
         .open(path)
         .map_err(|error| format!("open Prism worker lock: {error}"))?;
+    #[cfg(unix)]
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
         .map_err(|error| format!("secure Prism worker lock: {error}"))?;
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if result == -1 {
-        return Err(format!(
-            "Prism worker is already running: {}",
-            std::io::Error::last_os_error()
-        ));
+    #[cfg(windows)]
+    crate::system::windows_security::secure_path(path, false)
+        .map_err(|error| format!("secure Prism worker lock: {error}"))?;
+    #[cfg(unix)]
+    let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    #[cfg(windows)]
+    let locked = fs4::FileExt::try_lock(&file).is_ok();
+    if !locked {
+        return Err("Prism worker is already running".to_string());
     }
     Ok(file)
 }
@@ -1458,11 +1431,13 @@ pub fn runtime_dir() -> PathBuf {
     let override_path = std::env::var_os("PRISM_RUNTIME_DIR").filter(|path| !path.is_empty());
     let xdg_runtime = std::env::var_os("XDG_RUNTIME_DIR").filter(|path| !path.is_empty());
     let home = std::env::var_os("HOME").filter(|home| !home.is_empty());
+    let local_app_data = std::env::var_os("LOCALAPPDATA").filter(|path| !path.is_empty());
     runtime_dir_for(
         crate::platform::current_os(),
         override_path.as_deref(),
         xdg_runtime.as_deref(),
         home.as_deref(),
+        local_app_data.as_deref(),
         &crate::util::prism_config_dir(),
     )
 }
@@ -1472,6 +1447,7 @@ fn runtime_dir_for(
     override_path: Option<&std::ffi::OsStr>,
     xdg_runtime: Option<&std::ffi::OsStr>,
     home: Option<&std::ffi::OsStr>,
+    local_app_data: Option<&std::ffi::OsStr>,
     fallback_config: &Path,
 ) -> PathBuf {
     if let Some(path) = override_path {
@@ -1491,21 +1467,73 @@ fn runtime_dir_for(
             .join("Prism")
             .join("runtime");
     }
+    if os == SupportedOs::Windows
+        && let Some(local_app_data) = local_app_data
+    {
+        return PathBuf::from(local_app_data).join("Prism").join("runtime");
+    }
     fallback_config.join("runtime")
 }
 
 pub fn socket_path() -> PathBuf {
-    runtime_dir().join("worker.sock")
+    #[cfg(unix)]
+    return runtime_dir().join("worker.sock");
+    #[cfg(windows)]
+    return runtime_dir().join("worker.endpoint");
 }
 
-fn validated_socket_path() -> Result<WorkerSocketPath, String> {
-    WorkerSocketPath::for_runtime(&runtime_dir())
+fn validated_socket_path() -> Result<WorkerEndpoint, String> {
+    WorkerEndpoint::for_runtime(&runtime_dir())
 }
 
 #[cfg(test)]
+mod authentication_tests {
+    use super::{authenticate_command, authenticated_command};
+
+    #[test]
+    fn worker_commands_require_the_exact_run_secret() {
+        let command = authenticated_command("secret-one", r#"{"type":"workflow_list"}"#);
+        assert_eq!(
+            authenticate_command("secret-one", &command),
+            Some(r#"{"type":"workflow_list"}"#)
+        );
+        assert_eq!(authenticate_command("secret-two", &command), None);
+        assert_eq!(authenticate_command("secret-one", "health"), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_worker_lock_is_exclusive_released_and_permanent() {
+        let runtime = std::env::temp_dir().join(format!(
+            "prism-windows-worker-lock-{}-{}",
+            std::process::id(),
+            crate::util::timestamp_nanos()
+        ));
+        std::fs::create_dir_all(&runtime).unwrap();
+        let path = runtime.join("worker.lock");
+        let first = super::acquire_lock(&path).unwrap();
+        assert!(super::acquire_lock(&path).is_err());
+        drop(first);
+        let second = super::acquire_lock(&path).unwrap();
+        assert!(path.exists());
+        drop(second);
+        std::fs::remove_dir_all(runtime).unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    type WorkerSocketPath = WorkerEndpoint;
+    const SOCKET_PATH_BUDGET: usize = worker_ipc::UNIX_SOCKET_PATH_BUDGET;
+
+    fn socket_path_bytes(path: &Path) -> &[u8] {
+        path.as_os_str().as_bytes()
+    }
 
     fn test_socket_path() -> (crate::compact_runtime::CompactTempDir, WorkerSocketPath) {
         let runtime = crate::compact_runtime::CompactTempDir::new("worker-socket");
@@ -1591,10 +1619,13 @@ mod tests {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         let active = Arc::new(Mutex::new(BTreeSet::new()));
         let subscriber = Arc::new(Mutex::new(Vec::new()));
-        client.write_all(b"subscribe-notifications\n").unwrap();
+        client
+            .write_all(b"auth test-secret subscribe-notifications\n")
+            .unwrap();
 
         assert!(!respond(
             &mut server,
+            "test-secret",
             "daemon-test",
             &active,
             &subscriber,
@@ -1626,6 +1657,7 @@ mod tests {
     #[test]
     fn notification_subscription_reconnects_after_a_protocol_error() {
         let (_runtime, socket) = test_socket_path();
+        let secret = worker_ipc::create_secret(&socket).unwrap();
         let listener = UnixListener::bind(socket.as_path()).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let listener_stop = Arc::clone(&stop);
@@ -1639,11 +1671,11 @@ mod tests {
         });
 
         let (mut rejected, _) = listener.accept().unwrap();
-        let mut request = [0_u8; 64];
+        let mut request = [0_u8; 128];
         let size = rejected.read(&mut request).unwrap();
         assert_eq!(
             std::str::from_utf8(&request[..size]).unwrap(),
-            "subscribe-notifications\n"
+            format!("auth {secret} subscribe-notifications\n")
         );
         rejected.write_all(b"error unknown-command\n").unwrap();
 
@@ -1681,13 +1713,14 @@ mod tests {
     }
 
     #[test]
-    fn platform_contract_runtime_paths_cover_linux_and_macos() {
+    fn platform_contract_runtime_paths_cover_all_supported_hosts() {
         assert_eq!(
             runtime_dir_for(
                 SupportedOs::Linux,
                 None,
                 Some(OsStr::new("/run/user/1000")),
                 Some(OsStr::new("/home/user")),
+                None,
                 Path::new("/fallback"),
             ),
             PathBuf::from("/run/user/1000/prism")
@@ -1698,6 +1731,7 @@ mod tests {
                 None,
                 None,
                 Some(OsStr::new("/Users/user")),
+                None,
                 Path::new("/fallback"),
             ),
             PathBuf::from("/Users/user/Library/Application Support/Prism/runtime")
@@ -1708,9 +1742,21 @@ mod tests {
                 Some(OsStr::new("/override")),
                 Some(OsStr::new("/ignored")),
                 None,
+                None,
                 Path::new("/fallback"),
             ),
             PathBuf::from("/override")
+        );
+        assert_eq!(
+            runtime_dir_for(
+                SupportedOs::Windows,
+                None,
+                None,
+                None,
+                Some(OsStr::new("C:/Users/test/AppData/Local")),
+                Path::new("C:/fallback"),
+            ),
+            PathBuf::from("C:/Users/test/AppData/Local/Prism/runtime")
         );
     }
 
@@ -1760,12 +1806,14 @@ mod tests {
                 Some(long),
                 None,
                 None,
+                None,
                 Path::new("/fallback"),
             ),
             runtime_dir_for(
                 SupportedOs::Linux,
                 None,
                 Some(long),
+                None,
                 None,
                 Path::new("/fallback"),
             ),
@@ -1774,9 +1822,10 @@ mod tests {
                 None,
                 None,
                 Some(long),
+                None,
                 Path::new("/fallback"),
             ),
-            runtime_dir_for(SupportedOs::Linux, None, None, None, Path::new(long)),
+            runtime_dir_for(SupportedOs::Linux, None, None, None, None, Path::new(long)),
         ] {
             assert!(WorkerSocketPath::for_runtime(&runtime).is_err());
         }

@@ -399,7 +399,7 @@ pub(crate) fn approval_status(
     repo: &Repository,
     config: &Config,
 ) -> Result<ApprovalStatus, WorktrunkFailure> {
-    if config.worktree_command != "wt" {
+    if !is_worktrunk_command(&config.worktree_command) {
         return Ok(ApprovalStatus::NotWorktrunk);
     }
     let mut command = approvals_command(repo, config);
@@ -1049,6 +1049,18 @@ fn parse_version(output: &str) -> Option<WorktrunkVersion> {
     })
 }
 
+fn is_worktrunk_command(command: &str) -> bool {
+    Path::new(command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case("wt")
+                || name.eq_ignore_ascii_case("wt.exe")
+                || name.eq_ignore_ascii_case("git-wt")
+                || name.eq_ignore_ascii_case("git-wt.exe")
+        })
+}
+
 fn approvals_command(repo: &Repository, config: &Config) -> Command {
     let mut command = Command::new(config.tool(&config.worktree_command));
     command
@@ -1167,7 +1179,10 @@ fn safe_summary(output: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use crate::test_support::PermissionsExt;
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1519,6 +1534,7 @@ mod tests {
         assert_eq!(deleted_branch.kind, FailureKind::MalformedOutput);
     }
 
+    #[cfg(unix)]
     #[test]
     fn remove_accepts_requested_symlink_path_after_worktree_disappears() {
         let temp = unique_temp_dir("prism-wt-remove-symlink-path");
@@ -1554,6 +1570,7 @@ mod tests {
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[cfg(unix)]
     #[test]
     fn remove_failure_classifies_approval_and_preserves_exact_path_argument() {
         let temp = unique_temp_dir("prism-wt-remove-approval");
@@ -1672,6 +1689,7 @@ mod tests {
         assert!(snapshot.by_path.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn path_association_uses_canonical_paths_and_rejects_ambiguity() {
         let temp = unique_temp_dir("prism-wt-path-association");
@@ -1750,6 +1768,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn successful_switch_accepts_warnings_on_stderr() {
         let temp = unique_temp_dir("prism-wt-warning");
@@ -1778,6 +1797,7 @@ mod tests {
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[cfg(unix)]
     #[test]
     fn switch_capture_is_bounded() {
         let temp = unique_temp_dir("prism-wt-bounded");
@@ -1807,6 +1827,7 @@ mod tests {
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[cfg(unix)]
     #[test]
     fn switch_does_not_evaluate_shell_syntax_in_branch_argument() {
         let temp = unique_temp_dir("prism-wt-no-shell");
@@ -1948,6 +1969,12 @@ mod tests {
     #[cfg(unix)]
     fn success_status() -> std::process::ExitStatus {
         use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(0)
+    }
+
+    #[cfg(windows)]
+    fn success_status() -> std::process::ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
         std::process::ExitStatus::from_raw(0)
     }
 

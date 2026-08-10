@@ -448,6 +448,9 @@ impl Drop for TestConnection {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use crate::test_support::PermissionsExt;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
 

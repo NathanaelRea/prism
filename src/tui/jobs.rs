@@ -940,6 +940,7 @@ where
     }
 
     #[cfg(test)]
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn cancel_all(&self) {
         self.cancel_all_except(&BTreeSet::new());
     }

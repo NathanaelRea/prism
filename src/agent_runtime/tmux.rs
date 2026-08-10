@@ -3,10 +3,10 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
-use crate::opencode::{OpencodeRuntime, load_runtime};
+use crate::opencode::{load_runtime, OpencodeRuntime};
 use crate::process::{
-    ProcessDescriptor, ProcessPolicy, run_capture_named, run_output_allow_failure_named,
-    run_output_named, run_status_inherited_named, run_status_with_stdin_named, split_command_words,
+    run_capture_named, run_output_allow_failure_named, run_output_named, run_status_attached_named,
+    run_status_with_stdin_named, split_command_words, ProcessDescriptor, ProcessPolicy,
 };
 use crate::repo::Repository;
 use crate::session::Session;
@@ -529,7 +529,7 @@ fn attach_target(config: &Config, size_target: &str, attach_target: &str) -> Res
         .env_remove("TMUX")
         .args(["attach-session", "-t", attach_target]);
     let descriptor = ProcessDescriptor::for_tmux(&command);
-    run_status_inherited_named(&mut command, descriptor)
+    run_status_attached_named(&mut command, descriptor)
 }
 
 fn create_detached_agent_session(
@@ -718,7 +718,12 @@ fn ensure_window(
         TmuxWindow::LazyGit => config.tool("lazygit"),
         TmuxWindow::Terminal => crate::terminal::shell_program_from_env(),
     };
-    let command = crate::terminal::posix_shell_quote(&command);
+    let command = crate::terminal::shell_command_for(
+        crate::platform::current_os(),
+        &[command],
+        &std::collections::BTreeMap::new(),
+        None,
+    )?;
     run_tmux_status(
         Command::new(config.tool("tmux"))
             .env_remove("TMUX")
@@ -954,30 +959,12 @@ fn agent_shell_command(
             config.default_agent
         ));
     }
-    let command = argv
-        .iter()
-        .map(|arg| crate::terminal::posix_shell_quote(arg))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let command = if invocation.environment.is_empty() {
-        command
-    } else {
-        let assignments = invocation
-            .environment
-            .iter()
-            .map(|(key, value)| format!("{}={}", key, crate::terminal::posix_shell_quote(value)))
-            .collect::<Vec<_>>()
-            .join(" ");
-        format!("env {assignments} {command}")
-    };
-    if let Some(path) = invocation.prompt_file {
-        Ok(format!(
-            "{command}; prism_status=$?; rm -f {}; exit $prism_status",
-            crate::terminal::posix_shell_quote(&path.display().to_string())
-        ))
-    } else {
-        Ok(command)
-    }
+    crate::terminal::shell_command_for(
+        crate::platform::current_os(),
+        &argv,
+        &invocation.environment,
+        invocation.prompt_file.as_deref(),
+    )
 }
 
 fn interactive_agent_invocation(
@@ -1208,13 +1195,16 @@ fn safe_tmux_name(value: &str) -> String {
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
+    #[cfg(windows)]
+    use crate::test_support::PermissionsExt;
     use std::collections::BTreeMap;
     use std::fs;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::io::{Error, ErrorKind};
     use std::net::{TcpListener, TcpStream};
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::thread;
@@ -1222,16 +1212,17 @@ mod tests {
 
     use crate::agent::AgentState;
     use crate::config::Config;
-    use crate::opencode::{OpencodeRuntime, save_runtime, server_url};
+    use crate::opencode::{save_runtime, server_url, OpencodeRuntime};
     use crate::remote::PrCache;
     use crate::repo::Repository;
     use crate::session::Session;
 
     use super::{
-        TmuxAgentSession, TmuxWindow, attach_or_create_agent, attach_or_create_plan_mode,
-        attach_or_create_window, capture_agent_pane, ensure_agent_session,
-        latest_agent_session_generation, migrate_legacy_agent_sessions, pane_command_matches_agent,
-        pane_start_command_matches_agent, paste_agent_prompt, session_exists,
+        attach_or_create_agent, attach_or_create_plan_mode, attach_or_create_window,
+        capture_agent_pane, ensure_agent_session, latest_agent_session_generation,
+        migrate_legacy_agent_sessions, pane_command_matches_agent,
+        pane_start_command_matches_agent, paste_agent_prompt, session_exists, TmuxAgentSession,
+        TmuxWindow,
     };
 
     #[test]

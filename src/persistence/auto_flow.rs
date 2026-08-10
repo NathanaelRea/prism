@@ -965,7 +965,7 @@ pub(crate) fn test_install_selected_step_failure(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn test_install_policy_refresh_failure(path: &Path) -> Result<(), String> {
     test_execute(path, async |connection| {
         sqlx::query_file!("sql/auto_flow/test_fail_policy_refresh.sql")

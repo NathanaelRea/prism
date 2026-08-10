@@ -678,21 +678,31 @@ fn record_worktree_observation_error(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::collections::BTreeMap;
+    #[cfg(unix)]
     use std::fs;
     #[cfg(unix)]
     use std::path::PathBuf;
+    #[cfg(unix)]
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[cfg(unix)]
     use crate::agent::AgentState;
     use crate::config::{AutoConfig, Config};
     use crate::remote::{
         CachedCiFailure, PrCache, PrCheckContext, PrCheckState, PrComment, PrDetails, PrReview,
-        PrReviewComment, PrSummary, ProviderKind, RepoPolicyCache, record_pr_summary,
-        save_pr_cache, save_pr_details_cache, save_repo_policy_cache,
+        PrReviewComment, PrSummary, ProviderKind, RepoPolicyCache,
     };
+    #[cfg(unix)]
+    use crate::remote::{
+        record_pr_summary, save_pr_cache, save_pr_details_cache, save_repo_policy_cache,
+    };
+    #[cfg(unix)]
     use crate::repo::Repository;
+    #[cfg(unix)]
     use crate::session::{Session, SessionClassification};
+    #[cfg(unix)]
     use crate::test_support::write_executable;
 
     use super::*;
@@ -1151,6 +1161,7 @@ esac
         assert!(matches!(approved_policy, PolicyFacts::Satisfied));
     }
 
+    #[cfg(unix)]
     #[test]
     fn approval_count_is_cleared_when_the_exact_head_changes() {
         let temp = unique_temp_dir("prism-approval-head-change-test");

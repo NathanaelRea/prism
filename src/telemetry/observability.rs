@@ -1217,6 +1217,9 @@ fn with_state<T>(run: impl FnOnce(&mut ObserverState) -> T) -> Option<T> {
 fn append_text_line(path: &Path, line: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| format!("create log dir: {error}"))?;
+        #[cfg(windows)]
+        crate::system::windows_security::secure_path(parent, true)
+            .map_err(|error| format!("secure log dir: {error}"))?;
     }
     rotate_runtime_log(path)?;
     let mut file = OpenOptions::new()
@@ -1224,6 +1227,9 @@ fn append_text_line(path: &Path, line: &str) -> Result<(), String> {
         .append(true)
         .open(path)
         .map_err(|error| format!("open {}: {error}", path.display()))?;
+    #[cfg(windows)]
+    crate::system::windows_security::secure_path(path, false)
+        .map_err(|error| format!("secure {}: {error}", path.display()))?;
     writeln!(file, "{line}").map_err(|error| format!("write {}: {error}", path.display()))
 }
 

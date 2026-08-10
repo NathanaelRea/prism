@@ -11,8 +11,8 @@ use crate::tui_runtime::{RuntimeEvent, TerminalRuntime};
 use crate::view;
 
 use super::{
-    REMOTE_MUTATION_RECONCILIATION_KEY, TUI_ACTION_JOB_TIMEOUT, Tui, TuiJobKey, TuiJobKind,
-    TuiJobPayload, ctrl_key,
+    ctrl_key, Tui, TuiJobKey, TuiJobKind, TuiJobPayload, REMOTE_MUTATION_RECONCILIATION_KEY,
+    TUI_ACTION_JOB_TIMEOUT,
 };
 
 fn merge_is_authoritatively_pending(queue_state: &str) -> bool {
@@ -729,6 +729,7 @@ impl Tui {
                     RuntimeEvent::Resize => self.draw(runtime)?,
                     RuntimeEvent::Key(_)
                     | RuntimeEvent::Mouse(_)
+                    | RuntimeEvent::Paste(_)
                     | RuntimeEvent::FocusGained
                     | RuntimeEvent::FocusLost => {}
                 }

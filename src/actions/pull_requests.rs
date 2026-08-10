@@ -137,6 +137,9 @@ pub(super) fn validate_push_target_after_checks(
 }
 
 pub(super) fn open_url_in_browser(url: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    return crate::platform::open_url_with_shell_execute(url);
+    #[cfg(unix)]
     run_browser_opener(
         crate::platform::browser_candidates(crate::platform::current_os()),
         url,
@@ -151,6 +154,9 @@ pub(super) fn open_http_url_in_browser(url: &str) -> Result<(), String> {
     }) {
         return Err("development URL must use http or https".to_string());
     }
+    #[cfg(windows)]
+    return crate::platform::open_url_with_shell_execute(url);
+    #[cfg(unix)]
     run_browser_opener_private(
         crate::platform::browser_candidates(crate::platform::current_os()),
         url,
@@ -158,6 +164,7 @@ pub(super) fn open_http_url_in_browser(url: &str) -> Result<(), String> {
     .map(|_| ())
 }
 
+#[cfg(unix)]
 fn run_browser_opener_private(
     candidates: &[crate::platform::CommandCandidate<'_>],
     url: &str,
@@ -187,6 +194,7 @@ fn run_browser_opener_private(
     Err("no usable browser opener found".to_string())
 }
 
+#[cfg(any(unix, test))]
 pub(super) fn run_browser_opener(
     candidates: &[crate::platform::CommandCandidate<'_>],
     url: &str,

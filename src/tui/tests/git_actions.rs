@@ -71,6 +71,7 @@ fn git_actions_allow_push_before_remote_capabilities_or_a_pr_are_known() {
     assert!(!tui.git_action_enabled(GitAction::CiFix));
 }
 
+#[cfg(unix)]
 #[test]
 fn submit_review_requires_the_configured_gh_executable() {
     let temp = unique_temp_dir("prism-tui-submit-review-test");

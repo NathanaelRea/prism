@@ -1682,6 +1682,7 @@ mod tests {
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[cfg(unix)]
     #[test]
     fn final_merge_rejects_a_changed_remote_with_the_same_number_and_head() {
         let (temp, mut config, log) = manual_merge_test_config();
@@ -2433,6 +2434,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn manual_merge_rechecks_local_gates_in_the_final_execution_job() {
         let (temp, mut config, log) = manual_merge_test_config();

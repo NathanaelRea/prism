@@ -35,11 +35,7 @@ Run the local CI gate before pushing:
 scripts/full-check.sh
 ```
 
-Prism supports Linux and macOS. On Linux, the gate runs native tests and clippy,
-the host-independent policy tests for both supported operating systems, and
-Darwin cross-clippy for Apple Silicon. There are no architecture-specific code
-paths warranting a duplicate Intel cross-check. Cross-compilation does not
-replace native macOS verification.
+Prism supports Linux, macOS, and native `x86_64-pc-windows-msvc`. On Linux, the gate runs native tests and Clippy, host-independent platform-policy tests, Darwin cross-Clippy for Apple Silicon, and Windows MSVC cross-Clippy. There are no architecture-specific macOS code paths warranting a duplicate Intel cross-check. Cross-compilation does not replace native macOS or Windows verification.
 
 Run the focused native contracts on a prepared macOS host before the complete
 suite:
@@ -56,6 +52,17 @@ OpenCode, and tmux contracts without invoking a model. Deterministic policy,
 errno classification, and fault-injection tests remain in the full suite except
 where a staging test also proves a native durability primitive.
 
+On native Windows with PowerShell 7, run the required root gate and pinned compatibility smoke:
+
+```powershell
+scripts/windows-check.ps1
+scripts/install-windows-smoke-tools.ps1
+npm install --global opencode-ai@1.17.20
+scripts/windows-platform-smoke.ps1
+```
+
+The Windows gate covers formatting, SQLx-offline compilation, Clippy, normal tests, native process/IPC/security/persistence/storage contracts, and release-zip installation. The compatibility smoke uses native Git, psmux 3.3.7, Worktrunk 0.71.0 through `git-wt.exe`, and a real no-model OpenCode server. Interactive attach/detach, input, resize, restoration, and rendering remain a focused real-terminal check documented in [Windows interactive smoke](windows-interactive-smoke.md).
+
 To synchronize the current worktree, including uncommitted files, to an
 SSH-accessible Mac and run that smoke command without pushing a branch:
 
@@ -68,7 +75,7 @@ The destination must already be a Git checkout or worktree. Its working files
 are treated as a dedicated mirror: rsync deletes stale files while excluding
 `.git` and `target`.
 
-CI also runs a no-model smoke test against a pinned real OpenCode binary on Linux and macOS. To run it locally with an installed OpenCode:
+CI also runs no-model smoke coverage against a pinned real OpenCode binary on Linux, macOS, and Windows. To run the portable API test locally with an installed OpenCode:
 
 ```sh
 PRISM_TEST_OPENCODE="$(command -v opencode)" \
@@ -78,7 +85,7 @@ PRISM_TEST_OPENCODE="$(command -v opencode)" \
 
 The smoke test starts `opencode serve`, waits for its health endpoint, and verifies Prism can create, list, retrieve, and persist a prompt in a session. It does not require provider credentials.
 
-CI also exercises the full headless stack with the real Prism binary, OpenCode, and tmux on an isolated socket. To run it locally:
+CI also exercises the full headless stack with the real Prism binary, OpenCode, and tmux or psmux in isolated runtime state. To run the Unix test locally:
 
 ```sh
 PRISM_TEST_OPENCODE="$(command -v opencode)" \
@@ -87,7 +94,7 @@ PRISM_TEST_TMUX="$(command -v tmux)" \
     -- --ignored --exact
 ```
 
-The full-stack test creates a Git worktree, runs `prism agent ensure`, verifies the OpenCode-backed tmux session, runs ensure again to check reuse, and cleans up the isolated server and socket. It does not invoke a model.
+The full-stack test creates a Git worktree, runs `prism agent ensure`, verifies the OpenCode-backed session, runs ensure again to check reuse, and cleans up the isolated server and runtime state. The Windows equivalent is `scripts/windows-platform-smoke.ps1`. Neither path invokes a model.
 
 ## Remote Compatibility
 
@@ -117,7 +124,7 @@ the recorded metadata and security boundaries.
 
 ## Worktrunk Compatibility
 
-Prism's Worktrunk support floor is 0.58.0. CI installs and smoke-tests the pinned current version 0.71.0 on Linux and macOS using the versioned installer published with that upstream release. The smoke creates a repository whose path contains spaces, creates the `ci/real-smoke` branch, reads `wt list --format=json`, and removes the worktree while preserving the branch. It sets `WORKTRUNK_CONFIG_PATH` and `WORKTRUNK_WORKTREE_PATH` under a temporary directory so it never reads or mutates user configuration or approvals.
+Prism's Worktrunk support floor is 0.58.0. CI installs and smoke-tests the pinned current version 0.71.0 on Linux, macOS, and Windows. The Windows gate verifies the upstream archive checksum and installs its executable as `git-wt.exe` to avoid collision with Windows Terminal's `wt.exe`. The smoke creates a repository whose path contains spaces, creates the `ci/real-smoke` branch, reads machine JSON from Worktrunk, and removes the worktree while preserving the branch. It sets `WORKTRUNK_CONFIG_PATH` and `WORKTRUNK_WORKTREE_PATH` under a temporary directory so it never reads or mutates user configuration or approvals.
 
 `PRISM_TEST_WORKTRUNK` is the real-tool smoke selector and contains the absolute path to `wt`. To exercise the same binary selection locally:
 
@@ -127,7 +134,7 @@ test -x "$PRISM_TEST_WORKTRUNK"
 "$PRISM_TEST_WORKTRUNK" --version
 ```
 
-Parser coverage does not require Worktrunk. Redacted fixtures under `tests/fixtures/worktrunk` cover the 0.58.0 schema-1 floor and the schema-1/schema-2 output documented for 0.71.0, including absent and null observations. Unknown schemas must fail closed.
+On Windows, use `$env:PRISM_TEST_WORKTRUNK = (Get-Command git-wt.exe).Source` instead. Parser coverage does not require Worktrunk. Redacted fixtures under `tests/fixtures/worktrunk` cover the 0.58.0 schema-1 floor and the schema-1/schema-2 output documented for 0.71.0, including absent and null observations. Unknown schemas must fail closed.
 
 To enforce the same gate as a pre-push hook, opt into the versioned hooks:
 

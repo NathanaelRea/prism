@@ -1,13 +1,22 @@
+#[cfg(windows)]
+use process_wrap::std::{ChildWrapper, CommandWrap, CreationFlags, JobObject};
 use std::cell::RefCell;
 use std::env;
 use std::error::Error;
 use std::fmt;
 use std::io::{self, Read, Write};
+#[cfg(unix)]
 use std::ops::{Deref, DerefMut};
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::process::{CommandExt, ExitStatusExt};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::Path;
-use std::process::{Child, Command, ExitStatus, Stdio};
+#[cfg(unix)]
+use std::process::Child;
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -15,6 +24,11 @@ use std::time::{Duration, Instant};
 
 use crate::flight_recorder::{self, ExternalCallCategory, ExternalCallOutcome, ExternalCallTrace};
 use crate::observability::{self, LogLevel};
+
+#[cfg(unix)]
+type ManagedChild = Child;
+#[cfg(windows)]
+type ManagedChild = Box<dyn ChildWrapper>;
 
 thread_local! {
     static CURRENT_CANCELLATION: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
@@ -165,6 +179,7 @@ pub fn observe_process(
     }
 }
 
+#[cfg(unix)]
 pub fn terminate_recorded_process(
     process: RecordedProcess,
     grace: Duration,
@@ -222,6 +237,62 @@ pub fn terminate_recorded_process(
     }
 }
 
+#[cfg(windows)]
+pub fn terminate_recorded_process(
+    process: RecordedProcess,
+    grace: Duration,
+) -> Result<TerminationOutcome, ProcessLifecycleError> {
+    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_TERMINATE, TerminateProcess,
+        WaitForSingleObject,
+    };
+    const SYNCHRONIZE_PROCESS: PROCESS_ACCESS_RIGHTS = PROCESS_ACCESS_RIGHTS(0x0010_0000);
+
+    let native = native_process_observation(process.pid)?;
+    match decide_process_request(process.identity, native, ProcessRequest::Terminate) {
+        ProcessDecision::TerminationOutcome(outcome) => return Ok(outcome),
+        ProcessDecision::Terminate => {}
+        ProcessDecision::Observation(_) => unreachable!("termination request cannot observe"),
+    }
+
+    // CTRL+BREAK is valid only for compatible console process groups. Failure is expected for
+    // detached and GUI processes; deterministic termination below does not depend on it.
+    let _ = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, process.pid) };
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        if matches!(observe_process(process)?, ProcessObservation::Missing) {
+            return Ok(TerminationOutcome::Terminated);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let handle =
+        unsafe { OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE_PROCESS, false, process.pid) }
+            .map_err(|source| ProcessLifecycleError::Signal {
+                pid: process.pid,
+                source: io::Error::other(source),
+            })?;
+    let result = (|| {
+        unsafe { TerminateProcess(handle, 1) }.map_err(|source| ProcessLifecycleError::Signal {
+            pid: process.pid,
+            source: io::Error::other(source),
+        })?;
+        let wait_ms = grace.as_millis().min(u128::from(u32::MAX)) as u32;
+        match unsafe { WaitForSingleObject(handle, wait_ms) } {
+            WAIT_OBJECT_0 => Ok(TerminationOutcome::Terminated),
+            WAIT_TIMEOUT => Err(ProcessLifecycleError::TerminationTimedOut { pid: process.pid }),
+            _ => Err(ProcessLifecycleError::Inspect {
+                pid: process.pid,
+                source: io::Error::last_os_error(),
+            }),
+        }
+    })();
+    let _ = unsafe { CloseHandle(handle) };
+    result
+}
+
 pub fn process_arguments(pid: u32) -> Result<Option<Vec<String>>, ProcessLifecycleError> {
     native_process_arguments(pid).map_err(|source| ProcessLifecycleError::Inspect { pid, source })
 }
@@ -240,6 +311,7 @@ fn native_process_observation(pid: u32) -> Result<NativeProcessObservation, Proc
     Ok(NativeProcessObservation::Running(identity))
 }
 
+#[cfg(unix)]
 fn probe_result(result: libc::c_int, error: Option<i32>) -> io::Result<bool> {
     if result == 0 {
         return Ok(true);
@@ -252,6 +324,7 @@ fn probe_result(result: libc::c_int, error: Option<i32>) -> io::Result<bool> {
     }
 }
 
+#[cfg(unix)]
 fn native_pid(pid: u32) -> io::Result<libc::pid_t> {
     let pid = libc::pid_t::try_from(pid)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "process id is out of range"))?;
@@ -265,6 +338,7 @@ fn native_pid(pid: u32) -> io::Result<libc::pid_t> {
     }
 }
 
+#[cfg(unix)]
 fn probe_process(pid: u32) -> io::Result<bool> {
     let result = unsafe { libc::kill(native_pid(pid)?, 0) };
     probe_result(
@@ -275,6 +349,7 @@ fn probe_process(pid: u32) -> io::Result<bool> {
     )
 }
 
+#[cfg(unix)]
 fn probe_process_group(pid: u32) -> io::Result<bool> {
     let result = unsafe { libc::kill(-native_pid(pid)?, 0) };
     probe_result(
@@ -285,6 +360,7 @@ fn probe_process_group(pid: u32) -> io::Result<bool> {
     )
 }
 
+#[cfg(unix)]
 fn send_process_group_signal(pid: u32, signal: libc::c_int) -> io::Result<bool> {
     let result = unsafe { libc::kill(-native_pid(pid)?, signal) };
     if result == 0 {
@@ -295,6 +371,36 @@ fn send_process_group_signal(pid: u32, signal: libc::c_int) -> io::Result<bool> 
         Ok(false)
     } else {
         Err(error)
+    }
+}
+
+#[cfg(windows)]
+fn probe_process(pid: u32) -> io::Result<bool> {
+    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
+    };
+    const SYNCHRONIZE_PROCESS: PROCESS_ACCESS_RIGHTS = PROCESS_ACCESS_RIGHTS(0x0010_0000);
+
+    let handle = match unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE_PROCESS,
+            false,
+            pid,
+        )
+    } {
+        Ok(handle) => handle,
+        Err(error) if error.code().0 as u32 == 0x8007_0057 => return Ok(false),
+        // Access denied proves that the PID is allocated, but not its identity.
+        Err(error) if error.code().0 as u32 == 0x8007_0005 => return Ok(true),
+        Err(error) => return Err(io::Error::other(error)),
+    };
+    let wait = unsafe { WaitForSingleObject(handle, 0) };
+    let _ = unsafe { CloseHandle(handle) };
+    match wait {
+        WAIT_TIMEOUT => Ok(true),
+        WAIT_OBJECT_0 => Ok(false),
+        _ => Err(io::Error::last_os_error()),
     }
 }
 
@@ -339,6 +445,35 @@ fn native_process_identity(pid: u32) -> io::Result<Option<ProcessIdentity>> {
         return Ok(None);
     }
     Ok(Some(ProcessIdentity(seconds | info.pbi_start_tvusec)))
+}
+
+#[cfg(windows)]
+fn native_process_identity(pid: u32) -> io::Result<Option<ProcessIdentity>> {
+    use windows::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+        Ok(handle) => handle,
+        Err(error) if error.code().0 as u32 == 0x8007_0057 => return Ok(None),
+        Err(error) if error.code().0 as u32 == 0x8007_0005 => return Ok(None),
+        Err(error) => return Err(io::Error::other(error)),
+    };
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    let result =
+        unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) }
+            .map(|()| {
+                ProcessIdentity(
+                    (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime),
+                )
+            })
+            .map_err(io::Error::other);
+    let _ = unsafe { CloseHandle(handle) };
+    result.map(Some)
 }
 
 #[cfg(target_os = "linux")]
@@ -400,6 +535,46 @@ fn native_process_arguments(pid: u32) -> io::Result<Option<Vec<String>>> {
     }
     bytes.truncate(size);
     parse_macos_process_arguments(&bytes).map(Some)
+}
+
+#[cfg(windows)]
+fn native_process_arguments(pid: u32) -> io::Result<Option<Vec<String>>> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW,
+    };
+    use windows::core::PWSTR;
+
+    let handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+        Ok(handle) => handle,
+        Err(error) if error.code().0 as u32 == 0x8007_0057 => return Ok(None),
+        // Command-line access is deliberately classified as unavailable when denied.
+        Err(error) if error.code().0 as u32 == 0x8007_0005 => return Ok(None),
+        Err(error) => return Err(io::Error::other(error)),
+    };
+    let mut path = vec![0_u16; 32_768];
+    let mut len = path.len() as u32;
+    let result = unsafe {
+        QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            PWSTR(path.as_mut_ptr()),
+            &mut len,
+        )
+    }
+    .map(|()| {
+        path.truncate(len as usize);
+        vec![
+            std::ffi::OsString::from_wide(&path)
+                .to_string_lossy()
+                .into_owned(),
+        ]
+    })
+    .map_err(io::Error::other);
+    let _ = unsafe { CloseHandle(handle) };
+    result.map(Some)
 }
 
 #[cfg(target_os = "macos")]
@@ -590,6 +765,7 @@ fn append_status_fields(fields: &mut Vec<flight_recorder::Field>, status: ExitSt
     if let Some(code) = status.code() {
         fields.push(flight_recorder::unsigned("exit_code", code));
     }
+    #[cfg(unix)]
     if let Some(signal) = status.signal() {
         fields.push(flight_recorder::unsigned("signal", signal));
     }
@@ -698,8 +874,36 @@ struct PolicySettings {
     capture_bytes: usize,
 }
 
+fn child_stdin(child: &mut ManagedChild) -> &mut Option<std::process::ChildStdin> {
+    #[cfg(unix)]
+    return &mut child.stdin;
+    #[cfg(windows)]
+    return child.stdin();
+}
+
+fn child_stdout(child: &mut ManagedChild) -> &mut Option<std::process::ChildStdout> {
+    #[cfg(unix)]
+    return &mut child.stdout;
+    #[cfg(windows)]
+    return child.stdout();
+}
+
+fn child_stderr(child: &mut ManagedChild) -> &mut Option<std::process::ChildStderr> {
+    #[cfg(unix)]
+    return &mut child.stderr;
+    #[cfg(windows)]
+    return child.stderr();
+}
+
+fn configure_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    command.process_group(0);
+    #[cfg(windows)]
+    let _ = command;
+}
+
 pub struct SupervisedChild {
-    child: Child,
+    child: ManagedChild,
     stdin_writer: Option<JoinHandle<io::Result<()>>>,
     started: Instant,
     deadline: Option<Duration>,
@@ -749,10 +953,10 @@ impl SupervisedChild {
         } else {
             Stdio::null()
         });
-        command.process_group(0);
+        configure_process_group(command);
 
         let started = Instant::now();
-        let mut child = match command.spawn() {
+        let mut child = match spawn_managed(command) {
             Ok(child) => child,
             Err(error) => {
                 trace.finish(
@@ -762,10 +966,10 @@ impl SupervisedChild {
                 return Err(ProcessError::Spawn(error));
             }
         };
-        let stdout_counted = child.stdout.is_some();
-        let stderr_counted = child.stderr.is_some();
+        let stdout_counted = child_stdout(&mut child).is_some();
+        let stderr_counted = child_stderr(&mut child).is_some();
         let stdin_writer = if let Some(bytes) = input {
-            let Some(mut stdin) = child.stdin.take() else {
+            let Some(mut stdin) = child_stdin(&mut child).take() else {
                 let _ = terminate_active_child(&mut child, Duration::from_secs(1));
                 trace.finish(
                     ExternalCallOutcome::Failed,
@@ -811,17 +1015,21 @@ impl SupervisedChild {
     }
 
     pub fn take_stdout(&mut self) -> Option<CountingReader<std::process::ChildStdout>> {
-        self.child.stdout.take().map(|inner| CountingReader {
-            inner,
-            bytes: Arc::clone(&self.stdout_bytes),
-        })
+        child_stdout(&mut self.child)
+            .take()
+            .map(|inner| CountingReader {
+                inner,
+                bytes: Arc::clone(&self.stdout_bytes),
+            })
     }
 
     pub fn take_stderr(&mut self) -> Option<CountingReader<std::process::ChildStderr>> {
-        self.child.stderr.take().map(|inner| CountingReader {
-            inner,
-            bytes: Arc::clone(&self.stderr_bytes),
-        })
+        child_stderr(&mut self.child)
+            .take()
+            .map(|inner| CountingReader {
+                inner,
+                bytes: Arc::clone(&self.stderr_bytes),
+            })
     }
 
     pub fn terminate(&mut self) -> Result<TerminationStage, ProcessError> {
@@ -921,6 +1129,7 @@ impl SupervisedChild {
     }
 }
 
+#[cfg(unix)]
 impl Deref for SupervisedChild {
     type Target = Child;
 
@@ -929,9 +1138,21 @@ impl Deref for SupervisedChild {
     }
 }
 
+#[cfg(unix)]
 impl DerefMut for SupervisedChild {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.child
+    }
+}
+
+#[cfg(windows)]
+impl SupervisedChild {
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    pub fn kill(&mut self) -> io::Result<()> {
+        self.child.kill()
     }
 }
 
@@ -983,6 +1204,7 @@ pub enum ProcessInput<'a> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(windows, allow(dead_code))]
 pub enum ProcessCompletion {
     Exited,
     Signaled,
@@ -1169,6 +1391,7 @@ pub fn spawn_detached_named(
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
+            #[cfg(unix)]
             unsafe {
                 // Daemons deliberately escape the normal supervised process group.
                 command.pre_exec(|| {
@@ -1177,6 +1400,13 @@ pub fn spawn_detached_named(
                     }
                     Ok(())
                 });
+            }
+            #[cfg(windows)]
+            {
+                use windows::Win32::System::Threading::{
+                    CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS,
+                };
+                command.creation_flags((CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS).0);
             }
         }
     }
@@ -1205,7 +1435,8 @@ pub fn spawn_detached_named(
         })
     {
         if let Some(mut child) = child.lock().ok().and_then(|mut child| child.take()) {
-            let _ = terminate_active_child(&mut child, Duration::from_secs(1));
+            let _ = child.kill();
+            let _ = child.wait();
         }
         trace.finish(
             ExternalCallOutcome::Failed,
@@ -1501,17 +1732,17 @@ fn supervise_with_settings(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    command.process_group(0);
+    configure_process_group(command);
 
     let started = Instant::now();
-    let mut child = spawn_supervised(command).map_err(ProcessError::Spawn)?;
+    let mut child = spawn_managed(command).map_err(ProcessError::Spawn)?;
     let child_pid = child.id();
     let stop_readers = Arc::new(AtomicBool::new(false));
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
+    let stdout = child_stdout(&mut child).take();
+    let stderr = child_stderr(&mut child).take();
     let stdin = match input {
         ProcessInput::Null => None,
-        ProcessInput::Bytes(_) => child.stdin.take(),
+        ProcessInput::Bytes(_) => child_stdin(&mut child).take(),
     };
     let missing_pipe = if stdout.is_none() {
         Some("stdout")
@@ -1594,7 +1825,7 @@ fn supervise_with_settings(
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        match signal_kill(child_pid) {
+        match force_kill(&mut child, child_pid) {
             Ok(true) => termination_stage = TerminationStage::Kill,
             Ok(false) => {}
             Err(error) => {
@@ -1626,7 +1857,7 @@ fn supervise_with_settings(
                 || !stdout_reader.is_finished()
                 || !stderr_reader.is_finished()
             {
-                match signal_kill(child_pid) {
+                match force_kill(&mut child, child_pid) {
                     Ok(true) => termination_stage = TerminationStage::Kill,
                     Ok(false) => {}
                     Err(error) => {
@@ -1680,18 +1911,31 @@ fn supervise_with_settings(
         elapsed: started.elapsed(),
         deadline: settings.deadline,
         child_pid,
-        process_group: Some(child_pid),
+        process_group: unix_process_group(child_pid),
     })
 }
 
 fn completion_from_status(status: ExitStatus) -> ProcessCompletion {
+    #[cfg(unix)]
     if status.signal().is_some() {
         return ProcessCompletion::Signaled;
     }
+    let _ = status;
     ProcessCompletion::Exited
 }
 
-fn spawn_supervised(command: &mut Command) -> io::Result<Child> {
+const fn unix_process_group(child_pid: u32) -> Option<u32> {
+    #[cfg(unix)]
+    return Some(child_pid);
+    #[cfg(windows)]
+    {
+        let _ = child_pid;
+        None
+    }
+}
+
+#[cfg(unix)]
+fn spawn_managed(command: &mut Command) -> io::Result<ManagedChild> {
     const BUSY_RETRIES: usize = 4;
 
     for retry in 0..=BUSY_RETRIES {
@@ -1707,6 +1951,22 @@ fn spawn_supervised(command: &mut Command) -> io::Result<Child> {
     unreachable!("bounded spawn loop always returns")
 }
 
+#[cfg(windows)]
+fn spawn_managed(command: &mut Command) -> io::Result<ManagedChild> {
+    use windows::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
+
+    let owned = std::mem::replace(command, Command::new(""));
+    let mut wrapped = CommandWrap::from(owned);
+    // CreationFlags must precede JobObject so the latter can add CREATE_SUSPENDED and assign the
+    // process before its first instruction executes.
+    wrapped.wrap(CreationFlags(CREATE_NEW_PROCESS_GROUP));
+    wrapped.wrap(JobObject);
+    let result = wrapped.spawn();
+    *command = wrapped.into_command();
+    result
+}
+
+#[cfg(unix)]
 fn spawn_capture_reader<R>(
     reader: R,
     max_bytes: usize,
@@ -1718,6 +1978,7 @@ where
     std::thread::spawn(move || read_captured_tail(reader, max_bytes, &stop))
 }
 
+#[cfg(unix)]
 fn read_captured_tail(
     mut reader: impl Read + AsRawFd,
     max_bytes: usize,
@@ -1749,6 +2010,32 @@ fn read_captured_tail(
                     return Err(io::Error::last_os_error());
                 }
             }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn spawn_capture_reader<R>(
+    reader: R,
+    max_bytes: usize,
+    _stop: Arc<AtomicBool>,
+) -> JoinHandle<io::Result<CapturedTail>>
+where
+    R: Read + Send + 'static,
+{
+    std::thread::spawn(move || read_captured_tail(reader, max_bytes))
+}
+
+#[cfg(windows)]
+fn read_captured_tail(mut reader: impl Read, max_bytes: usize) -> io::Result<CapturedTail> {
+    let mut tail = TailBuffer::new(max_bytes);
+    let mut buffer = [0_u8; 8192];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok(tail.finish()),
+            Ok(read) => tail.push(&buffer[..read]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
         }
     }
@@ -1817,14 +2104,37 @@ fn join_stdin(writer: Option<JoinHandle<io::Result<()>>>) -> Result<(), ProcessE
         .map_err(ProcessError::Stdin)
 }
 
+#[cfg(unix)]
 fn signal_term(process_id: u32) -> Result<TerminationStage, ProcessError> {
     signal_process_group(process_id, libc::SIGTERM).map(|_| TerminationStage::Term)
 }
 
-fn signal_kill(process_id: u32) -> Result<bool, ProcessError> {
+#[cfg(windows)]
+fn signal_term(process_id: u32) -> Result<TerminationStage, ProcessError> {
+    use windows::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
+    // Detached and GUI commands have no compatible console group. A failed graceful attempt is
+    // not a supervision failure because force_kill still terminates the Job Object.
+    let _ = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, process_id) };
+    Ok(TerminationStage::Term)
+}
+
+#[cfg(unix)]
+fn force_kill(_child: &mut ManagedChild, process_id: u32) -> Result<bool, ProcessError> {
     signal_process_group(process_id, libc::SIGKILL)
 }
 
+#[cfg(windows)]
+fn force_kill(child: &mut ManagedChild, _process_id: u32) -> Result<bool, ProcessError> {
+    child
+        .start_kill()
+        .map(|()| true)
+        .map_err(|source| ProcessError::Signal {
+            signal: "TerminateJobObject",
+            source,
+        })
+}
+
+#[cfg(unix)]
 fn signal_process_group(process_id: u32, signal: libc::c_int) -> Result<bool, ProcessError> {
     send_process_group_signal(process_id, signal).map_err(|error| ProcessError::Signal {
         signal: match signal {
@@ -1837,11 +2147,14 @@ fn signal_process_group(process_id: u32, signal: libc::c_int) -> Result<bool, Pr
 }
 
 fn process_group_exists(process_id: u32) -> bool {
-    probe_process_group(process_id).unwrap_or(true)
+    #[cfg(unix)]
+    return probe_process_group(process_id).unwrap_or(true);
+    #[cfg(windows)]
+    return probe_process(process_id).unwrap_or(true);
 }
 
 pub fn terminate_active_child(
-    child: &mut Child,
+    child: &mut ManagedChild,
     grace: Duration,
 ) -> Result<TerminationStage, ProcessError> {
     let process_id = child.id();
@@ -1875,7 +2188,7 @@ pub fn terminate_active_child(
     }
 
     // The leader may have honored TERM while a descendant retained the group.
-    match signal_kill(process_id) {
+    match force_kill(child, process_id) {
         Ok(true) => stage = TerminationStage::Kill,
         Ok(false) => {}
         Err(error) => {
@@ -1930,6 +2243,45 @@ pub fn run_status_inherited_named(
         .success()
         .then_some(())
         .ok_or_else(|| format!("{command_display}: exited with {}", output.status))
+}
+
+#[cfg(unix)]
+pub fn run_status_attached_named(
+    command: &mut Command,
+    descriptor: ProcessDescriptor,
+) -> Result<(), String> {
+    run_status_inherited_named(command, descriptor)
+}
+
+#[cfg(windows)]
+pub fn run_status_attached_named(
+    command: &mut Command,
+    descriptor: ProcessDescriptor,
+) -> Result<(), String> {
+    let command_display = observability::command_display(command);
+    let mut trace = ExternalCallTrace::begin(
+        ExternalCallCategory::Process,
+        descriptor.name,
+        vec![flight_recorder::text("policy", "attached_console")],
+    );
+    let _interrupt_owner = crate::system::windows_console::attached_child_owns_interrupt()
+        .map_err(|error| format!("{command_display}: prepare attached console: {error}"))?;
+    let status = command.status().map_err(|error| {
+        trace.finish(
+            ExternalCallOutcome::SpawnFailed,
+            process_error_fields(ProcessErrorKind::Spawn),
+        );
+        format!("{command_display}: {error}")
+    })?;
+    let completion = completion_from_status(status);
+    trace.finish(
+        process_outcome(Some(status), completion),
+        vec![flight_recorder::text("completion", completion.label())],
+    );
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| format!("{command_display}: exited with {status}"))
 }
 
 pub fn run_capture_interactive(
@@ -2065,8 +2417,8 @@ fn run_interactive_inner(
                 .stderr(Stdio::inherit());
         }
     }
-    command.process_group(0);
-    let mut child = command.spawn().map_err(|error| {
+    configure_process_group(command);
+    let mut child = spawn_managed(command).map_err(|error| {
         trace.finish(
             ExternalCallOutcome::SpawnFailed,
             process_error_fields(ProcessErrorKind::Spawn),
@@ -2095,12 +2447,10 @@ fn run_interactive_inner(
     let (stdin_writer, stdout_reader) = match io_mode {
         InteractiveIo::Inherited => (None, None),
         InteractiveIo::CaptureStdout { input, max_bytes } => {
-            let mut stdin = child
-                .stdin
+            let mut stdin = child_stdin(&mut child)
                 .take()
                 .expect("configured interactive stdin pipe");
-            let stdout = child
-                .stdout
+            let stdout = child_stdout(&mut child)
                 .take()
                 .expect("configured interactive stdout pipe");
             let input = input.to_vec();
@@ -2217,12 +2567,17 @@ fn run_interactive_inner(
 
 struct InteractiveSignalCancellation {
     flag: Arc<AtomicBool>,
+    #[cfg(unix)]
     registrations: Vec<signal_hook::SigId>,
 }
 
 impl InteractiveSignalCancellation {
     fn install() -> io::Result<Self> {
+        #[cfg(unix)]
         let flag = Arc::new(AtomicBool::new(false));
+        #[cfg(windows)]
+        let flag = crate::system::windows_console::cancellation()?;
+        #[cfg(unix)]
         let registrations = {
             let mut registrations = Vec::new();
             for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
@@ -2240,11 +2595,13 @@ impl InteractiveSignalCancellation {
         };
         Ok(Self {
             flag,
+            #[cfg(unix)]
             registrations,
         })
     }
 }
 
+#[cfg(unix)]
 impl Drop for InteractiveSignalCancellation {
     fn drop(&mut self) {
         for registration in self.registrations.drain(..) {
@@ -2253,10 +2610,12 @@ impl Drop for InteractiveSignalCancellation {
     }
 }
 
+#[cfg(unix)]
 struct ForegroundProcessGroup {
     original: Option<libc::pid_t>,
 }
 
+#[cfg(unix)]
 impl ForegroundProcessGroup {
     fn give_to(process_id: u32) -> io::Result<Self> {
         if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
@@ -2273,6 +2632,7 @@ impl ForegroundProcessGroup {
     }
 }
 
+#[cfg(unix)]
 impl Drop for ForegroundProcessGroup {
     fn drop(&mut self) {
         if let Some(original) = self.original {
@@ -2281,6 +2641,24 @@ impl Drop for ForegroundProcessGroup {
     }
 }
 
+#[cfg(windows)]
+struct ForegroundProcessGroup;
+
+#[cfg(windows)]
+impl ForegroundProcessGroup {
+    fn give_to(_process_id: u32) -> io::Result<Self> {
+        // Windows console and psmux/ConPTY keep ownership of the inherited console. Prism does
+        // not emulate Unix tcsetpgrp handoff.
+        Ok(Self)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ForegroundProcessGroup {
+    fn drop(&mut self) {}
+}
+
+#[cfg(unix)]
 fn set_foreground_process_group(process_group: libc::pid_t) -> io::Result<()> {
     unsafe {
         let mut blocked = std::mem::zeroed::<libc::sigset_t>();
@@ -2327,13 +2705,31 @@ fn first_non_empty_line(output: &str) -> String {
 }
 
 pub fn command_exists(command: &str) -> bool {
-    if command.contains('/') {
-        return Path::new(command).is_file();
+    if command.contains('/') || command.contains('\\') {
+        return executable_path_exists(Path::new(command));
     }
     let Some(path) = env::var_os("PATH") else {
         return false;
     };
-    env::split_paths(&path).any(|dir| dir.join(command).is_file())
+    env::split_paths(&path).any(|dir| executable_path_exists(&dir.join(command)))
+}
+
+fn executable_path_exists(path: &Path) -> bool {
+    if path.is_file() {
+        return true;
+    }
+    #[cfg(windows)]
+    if path.extension().is_none() {
+        let extensions = env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+        return extensions
+            .split(';')
+            .filter(|extension| !extension.is_empty())
+            .any(|extension| {
+                path.with_extension(extension.trim_start_matches('.'))
+                    .is_file()
+            });
+    }
+    false
 }
 
 pub fn command_version(command: &str) -> Option<String> {
@@ -2522,6 +2918,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn platform_contract_process_probe_treats_permission_denied_as_existing() {
         assert!(probe_result(-1, Some(libc::EPERM)).unwrap());
@@ -2561,9 +2958,11 @@ mod tests {
             terminate_recorded_process(process, Duration::from_millis(10)).unwrap(),
             TerminationOutcome::AlreadyExited
         );
+        #[cfg(unix)]
         assert!(!probe_process_group(process.pid).unwrap());
     }
 
+    #[cfg(unix)]
     #[test]
     fn platform_smoke_native_identity_checked_termination_rejects_reuse() {
         use std::os::unix::process::CommandExt;
@@ -2679,6 +3078,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn output_timeout_terminates_long_running_process() {
         let error = run_output_allow_failure(
@@ -2691,6 +3091,7 @@ mod tests {
         assert!(error.contains("subprocess timed out"), "{error}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_capture_rejects_truncated_success_output() {
         let error = run_capture(
@@ -2723,6 +3124,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn interactive_capture_preserves_input_without_a_deadline() {
         let output = run_capture_interactive(
@@ -2812,6 +3214,7 @@ mod tests {
         std::fs::remove_dir_all(temp).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn supervisor_uses_null_stdin_unless_input_is_supplied() {
         let outcome = supervise(
@@ -2978,5 +3381,159 @@ mod tests {
         assert!(!outcome.stdout.bytes.is_empty());
         assert!(!outcome.stderr.bytes.is_empty());
         std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_job_cancellation_bounds_output_and_removes_stubborn_descendants() {
+        let temp = std::env::temp_dir().join(format!(
+            "prism-windows-process-{}-{}",
+            std::process::id(),
+            crate::util::timestamp_nanos()
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        let descendant_path = temp.join("descendant.pid");
+        let canceled = Arc::new(AtomicBool::new(false));
+        let cancel_when_ready = Arc::clone(&canceled);
+        let marker = descendant_path.clone();
+        let canceler = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !marker.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                marker.exists(),
+                "PowerShell fixture did not report its descendant"
+            );
+            cancel_when_ready.store(true, Ordering::Release);
+        });
+        let script = r#"
+            $child = Start-Process pwsh.exe -ArgumentList @(
+                '-NoProfile', '-Command',
+                'while ($true) { Start-Sleep -Seconds 1 }'
+            ) -PassThru
+            Set-Content -LiteralPath $env:PRISM_DESCENDANT_PID -Value $child.Id
+            [Console]::Out.Write(('o' * 8192))
+            [Console]::Error.Write(('e' * 8192))
+            while ($true) { Start-Sleep -Seconds 1 }
+        "#;
+        let settings = PolicySettings {
+            deadline: Duration::from_secs(15),
+            termination_grace: Duration::from_millis(100),
+            capture_bytes: 1024,
+        };
+        let mut command = Command::new("pwsh.exe");
+        command
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ])
+            .env("PRISM_DESCENDANT_PID", &descendant_path);
+        let outcome = supervise_with_settings(
+            &mut command,
+            ProcessPolicy::Test,
+            settings,
+            ProcessInput::Null,
+            Some(&canceled),
+        )
+        .unwrap();
+        canceler.join().unwrap();
+
+        assert_eq!(outcome.completion, ProcessCompletion::Canceled);
+        assert_eq!(outcome.termination_stage, TerminationStage::Kill);
+        assert_eq!(outcome.process_group, None);
+        assert_eq!(outcome.stdout.bytes.len(), 1024);
+        assert_eq!(outcome.stderr.bytes.len(), 1024);
+        assert!(outcome.stdout.truncated);
+        assert!(outcome.stderr.truncated);
+
+        let descendant = std::fs::read_to_string(&descendant_path)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        let recorded = record_process(descendant).unwrap();
+        assert_eq!(
+            recorded.identity, None,
+            "managed descendant survived Job termination"
+        );
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_managed_child_drop_removes_descendants_after_parent_failure() {
+        let marker = std::env::temp_dir().join(format!(
+            "prism-windows-drop-{}-{}.pid",
+            std::process::id(),
+            crate::util::timestamp_nanos()
+        ));
+        let script = r#"
+            $child = Start-Process pwsh.exe -ArgumentList @(
+                '-NoProfile', '-Command',
+                'while ($true) { Start-Sleep -Seconds 1 }'
+            ) -PassThru
+            Set-Content -LiteralPath $env:PRISM_DESCENDANT_PID -Value $child.Id
+            while ($true) { Start-Sleep -Seconds 1 }
+        "#;
+        let mut command = Command::new("pwsh.exe");
+        command
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ])
+            .env("PRISM_DESCENDANT_PID", &marker);
+        let child = SupervisedChild::spawn(&mut command, Some(ProcessPolicy::Test), None).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !marker.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let descendant = std::fs::read_to_string(&marker)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+
+        drop(child);
+
+        assert_eq!(
+            observe_process(RecordedProcess::from_stored(descendant, Some(u64::MAX))).unwrap(),
+            ProcessObservation::Missing
+        );
+        std::fs::remove_file(marker).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_pre_spawn_cancellation_is_reaped_without_a_race() {
+        let canceled = AtomicBool::new(true);
+        let mut command = Command::new("pwsh.exe");
+        command.args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "while ($true) { Start-Sleep -Seconds 1 }",
+        ]);
+
+        let outcome = supervise(
+            &mut command,
+            ProcessPolicy::Test,
+            ProcessInput::Null,
+            Some(&canceled),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.completion, ProcessCompletion::Canceled);
+        assert_eq!(
+            observe_process(RecordedProcess::from_stored(outcome.child_pid, None)).unwrap(),
+            ProcessObservation::Missing
+        );
     }
 }

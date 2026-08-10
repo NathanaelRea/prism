@@ -116,7 +116,7 @@ fn join_containment_job(name: &str) -> SpikeResult {
     result
 }
 
-unsafe extern "system" fn console_handler(control: u32) -> BOOL {
+extern "system" fn console_handler(control: u32) -> BOOL {
     if control != CTRL_BREAK_EVENT {
         return false.into();
     }

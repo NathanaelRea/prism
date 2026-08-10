@@ -7,3 +7,4 @@ pub(crate) mod plan;
 pub(crate) mod review;
 pub(crate) mod verify;
 pub(crate) mod worker;
+mod worker_ipc;

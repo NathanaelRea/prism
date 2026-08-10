@@ -25,9 +25,9 @@ use crate::plan_run::{
     archive_plan_run, load_plan_run, retry_failed_steps, retry_from_step, save_plan_run,
     skip_plan_step,
 };
-use crate::process::{
-    ProcessPolicy, command_exists, parse_command_words, run_output_allow_failure,
-};
+use crate::process::parse_command_words;
+#[cfg(any(unix, test))]
+use crate::process::{ProcessPolicy, command_exists, run_output_allow_failure};
 use crate::remote::dispatcher::{
     create_change_request as create_pull_request,
     fetch_change_request_branch as fetch_pull_request_branch,

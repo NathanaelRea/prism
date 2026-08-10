@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::future::Future;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::pin::Pin;
@@ -12,6 +13,14 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
+
+#[cfg(windows)]
+use process_wrap::tokio::{ChildWrapper, CommandWrap, CreationFlags, JobObject, KillOnDrop};
+
+#[cfg(unix)]
+type WorkflowCommandChild = tokio::process::Child;
+#[cfg(windows)]
+type WorkflowCommandChild = Box<dyn ChildWrapper>;
 
 use crate::persistence::artifacts::{ArtifactBody, ArtifactStore, PublishArtifact};
 use crate::persistence::control_plane::{
@@ -184,6 +193,69 @@ impl StepImplementation for HarnessImplementation {
     }
 }
 
+fn configure_workflow_command(command: &mut Command) {
+    #[cfg(unix)]
+    command.as_std_mut().process_group(0);
+    #[cfg(windows)]
+    let _ = command;
+}
+
+#[cfg(unix)]
+fn spawn_workflow_command(command: &mut Command) -> std::io::Result<WorkflowCommandChild> {
+    command.spawn()
+}
+
+#[cfg(windows)]
+fn spawn_workflow_command(command: &mut Command) -> std::io::Result<WorkflowCommandChild> {
+    use windows::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
+
+    let owned = std::mem::replace(command, Command::new(""));
+    let mut wrapped = CommandWrap::from(owned);
+    wrapped.wrap(CreationFlags(CREATE_NEW_PROCESS_GROUP));
+    wrapped.wrap(JobObject);
+    wrapped.wrap(KillOnDrop);
+    let result = wrapped.spawn();
+    *command = wrapped.into_command();
+    result
+}
+
+#[cfg(unix)]
+async fn kill_workflow_child(child: &mut WorkflowCommandChild) -> std::io::Result<()> {
+    child.kill().await
+}
+
+#[cfg(windows)]
+async fn kill_workflow_child(child: &mut WorkflowCommandChild) -> std::io::Result<()> {
+    Box::into_pin(child.kill()).await
+}
+
+fn workflow_child_stdin(
+    child: &mut WorkflowCommandChild,
+) -> &mut Option<tokio::process::ChildStdin> {
+    #[cfg(unix)]
+    return &mut child.stdin;
+    #[cfg(windows)]
+    return child.stdin();
+}
+
+fn workflow_child_stdout(
+    child: &mut WorkflowCommandChild,
+) -> &mut Option<tokio::process::ChildStdout> {
+    #[cfg(unix)]
+    return &mut child.stdout;
+    #[cfg(windows)]
+    return child.stdout();
+}
+
+fn workflow_child_stderr(
+    child: &mut WorkflowCommandChild,
+) -> &mut Option<tokio::process::ChildStderr> {
+    #[cfg(unix)]
+    return &mut child.stderr;
+    #[cfg(windows)]
+    return child.stderr();
+}
+
 impl StepImplementation for CommandImplementation {
     fn execute<'a>(&'a self, context: ExecutionContext) -> StepFuture<'a> {
         Box::pin(async move {
@@ -196,7 +268,7 @@ impl StepImplementation for CommandImplementation {
                 return Err("command program must not be empty".into());
             }
             let mut command = Command::new(&input.program);
-            command.as_std_mut().process_group(0);
+            configure_workflow_command(&mut command);
             command
                 .args(&input.args)
                 .envs(&input.environment)
@@ -211,11 +283,10 @@ impl StepImplementation for CommandImplementation {
             if let Some(cwd) = input.cwd {
                 command.current_dir(cwd);
             }
-            let mut child = command
-                .spawn()
+            let mut child = spawn_workflow_command(&mut command)
                 .map_err(|error| format!("spawn command '{}': {error}", input.program))?;
             if let Some(stdin) = input.stdin
-                && let Some(mut writer) = child.stdin.take()
+                && let Some(mut writer) = workflow_child_stdin(&mut child).take()
             {
                 writer
                     .write_all(stdin.as_bytes())
@@ -237,12 +308,10 @@ impl StepImplementation for CommandImplementation {
                 )
                 .await
                 .map_err(|error| error.to_string())?;
-            let stdout = child
-                .stdout
+            let stdout = workflow_child_stdout(&mut child)
                 .take()
                 .ok_or_else(|| "capture command stdout".to_string())?;
-            let stderr = child
-                .stderr
+            let stderr = workflow_child_stderr(&mut child)
                 .take()
                 .ok_or_else(|| "capture command stderr".to_string())?;
             let stdout_task = tokio::spawn(pump_command_output(stdout, context.clone(), false));
@@ -258,9 +327,12 @@ impl StepImplementation for CommandImplementation {
                         .await
                         .map_err(|error| format!("join command termination: {error}"))?;
                         if let Err(error) = termination {
-                            let _ = child.kill().await;
+                            let _ = kill_workflow_child(&mut child).await;
                             return Err(format!("cancel command '{}': {error}", input.program));
                         }
+                        #[cfg(windows)]
+                        let _ = kill_workflow_child(&mut child).await;
+                        #[cfg(unix)]
                         let _ = child.wait().await;
                         return Err("command cancelled".into());
                     }

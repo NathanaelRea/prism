@@ -6,16 +6,16 @@ use std::{
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{
-        self, DisableFocusChange, EnableFocusChange, EnableMouseCapture, Event, KeyEvent,
-        MouseEvent,
+        self, DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
+        EnableMouseCapture, Event, KeyEvent, MouseEvent,
     },
     execute,
     terminal::{
-        Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
-        enable_raw_mode,
+        disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
+        LeaveAlternateScreen,
     },
 };
-use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
+use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 
 use crate::view;
 
@@ -27,6 +27,7 @@ pub(crate) struct TerminalRuntime {
 pub(crate) enum RuntimeEvent {
     Key(KeyEvent),
     Mouse(MouseEvent),
+    Paste(String),
     Resize,
     FocusGained,
     FocusLost,
@@ -46,19 +47,19 @@ impl TerminalRuntime {
             EnterAlternateScreen,
             EnableMouseCapture,
             EnableFocusChange,
+            EnableBracketedPaste,
             Hide
         )
         .map_err(|error| error.to_string())
         {
-            let _ = disable_raw_mode();
+            restore_terminal();
             return Err(error);
         }
         let backend = CrosstermBackend::new(stdout);
         let terminal = match Terminal::new(backend).map_err(|error| error.to_string()) {
             Ok(terminal) => terminal,
             Err(error) => {
-                let _ = execute!(io::stdout(), DisableFocusChange, LeaveAlternateScreen, Show);
-                let _ = disable_raw_mode();
+                restore_terminal();
                 return Err(error);
             }
         };
@@ -120,9 +121,13 @@ impl TerminalRuntime {
                 EnterAlternateScreen,
                 EnableMouseCapture,
                 EnableFocusChange,
+                EnableBracketedPaste,
                 Hide
             )
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| {
+                restore_terminal();
+                error.to_string()
+            })?;
             self.active = true;
             self.terminal.clear().map_err(|error| error.to_string())?;
             Ok(())
@@ -176,9 +181,9 @@ impl TerminalRuntime {
             Event::Resize(_, _) => Ok(Some(RuntimeEvent::Resize)),
             Event::FocusGained => Ok(Some(RuntimeEvent::FocusGained)),
             Event::FocusLost => Ok(Some(RuntimeEvent::FocusLost)),
-            Event::Paste(_) => {
+            Event::Paste(text) => {
                 crate::flight_recorder::finish_pending_input_without_frame();
-                Ok(None)
+                Ok(Some(RuntimeEvent::Paste(text)))
             }
         };
         crate::flight_recorder::record(
@@ -220,6 +225,7 @@ impl TerminalRuntime {
             io::stdout(),
             crossterm::event::DisableMouseCapture,
             DisableFocusChange,
+            DisableBracketedPaste,
             LeaveAlternateScreen,
             Clear(ClearType::All),
             MoveTo(0, 0),
@@ -232,13 +238,18 @@ impl TerminalRuntime {
 
 impl Drop for TerminalRuntime {
     fn drop(&mut self) {
-        let _ = execute!(
-            io::stdout(),
-            crossterm::event::DisableMouseCapture,
-            DisableFocusChange,
-            LeaveAlternateScreen,
-            Show
-        );
-        let _ = disable_raw_mode();
+        restore_terminal();
     }
+}
+
+fn restore_terminal() {
+    let _ = execute!(
+        io::stdout(),
+        crossterm::event::DisableMouseCapture,
+        DisableFocusChange,
+        DisableBracketedPaste,
+        LeaveAlternateScreen,
+        Show
+    );
+    let _ = disable_raw_mode();
 }

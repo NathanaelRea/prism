@@ -8,10 +8,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use wait_timeout::ChildExt;
 
-use crate::support::{SpikeResult, TempDir, fail, require, unique_name};
+use crate::support::{fail, require, unique_name, SpikeResult, TempDir};
 
 const PSMUX_VERSION: &str = "3.3.7";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -281,6 +281,130 @@ pub fn run_spike() -> SpikeResult {
     )?;
 
     let temp = TempDir::new("prism-windows-psmux")?;
+    run_mux_strings(
+        &psmux,
+        &namespace,
+        &["set-option", "-t", session, "base-index", "1"],
+    )?;
+    run_mux_strings(
+        &psmux,
+        &namespace,
+        &["set-option", "-t", session, "renumber-windows", "off"],
+    )?;
+    run_mux_strings(
+        &psmux,
+        &namespace,
+        &["set-option", "-t", session, "detach-on-destroy", "on"],
+    )?;
+    run_mux_strings(
+        &psmux,
+        &namespace,
+        &[
+            "set-option",
+            "-t",
+            session,
+            "@prism-opencode-runtime",
+            "schema=1;port=43000",
+        ],
+    )?;
+    let option = run_mux_strings(
+        &psmux,
+        &namespace,
+        &[
+            "show-options",
+            "-v",
+            "-t",
+            session,
+            "@prism-opencode-runtime",
+        ],
+    )?;
+    require(
+        String::from_utf8(option.stdout)?.trim() == "schema=1;port=43000",
+        "psmux did not round-trip Prism's custom runtime option",
+    )?;
+    run_mux_strings(
+        &psmux,
+        &namespace,
+        &[
+            "move-window",
+            "-s",
+            &format!("{session}:0"),
+            "-t",
+            &format!("{session}:1"),
+        ],
+    )?;
+    run_mux_strings(
+        &psmux,
+        &namespace,
+        &["rename-window", "-t", &format!("{session}:1"), "agent"],
+    )?;
+    let temp_path = temp.path().display().to_string();
+    run_mux_strings(
+        &psmux,
+        &namespace,
+        &[
+            "new-window",
+            "-d",
+            "-t",
+            &format!("{session}:2"),
+            "-n",
+            "lazygit",
+            "-c",
+            &temp_path,
+            "pwsh.exe -NoLogo -NoProfile",
+        ],
+    )?;
+    run_mux_strings(
+        &psmux,
+        &namespace,
+        &[
+            "new-window",
+            "-d",
+            "-t",
+            &format!("{session}:3"),
+            "-n",
+            "terminal",
+            "-c",
+            &temp_path,
+            "pwsh.exe -NoLogo -NoProfile",
+        ],
+    )?;
+    let windows = run_mux_strings(
+        &psmux,
+        &namespace,
+        &[
+            "list-windows",
+            "-t",
+            session,
+            "-F",
+            "#{window_index}|#{window_name}",
+        ],
+    )?;
+    let windows = String::from_utf8(windows.stdout)?;
+    for expected in ["1|agent", "2|lazygit", "3|terminal"] {
+        require(
+            windows.lines().any(|line| line == expected),
+            format!("psmux window contract omitted {expected:?}: {windows:?}"),
+        )?;
+    }
+    let display = run_mux_strings(
+        &psmux,
+        &namespace,
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            &format!("{session}:1"),
+            "#{session_name}|#{window_index}|#{pane_id}",
+        ],
+    )?;
+    let display = String::from_utf8(display.stdout)?;
+    let fields = display.trim().split('|').collect::<Vec<_>>();
+    require(
+        fields.len() == 3 && fields[0] == session && fields[1] == "1" && fields[2].starts_with('%'),
+        format!("psmux display-message returned incompatible fields: {display:?}"),
+    )?;
+
     let prompt_path = buffer_path(temp.path());
     let marker = "PRISM_PSMUX_CAPTURE_\u{2603}";
     fs::write(&prompt_path, format!("Write-Output '{marker}'"))?;
@@ -300,15 +424,15 @@ pub fn run_spike() -> SpikeResult {
             "-b",
             "prism-phase0",
             "-t",
-            &format!("{session}:0"),
+            &format!("{session}:1"),
         ],
     )?;
     run_mux_strings(
         &psmux,
         &namespace,
-        &["send-keys", "-t", &format!("{session}:0"), "Enter"],
+        &["send-keys", "-t", &format!("{session}:1"), "Enter"],
     )?;
-    poll_capture(&psmux, &namespace, &format!("{session}:0"), marker)?;
+    poll_capture(&psmux, &namespace, &format!("{session}:1"), marker)?;
 
     run_mux_strings(
         &psmux,
@@ -316,7 +440,7 @@ pub fn run_spike() -> SpikeResult {
         &[
             "resize-window",
             "-t",
-            &format!("{session}:0"),
+            &format!("{session}:1"),
             "-x",
             "100",
             "-y",

@@ -1,4 +1,5 @@
 use std::future::Future;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -293,16 +294,25 @@ fn prepare_parent(path: &Path) -> Result<(), DatabaseError> {
             path: parent.into(),
             source,
         })?;
+        #[cfg(windows)]
+        crate::system::windows_security::secure_path(parent, true).map_err(|source| {
+            DatabaseError::SetPermissions {
+                path: parent.into(),
+                source,
+            }
+        })?;
     }
     Ok(())
 }
 
 pub(super) fn set_owner_only(path: &Path) -> Result<(), DatabaseError> {
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|source| {
-        DatabaseError::SetPermissions {
-            path: path.into(),
-            source,
-        }
+    #[cfg(unix)]
+    let result = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    #[cfg(windows)]
+    let result = crate::system::windows_security::secure_path(path, false);
+    result.map_err(|source| DatabaseError::SetPermissions {
+        path: path.into(),
+        source,
     })
 }
 

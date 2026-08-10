@@ -20,6 +20,10 @@ pub(super) fn ctrl_key(event: KeyEvent) -> bool {
     event.modifiers.contains(KeyModifiers::CONTROL)
 }
 
+pub(super) fn append_line_paste(input: &mut String, pasted: &str) {
+    input.extend(pasted.chars().filter(|character| !character.is_control()));
+}
+
 pub(super) fn confirmation_result(input: &str, default: bool) -> Option<bool> {
     match input.trim().to_ascii_lowercase().as_str() {
         "" => Some(default),
@@ -306,33 +310,33 @@ impl Tui {
             let Some(event) = runtime.poll_event(Duration::from_millis(100))? else {
                 continue;
             };
-            let RuntimeEvent::Key(event) = event else {
-                self.draw(runtime)?;
-                continue;
-            };
-            if event.kind != KeyEventKind::Press {
-                continue;
-            }
-            match event.code {
-                KeyCode::Enter => {
-                    self.dialog = None;
+            match event {
+                RuntimeEvent::Paste(pasted) => append_line_paste(&mut input, &pasted),
+                RuntimeEvent::Key(event) if event.kind == KeyEventKind::Press => match event.code {
+                    KeyCode::Enter => {
+                        self.dialog = None;
+                        self.draw(runtime)?;
+                        return Ok(Some(input));
+                    }
+                    KeyCode::Esc | KeyCode::Char('c')
+                        if event.code == KeyCode::Esc || ctrl_key(event) =>
+                    {
+                        self.dialog = None;
+                        self.draw(runtime)?;
+                        return Ok(None);
+                    }
+                    KeyCode::Backspace => {
+                        input.pop();
+                    }
+                    KeyCode::Char(ch) if plain_key(event) && !ch.is_control() => {
+                        input.push(ch);
+                    }
+                    _ => {}
+                },
+                _ => {
                     self.draw(runtime)?;
-                    return Ok(Some(input));
+                    continue;
                 }
-                KeyCode::Esc | KeyCode::Char('c')
-                    if event.code == KeyCode::Esc || ctrl_key(event) =>
-                {
-                    self.dialog = None;
-                    self.draw(runtime)?;
-                    return Ok(None);
-                }
-                KeyCode::Backspace => {
-                    input.pop();
-                }
-                KeyCode::Char(ch) if plain_key(event) && !ch.is_control() => {
-                    input.push(ch);
-                }
-                _ => {}
             }
             self.dialog = Some(view::DialogModel::Prompt {
                 title: title.to_string(),

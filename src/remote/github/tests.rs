@@ -11,9 +11,12 @@ use crate::remote::store::{
     save_pr_details_cache_for_association, save_repo_policy_cache,
 };
 use crate::session::Session;
+#[cfg(windows)]
+use crate::test_support::PermissionsExt;
 use crate::test_support::write_executable;
 use std::collections::BTreeMap;
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -218,6 +221,7 @@ fn merge_pr_args_use_configured_method() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn merge_pull_request_does_not_delegate_branch_deletion_to_gh() {
     let temp = unique_temp_dir("prism-merge-no-delete-branch-test");
@@ -557,6 +561,7 @@ fn ghes_review_thread_mutation_uses_the_canonical_hostname() {
     fs::remove_dir_all(temp).unwrap();
 }
 
+#[cfg(unix)]
 #[test]
 fn phase_1_failed_forced_summary_keeps_stale_display_but_authoritative_access_errors() {
     let temp = unique_temp_dir("prism-phase-1-failed-summary-refresh");
@@ -626,6 +631,7 @@ fn phase_1_details_for_head_a_are_rejected_after_same_pr_advances_to_head_b() {
     let _ = fs::remove_dir_all(temp);
 }
 
+#[cfg(unix)]
 #[test]
 fn phase_1_malformed_github_summary_output_is_failure_not_authoritative_absence() {
     let temp = unique_temp_dir("prism-phase-1-malformed-summary");
@@ -1212,6 +1218,7 @@ fn preserved_stale_cache_remains_displayable_but_has_distinct_render_signature()
     assert!(stale.trusted_summary_and_details().is_err());
 }
 
+#[cfg(unix)]
 #[test]
 fn pr_summary_index_refresh_updates_sessions_and_pr_cache_storage() {
     let temp = unique_temp_dir("prism-pr-summary-index-test");
@@ -1318,6 +1325,7 @@ fn stale_pr_summary_index_refresh_does_not_clear_newer_direct_refresh() {
     let _ = fs::remove_dir_all(temp);
 }
 
+#[cfg(unix)]
 #[test]
 fn merged_pr_from_previous_branch_generation_is_not_reused() {
     let temp = unique_temp_dir("prism-reused-branch-pr-test");
@@ -1372,6 +1380,7 @@ fn merged_pr_from_previous_branch_generation_is_not_reused() {
     let _ = fs::remove_dir_all(temp);
 }
 
+#[cfg(unix)]
 #[test]
 fn open_pr_from_previous_branch_generation_is_not_reused_even_when_old_head_is_ancestor() {
     let temp = unique_temp_dir("prism-reused-open-branch-pr-test");
@@ -1423,6 +1432,7 @@ fn open_pr_from_previous_branch_generation_is_not_reused_even_when_old_head_is_a
     let _ = fs::remove_dir_all(temp);
 }
 
+#[cfg(unix)]
 #[test]
 fn canonical_cached_pr_requires_fresh_reassociation_after_restart() {
     let temp = unique_temp_dir("prism-synthetic-canonical-pr-test");
@@ -1472,6 +1482,7 @@ fn canonical_cached_pr_requires_fresh_reassociation_after_restart() {
     let _ = fs::remove_dir_all(temp);
 }
 
+#[cfg(unix)]
 #[test]
 fn guarded_repair_head_uses_exact_lookup_after_restart() {
     let temp = unique_temp_dir("prism-guarded-repair-restart-test");
@@ -1527,6 +1538,7 @@ printf '%s\n' '{"data":{"repository":{"pullRequest":{"id":"PR_test","number":42,
     let _ = fs::remove_dir_all(temp);
 }
 
+#[cfg(unix)]
 #[test]
 fn unavailable_remote_discovery_preserves_persisted_cache_as_stale() {
     let temp = unique_temp_dir("prism-unavailable-remote-cache-test");
@@ -1571,6 +1583,7 @@ fn unavailable_remote_discovery_preserves_persisted_cache_as_stale() {
     let _ = fs::remove_dir_all(temp);
 }
 
+#[cfg(unix)]
 #[test]
 fn known_open_pr_is_preserved_while_local_repair_is_unpushed() {
     let temp = unique_temp_dir("prism-known-open-pr-local-divergence-test");
@@ -1962,6 +1975,7 @@ fn parses_classic_branch_protection_without_discarding_checks_shape() {
     assert!(parse_classic_branch_protection("{}").is_err());
 }
 
+#[cfg(unix)]
 #[test]
 fn fetches_and_combines_exact_branch_classic_and_evaluated_ruleset_policy() {
     let temp = unique_temp_dir("prism-github-exact-policy");
@@ -2015,6 +2029,7 @@ esac
     let _ = fs::remove_dir_all(temp);
 }
 
+#[cfg(unix)]
 #[test]
 fn authoritative_unprotected_and_empty_rulesets_produce_known_empty_policy() {
     let temp = unique_temp_dir("prism-github-empty-policy");
@@ -2122,6 +2137,7 @@ fn only_explicit_unprotected_404_is_authoritative_classic_absence() {
     ));
 }
 
+#[cfg(unix)]
 #[test]
 fn failed_policy_refresh_preserves_identity_matched_stale_facts() {
     let temp = unique_temp_dir("prism-github-stale-policy-refresh");
@@ -2528,6 +2544,7 @@ fn rejects_truncated_comments_inside_a_review_thread() {
     assert!(error.contains("only 1 of 101 comments"));
 }
 
+#[cfg(unix)]
 #[test]
 fn canonical_target_number_details_use_complete_paginated_endpoints() {
     let temp = unique_temp_dir("prism-github-paginated-details");
@@ -2601,6 +2618,7 @@ esac
     let _ = fs::remove_dir_all(temp);
 }
 
+#[cfg(unix)]
 #[test]
 fn fetch_pr_summary_uses_merged_at_instead_of_removed_merged_field() {
     let temp = unique_temp_dir("prism-gh-summary-test");
@@ -2677,6 +2695,7 @@ JSON
     let _ = fs::remove_dir_all(temp);
 }
 
+#[cfg(unix)]
 #[test]
 fn fetch_pr_summary_preserves_unknown_native_lifecycle() {
     let temp = unique_temp_dir("prism-gh-unknown-summary-test");
@@ -2835,6 +2854,7 @@ fn initial_association_requires_origin_push_source_and_exact_local_head() {
     ));
 }
 
+#[cfg(unix)]
 #[test]
 fn summary_index_association_uses_the_branch_push_remote() {
     let temp = unique_temp_dir("prism-branch-push-summary-association");

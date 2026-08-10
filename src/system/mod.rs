@@ -9,3 +9,7 @@ pub(crate) mod process;
 pub mod storage;
 pub(crate) mod terminal;
 pub(crate) mod util;
+#[cfg(windows)]
+pub(crate) mod windows_console;
+#[cfg(windows)]
+pub(crate) mod windows_security;

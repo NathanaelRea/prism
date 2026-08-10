@@ -1,9 +1,11 @@
 use super::*;
 use std::fs;
+#[cfg(unix)]
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::Config;
+#[cfg(unix)]
 use crate::test_support::write_executable;
 
 pub(crate) struct TestDatabase {
@@ -2739,6 +2741,7 @@ fn cleanup_after_restart_rejects_replaced_worktree_incarnation() {
     assert!(worktree.join(".git").exists());
 }
 
+#[cfg(unix)]
 #[test]
 fn cleanup_escalates_pending_worktrunk_approval_without_retiring_metadata() {
     let temp = TempDir::new("cleanup-worktrunk-approval");
@@ -2795,6 +2798,7 @@ fn cleanup_escalates_pending_worktrunk_approval_without_retiring_metadata() {
     assert!(worktree.exists());
 }
 
+#[cfg(unix)]
 #[test]
 fn pending_cleanup_intent_with_present_worktree_rechecks_worktrunk_approval() {
     let temp = TempDir::new("pending-cleanup-rechecks-approval");

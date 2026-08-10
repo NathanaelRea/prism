@@ -1,5 +1,9 @@
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-compile_error!("unsupported Prism target OS; Prism supports only Linux and macOS");
+// Unix-only executable fixture tests are replaced by native Windows capability contracts.
+// Some shared helper imports remain after their Unix call sites are cfg'd out.
+#![cfg_attr(all(test, windows), allow(dead_code, unused_imports))]
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+compile_error!("unsupported Prism target OS; Prism supports only Linux, macOS, and Windows");
 
 mod actions;
 mod agent_runtime;
@@ -14,17 +18,20 @@ mod remote;
 mod repository;
 pub(crate) use repository::{git, lifecycle, repo, session, workspace, workspace_state, worktrunk};
 mod system;
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+pub(crate) use system::desktop_notification;
 pub(crate) use system::{
-    async_runtime, desktop_notification, durability, json, notification, platform, process,
-    terminal, util,
+    async_runtime, durability, json, notification, platform, process, terminal, util,
 };
 pub use system::{file_persistence, storage};
 mod telemetry;
 pub(crate) use telemetry::{flight_recorder, observability, run_marker};
 #[cfg(test)]
 mod testing;
+#[cfg(all(test, unix))]
+pub(crate) use testing::compact_runtime;
 #[cfg(test)]
-pub(crate) use testing::{compact_runtime, test_support};
+pub(crate) use testing::test_support;
 mod tui;
 pub(crate) use tui::{
     input, jobs as tui_jobs, runtime as tui_runtime, signal as tui_signal, state as ui_state,

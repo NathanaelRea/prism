@@ -49,19 +49,30 @@ impl PlanModeLaunch {
     fn prepare(cwd: &Path) -> Result<Self, String> {
         let exe = std::env::current_exe()
             .map_err(|error| format!("resolve prism executable: {error}"))?;
-        let command = [
-            crate::terminal::posix_shell_quote(&exe.to_string_lossy()),
+        let argv = vec![
+            exe.display().to_string(),
             "--repo".to_string(),
-            crate::terminal::posix_shell_quote(&cwd.to_string_lossy()),
+            cwd.display().to_string(),
             "plan".to_string(),
-        ]
-        .join(" ");
+        ];
+        let command = crate::terminal::shell_command_for(
+            crate::platform::current_os(),
+            &argv,
+            &std::collections::BTreeMap::new(),
+            None,
+        )?;
+        let shell_command = match crate::platform::current_os() {
+            crate::platform::SupportedOs::Linux | crate::platform::SupportedOs::MacOs => format!(
+                "{command}; status=$?; printf '\\n[prism plan mode exited with status %s]\\nPress Enter to close this tmux session. ' \"$status\"; read _; exit \"$status\""
+            ),
+            crate::platform::SupportedOs::Windows => format!(
+                "{command}; $prismStatus = $LASTEXITCODE; Write-Host \"`n[prism plan mode exited with status $prismStatus]\"; Read-Host 'Press Enter to close this psmux session'; exit $prismStatus"
+            ),
+        };
         Ok(Self {
             cwd: cwd.to_path_buf(),
             tmux_session_name: plan_mode_session_name(cwd),
-            shell_command: format!(
-                "{command}; status=$?; printf '\\n[prism plan mode exited with status %s]\\nPress Enter to close this tmux session. ' \"$status\"; read _; exit \"$status\""
-            ),
+            shell_command,
         })
     }
 }

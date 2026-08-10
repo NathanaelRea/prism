@@ -1,5 +1,8 @@
+#[cfg(windows)]
+use crate::test_support::PermissionsExt;
 use std::collections::BTreeMap;
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -117,6 +120,7 @@ fn applying_pr_poll_result_does_no_io_on_tui_thread() {
     let _ = fs::remove_dir_all(temp);
 }
 
+#[cfg(unix)]
 #[test]
 fn remote_review_update_replans_auto_flow_and_refreshes_worktree_status() {
     let temp = unique_temp_dir("prism-tui-remote-gate-replan-test");
@@ -337,6 +341,7 @@ fn repeated_dashboard_rendering_uses_only_cached_output() {
     let _ = fs::remove_dir_all(temp);
 }
 
+#[cfg(unix)]
 #[test]
 fn returning_from_tmux_does_not_wait_for_worktree_refresh() {
     let temp = unique_temp_dir("prism-tmux-return-refresh-test");
@@ -474,6 +479,7 @@ fn tmux_portal_starts_capture_immediately_after_selection() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn workflow_database_writer_does_not_block_tmux_portal_polling() {
     let temp = unique_temp_dir("prism-tmux-portal-database-test");
@@ -517,6 +523,7 @@ fn workflow_database_writer_does_not_block_tmux_portal_polling() {
     let _ = fs::remove_dir_all(temp);
 }
 
+#[cfg(unix)]
 #[test]
 fn tmux_portal_resizes_once_for_unchanged_target_and_size() {
     let temp = unique_temp_dir("prism-tmux-portal-resize-test");

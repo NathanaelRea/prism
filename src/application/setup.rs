@@ -316,7 +316,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::harness::HarnessConfig;
-    use crate::test_support::{install_tool, test_config};
+    #[cfg(unix)]
+    use crate::test_support::install_tool;
+    use crate::test_support::test_config;
 
     #[test]
     fn first_start_harness_selection_persists_choice() {
@@ -357,6 +359,7 @@ mod tests {
         let _ = fs::remove_dir_all(directory);
     }
 
+    #[cfg(unix)]
     #[test]
     fn first_start_harness_choices_include_only_installed_builtins() {
         let directory = std::env::temp_dir().join(format!(

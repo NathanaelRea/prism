@@ -316,8 +316,11 @@ mod tests {
     use crate::persistence::database::TestDatabase;
     use crate::repo::Repository;
     use crate::sqlx_test_params as params;
+    #[cfg(windows)]
+    use crate::test_support::PermissionsExt;
     use crate::test_support::write_executable;
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -371,6 +374,7 @@ mod tests {
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[cfg(unix)]
     #[test]
     fn create_worktree_session_preserves_metadata_when_switch_result_is_not_in_git_inventory() {
         let temp = unique_temp_dir("prism-create-verification-failure-test");
@@ -415,6 +419,7 @@ mod tests {
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[cfg(unix)]
     #[test]
     fn create_worktree_session_restores_existing_hidden_worktree_without_creating() {
         let temp = unique_temp_dir("prism-create-restores-hidden-test");
@@ -452,6 +457,7 @@ mod tests {
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[cfg(unix)]
     #[test]
     fn phase_1_restore_by_create_clears_hidden_and_archived_state() {
         let temp = unique_temp_dir("prism-create-restores-archived-test");
@@ -510,6 +516,7 @@ mod tests {
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[cfg(unix)]
     #[test]
     fn check_worktrunk_approval_status_reports_pending() {
         let temp = unique_temp_dir("prism-wt-approval-status-test");
@@ -533,6 +540,7 @@ mod tests {
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[cfg(unix)]
     #[test]
     fn create_worktree_session_adds_worktrunk_approval_hint() {
         let temp = unique_temp_dir("prism-create-wt-approval-hint-test");
@@ -571,6 +579,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn move_current_branch_uses_typed_worktrunk_switch() {
         let temp = unique_temp_dir("prism-move-current-branch-test");
@@ -614,6 +623,7 @@ mod tests {
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[cfg(unix)]
     #[test]
     fn complete_delete_removes_all_owned_state_and_preserves_auto_flow_audit() {
         let temp = unique_temp_dir("prism-delete-kills-tmux-test");
@@ -822,6 +832,7 @@ exit 0
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[cfg(unix)]
     #[test]
     fn delete_worktree_session_cleans_only_the_removed_session_runtime() {
         let temp = unique_temp_dir("prism-delete-deregistered-failure-test");
@@ -971,6 +982,7 @@ exit 0
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[cfg(unix)]
     #[test]
     fn failed_worktrunk_removal_preserves_prism_state_branch_and_artifacts() {
         let temp = unique_temp_dir("prism-phase-1-preserve-failed-delete-test");
@@ -1152,6 +1164,7 @@ exit 0
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[cfg(unix)]
     #[test]
     fn failed_worktrunk_removal_after_path_removal_is_resumable_without_repeating_remove() {
         let temp = unique_temp_dir("prism-wt-failed-after-remove-retry-test");
@@ -1242,6 +1255,7 @@ exit 0
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[cfg(unix)]
     #[test]
     fn pending_removed_worktree_with_absent_branch_resumes_owned_state_cleanup() {
         let temp = unique_temp_dir("prism-pending-removed-absent-branch-test");
@@ -1321,6 +1335,7 @@ exit 0
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[cfg(unix)]
     #[test]
     fn branch_delete_failure_reports_removed_worktree_and_retained_branch() {
         let temp = unique_temp_dir("prism-delete-branch-retained-test");
@@ -1397,6 +1412,7 @@ exit 0
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[cfg(unix)]
     #[test]
     fn branch_identity_failure_stops_before_worktree_removal() {
         let temp = unique_temp_dir("prism-delete-branch-identity-failure-test");

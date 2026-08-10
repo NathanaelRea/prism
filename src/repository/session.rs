@@ -1042,8 +1042,15 @@ pub(crate) fn worktree_incarnation(path: &Path) -> String {
         return String::new();
     };
     if metadata.is_dir() {
-        use std::os::unix::fs::MetadataExt;
-        return format!("directory:{}:{}", metadata.dev(), metadata.ino());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            return format!("directory:{}:{}", metadata.dev(), metadata.ino());
+        }
+        #[cfg(windows)]
+        return file_id::get_file_id(&git_link)
+            .map(|identity| format!("directory:{identity:?}"))
+            .unwrap_or_default();
     }
     let modified = metadata
         .modified()
@@ -1052,10 +1059,15 @@ pub(crate) fn worktree_incarnation(path: &Path) -> String {
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
     let target = fs::read_to_string(&git_link).unwrap_or_default();
+    #[cfg(unix)]
     let file_id = {
         use std::os::unix::fs::MetadataExt;
-        metadata.ino()
+        metadata.ino().to_string()
     };
+    #[cfg(windows)]
+    let file_id = file_id::get_file_id(&git_link)
+        .map(|identity| format!("{identity:?}"))
+        .unwrap_or_default();
     format!("{file_id}:{modified}:{}:{target}", metadata.len())
 }
 
@@ -1296,8 +1308,11 @@ mod tests {
     use crate::sqlx_test_params as params;
     use crate::test_support::write_executable;
 
+    #[cfg(windows)]
+    use crate::test_support::PermissionsExt;
     use std::collections::BTreeMap;
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1385,6 +1400,7 @@ mod tests {
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[cfg(unix)]
     #[test]
     fn discover_sessions_skips_missing_worktree_paths() {
         let temp = unique_temp_dir("prism-session-missing-worktree-test");
@@ -1442,6 +1458,7 @@ exit 0
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[cfg(unix)]
     #[test]
     fn reconcile_worktree_state_removes_only_stale_persisted_sessions() {
         let temp = unique_temp_dir("prism-session-reconcile-test");
@@ -1536,6 +1553,7 @@ exit 0
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[cfg(unix)]
     #[test]
     fn reconcile_external_branch_rename_removes_only_old_adopted_state() {
         let temp = unique_temp_dir("prism-reconcile-external-rename-test");
@@ -1600,6 +1618,7 @@ exit 0
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[cfg(unix)]
     #[test]
     fn reconcile_removes_stale_non_adopted_agent_and_runtime_state() {
         let temp = unique_temp_dir("prism-reconcile-non-adopted-test");
@@ -1650,6 +1669,7 @@ exit 0
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[cfg(unix)]
     #[test]
     fn reconcile_moved_adopted_branch_keeps_branch_state_and_retires_old_path_runtime() {
         let temp = unique_temp_dir("prism-reconcile-moved-adopted-test");
@@ -1748,6 +1768,7 @@ exit 0
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[cfg(unix)]
     #[test]
     fn reconcile_moved_non_adopted_branch_keeps_branch_only_retry_state() {
         let temp = unique_temp_dir("prism-reconcile-moved-non-adopted-test");
@@ -1811,6 +1832,7 @@ exit 0
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[cfg(unix)]
     #[test]
     fn cleanup_shutdown_failure_keeps_rows_for_successful_retry() {
         let temp = unique_temp_dir("prism-cleanup-shutdown-retry-test");
@@ -1916,6 +1938,7 @@ exit 0
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[cfg(unix)]
     #[test]
     fn recreated_same_path_and_branch_after_git_removal_retains_resources_and_state() {
         let temp = unique_temp_dir("prism-delete-recreated-after-remove-test");
@@ -2196,6 +2219,7 @@ exit 0
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[cfg(unix)]
     #[test]
     fn phase_1_same_path_changed_branch_does_not_inherit_agent_session_or_pr_cache_facts() {
         let temp = unique_temp_dir("prism-changed-branch-refresh-test");
@@ -2275,6 +2299,7 @@ exit 0
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn detached_session_discovery_refresh_preserves_matching_session() {
         let temp = unique_temp_dir("prism-detached-session-refresh-test");
@@ -2320,6 +2345,7 @@ exit 0
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[cfg(unix)]
     #[test]
     fn refresh_uses_repository_root_when_different_repositories_report_same_session_identity() {
         let temp = unique_temp_dir("prism-session-repository-identity-test");
@@ -2383,6 +2409,7 @@ exit 0
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[cfg(unix)]
     #[test]
     fn persistence_read_failure_preserves_previous_safe_session_facts() {
         let temp = unique_temp_dir("prism-session-metadata-read-failure-test");
@@ -2432,6 +2459,7 @@ exit 0
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[cfg(unix)]
     #[test]
     fn task_metadata_read_failure_does_not_replace_adopted_session_with_absence() {
         let temp = unique_temp_dir("prism-task-metadata-read-failure-test");
@@ -2533,6 +2561,7 @@ exit 0
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[cfg(unix)]
     #[test]
     fn creation_reports_partial_success_when_metadata_restoration_fails() {
         let temp = unique_temp_dir("prism-session-creation-partial-test");

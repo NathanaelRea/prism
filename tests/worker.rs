@@ -1,4 +1,7 @@
+#![cfg(unix)]
+
 mod common;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -36,7 +39,8 @@ fn worker_request(runtime: &Path, request: serde_json::Value) -> serde_json::Val
     use std::os::unix::net::UnixStream;
 
     let mut stream = UnixStream::connect(runtime.join("worker.sock")).unwrap();
-    writeln!(stream, "{request}").unwrap();
+    let secret = fs::read_to_string(runtime.join("worker.secret")).unwrap();
+    writeln!(stream, "auth {} {request}", secret.trim()).unwrap();
     stream.shutdown(std::net::Shutdown::Write).unwrap();
     let mut response = String::new();
     stream.read_to_string(&mut response).unwrap();

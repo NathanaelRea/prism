@@ -24,7 +24,7 @@ pub const CONFIG_SCHEMA_URL: &str =
 pub const CONFIG_SCHEMA_JSON: &str = include_str!("../../schemas/config.schema.json");
 
 pub fn config_example() -> String {
-    format!("#:schema {CONFIG_SCHEMA_URL}\n")
+    let example = format!("#:schema {CONFIG_SCHEMA_URL}\n")
         + r#"
 # Prism config. Harness settings are global; other settings may be repository overrides.
 default_harness = "opencode"
@@ -101,7 +101,18 @@ ci_failure = "Here are CI failures on PR {pr_number}.\n\nFix the failing checks.
 repair_commit_review = "fix: cr"
 repair_commit_ci = "fix: ci"
 repair_commit_merge = "fix: merge"
-"#
+"#;
+    if crate::platform::current_os() == crate::platform::SupportedOs::Windows {
+        example
+            .replace(
+                "worktree_command = \"wt\"",
+                "worktree_command = \"git-wt.exe\"",
+            )
+            .replace("tmux = \"tmux\"", "tmux = \"psmux.exe\"")
+            .replace("wt = \"wt\"", "\"git-wt.exe\" = \"git-wt.exe\"")
+    } else {
+        example
+    }
 }
 
 pub fn user_config_template() -> String {
@@ -512,6 +523,30 @@ fn parse_and_validate_config(
     Ok(raw)
 }
 
+#[cfg(unix)]
+fn secure_existing_config_path(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn secure_existing_config_path(path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent()
+        && parent.exists()
+    {
+        crate::system::windows_security::secure_path(parent, true).map_err(|error| {
+            format!(
+                "secure configuration directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    if path.exists() {
+        crate::system::windows_security::secure_path(path, false)
+            .map_err(|error| format!("secure configuration file {}: {error}", path.display()))?;
+    }
+    Ok(())
+}
+
 fn validate_config_values(raw: &RawConfig, is_user_config: bool) -> Result<(), String> {
     if raw.opencode_port_span == Some(0) {
         return Err("opencode_port_span must be greater than zero".to_string());
@@ -620,9 +655,17 @@ impl Config {
         let mut config = Self::defaults(user_path, repo_config_path);
 
         let user_path = config.user_path.clone();
-        config.apply_file(&user_path);
+        if let Err(error) = secure_existing_config_path(&user_path) {
+            config.config_errors.push(error);
+        } else {
+            config.apply_file(&user_path);
+        }
         let repo_config_path = config.repo_config_path.clone();
-        config.apply_file(&repo_config_path);
+        if let Err(error) = secure_existing_config_path(&repo_config_path) {
+            config.config_errors.push(error);
+        } else {
+            config.apply_file(&repo_config_path);
+        };
         config.default_agent = config.default_harness.clone();
         for (id, harness) in &config.harnesses {
             if let Err(error) = harness.validate(id) {
@@ -639,12 +682,14 @@ impl Config {
     }
 
     fn defaults(user_path: PathBuf, repo_config_path: PathBuf) -> Self {
+        let os = crate::platform::current_os();
+        let worktrunk = crate::platform::default_worktrunk_command(os);
         let tools = [
-            ("wt", "wt"),
+            (worktrunk, worktrunk),
             ("gh", "gh"),
             ("glab", "glab"),
             ("git", "git"),
-            ("tmux", "tmux"),
+            ("tmux", crate::platform::default_session_runtime(os)),
             ("lazygit", "lazygit"),
             ("fzf", "fzf"),
             ("opencode", "opencode"),
@@ -670,7 +715,7 @@ impl Config {
             default_base: Some("main".to_string()),
             plan_dir: "plans".to_string(),
             review_packet_dir: ".agent/review".to_string(),
-            worktree_command: "wt".to_string(),
+            worktree_command: worktrunk.to_string(),
             opencode_port_base: 41_000,
             opencode_port_span: 1_000,
             opencode_shutdown_owned_servers: false,
@@ -1581,13 +1626,29 @@ fn harness_config_source(config: &Config) -> String {
 fn resolve_executable(program: &str) -> Option<PathBuf> {
     let path = PathBuf::from(program);
     if path.components().count() > 1 {
-        return path.exists().then_some(path);
+        return resolve_executable_candidate(path);
     }
     std::env::var_os("PATH")
         .into_iter()
         .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
-        .map(|directory| directory.join(program))
-        .find(|candidate| candidate.is_file())
+        .find_map(|directory| resolve_executable_candidate(directory.join(program)))
+}
+
+fn resolve_executable_candidate(candidate: PathBuf) -> Option<PathBuf> {
+    if candidate.is_file() {
+        return Some(candidate);
+    }
+    #[cfg(windows)]
+    if candidate.extension().is_none() {
+        let extensions =
+            std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+        return extensions
+            .split(';')
+            .filter(|extension| !extension.is_empty())
+            .map(|extension| candidate.with_extension(extension.trim_start_matches('.')))
+            .find(|path| path.is_file());
+    }
+    None
 }
 
 pub fn ensure_required_tools(

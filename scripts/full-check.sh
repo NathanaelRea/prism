@@ -70,6 +70,16 @@ if [ "$(uname -s)" = Linux ]; then
       cargo sqlx prepare --check --workspace --database-url "sqlite://$sqlx_database" \
         -- --all-targets --target "$macos_target"
   done
+  windows_targets="${FULL_CHECK_WINDOWS_TARGETS:-x86_64-pc-windows-msvc}"
+  for windows_target in $windows_targets; do
+    require_rust_target "$windows_target"
+    env \
+      DOCS_RS=1 \
+      PKG_CONFIG_ALLOW_CROSS=1 \
+      LIBSQLITE3_SYS_USE_PKG_CONFIG=1 \
+      cargo sqlx prepare --check --workspace --database-url "sqlite://$sqlx_database" \
+        -- --all-targets --target "$windows_target"
+  done
 fi
 unset DATABASE_URL
 export SQLX_OFFLINE=true
@@ -98,6 +108,16 @@ case "$(uname -s)" in
         LIBSQLITE3_SYS_USE_PKG_CONFIG=1 \
         "$cc_var=clang" \
         cargo clippy --locked --target "$macos_target" --all-targets -- -D warnings
+    done
+    windows_targets="${FULL_CHECK_WINDOWS_TARGETS:-x86_64-pc-windows-msvc}"
+    for windows_target in $windows_targets; do
+      require_rust_target "$windows_target"
+      printf '\n==> cargo clippy --target %s --all-targets -- -D warnings\n' "$windows_target"
+      env \
+        DOCS_RS=1 \
+        PKG_CONFIG_ALLOW_CROSS=1 \
+        LIBSQLITE3_SYS_USE_PKG_CONFIG=1 \
+        cargo clippy --locked --target "$windows_target" --all-targets -- -D warnings
     done
     ;;
   Darwin)

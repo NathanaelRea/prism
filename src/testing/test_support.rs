@@ -1,8 +1,24 @@
 use std::collections::BTreeMap;
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(windows)]
+pub(crate) trait PermissionsExt {
+    fn set_mode(&mut self, _mode: u32);
+    fn mode(&self) -> u32;
+}
+
+#[cfg(windows)]
+impl PermissionsExt for std::fs::Permissions {
+    fn set_mode(&mut self, _mode: u32) {}
+
+    fn mode(&self) -> u32 {
+        0o600
+    }
+}
 
 use crate::config::{
     AutoConfig, Checks, Config, EscapeKey, IconStyle, LayoutConfig, MergeMethod, NotificationConfig,
@@ -95,9 +111,12 @@ pub(crate) fn write_executable(path: &Path, contents: &str) {
     let sequence = SHIM_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let staging = path.with_extension(format!("staging-{}-{sequence}", std::process::id()));
     fs::write(&staging, contents).unwrap();
-    let mut permissions = fs::metadata(&staging).unwrap().permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(&staging, permissions).unwrap();
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&staging).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&staging, permissions).unwrap();
+    }
     fs::rename(staging, path).unwrap();
 }
 

@@ -788,11 +788,18 @@ fn temporary_prompt_file(prompt: &str) -> Result<PathBuf, String> {
         ));
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
         match options.open(&path) {
             Ok(mut file) => {
+                #[cfg(windows)]
+                crate::system::windows_security::secure_path(&path, false)
+                    .map_err(|error| format!("secure prompt file: {error}"))?;
                 file.write_all(prompt.as_bytes())
+                    .and_then(|()| file.sync_all())
                     .map_err(|error| format!("write prompt file: {error}"))?;
                 return Ok(path);
             }

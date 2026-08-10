@@ -4,13 +4,13 @@
 
 Accepted
 
-Supersedes ADR 0004's decision that the supported operating-system set is permanently closed to Linux and macOS. This ADR does not advertise Windows support: the existing build rejection and package metadata remain correct until the later porting phases and required native gates are complete.
+Supersedes ADR 0004's decision that the supported operating-system set is permanently closed to Linux and macOS. Native `x86_64-pc-windows-msvc` is now part of the supported package contract and is guarded by the required Windows CI, compatibility smoke, and release-archive jobs.
 
 ## Context
 
 Prism intends to support native `x86_64-pc-windows-msvc` without WSL, Cygwin, or MSYS2. Its Unix implementations own process-tree supervision, local IPC, best-effort recorder datagrams, file locks and identity, atomic persistence, private runtime paths, and the tmux command boundary. A successful cross-compile cannot establish the Windows behavior these contracts require.
 
-Phase 0 therefore keeps a standalone native spike crate under `spikes/windows`. Keeping it outside the root package allows the Windows mechanisms to execute while Prism still intentionally rejects an incomplete Windows build. `.github/workflows/windows-feasibility.yml` runs the crate on `windows-2022`; `scripts/windows-phase0-spikes.ps1` is the equivalent local entry point.
+Phase 0 established a standalone native spike crate under `spikes/windows`. It remains as focused mechanism and psmux contract evidence. `.github/workflows/windows-feasibility.yml` runs the crate on `windows-2022`; `scripts/windows-phase0-spikes.ps1` is the equivalent local entry point. The root package now contains the selected production backends and `.github/workflows/ci.yml` runs the complete native Windows gate.
 
 The spikes use real process and crash boundaries rather than mocks. psmux is downloaded as an x64 archive at version 3.3.7 with SHA-256 `60ff7b236f64184921cef3c1ff2611aa5a36fcc7ed8e2a58e968b8ded57f6028`.
 
@@ -54,13 +54,13 @@ Stage replacement bytes adjacent to the target, flush the staging file, atomical
 
 Use `fs4` 1.1.0 for nonblocking cross-process file locks. The spike proves exclusivity and release after process death. Replacing a lock file can create a new lock domain even while an old handle remains locked, so lock files are permanent adjacent coordination objects and must never be atomically replaced.
 
-Windows does not provide a directly equivalent, documented parent-directory `fsync` contract. `ReplaceFileW` plus file-handle flushing is the selected starting mechanism; phase 4 must define the exact power-loss guarantee, sharing flags, reparse-point checks, and fault-injection expectations before this backend enters production.
+Windows does not provide a directly equivalent, documented parent-directory `fsync` contract. Prism therefore guarantees a flushed adjacent staging file, atomic `ReplaceFileW` for an existing destination (or write-through `MoveFileExW` for its first generation), and `FlushFileBuffers` through the committed file handle. It does not claim a parent-directory flush. Managed configuration, lock, and staging paths reject reparse points (including final configuration symlinks), lock files remain permanent, transient cleanup sharing violations receive only bounded retries, and crash-boundary tests require the path to contain the complete old or complete new generation.
 
 ### Private runtime ACLs
 
 Create runtime directories and files with, or immediately apply, a protected DACL containing exactly allow entries for the current user and LocalSystem. Do not grant Builtin Users, Authenticated Users, Interactive Users, or Everyone. Verify the applied descriptor through Windows security APIs rather than inferring privacy from a path under the user profile.
 
-The same DACL construction is used for named-pipe listeners. Phase 4 will additionally own inheritance, owner validation, reparse-point rejection, and recovery when an existing path has an unsafe descriptor.
+The same DACL construction is used for named-pipe listeners. Production path setup opens each ancestor with `FILE_FLAG_OPEN_REPARSE_POINT` while withholding delete sharing, keeps those handles pinned through the final open, rejects reparse attributes, applies a protected DACL through the final file handle, and then verifies the owner, inheritance protection, exact principals, ACE type, and access mask through that same handle. An existing unsafe descriptor is repaired before use; a path with the wrong owner or a reparse point fails closed.
 
 ## Verification
 
@@ -70,7 +70,14 @@ On native x86-64 Windows with PowerShell 7:
 scripts/windows-phase0-spikes.ps1
 ```
 
-The script verifies the pinned psmux archive, formatting, Clippy with warnings denied, and all seven runtime spikes. The pull-request feasibility workflow runs only this isolated contract crate; it is not the complete Windows Prism gate described by phase 7.
+The script verifies the pinned psmux archive, formatting, Clippy with warnings denied, and all seven runtime spikes. The required root-package and full-stack gates are:
+
+```powershell
+scripts/windows-check.ps1
+scripts/windows-platform-smoke.ps1
+```
+
+The first runs formatting, SQLx-offline compilation, Clippy, normal/native contracts, and archive installation verification. The second runs pinned psmux, real Git/Worktrunk, and no-model Prism/OpenCode/psmux compatibility smoke tests.
 
 Linux can compile-check the mechanisms after installing the MSVC standard library target, but this is only an early type signal:
 
@@ -84,7 +91,7 @@ cargo clippy --locked --manifest-path spikes/windows/Cargo.toml --target x86_64-
 
 - Later phases have concrete Windows mechanisms and executable contracts rather than placeholder `cfg(windows)` branches.
 - Linux and macOS production behavior and dependencies are unchanged in phase 0.
-- Windows remains unsupported until the root crate compiles, all capability backends land, native Prism and psmux/OpenCode smoke tests are required, and release artifacts are produced.
+- Windows support is gated by native root-package tests, the pinned psmux/OpenCode/Worktrunk smoke, archive installation verification, and the focused manual interactive checklist in `docs/windows-interactive-smoke.md`.
 - Job Objects provide deterministic forced cleanup; graceful console events are best effort and bounded.
 - Worker IPC and recorder telemetry intentionally use different transports because their delivery contracts differ.
 - psmux's terminal-owned sizing is a known contract difference that subsequent adapter and TUI work must preserve explicitly.

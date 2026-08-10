@@ -3805,7 +3805,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     #[ignore = "requires PRISM_TEST_OPENCODE pointing to a real OpenCode binary"]
     fn real_opencode_server_round_trips_prism_session_api() {
         let opencode = std::env::var("PRISM_TEST_OPENCODE")
@@ -3822,30 +3821,50 @@ mod tests {
         let worktree = fs::canonicalize(worktree).unwrap();
         let second_worktree = fs::canonicalize(second_worktree).unwrap();
         let repo = Repository::with_config_dir_for_test(worktree.clone(), temp.join("config"));
-        let wrapper = temp.join("opencode-isolated");
-        let real_home = std::env::var("HOME").unwrap_or_default();
-        let mise_data_dir = std::env::var("MISE_DATA_DIR").unwrap_or_else(|_| {
-            PathBuf::from(&real_home)
-                .join(".local/share/mise")
-                .display()
-                .to_string()
-        });
-        fs::write(
-            &wrapper,
-            format!(
-                "#!/bin/sh\nexport HOME={}\nexport MISE_DATA_DIR={}\nexport npm_config_cache={}\nexport OPENCODE_CONFIG_DIR={}\nexport OPENCODE_DISABLE_AUTOUPDATE=true\nexport OPENCODE_DISABLE_DEFAULT_PLUGINS=true\nexport OPENCODE_DISABLE_LSP_DOWNLOAD=true\nexport OPENCODE_DISABLE_MODELS_FETCH=true\nexport XDG_DATA_HOME={}\nexec {} \"$@\"\n",
-                shell_quote_for_test(&home.display().to_string()),
-                shell_quote_for_test(&mise_data_dir),
-                shell_quote_for_test(&format!("{real_home}/.npm")),
-                shell_quote_for_test(&config_dir.display().to_string()),
-                shell_quote_for_test(&data_dir.display().to_string()),
-                shell_quote_for_test(&opencode),
-            ),
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&wrapper).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&wrapper, permissions).unwrap();
+        #[cfg(unix)]
+        let wrapper = {
+            let wrapper = temp.join("opencode-isolated");
+            let real_home = std::env::var("HOME").unwrap_or_default();
+            let mise_data_dir = std::env::var("MISE_DATA_DIR").unwrap_or_else(|_| {
+                PathBuf::from(&real_home)
+                    .join(".local/share/mise")
+                    .display()
+                    .to_string()
+            });
+            fs::write(
+                &wrapper,
+                format!(
+                    "#!/bin/sh\nexport HOME={}\nexport MISE_DATA_DIR={}\nexport npm_config_cache={}\nexport OPENCODE_CONFIG_DIR={}\nexport OPENCODE_DISABLE_AUTOUPDATE=true\nexport OPENCODE_DISABLE_DEFAULT_PLUGINS=true\nexport OPENCODE_DISABLE_LSP_DOWNLOAD=true\nexport OPENCODE_DISABLE_MODELS_FETCH=true\nexport XDG_DATA_HOME={}\nexec {} \"$@\"\n",
+                    shell_quote_for_test(&home.display().to_string()),
+                    shell_quote_for_test(&mise_data_dir),
+                    shell_quote_for_test(&format!("{real_home}/.npm")),
+                    shell_quote_for_test(&config_dir.display().to_string()),
+                    shell_quote_for_test(&data_dir.display().to_string()),
+                    shell_quote_for_test(&opencode),
+                ),
+            )
+            .unwrap();
+            let mut permissions = fs::metadata(&wrapper).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&wrapper, permissions).unwrap();
+            wrapper
+        };
+        #[cfg(windows)]
+        let wrapper = {
+            let wrapper = temp.join("opencode-isolated.cmd");
+            fs::write(
+                &wrapper,
+                format!(
+                    "@echo off\r\nset \"HOME={}\"\r\nset \"OPENCODE_CONFIG_DIR={}\"\r\nset \"OPENCODE_DISABLE_AUTOUPDATE=true\"\r\nset \"OPENCODE_DISABLE_DEFAULT_PLUGINS=true\"\r\nset \"OPENCODE_DISABLE_LSP_DOWNLOAD=true\"\r\nset \"OPENCODE_DISABLE_MODELS_FETCH=true\"\r\nset \"XDG_DATA_HOME={}\"\r\ncall \"{}\" %*\r\n",
+                    home.display(),
+                    config_dir.display(),
+                    data_dir.display(),
+                    opencode,
+                ),
+            )
+            .unwrap();
+            wrapper
+        };
         let mut config = Config::load(&repo);
         config.opencode_port_base = 41_000;
         config.opencode_port_span = 1_000;
@@ -4048,6 +4067,7 @@ mod tests {
         fs::remove_dir_all(temp).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn stored_server_shutdown_uses_verified_bounded_process_group_recovery() {
         let temp = unique_temp_dir("prism-stored-opencode-process");
@@ -4121,6 +4141,7 @@ mod tests {
         fs::remove_dir_all(temp).unwrap();
     }
 
+    #[cfg(unix)]
     fn shell_quote_for_test(value: &str) -> String {
         format!("'{}'", value.replace('\'', "'\"'\"'"))
     }

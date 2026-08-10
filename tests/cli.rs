@@ -23,6 +23,8 @@ where
         .args(args)
         .current_dir(cwd)
         .env("XDG_CONFIG_HOME", config_home)
+        .env("APPDATA", config_home)
+        .env("LOCALAPPDATA", config_home.join("local"))
         .env("HOME", config_home)
         .env("PRISM_RUNTIME_DIR", config_home.join("runtime"));
     command.output().expect("run prism")
@@ -416,10 +418,11 @@ fn config_discovery_commands_print_templates_schema_and_paths() {
     let paths = run(["config", "paths"], &repo, &config_home);
     assert!(paths.status.success(), "{}", stderr(&paths));
     let paths_stdout = stdout(&paths);
-    assert!(paths_stdout.contains(&format!(
-        "user_config = {}",
-        config_home.join("prism/config.toml").display()
-    )));
+    #[cfg(unix)]
+    let expected_user_config = config_home.join("prism/config.toml");
+    #[cfg(windows)]
+    let expected_user_config = config_home.join("Prism/config.toml");
+    assert!(paths_stdout.contains(&format!("user_config = {}", expected_user_config.display())));
     assert!(paths_stdout.contains("repo_config = "));
     assert!(paths_stdout.contains("schema_url = https://raw.githubusercontent.com/"));
 }
@@ -1016,6 +1019,7 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+#[cfg(unix)]
 fn toml_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
