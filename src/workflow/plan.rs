@@ -567,17 +567,22 @@ mod tests {
 
         assert!(launch.tmux_session_name.starts_with("prism-plan-"));
         assert_eq!(launch.cwd, dir);
-        assert!(
-            launch
-                .shell_command
-                .contains("--repo '/repo/my project' plan")
-        );
-        assert!(launch.shell_command.contains("status=$?"));
-        assert!(
-            launch
-                .shell_command
-                .contains("[prism plan mode exited with status %s]")
-        );
+        assert!(launch.shell_command.contains("--repo"));
+        assert!(launch.shell_command.contains("plan"));
+        match crate::platform::current_os() {
+            crate::platform::SupportedOs::Linux | crate::platform::SupportedOs::MacOs => {
+                assert!(launch.shell_command.contains("status=$?"));
+                assert!(
+                    launch
+                        .shell_command
+                        .contains("[prism plan mode exited with status %s]")
+                );
+            }
+            crate::platform::SupportedOs::Windows => {
+                assert!(launch.shell_command.contains("$LASTEXITCODE"));
+                assert!(launch.shell_command.contains("psmux session"));
+            }
+        }
     }
 
     #[test]

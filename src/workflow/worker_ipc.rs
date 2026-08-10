@@ -212,20 +212,22 @@ pub(super) fn set_write_timeout(stream: &WorkerStream, timeout: Duration) -> io:
 }
 
 pub(super) fn prepare_runtime(runtime: &Path) -> Result<(), String> {
-    if let Ok(metadata) = fs::symlink_metadata(runtime) {
-        if metadata.file_type().is_symlink() {
-            return Err(format!(
-                "Prism worker runtime directory is a symlink: {}",
-                runtime.display()
-            ));
-        }
-        #[cfg(unix)]
-        if metadata.uid() != unsafe { libc::geteuid() } {
-            return Err(format!(
-                "Prism worker runtime directory is owned by another user: {}",
-                runtime.display()
-            ));
-        }
+    let metadata = fs::symlink_metadata(runtime).ok();
+    if metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(format!(
+            "Prism worker runtime directory is a symlink: {}",
+            runtime.display()
+        ));
+    }
+    #[cfg(unix)]
+    if metadata.is_some_and(|metadata| metadata.uid() != unsafe { libc::geteuid() }) {
+        return Err(format!(
+            "Prism worker runtime directory is owned by another user: {}",
+            runtime.display()
+        ));
     }
     fs::create_dir_all(runtime).map_err(|error| format!("create worker runtime dir: {error}"))?;
     #[cfg(unix)]

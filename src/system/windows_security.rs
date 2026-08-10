@@ -18,7 +18,7 @@ use windows::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
-    OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
+    OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::core::{PCWSTR, PWSTR};
@@ -132,7 +132,13 @@ fn open_path_without_reparse(
             .chain(std::iter::once(0))
             .collect::<Vec<_>>();
         let desired_access = if is_final {
-            FILE_READ_ATTRIBUTES.0 | READ_CONTROL.0 | if write_dacl { WRITE_DAC.0 } else { 0 }
+            FILE_READ_ATTRIBUTES.0
+                | READ_CONTROL.0
+                | if write_dacl {
+                    WRITE_DAC.0 | WRITE_OWNER.0
+                } else {
+                    0
+                }
         } else {
             FILE_READ_ATTRIBUTES.0
         };
@@ -249,13 +255,17 @@ fn secure_handle(handle: HANDLE, is_directory: bool) -> io::Result<()> {
     if !present.as_bool() || dacl.is_null() {
         return Err(io::Error::other("private security descriptor has no DACL"));
     }
-    // SAFETY: handle is live and dacl remains owned by allocation during this call.
+    let owner = sid_allocation(&current_user_sid_string()?)?;
+    // SAFETY: handle is live, and the owner SID and DACL remain owned by their allocations
+    // during this call.
     let result = unsafe {
         SetSecurityInfo(
             handle,
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            None,
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
+            Some(owner.as_sid()),
             None,
             Some(dacl),
             None,

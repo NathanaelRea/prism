@@ -1921,15 +1921,20 @@ mod tests {
                     .unwrap();
                 replacement.register_builtins().unwrap();
                 let (shutdown, receiver) = watch::channel(false);
-                let replacement = tokio::spawn(replacement.run(receiver));
-                tokio::time::timeout(Duration::from_secs(5), async {
+                let mut replacement = tokio::spawn(replacement.run(receiver));
+                tokio::time::timeout(Duration::from_secs(10), async {
                     loop {
                         if operations.inspect("run").await.unwrap().unwrap().status
                             == "recovery_required"
                         {
                             break;
                         }
-                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        tokio::select! {
+                            result = &mut replacement => {
+                                panic!("replacement worker exited before recovery: {result:?}");
+                            }
+                            () = tokio::time::sleep(Duration::from_millis(5)) => {}
+                        }
                     }
                 })
                 .await

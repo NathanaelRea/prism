@@ -1774,9 +1774,11 @@ mod tests {
             root: PathBuf::from("/work/example"),
         };
 
+        let extension = if cfg!(windows) { "endpoint" } else { "sock" };
         assert_eq!(
             control_socket_path(&repo),
-            control_runtime_dir().join(format!("repo-{:016x}.sock", stable_hash(&repo.root)))
+            control_runtime_dir()
+                .join(format!("repo-{:016x}.{extension}", stable_hash(&repo.root)))
         );
     }
 

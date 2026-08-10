@@ -546,7 +546,8 @@ fn open_lock(path: &Path) -> Result<File, PersistenceError> {
             windows::Win32::Foundation::GENERIC_READ.0
                 | windows::Win32::Foundation::GENERIC_WRITE.0
                 | windows::Win32::Storage::FileSystem::READ_CONTROL.0
-                | windows::Win32::Storage::FileSystem::WRITE_DAC.0,
+                | windows::Win32::Storage::FileSystem::WRITE_DAC.0
+                | windows::Win32::Storage::FileSystem::WRITE_OWNER.0,
         )
         .custom_flags(windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT.0);
     let file = options
@@ -617,7 +618,8 @@ fn create_staging(target: &Path, parent: &Path) -> Result<(File, PathBuf), Persi
             .access_mode(
                 windows::Win32::Foundation::GENERIC_WRITE.0
                     | windows::Win32::Storage::FileSystem::READ_CONTROL.0
-                    | windows::Win32::Storage::FileSystem::WRITE_DAC.0,
+                    | windows::Win32::Storage::FileSystem::WRITE_DAC.0
+                    | windows::Win32::Storage::FileSystem::WRITE_OWNER.0,
             )
             .custom_flags(windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT.0);
         match options.open(&path) {
