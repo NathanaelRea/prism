@@ -428,7 +428,8 @@ fn platform_smoke_native_worker_starts_once_reports_health_and_shuts_down() {
     let health = run(&runtime, &home, &["worker", "health"]);
     assert!(health.status.success());
     let health = String::from_utf8_lossy(&health.stdout);
-    assert!(health.starts_with("ok 2 "), "unexpected health: {health}");
+    assert!(health.starts_with("ok 3 "), "unexpected health: {health}");
+    assert!(health.contains("generation="));
     assert!(health.contains("state=running active=0"));
 
     let second = run(&runtime, &home, &["worker", "serve"]);

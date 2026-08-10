@@ -10,7 +10,7 @@ revision and updated golden fixtures.
 | Workflow Definition TOML | `schema_version = 2` | Reject unknown versions. Source migration is explicit, previewable, backed up, and never imports Plan/Auto state. |
 | Package manifest TOML | `schema_version = 1` | Reject unknown versions before resolving or activating resources. |
 | Scope lockfile TOML | `schema_version = 1` | Reject unknown versions. Every dependency uses an exact source revision and digest; no semver or floating resolution is allowed in a retained lock. |
-| Extension JSON Lines protocol | `protocol_major = 1`, `protocol_minor = 0` | Reject a different major. A peer may use a minor-version feature only when both peers negotiated its named feature; unknown optional features and fields are ignored within configured bounds. Unknown required messages fail the affected call. |
+| Extension JSON Lines protocol | `protocol_major = 1`, `protocol_minor = 1` | Reject a different major. A peer may use a minor-version feature only when both peers negotiated its named feature; unknown optional features and fields are ignored within configured bounds. Unknown required messages fail the affected call. |
 | CLI stable JSON envelope | `schema_version = 1` | Every stable `--json` response is an object with `schema_version`, `kind`, and `data`. Consumers must ignore unknown fields, and Prism must not change the meaning or type of an existing field within version 1. Breaking changes require a new schema version. |
 
 ## Canonical Identity And Revisions

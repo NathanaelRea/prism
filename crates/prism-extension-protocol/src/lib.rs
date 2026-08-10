@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 0;
+pub const PROTOCOL_MINOR: u16 = 1;
 pub const DEFAULT_MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub const HOST_FEATURES: [&str; 7] = [
     "host.read_artifact",
@@ -214,7 +214,10 @@ pub struct ProcessRequest {
     pub working_scope: OpaqueReference,
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
-    pub timeout_ms: u64,
+    /// Optional operation deadline. The enclosing Workflow Step owns the execution deadline;
+    /// this field is only for callers that need a stricter child-process bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
     pub max_output_bytes: u64,
 }
 
@@ -226,7 +229,10 @@ pub struct AgentRequest {
     pub working_scope: OpaqueReference,
     pub continuation: Option<OpaqueReference>,
     pub tool_policy: Value,
-    pub timeout_ms: u64,
+    /// Optional operation deadline. Long-running Agents otherwise rely on Workflow cancellation,
+    /// lease health, and any explicit Step timeout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
     pub max_output_bytes: u64,
 }
 

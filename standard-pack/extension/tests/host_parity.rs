@@ -494,6 +494,31 @@ async fn calls_are_bounded_per_executable_revision() {
 }
 
 #[tokio::test]
+async fn execute_is_not_bounded_by_the_control_request_timeout() {
+    let client = ExtensionClient::launch(
+        env!("CARGO_BIN_EXE_third-party-fixture"),
+        Arc::new(NoHostOperations),
+        HostLimits {
+            request_timeout: std::time::Duration::from_millis(20),
+            heartbeat_interval: std::time::Duration::from_secs(60),
+            ..HostLimits::default()
+        },
+    )
+    .await
+    .unwrap();
+    let (_owner, cancellation) = tokio::sync::watch::channel(false);
+    let result = client
+        .execute(
+            attempt("long-running", serde_json::json!({"delay_ms":100})),
+            cancellation,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(result.outcome, AttemptOutcome::Succeeded { .. }));
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn host_cancellation_is_attempt_and_generation_bound() {
     let client = ExtensionClient::launch(
         env!("CARGO_BIN_EXE_third-party-fixture"),

@@ -20,6 +20,7 @@ pub(crate) struct RunnableStep {
     pub input_json: String,
     pub input_revisions_json: String,
     pub repository: Option<String>,
+    pub timeout_seconds: Option<i64>,
 }
 
 pub(crate) struct DurableClaim<'a> {

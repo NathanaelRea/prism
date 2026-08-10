@@ -721,7 +721,7 @@ impl RunLedger {
                 // Every step passes through readiness resolution, including roots. This is where
                 // exact input artifact revisions are frozen for the eventual attempt.
                 let status = "waiting";
-                sqlx::query("insert into workflow_step (id, run_id, step_key, implementation, target_id, status, available_unix_ms, input_json, class, bindings_json, outputs_json, settings_json, condition_json, on_unknown, skippable, retry_max_attempts, child_snapshot_id, runtime_status, repeat_json, effect_boundary) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+                sqlx::query("insert into workflow_step (id, run_id, step_key, implementation, target_id, status, available_unix_ms, input_json, class, bindings_json, outputs_json, settings_json, condition_json, on_unknown, skippable, retry_max_attempts, child_snapshot_id, runtime_status, repeat_json, effect_boundary, timeout_seconds, timeout_policy, retry_json) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
                     .bind(&step_id).bind(&run_id).bind(&step.id).bind(implementation).bind(target).bind(status).bind(now)
                     .bind(input.to_string()).bind(class)
                     .bind(serde_json::to_string(&step.inputs).unwrap_or_else(|_| "{}".into()))
@@ -732,6 +732,9 @@ impl RunLedger {
                     .bind(child_snapshot_id).bind(status)
                     .bind(step.repeat.as_ref().map(|repeat| serde_json::to_string(repeat).unwrap_or_default()))
                     .bind(effect_boundary_name(step.effect_boundary))
+                    .bind(step.timeout_seconds.and_then(|value| i64::try_from(value).ok()))
+                    .bind(timeout_policy_name(step.on_timeout))
+                    .bind(persisted_retry_policy(&step.retry))
                     .execute(&mut *connection).await.map_err(DatabaseError::Query)?;
                 for resource in &step.resources {
                     sqlx::query("insert into step_resource_requirement (step_id, resource_key) values (?, ?)")
@@ -1365,6 +1368,45 @@ fn effect_boundary_name(boundary: prism_extension_protocol::EffectBoundary) -> &
     }
 }
 
+fn persisted_retry_policy(policy: &crate::workflow::definition::RetryDefinition) -> String {
+    let mut policy = policy.clone();
+    // Snapshot schema v1 represented the default as zero. Preserve launch compatibility while
+    // persisting the clearer total-Attempt semantics used by the current scheduler.
+    policy.max_attempts = policy.max_attempts.max(1);
+    serde_json::to_string(&policy).unwrap_or_else(|_| {
+        serde_json::to_string(&crate::workflow::definition::RetryDefinition::default())
+            .expect("default Retry policy serializes")
+    })
+}
+
+fn retry_delay_ms(
+    policy: &crate::workflow::definition::RetryDefinition,
+    attempts: i64,
+    step_id: &str,
+) -> i64 {
+    let exponent = u32::try_from(attempts.saturating_sub(1))
+        .unwrap_or(u32::MAX)
+        .min(31);
+    let initial_ms = policy.initial_delay_seconds.saturating_mul(1_000);
+    let maximum_ms = policy.max_delay_seconds.saturating_mul(1_000);
+    let base = initial_ms.saturating_mul(1_u64 << exponent).min(maximum_ms);
+    if base == 0 {
+        return 0;
+    }
+    let digest = Sha256::digest(format!("{step_id}:{attempts}"));
+    let sample = u16::from_be_bytes([digest[0], digest[1]]) as u64;
+    let jitter = sample % base.saturating_div(4).saturating_add(1);
+    i64::try_from(base.saturating_add(jitter).min(maximum_ms)).unwrap_or(i64::MAX)
+}
+
+fn timeout_policy_name(policy: crate::workflow::definition::TimeoutPolicy) -> &'static str {
+    use crate::workflow::definition::TimeoutPolicy;
+    match policy {
+        TimeoutPolicy::Fail => "fail",
+        TimeoutPolicy::InputRequired => "input_required",
+    }
+}
+
 fn unknown_policy_name(
     policy: crate::workflow::definition::UnknownConditionPolicy,
 ) -> &'static str {
@@ -1484,8 +1526,8 @@ pub(super) async fn project_run_state(
         sqlx::query("update workflow_run set status = 'succeeded', runtime_status = 'succeeded', updated_unix_ms = ?, completed_unix_ms = ? where id = ?")
             .bind(now_unix_ms).bind(now_unix_ms).bind(run_id).execute(connection).await.map_err(DatabaseError::Query)?;
     } else {
-        sqlx::query("update workflow_run set status = case when exists(select 1 from workflow_step where run_id = ? and status in ('runnable','claimed')) then 'runnable' else 'waiting' end, runtime_status = case when exists(select 1 from workflow_step where run_id = ? and status in ('runnable','claimed')) then 'runnable' else 'waiting' end, updated_unix_ms = ? where id = ? and status <> 'paused'")
-            .bind(run_id).bind(run_id).bind(now_unix_ms).bind(run_id).execute(connection).await.map_err(DatabaseError::Query)?;
+        sqlx::query("update workflow_run set status = case when exists(select 1 from workflow_step where run_id = ? and runtime_status = 'input_required') then 'waiting' when exists(select 1 from workflow_step where run_id = ? and status in ('runnable','claimed')) then 'runnable' else 'waiting' end, runtime_status = case when exists(select 1 from workflow_step where run_id = ? and runtime_status = 'input_required') then 'input_required' when exists(select 1 from workflow_step where run_id = ? and status in ('runnable','claimed')) then 'runnable' else 'waiting' end, updated_unix_ms = ? where id = ? and status <> 'paused'")
+            .bind(run_id).bind(run_id).bind(run_id).bind(run_id).bind(now_unix_ms).bind(run_id).execute(connection).await.map_err(DatabaseError::Query)?;
     }
     Ok(())
 }
@@ -1845,7 +1887,7 @@ impl Coordinator {
         self.database
             .write_immediate(|connection| {
                 Box::pin(async move {
-                    let (class, outputs_json, retry_max, run_id, settings_json): (String, String, i64, String, String) = sqlx::query_as("select class, outputs_json, retry_max_attempts, run_id, settings_json from workflow_step where id = ?")
+                    let (class, outputs_json, run_id, settings_json, retry_json, effect_boundary, timeout_policy): (String, String, String, String, String, String, String) = sqlx::query_as("select class, outputs_json, run_id, settings_json, retry_json, effect_boundary, timeout_policy from workflow_step where id = ?")
                         .bind(&lease.step_id).fetch_one(&mut *connection).await.map_err(DatabaseError::Query)?;
                     let mut effective_status = status.clone();
                     let mut effective_result = result_json.clone();
@@ -1898,18 +1940,43 @@ impl Coordinator {
                     exactly_one_fenced(changed)?;
                     let attempts: i64 = sqlx::query_scalar("select count(*) from step_attempt where step_id = ?")
                         .bind(&lease.step_id).fetch_one(&mut *connection).await.map_err(DatabaseError::Query)?;
-                    // `max_attempts` is the total number of attempts, not the retry count.
-                    let retry = effective_status == "failed" && attempts < retry_max;
+                    let retry_policy: crate::workflow::definition::RetryDefinition = serde_json::from_str(&retry_json)
+                        .map_err(|error| DatabaseError::InvalidValue { field: "persisted Retry policy", value: error.to_string() })?;
+                    let failure_kind = serde_json::from_str::<serde_json::Value>(&effective_result).ok()
+                        .and_then(|value| value.get("failure_kind").and_then(serde_json::Value::as_str).map(str::to_owned));
+                    let retry_failure = match failure_kind.as_deref() {
+                        Some("transient") => Some(crate::workflow::definition::RetryFailure::Transient),
+                        Some("timeout") => Some(crate::workflow::definition::RetryFailure::Timeout),
+                        _ => None,
+                    };
+                    // `max_attempts` is the total number of Attempts, not the retry count. An
+                    // unbrokered mutation is never repeated automatically even if stale persisted
+                    // policy from an older version requested it.
+                    let retry = effective_status == "failed"
+                        && class != "notification"
+                        && effect_boundary != "unbrokered"
+                        && attempts < i64::from(retry_policy.max_attempts)
+                        && retry_failure.is_some_and(|kind| retry_policy.on.contains(&kind));
+                    let retry_delay = if retry {
+                        retry_delay_ms(&retry_policy, attempts, &lease.step_id)
+                    } else {
+                        0
+                    };
+                    let timed_out_for_input = effective_status == "failed"
+                        && failure_kind.as_deref() == Some("timeout")
+                        && timeout_policy == "input_required"
+                        && !retry;
                     let gate_reobserve = class == "gate" && effective_status == "succeeded"
                         && serde_json::from_str::<serde_json::Value>(&effective_result).ok().and_then(|value| value.get("ready").and_then(serde_json::Value::as_bool)) == Some(false);
-                    let step_status = if gate_reobserve { "waiting" } else if class == "notification" { "succeeded" } else if retry { "runnable" } else { effective_status.as_str() };
-                    let runtime_status = if gate_reobserve { "waiting_gate" } else if class == "notification" && effective_status != "succeeded" { "succeeded_with_diagnostic" } else { step_status };
+                    let step_status = if gate_reobserve || timed_out_for_input { "waiting" } else if class == "notification" { "succeeded" } else if retry { "runnable" } else { effective_status.as_str() };
+                    let runtime_status = if gate_reobserve { "waiting_gate" } else if timed_out_for_input { "input_required" } else if class == "notification" && effective_status != "succeeded" { "succeeded_with_diagnostic" } else { step_status };
+                    let available_unix_ms = finished_unix_ms.saturating_add(retry_delay);
                     let step_changed = sqlx::query(
                         "update workflow_step set status = ?, runtime_status = ?, available_unix_ms = ? where id = ? and status = 'claimed'",
                     )
                     .bind(step_status)
                     .bind(runtime_status)
-                    .bind(finished_unix_ms)
+                    .bind(available_unix_ms)
                     .bind(&lease.step_id)
                     .execute(&mut *connection)
                     .await
@@ -2000,6 +2067,7 @@ fn exactly_one_fenced(changed: u64) -> Result<(), DatabaseError> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use sqlx::Connection;
@@ -2126,6 +2194,108 @@ mod tests {
             ));
         });
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn transient_failures_retry_with_backoff() {
+        let path = path();
+        runtime().block_on(async {
+            let database = WorkflowDatabase::open(&path).await.unwrap();
+            fixture(&database).await;
+            database
+                .write_immediate(|connection| {
+                    Box::pin(async move {
+                        sqlx::query("update workflow_step set retry_json = ? where id = 'step-1'")
+                            .bind(
+                                serde_json::to_string(
+                                    &crate::workflow::definition::RetryDefinition {
+                                        max_attempts: 2,
+                                        on: BTreeSet::from([
+                                            crate::workflow::definition::RetryFailure::Transient,
+                                        ]),
+                                        initial_delay_seconds: 2,
+                                        max_delay_seconds: 30,
+                                    },
+                                )
+                                .unwrap(),
+                            )
+                            .execute(connection)
+                            .await
+                            .map_err(DatabaseError::Query)?;
+                        Ok(())
+                    })
+                })
+                .await
+                .unwrap();
+            let coordinator = Coordinator::new(database.clone());
+            let lease = coordinator
+                .claim(ClaimRequest {
+                    attempt_id: "attempt-retry",
+                    step_id: "step-1",
+                    worker_id: "worker",
+                    now_unix_ms: 2,
+                    lease_expires_unix_ms: 10_000,
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            coordinator
+                .finish(
+                    &lease,
+                    AttemptResult {
+                        status: "failed",
+                        result_json: r#"{"error":"temporary outage","failure_kind":"transient"}"#,
+                        finished_unix_ms: 3,
+                    },
+                )
+                .await
+                .unwrap();
+            let (status, available): (String, i64) = sqlx::query_as(
+                "select status, available_unix_ms from workflow_step where id='step-1'",
+            )
+            .fetch_one(database.readers())
+            .await
+            .unwrap();
+            assert_eq!(status, "runnable");
+            assert!(available >= 2_003);
+            database.close().await;
+        });
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn exhausted_timeout_can_require_operator_input() {
+        let path = path();
+        runtime().block_on(async {
+            let database = WorkflowDatabase::open(&path).await.unwrap();
+            fixture(&database).await;
+            database.write_immediate(|connection| Box::pin(async move {
+                sqlx::query("update workflow_step set timeout_policy='input_required' where id='step-1'")
+                    .execute(connection).await.map_err(DatabaseError::Query)?;
+                Ok(())
+            })).await.unwrap();
+            let coordinator = Coordinator::new(database.clone());
+            let lease = coordinator.claim(ClaimRequest {
+                attempt_id: "attempt-timeout",
+                step_id: "step-1",
+                worker_id: "worker",
+                now_unix_ms: 2,
+                lease_expires_unix_ms: 10_000,
+            }).await.unwrap().unwrap();
+            coordinator.finish(&lease, AttemptResult {
+                status: "failed",
+                result_json: r#"{"error":"deadline","failure_kind":"timeout"}"#,
+                finished_unix_ms: 3,
+            }).await.unwrap();
+            let step: (String, String) = sqlx::query_as("select status, runtime_status from workflow_step where id='step-1'")
+                .fetch_one(database.readers()).await.unwrap();
+            let run: (String, String) = sqlx::query_as("select status, runtime_status from workflow_run where id='run-1'")
+                .fetch_one(database.readers()).await.unwrap();
+            assert_eq!(step, ("waiting".into(), "input_required".into()));
+            assert_eq!(run, ("waiting".into(), "input_required".into()));
+            database.close().await;
+        });
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

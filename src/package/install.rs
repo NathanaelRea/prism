@@ -465,6 +465,15 @@ fn bootstrap_standard_pack_with_extension(
     global_root: &Path,
     executable: &Path,
 ) -> Result<bool, InstallError> {
+    let updated = sync_standard_pack_with_extension(global_root, executable)?;
+    let retired = retire_legacy_standard_workflow_promotions(global_root)?;
+    Ok(updated || retired)
+}
+
+fn sync_standard_pack_with_extension(
+    global_root: &Path,
+    executable: &Path,
+) -> Result<bool, InstallError> {
     let root = global_root.join("packages/prism.standard");
     let candidate = global_root.join(format!(
         "packages/.prism.standard-bootstrap-{}",
@@ -623,6 +632,73 @@ fn bootstrap_standard_pack_with_extension(
             Err(error.into())
         }
     }
+}
+
+fn retire_legacy_standard_workflow_promotions(global_root: &Path) -> Result<bool, InstallError> {
+    let package_root = global_root.join("packages/prism.standard");
+    let manifest_path = package_root.join("prism-package.toml");
+    if !manifest_path.is_file() {
+        return Ok(false);
+    }
+    let manifest = PackageManifest::parse(&fs::read_to_string(manifest_path)?)?;
+    let packaged = manifest
+        .resources
+        .iter()
+        .map(|resource| resource.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let marker_root = global_root.join("state/standard-workflow-promotions");
+    let archive_root = global_root.join("state/retired-standard-workflow-promotions");
+    let mut changed = false;
+
+    for name in standard_workflows().keys() {
+        let id = format!("prism.standard/{name}");
+        let marker = marker_root.join(name);
+        if !packaged.contains(id.as_str())
+            || !marker.is_file()
+            || fs::read_to_string(&marker)?.trim() != id
+        {
+            continue;
+        }
+
+        let loose = global_root
+            .join("workflows")
+            .join(format!("prism-standard-{name}.toml"));
+        if loose.is_file() {
+            fs::create_dir_all(&archive_root)?;
+            archive_legacy_promotion(&loose, &archive_root.join(format!("{name}.toml")))?;
+        }
+        fs::remove_file(marker)?;
+        changed = true;
+    }
+    Ok(changed)
+}
+
+fn archive_legacy_promotion(source: &Path, preferred: &Path) -> Result<(), InstallError> {
+    let source_bytes = fs::read(source)?;
+    let destination = if !preferred.exists() || fs::read(preferred)? == source_bytes {
+        preferred.to_path_buf()
+    } else {
+        let digest = format!("{:x}", Sha256::digest(&source_bytes));
+        preferred.with_file_name(format!(
+            "{}-{digest}.toml",
+            preferred
+                .file_stem()
+                .expect("retired promotion has a file stem")
+                .to_string_lossy()
+        ))
+    };
+    if destination.exists() {
+        if fs::read(&destination)? != source_bytes {
+            return Err(InstallError::Invalid(format!(
+                "cannot preserve legacy Standard Workflow at {} because the archive differs",
+                destination.display()
+            )));
+        }
+        fs::remove_file(source)?;
+    } else {
+        fs::rename(source, destination)?;
+    }
+    Ok(())
 }
 
 fn update_standard_pack(
@@ -806,6 +882,42 @@ mod tests {
             !deleted.exists(),
             "a local deletion must remain a tombstone"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn standard_pack_retires_a_legacy_promoted_workflow_without_losing_its_source() {
+        let root = std::env::temp_dir().join(format!(
+            "prism-standard-promotion-retirement-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("fixture-extension");
+        fs::write(&executable, b"pinned executable bytes").unwrap();
+        assert!(bootstrap_standard_pack_with_extension(&root, &executable).unwrap());
+
+        let legacy_source = "# Standard workflow added by a Prism upgrade; this is an editable global drop-in.\nid = \"prism.standard/stabilize\"\n";
+        let loose = root.join("workflows/prism-standard-stabilize.toml");
+        let marker = root.join("state/standard-workflow-promotions/stabilize");
+        fs::create_dir_all(loose.parent().unwrap()).unwrap();
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        fs::write(&loose, legacy_source).unwrap();
+        fs::write(&marker, "prism.standard/stabilize\n").unwrap();
+        assert!(crate::resource::discover(&root, None).is_err());
+
+        assert!(bootstrap_standard_pack_with_extension(&root, &executable).unwrap());
+
+        assert!(!loose.exists());
+        assert!(!marker.exists());
+        assert_eq!(
+            fs::read_to_string(
+                root.join("state/retired-standard-workflow-promotions/stabilize.toml")
+            )
+            .unwrap(),
+            legacy_source
+        );
+        crate::resource::discover(&root, None).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 

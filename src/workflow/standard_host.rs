@@ -14,15 +14,14 @@ use prism_extension_protocol::{
     ProcessRequest, ProtocolError,
 };
 use serde_json::Value;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 use crate::extension::{BrokerFuture, HostFuture, HostOperationServices, ProtectedEffectBackend};
-use crate::persistence::pools::WorkflowDatabase;
+use crate::persistence::pools::{HostAgentSessionRecord, WorkflowDatabase};
 use crate::workflow::effect::ProtectedEffectKind;
 
 const MAX_HOST_OUTPUT_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_HOST_TIMEOUT_MS: u64 = 3_600_000;
 
 #[derive(Clone)]
 pub(crate) struct StandardHostServices {
@@ -39,7 +38,7 @@ struct ClaimedAttempt {
 
 struct ChildPolicy {
     stdin: Option<String>,
-    timeout_ms: u64,
+    timeout_ms: Option<u64>,
     maximum: u64,
 }
 
@@ -175,12 +174,6 @@ impl StandardHostServices {
                 "Agent prompt is empty",
             ));
         }
-        if request.continuation.is_some() {
-            return Err(ProtocolError::new(
-                "unsupported_continuation",
-                "production workflow Agents do not resume interactive sessions",
-            ));
-        }
         let attempt = self.claimed_attempt(attempt_id, generation).await?;
         let worktree = resolve_worktree(&attempt.repository, &request.working_scope)?;
         let repository = crate::repo::Repository {
@@ -201,6 +194,26 @@ impl StandardHostServices {
         let harness_config = config
             .harness_config(harness_id)
             .map_err(|error| ProtocolError::new("harness_configuration", error))?;
+        if harness_config.adapter == "pi" {
+            return self
+                .run_pi_agent_rpc(
+                    attempt_id,
+                    generation,
+                    &attempt,
+                    &worktree,
+                    &harness_config,
+                    request,
+                )
+                .await;
+        }
+        if request.continuation.is_some() {
+            return Err(ProtocolError::new(
+                "unsupported_continuation",
+                format!(
+                    "harness '{harness_id}' does not expose a resumable Workflow Agent protocol"
+                ),
+            ));
+        }
         let invocation = crate::harness::Harness::new(harness_id, &harness_config)
             .headless(
                 &request.prompt,
@@ -263,13 +276,244 @@ impl StandardHostServices {
         Ok(output)
     }
 
+    async fn run_pi_agent_rpc(
+        &self,
+        attempt_id: &str,
+        generation: u64,
+        attempt: &ClaimedAttempt,
+        worktree: &Path,
+        harness: &crate::harness::HarnessConfig,
+        request: AgentRequest,
+    ) -> Result<Value, ProtocolError> {
+        let mut arguments = harness.interactive_command.clone();
+        arguments.extend(harness.arguments.clone());
+        let (program, prefix) = arguments.split_first().ok_or_else(|| {
+            ProtocolError::new("harness_invocation", "Pi harness has no executable")
+        })?;
+        let mut command = Command::new(program);
+        command.as_std_mut().process_group(0);
+        command
+            .args(prefix)
+            .args([
+                "--mode",
+                "rpc",
+                "--name",
+                &format!("Prism Workflow {attempt_id}"),
+            ])
+            .envs(&harness.environment)
+            .current_dir(worktree)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        if let Some(model) = request.model.as_deref() {
+            command.args(["--model", model]);
+        }
+        if let Some(continuation) = request.continuation.as_ref() {
+            command.args(["--session", continuation.id.as_str()]);
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|error| ProtocolError::new("process_spawn", error.to_string()))?;
+        let pid = child
+            .id()
+            .ok_or_else(|| ProtocolError::new("process_identity", "Pi RPC process has no PID"))?;
+        let recorded = tokio::task::spawn_blocking(move || crate::process::record_process(pid))
+            .await
+            .map_err(|error| ProtocolError::new("process_identity", error.to_string()))?
+            .map_err(|error| ProtocolError::new("process_identity", error.to_string()))?;
+        if let Err(error) = self.record_process(attempt_id, attempt, recorded).await {
+            terminate(recorded).await;
+            return Err(error);
+        }
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| ProtocolError::new("process_stdin", "Pi RPC stdin is unavailable"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| ProtocolError::new("process_output", "Pi RPC stdout is unavailable"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| ProtocolError::new("process_output", "Pi RPC stderr is unavailable"))?;
+        let stderr_task = tokio::spawn(read_bounded(stderr, request.max_output_bytes));
+        let state = serde_json::json!({"id":"prism-state","type":"get_state"});
+        let prompt =
+            serde_json::json!({"id":"prism-prompt","type":"prompt","message":request.prompt});
+        for message in [state, prompt] {
+            stdin
+                .write_all(format!("{message}\n").as_bytes())
+                .await
+                .map_err(|error| ProtocolError::new("process_stdin", error.to_string()))?;
+        }
+        stdin
+            .flush()
+            .await
+            .map_err(|error| ProtocolError::new("process_stdin", error.to_string()))?;
+
+        let deadline = async move {
+            match request.timeout_ms {
+                Some(timeout_ms) => tokio::time::sleep(Duration::from_millis(timeout_ms)).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(deadline);
+        let mut stdout = BufReader::new(stdout);
+        let mut transcript = Vec::new();
+        let mut session_id = None;
+        let mut session_file = None;
+        let mut session_recorded = false;
+        let mut prompt_accepted = false;
+        let mut settled = false;
+        while !settled {
+            let mut line = Vec::new();
+            tokio::select! {
+                read = stdout.read_until(b'\n', &mut line) => {
+                    let count = read.map_err(|error| ProtocolError::new("process_output", error.to_string()))?;
+                    if count == 0 {
+                        terminate(recorded).await;
+                        let stderr = join_output(stderr_task).await.unwrap_or_default();
+                        return Err(ProtocolError::new("pi_rpc_closed", format!("Pi RPC closed before settling: {}", truncate_message(&String::from_utf8_lossy(&stderr)))));
+                    }
+                }
+                _ = &mut deadline => {
+                    let _ = stdin.write_all(b"{\"type\":\"abort\"}\n").await;
+                    terminate(recorded).await;
+                    let _ = child.wait().await;
+                    return Err(ProtocolError::new("agent_timeout", "Pi Agent exceeded its operation timeout"));
+                }
+                _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                    if self.claimed_attempt(attempt_id, generation).await.is_err() {
+                        let _ = stdin.write_all(b"{\"type\":\"abort\"}\n").await;
+                        terminate(recorded).await;
+                        let _ = child.wait().await;
+                        return Err(ProtocolError::new("agent_cancelled", "Attempt was cancelled or lost its lease"));
+                    }
+                    continue;
+                }
+            }
+            if transcript.len().saturating_add(line.len())
+                > usize::try_from(request.max_output_bytes).unwrap_or(usize::MAX)
+            {
+                terminate(recorded).await;
+                let _ = child.wait().await;
+                return Err(ProtocolError::new(
+                    "output_limit",
+                    "Pi RPC output exceeded its bound",
+                ));
+            }
+            transcript.extend_from_slice(&line);
+            let value: Value = serde_json::from_slice(line.strip_suffix(b"\n").unwrap_or(&line))
+                .map_err(|error| ProtocolError::new("pi_rpc_protocol", error.to_string()))?;
+            if value.get("id").and_then(Value::as_str) == Some("prism-state") {
+                if value.get("success").and_then(Value::as_bool) != Some(true) {
+                    return Err(ProtocolError::new("pi_rpc_state", "Pi rejected get_state"));
+                }
+                session_id = value
+                    .pointer("/data/sessionId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                session_file = value
+                    .pointer("/data/sessionFile")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                if let (Some(id), Some(file)) = (session_id.as_deref(), session_file.as_deref()) {
+                    session_recorded = self
+                        .database
+                        .record_host_agent_session(HostAgentSessionRecord {
+                            attempt_id,
+                            worker_id: &attempt.worker_id,
+                            target_id: &attempt.target_id,
+                            fencing_token: attempt.fencing_token,
+                            session_id: id,
+                            session_file: file,
+                            now_unix_ms: unix_ms(),
+                        })
+                        .await
+                        .map_err(|error| ProtocolError::new("workflow_store", error.to_string()))?;
+                    if !session_recorded {
+                        return Err(ProtocolError::new(
+                            "stale_attempt",
+                            "Attempt lost its lease before the Agent Session was recorded",
+                        ));
+                    }
+                }
+            } else if value.get("id").and_then(Value::as_str) == Some("prism-prompt") {
+                prompt_accepted = value.get("success").and_then(Value::as_bool) == Some(true);
+                if !prompt_accepted {
+                    return Err(ProtocolError::new(
+                        "pi_prompt_rejected",
+                        value
+                            .get("error")
+                            .map(Value::to_string)
+                            .unwrap_or_else(|| "Pi rejected the Workflow prompt".into()),
+                    ));
+                }
+            } else if value.get("type").and_then(Value::as_str) == Some("agent_settled") {
+                settled = true;
+            }
+        }
+        drop(stdin);
+        if tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await
+            .is_err()
+        {
+            terminate(recorded).await;
+            let _ = child.wait().await;
+        }
+        let stderr = String::from_utf8_lossy(&join_output(stderr_task).await?).into_owned();
+        if !prompt_accepted {
+            return Err(ProtocolError::new(
+                "pi_prompt_unconfirmed",
+                "Pi settled without accepting the Workflow prompt",
+            ));
+        }
+        let transcript = String::from_utf8_lossy(&transcript).into_owned();
+        if !session_recorded {
+            return Err(ProtocolError::new(
+                "pi_session_unidentified",
+                "Pi did not provide a persistent Agent Session identity",
+            ));
+        }
+        let structured = extract_structured_agent_result(&transcript);
+        if request.prompt.starts_with("agent-repair-") && structured.is_none() {
+            return Err(ProtocolError::new(
+                "malformed_agent_output",
+                "repair Agent did not emit a structured JSON result; its Pi session was preserved for recovery",
+            ));
+        }
+        let mut output = structured.unwrap_or_else(|| serde_json::json!({"summary": transcript}));
+        if let Some(object) = output.as_object_mut() {
+            object.insert(
+                "agent_session".into(),
+                serde_json::json!({
+                    "adapter":"pi",
+                    "id":session_id,
+                    "file":session_file,
+                    "state":"settled"
+                }),
+            );
+            object.insert(
+                "process".into(),
+                serde_json::json!({
+                    "pid":recorded.pid,
+                    "stderr":stderr,
+                    "protocol":"pi_rpc"
+                }),
+            );
+        }
+        Ok(output)
+    }
+
     async fn run_child(
         &self,
         attempt_id: &str,
         generation: u64,
         attempt: &ClaimedAttempt,
         command: Command,
-        timeout_ms: u64,
+        timeout_ms: Option<u64>,
         maximum: u64,
     ) -> Result<Value, ProtocolError> {
         self.run_child_with_stdin(
@@ -332,7 +576,12 @@ impl StandardHostServices {
             .ok_or_else(|| ProtocolError::new("process_output", "stderr is unavailable"))?;
         let stdout_task = tokio::spawn(read_bounded(stdout, maximum));
         let stderr_task = tokio::spawn(read_bounded(stderr, maximum));
-        let deadline = tokio::time::sleep(Duration::from_millis(timeout_ms));
+        let deadline = async move {
+            match timeout_ms {
+                Some(timeout_ms) => tokio::time::sleep(Duration::from_millis(timeout_ms)).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
         tokio::pin!(deadline);
         let status = loop {
             tokio::select! {
@@ -340,7 +589,7 @@ impl StandardHostServices {
                 _ = &mut deadline => {
                     terminate(recorded).await;
                     let _ = child.wait().await;
-                    return Err(ProtocolError::new("process_timeout", format!("process exceeded {timeout_ms}ms")));
+                    return Err(ProtocolError::new("process_timeout", format!("process exceeded {}ms", timeout_ms.unwrap_or_default())));
                 }
                 _ = tokio::time::sleep(Duration::from_millis(200)) => {
                     if self.claimed_attempt(attempt_id, generation).await.is_err() {
@@ -1114,11 +1363,11 @@ fn git_capture(
     }
 }
 
-fn validate_launch_limits(timeout_ms: u64, maximum: u64) -> Result<(), ProtocolError> {
-    if timeout_ms == 0 || timeout_ms > MAX_HOST_TIMEOUT_MS {
+fn validate_launch_limits(timeout_ms: Option<u64>, maximum: u64) -> Result<(), ProtocolError> {
+    if timeout_ms == Some(0) {
         return Err(ProtocolError::new(
             "invalid_timeout",
-            format!("timeout must be between 1 and {MAX_HOST_TIMEOUT_MS}ms"),
+            "timeout must be positive when supplied",
         ));
     }
     if maximum == 0 || maximum > MAX_HOST_OUTPUT_BYTES {
@@ -1261,6 +1510,13 @@ mod tests {
     #[test]
     fn structured_agent_result_is_required_to_contain_contract_fields() {
         assert!(extract_structured_agent_result("ordinary harness output").is_none());
+        assert_eq!(
+            extract_structured_agent_result(
+                r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"{\"summary\":\"fixed through RPC\",\"addressed_thread_ids\":[\"T1\"]}"}]}}"#
+            )
+            .unwrap()["summary"],
+            "fixed through RPC"
+        );
         assert_eq!(
             extract_structured_agent_result(
                 "log\n{\"summary\":\"fixed\",\"addressed_thread_ids\":[\"T1\"]}"

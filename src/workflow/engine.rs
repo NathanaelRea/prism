@@ -844,6 +844,7 @@ impl WorkflowWorker {
             self.worker_id.clone(),
             self.config.clone(),
             registry.clone(),
+            self.execution.clone(),
             dispatch_tx,
             stop_rx.clone(),
         ));
@@ -919,13 +920,14 @@ impl WorkflowWorker {
     }
 }
 
-#[derive(Clone)]
 struct Dispatch {
     lease: AttemptLease,
     run_id: String,
     implementation: String,
     input_json: String,
     input_revisions_json: String,
+    timeout_seconds: Option<u64>,
+    reservation: Option<DispatchReservation>,
 }
 
 struct ActiveAttempt {
@@ -934,16 +936,72 @@ struct ActiveAttempt {
     cancel: watch::Sender<bool>,
 }
 
+#[derive(Default)]
+struct ExecutionAdmission {
+    draining: bool,
+    pending_dispatches: usize,
+}
+
+struct DispatchReservation {
+    admission: Arc<Mutex<ExecutionAdmission>>,
+}
+
+impl Drop for DispatchReservation {
+    fn drop(&mut self) {
+        if let Ok(mut admission) = self.admission.lock() {
+            admission.pending_dispatches = admission.pending_dispatches.saturating_sub(1);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ExecutionControl {
     active: Arc<Mutex<HashMap<String, ActiveAttempt>>>,
+    admission: Arc<Mutex<ExecutionAdmission>>,
 }
 
 impl ExecutionControl {
     fn new() -> Self {
         Self {
             active: Arc::new(Mutex::new(HashMap::new())),
+            admission: Arc::new(Mutex::new(ExecutionAdmission::default())),
         }
+    }
+
+    fn reserve_dispatch(&self) -> Result<Option<DispatchReservation>, WorkerError> {
+        let mut admission = self
+            .admission
+            .lock()
+            .map_err(|_| WorkerError::Stopped("execution admission state poisoned".into()))?;
+        if admission.draining {
+            return Ok(None);
+        }
+        admission.pending_dispatches = admission.pending_dispatches.saturating_add(1);
+        Ok(Some(DispatchReservation {
+            admission: Arc::clone(&self.admission),
+        }))
+    }
+
+    pub(crate) fn begin_draining(&self) {
+        if let Ok(mut admission) = self.admission.lock() {
+            admission.draining = true;
+        }
+    }
+
+    pub(crate) fn active_count(&self) -> usize {
+        // Read pending first: dispatch inserts into `active` before releasing its reservation,
+        // so this ordering cannot observe zero between those two states.
+        let pending = self
+            .admission
+            .lock()
+            .map(|admission| admission.pending_dispatches)
+            .unwrap_or(usize::MAX);
+        let active = self
+            .active
+            .lock()
+            .map(|active| active.len())
+            .unwrap_or(usize::MAX);
+        pending.saturating_add(active)
     }
 
     pub(crate) fn cancel_run(&self, run_id: &str) {
@@ -983,6 +1041,7 @@ async fn scheduler_task(
     worker_id: String,
     config: WorkerConfig,
     registry: ExecutionRegistry,
+    execution: ExecutionControl,
     dispatch: mpsc::Sender<Dispatch>,
     mut stop: watch::Receiver<bool>,
 ) -> Result<(), WorkerError> {
@@ -1015,6 +1074,9 @@ async fn scheduler_task(
                         ExecutionClass::Command => config.command_capacity,
                         ExecutionClass::Provider => config.provider_capacity,
                     };
+                    let Some(reservation) = execution.reserve_dispatch()? else {
+                        break;
+                    };
                     let attempt_id = next_attempt_id(&worker_id);
                     let resources = coordinator.required_resources(&step.id).await?;
                     let mut capacities = vec![
@@ -1045,6 +1107,8 @@ async fn scheduler_task(
                         implementation: step.implementation,
                         input_json: step.input_json,
                         input_revisions_json: step.input_revisions_json,
+                        timeout_seconds: step.timeout_seconds.and_then(|value| u64::try_from(value).ok()),
+                        reservation: Some(reservation),
                     }).await {
                         // A failed ephemeral handoff must not consume durable capacity until lease
                         // expiry. Release it explicitly; a concurrent expiry is already safe.
@@ -1077,14 +1141,15 @@ async fn execution_task(
     loop {
         tokio::select! {
             item = dispatch.recv() => match item {
-                Some(item) => {
+                Some(mut item) => {
                     let (cancel, cancellation) = watch::channel(false);
                     active.lock().map_err(|_| WorkerError::Stopped("active attempt registry poisoned".into()))?
                         .insert(item.lease.attempt_id.clone(), ActiveAttempt {
                             lease: item.lease.clone(),
                             run_id: item.run_id.clone(),
-                            cancel,
+                            cancel: cancel.clone(),
                         });
+                    drop(item.reservation.take());
                     if coordinator.run_is_cancelled(&item.run_id).await?
                         && let Ok(active) = active.lock()
                         && let Some(attempt) = active.get(&item.lease.attempt_id)
@@ -1101,32 +1166,46 @@ async fn execution_task(
                     let stores = stores.clone();
                     executions.spawn(async move {
                         let completion_cancellation = cancellation.clone();
-                        let result = if *completion_cancellation.borrow() {
-                            Err("attempt cancelled".into())
-                        } else {
+                        let execute = async {
+                            if *completion_cancellation.borrow() {
+                                return Err("attempt cancelled".into());
+                            }
                             match (implementation, target) {
                                 (Some(implementation), Some(target)) => target.execute(implementation, ExecutionContext {
                                     run_attempt_id: item.lease.attempt_id.clone(),
                                     step_id: item.lease.step_id.clone(),
-                                    input_json: item.input_json,
-                                    input_revisions_json: item.input_revisions_json,
+                                    input_json: item.input_json.clone(),
+                                    input_revisions_json: item.input_revisions_json.clone(),
                                     output: output.clone(),
-                                    cancellation,
-                                    control: stores.control,
-                                    effects: stores.effects,
-                                    artifacts: stores.artifacts,
+                                    cancellation: cancellation.clone(),
+                                    control: stores.control.clone(),
+                                    effects: stores.effects.clone(),
+                                    artifacts: stores.artifacts.clone(),
                                     lease: item.lease.clone(),
                                 }).await,
                                 (None, _) => Err(format!("unregistered step implementation '{}'", item.implementation)),
                                 (_, None) => Err(format!("unregistered execution target '{}'", item.lease.target_id)),
                             }
                         };
-                        let (status, result_json) = if *completion_cancellation.borrow() {
+                        let (result, timed_out) = execute_with_deadline(
+                            execute,
+                            item.timeout_seconds.map(Duration::from_secs),
+                            &cancel,
+                        ).await;
+                        let (status, result_json) = if timed_out {
+                            ("failed", serde_json::json!({
+                                "error": result.err().unwrap_or_else(|| "Workflow Step timed out".into()),
+                                "failure_kind": "timeout"
+                            }).to_string())
+                        } else if *completion_cancellation.borrow() {
                             ("cancelled", serde_json::json!({"error": "attempt cancelled"}).to_string())
                         } else {
                             match result {
                                 Ok(value) => ("succeeded", value),
-                                Err(error) => ("failed", serde_json::json!({"error": error}).to_string()),
+                                Err(error) => {
+                                    let kind = classify_failure(&error);
+                                    ("failed", serde_json::json!({"error": error, "failure_kind": kind}).to_string())
+                                }
                             }
                         };
                         let (acknowledgement, flushed) = oneshot::channel();
@@ -1162,6 +1241,33 @@ async fn execution_task(
                     return Ok(());
                 }
             }
+        }
+    }
+}
+
+async fn execute_with_deadline<F>(
+    execution: F,
+    deadline: Option<Duration>,
+    cancel: &watch::Sender<bool>,
+) -> (Result<String, String>, bool)
+where
+    F: Future<Output = Result<String, String>>,
+{
+    let Some(deadline) = deadline else {
+        return (execution.await, false);
+    };
+    tokio::pin!(execution);
+    tokio::select! {
+        result = &mut execution => (result, false),
+        _ = tokio::time::sleep(deadline) => {
+            let _ = cancel.send(true);
+            // Give implementations a bounded control-plane grace period to abort owned
+            // processes. The Workflow deadline itself remains the authoritative outcome.
+            let _ = tokio::time::timeout(Duration::from_secs(5), &mut execution).await;
+            (
+                Err(format!("Workflow Step exceeded its {}ms timeout", deadline.as_millis())),
+                true,
+            )
         }
     }
 }
@@ -1536,6 +1642,36 @@ fn duration_ms(duration: Duration) -> i64 {
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
 }
 
+fn classify_failure(error: &str) -> &'static str {
+    let error = error.to_ascii_lowercase();
+    if error.contains("timeout") || error.contains("timed out") || error.contains("exceeded its") {
+        "timeout"
+    } else if [
+        "extension process exited",
+        "extension transport",
+        "connection reset",
+        "connection refused",
+        "temporarily unavailable",
+        "rate limit",
+        "too many requests",
+        " 429",
+        " 500",
+        " 502",
+        " 503",
+        " 504",
+        "provider observation",
+        "provider_observation",
+        "overloaded",
+    ]
+    .iter()
+    .any(|needle| error.contains(needle))
+    {
+        "transient"
+    } else {
+        "permanent"
+    }
+}
+
 fn unix_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1644,6 +1780,20 @@ mod tests {
         cancelled: Arc<AtomicBool>,
     }
 
+    #[test]
+    fn draining_blocks_new_dispatch_and_waits_for_reserved_handoffs() {
+        let control = ExecutionControl::new();
+        let reservation = control.reserve_dispatch().unwrap().unwrap();
+        assert_eq!(control.active_count(), 1);
+
+        control.begin_draining();
+        assert!(control.reserve_dispatch().unwrap().is_none());
+        assert_eq!(control.active_count(), 1);
+
+        drop(reservation);
+        assert_eq!(control.active_count(), 0);
+    }
+
     impl StepImplementation for CancellationImplementation {
         fn execute<'a>(&'a self, context: ExecutionContext) -> StepFuture<'a> {
             let started = self.started.clone();
@@ -1678,6 +1828,34 @@ mod tests {
                 Ok("{}".into())
             })
         }
+    }
+
+    #[tokio::test]
+    async fn workflow_step_deadline_is_optional_and_signals_cancellation() {
+        let (cancel, mut cancellation) = watch::channel(false);
+        let execution = async move {
+            while !*cancellation.borrow() {
+                cancellation
+                    .changed()
+                    .await
+                    .map_err(|_| "cancellation dropped".to_string())?;
+            }
+            Err("cancelled by deadline".into())
+        };
+        let (result, timed_out) =
+            execute_with_deadline(execution, Some(Duration::from_millis(10)), &cancel).await;
+        assert!(timed_out);
+        assert!(result.unwrap_err().contains("10ms timeout"));
+
+        let (cancel, _cancellation) = watch::channel(false);
+        let (result, timed_out) = execute_with_deadline(
+            async { Ok("completed without a deadline".into()) },
+            None,
+            &cancel,
+        )
+        .await;
+        assert!(!timed_out);
+        assert_eq!(result.unwrap(), "completed without a deadline");
     }
 
     #[test]

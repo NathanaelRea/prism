@@ -473,14 +473,6 @@ async fn run_workflow_async(repo: Option<&Path>, arguments: &[String]) -> Result
                 return Err(format!("workflow {id} does not allow manual launch"));
             }
             let inputs = typed_inputs(&arguments, &snapshot.definition.inputs, &snapshot.schemas)?;
-            let operations = WorkflowOperations::open_default()
-                .await
-                .map_err(|error| error.to_string())?;
-            // Discovery happens for every launch. Registration only pins the freshly compiled
-            // filesystem state so this run remains reproducible after later edits.
-            crate::register_catalog_snapshots(&operations, &catalog)
-                .await
-                .map_err(|error| error.to_string())?;
             let now = now_ms();
             let key = option_value(&arguments, "--idempotency-key")
                 .map(str::to_owned)
@@ -490,21 +482,23 @@ async fn run_workflow_async(repo: Option<&Path>, arguments: &[String]) -> Result
                 crate::util::stable_hash(Path::new(&key))
             );
             let input_json = serde_json::to_string(&inputs).map_err(string_error)?;
-            let launched = operations
-                .launch(LaunchWorkflow {
+            let repository = context
+                .repository
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned());
+            // The worker owns snapshot registration, migration, durable launch, and wakeup. A
+            // standalone launch process must not open a competing Workflow ledger connection.
+            let launched = crate::worker::launch_workflow(
+                &catalog,
+                LaunchWorkflow {
                     run_id: &run_id,
                     definition_snapshot_id: &snapshot.digest,
-                    repository: context
-                        .repository
-                        .as_ref()
-                        .map(|path| path.to_string_lossy())
-                        .as_deref(),
+                    repository: repository.as_deref(),
                     idempotency_key: &key,
                     input_json: &input_json,
                     now_unix_ms: now,
-                })
-                .await
-                .map_err(|error| error.to_string())?;
+                },
+            )?;
             output(
                 json_output,
                 "workflow.run",

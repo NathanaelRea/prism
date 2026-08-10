@@ -46,6 +46,7 @@ id = "observe-ci"
 class = "action"
 use = "prism.standard/observe-ci"
 inputs = { candidate = "inputs.candidate" }
+retry = { max_attempts = 3, on = ["transient"], initial_delay_seconds = 2, max_delay_seconds = 30 }
 skippable = false
 
 [[steps]]
@@ -54,6 +55,7 @@ class = "action"
 use = "prism.standard/observe-review"
 depends_on = []
 inputs = { candidate = "inputs.candidate" }
+retry = { max_attempts = 3, on = ["transient"], initial_delay_seconds = 2, max_delay_seconds = 30 }
 skippable = false
 
 [[steps]]
@@ -62,6 +64,7 @@ class = "action"
 use = "prism.standard/observe-policy"
 depends_on = []
 inputs = { candidate = "inputs.candidate" }
+retry = { max_attempts = 3, on = ["transient"], initial_delay_seconds = 2, max_delay_seconds = 30 }
 skippable = false
 
 [[steps]]
@@ -70,6 +73,7 @@ class = "action"
 use = "prism.standard/observe-mergeability"
 depends_on = []
 inputs = { candidate = "inputs.candidate" }
+retry = { max_attempts = 3, on = ["transient"], initial_delay_seconds = 2, max_delay_seconds = 30 }
 skippable = false
 
 [[steps]]
@@ -78,6 +82,7 @@ class = "action"
 use = "prism.standard/observe-merge-relation"
 depends_on = []
 inputs = { candidate = "inputs.candidate" }
+retry = { max_attempts = 3, on = ["transient"], initial_delay_seconds = 2, max_delay_seconds = 30 }
 skippable = false
 
 [[steps]]
@@ -152,6 +157,7 @@ class = "action"
 use = "prism.standard/reobserve-change-request"
 depends_on = ["push-successor", "resolve-addressed-threads"]
 inputs = { original = "inputs.candidate", successor = "steps.push-successor.outputs.candidate" }
+retry = { max_attempts = 3, on = ["transient"], initial_delay_seconds = 2, max_delay_seconds = 30 }
 skippable = false
 
 [[steps]]

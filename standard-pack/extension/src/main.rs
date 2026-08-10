@@ -539,7 +539,12 @@ async fn reobserve_change_request(context: &ExecuteContext, input: Value) -> Res
                 },
             })
             .await
-            .map_err(|error| format!("{operation} reobservation failed: {}", error.message))?;
+            .map_err(|error| {
+                format!(
+                    "{operation} reobservation failed [{}]: {}",
+                    error.code, error.message
+                )
+            })?;
         facts.insert(operation.into(), evidence);
     }
     Ok(json!({"observation":{"candidate":candidate,"facts":facts}}))
@@ -594,13 +599,18 @@ async fn semantic_agent(
         working_scope,
         continuation: None,
         tool_policy: json!({"protected_effects":false}),
-        timeout_ms: 3_600_000,
+        timeout_ms: None,
         max_output_bytes: 1_048_576,
     };
     let result = context
         .host_operation(HostOperation::RunAgent { request })
         .await
-        .map_err(|error| error.message)?;
+        .map_err(|error| {
+            format!(
+                "Agent host operation failed [{}]: {}",
+                error.code, error.message
+            )
+        })?;
     let mut candidate = result
         .get("candidate")
         .cloned()
@@ -648,7 +658,12 @@ async fn semantic_observation(
     let evidence = context
         .host_operation(HostOperation::ObserveProvider { request })
         .await
-        .map_err(|error| error.message)?;
+        .map_err(|error| {
+            format!(
+                "provider observation failed [{}]: {}",
+                error.code, error.message
+            )
+        })?;
     Ok(json!({"evidence":evidence}))
 }
 
@@ -689,7 +704,7 @@ async fn semantic_verification(context: &ExecuteContext, input: Value) -> Result
         working_scope: serde_json::from_value(worktree.clone())
             .map_err(|error| format!("invalid Worktree Session: {error}"))?,
         environment: Default::default(),
-        timeout_ms: 3_600_000,
+        timeout_ms: None,
         max_output_bytes: 1_048_576,
     };
     let process = context

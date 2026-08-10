@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
@@ -9,7 +8,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -19,10 +18,11 @@ use crate::platform::SupportedOs;
 use crate::process::DetachedProcessPolicy;
 use crate::repo::Repository;
 use crate::{observability, workspace};
+use sha2::{Digest, Sha256};
 
-// Version 2 is the generalized-workflow cutover epoch. A v1 response belongs to
-// a pre-cutover worker and must never be reused against the destructive schema.
-const PROTOCOL_VERSION: u32 = 2;
+// Version 3 makes Workflow launch a worker-owned operation and adds executable generation
+// identity. Older workers must be drained before they can observe the current ledger schema.
+const PROTOCOL_VERSION: u32 = 3;
 const NOTIFICATION_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const NOTIFICATION_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 const DAEMON_TRANSITION_TIMEOUT: Duration = Duration::from_secs(3);
@@ -74,6 +74,7 @@ pub struct DaemonHealth {
     pub protocol_version: Option<u32>,
     pub instance_id: Option<String>,
     pub pid: Option<u32>,
+    pub binary_generation: Option<String>,
     pub active: usize,
     pub notifications: bool,
 }
@@ -85,6 +86,7 @@ impl DaemonHealth {
             protocol_version: None,
             instance_id: None,
             pid: None,
+            binary_generation: None,
             active: 0,
             notifications: false,
         }
@@ -134,20 +136,20 @@ fn parse_health_response(response: &str) -> Result<DaemonHealth, String> {
         .next()
         .and_then(|value| value.parse::<u32>().ok())
         .ok_or_else(|| format!("invalid Prism daemon protocol: {response}"))?;
-    if version != PROTOCOL_VERSION {
-        return Err(format!("incompatible Prism daemon protocol {version}"));
-    }
     let instance_id = fields
         .next()
         .filter(|value| !value.is_empty())
         .ok_or_else(|| format!("missing Prism daemon instance ID: {response}"))?;
     let mut pid: Option<u32> = None;
     let mut state = None;
+    let mut binary_generation = None;
     let mut active = None;
     let mut notifications = false;
     for field in fields {
         if let Some(value) = field.strip_prefix("pid=") {
             pid = value.parse().ok();
+        } else if let Some(value) = field.strip_prefix("generation=") {
+            binary_generation = Some(value.to_string());
         } else if let Some(value) = field.strip_prefix("state=") {
             state = Some(match value {
                 "running" => DaemonState::Running,
@@ -165,13 +167,45 @@ fn parse_health_response(response: &str) -> Result<DaemonHealth, String> {
         protocol_version: Some(version),
         instance_id: Some(instance_id.to_string()),
         pid: Some(pid.ok_or_else(|| format!("missing Prism daemon PID: {response}"))?),
+        binary_generation,
         active: active.ok_or_else(|| format!("missing Prism daemon active count: {response}"))?,
         notifications,
     })
 }
 
+fn binary_generation() -> Result<String, String> {
+    static GENERATION: OnceLock<Result<String, String>> = OnceLock::new();
+    GENERATION
+        .get_or_init(|| {
+            let executable = std::env::current_exe()
+                .map_err(|error| format!("resolve Prism executable generation: {error}"))?;
+            let mut executable = File::open(&executable)
+                .map_err(|error| format!("open Prism executable generation: {error}"))?;
+            let mut digest = Sha256::new();
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                let read = executable
+                    .read(&mut buffer)
+                    .map_err(|error| format!("read Prism executable generation: {error}"))?;
+                if read == 0 {
+                    break;
+                }
+                digest.update(&buffer[..read]);
+            }
+            Ok(format!("{:x}", digest.finalize()))
+        })
+        .clone()
+}
+
+fn daemon_is_current(health: &DaemonHealth, generation: &str) -> bool {
+    health.protocol_version == Some(PROTOCOL_VERSION)
+        && health.binary_generation.as_deref() == Some(generation)
+        && health.notifications
+}
+
 pub fn ensure_running() -> Result<(), String> {
     let socket = validated_socket_path()?;
+    let generation = binary_generation()?;
     if std::env::var_os("PRISM_WAIT_FOR_WORKER_DRAIN").is_some() {
         loop {
             match probe_health_at(&socket)? {
@@ -179,31 +213,37 @@ pub fn ensure_running() -> Result<(), String> {
                     state: DaemonState::Stopped,
                     ..
                 } => break,
-                DaemonHealth {
-                    state: DaemonState::Running,
-                    notifications: true,
-                    ..
-                } => return Ok(()),
+                health
+                    if health.state == DaemonState::Running
+                        && daemon_is_current(&health, &generation) =>
+                {
+                    return Ok(());
+                }
                 _ => thread::sleep(Duration::from_millis(250)),
             }
         }
     }
     if wait_for_existing_daemon(DAEMON_TRANSITION_TIMEOUT, || probe_health_at(&socket))? {
         let health = probe_health_at(&socket)?;
-        if health.notifications {
+        if daemon_is_current(&health, &generation) {
             return Ok(());
         }
         let shutdown_health = parse_health_response(&request_at(&socket, "shutdown")?)?;
         if shutdown_health.active > 0 {
             spawn_worker_replacement()?;
-            return Ok(());
+            return Err(format!(
+                "Prism worker replacement is waiting for {} active Attempt(s) to drain; retry when daemon replacement completes",
+                shutdown_health.active
+            ));
         }
         wait_for_socket_to_close(&socket, DAEMON_TRANSITION_TIMEOUT)?;
     }
     let executable = std::env::current_exe()
         .map_err(|error| format!("resolve Prism worker executable: {error}"))?;
     let mut command = Command::new(executable);
-    command.args(["worker", "serve"]);
+    command
+        .args(["worker", "serve"])
+        .env("PRISM_WORKER_GENERATION", &generation);
     crate::process::spawn_detached_named(
         &mut command,
         DetachedProcessPolicy::WorkerDaemon,
@@ -215,12 +255,17 @@ pub fn ensure_running() -> Result<(), String> {
     let mut last_error = "worker did not become ready".to_string();
     while Instant::now() < deadline {
         match probe_health_at(&socket) {
-            Ok(DaemonHealth {
-                state: DaemonState::Running,
-                ..
-            }) => return Ok(()),
+            Ok(health)
+                if health.state == DaemonState::Running
+                    && daemon_is_current(&health, &generation) =>
+            {
+                return Ok(());
+            }
             Ok(health) => {
-                last_error = format!("worker did not become ready: state={:?}", health.state)
+                last_error = format!(
+                    "worker did not become ready: state={:?}, protocol={:?}, generation={:?}",
+                    health.state, health.protocol_version, health.binary_generation
+                )
             }
             Err(error) => last_error = error,
         }
@@ -394,7 +439,9 @@ pub fn health_response() -> Result<String, String> {
 pub fn shutdown() -> Result<(), String> {
     let socket = validated_socket_path()?;
     let response = request_at(&socket, "shutdown")?;
-    if !response.starts_with(&format!("ok {PROTOCOL_VERSION} ")) {
+    let health = parse_health_response(&response)
+        .map_err(|_| format!("Prism worker rejected shutdown: {response}"))?;
+    if health.state != DaemonState::Draining {
         return Err(format!("Prism worker rejected shutdown: {response}"));
     }
     wait_for_socket_to_close(&socket, DAEMON_TRANSITION_TIMEOUT)
@@ -446,6 +493,58 @@ pub fn list_workflows(
     }))?;
     serde_json::from_value(response["runs"].clone())
         .map_err(|error| format!("decode workflow list projection: {error}"))
+}
+
+pub fn launch_workflow(
+    catalog: &crate::workflow::definition::DefinitionCatalog,
+    run: crate::LaunchWorkflow<'_>,
+) -> Result<String, String> {
+    ensure_running()?;
+    for definition in catalog.list() {
+        let snapshot = catalog
+            .compile(&definition.id)
+            .map_err(|error| error.to_string())?;
+        let body = serde_json::to_string(&snapshot)
+            .map_err(|error| format!("serialize Workflow snapshot: {error}"))?;
+        workflow_request(serde_json::json!({
+            "type": "workflow_register_definition",
+            "definition": {
+                "id": snapshot.digest,
+                "name": snapshot.definition.name,
+                "revision": definition.revision,
+                "source": definition.path,
+                "trusted": snapshot.trusted,
+                "body_json": body,
+                "digest": snapshot.digest,
+                "now_unix_ms": run.now_unix_ms,
+            }
+        }))?;
+    }
+    let response = workflow_request(serde_json::json!({
+        "type": "workflow_launch",
+        "run": {
+            "run_id": run.run_id,
+            "definition_snapshot_id": run.definition_snapshot_id,
+            "repository": run.repository,
+            "idempotency_key": run.idempotency_key,
+            "input_json": run.input_json,
+            "now_unix_ms": run.now_unix_ms,
+        }
+    }))?;
+    let launched = response["run_id"]
+        .as_str()
+        .ok_or_else(|| "Workflow worker launch response omitted the Run ID".to_string())?
+        .to_string();
+    confirm_queued_worker(launched, request("wake"))
+}
+
+fn confirm_queued_worker(run_id: String, wake: Result<String, String>) -> Result<String, String> {
+    match wake {
+        Ok(_) => Ok(run_id),
+        Err(error) => Err(format!(
+            "Workflow Run {run_id} is durably queued, but the Prism worker became unavailable: {error}"
+        )),
+    }
 }
 
 pub fn inspect_workflows(run_ids: &[String]) -> Result<Vec<crate::WorkflowProjection>, String> {
@@ -523,6 +622,14 @@ fn format_request_error((action, error): (&str, std::io::Error)) -> String {
 }
 
 pub fn serve() -> Result<(), String> {
+    // The launcher captures this before spawning so an atomic installation cannot make an old
+    // process report the replacement file's digest during the narrow exec/startup window.
+    let generation = std::env::var("PRISM_WORKER_GENERATION")
+        .ok()
+        .filter(|generation| {
+            generation.len() == 64 && generation.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        .map_or_else(binary_generation, Ok)?;
     // One long-lived runtime supervises the generalized async control plane. The blocking Unix
     // socket adapter only translates requests; it does not run a second scheduling engine.
     let async_runtime = tokio::runtime::Builder::new_multi_thread()
@@ -571,8 +678,9 @@ pub fn serve() -> Result<(), String> {
         });
         // Socket polling is blocking, so isolate the protocol adapter from runtime worker threads.
         let socket_failure = Arc::clone(&control_plane_failure);
-        let socket =
-            tokio::task::spawn_blocking(move || serve_socket(&socket_failure, &operations));
+        let socket = tokio::task::spawn_blocking(move || {
+            serve_socket(&socket_failure, &operations, &generation)
+        });
         let socket_result = socket
             .await
             .map_err(|error| format!("join workflow socket adapter: {error}"))?;
@@ -587,6 +695,7 @@ pub fn serve() -> Result<(), String> {
 fn serve_socket(
     control_plane_failure: &Arc<Mutex<Option<String>>>,
     operations: &crate::WorkflowOperations,
+    generation: &str,
 ) -> Result<(), String> {
     let runtime = runtime_dir();
     let socket = WorkerSocketPath::for_runtime(&runtime)?;
@@ -644,7 +753,6 @@ fn serve_socket(
         .set_nonblocking(true)
         .map_err(|error| format!("configure Prism worker listener: {error}"))?;
 
-    let active = Arc::new(Mutex::new(BTreeSet::<PathBuf>::new()));
     let notification_subscriber = Arc::new(Mutex::new(Vec::<UnixStream>::new()));
     let notification_stop = Arc::new(AtomicBool::new(false));
     let observer_stop = Arc::clone(&notification_stop);
@@ -668,7 +776,7 @@ fn serve_socket(
                 if respond(
                     &mut stream,
                     &instance_id,
-                    &active,
+                    generation,
                     &notification_subscriber,
                     Some(operations),
                     draining,
@@ -680,12 +788,7 @@ fn serve_socket(
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(error) => return Err(format!("accept Prism worker connection: {error}")),
         }
-        if draining
-            && active
-                .lock()
-                .map(|active| active.is_empty())
-                .unwrap_or(false)
-        {
+        if draining && operations.active_attempt_count() == 0 {
             break;
         }
         thread::sleep(Duration::from_millis(50));
@@ -698,7 +801,7 @@ fn serve_socket(
 fn respond(
     stream: &mut UnixStream,
     instance_id: &str,
-    active: &Arc<Mutex<BTreeSet<PathBuf>>>,
+    generation: &str,
     notification_subscriber: &Arc<Mutex<Vec<UnixStream>>>,
     operations: Option<&crate::WorkflowOperations>,
     draining: bool,
@@ -713,10 +816,7 @@ fn respond(
         return false;
     }
     let command = command.trim();
-    let active = active
-        .lock()
-        .map(|active| active.len())
-        .unwrap_or(usize::MAX);
+    let active = operations.map_or(0, crate::WorkflowOperations::active_attempt_count);
     let mut new_notification_subscriber = None;
     let response = if command.starts_with('{') {
         operations.map_or_else(
@@ -731,14 +831,20 @@ fn respond(
     } else {
         match command {
             "health" | "wake" => format!(
-                "ok {PROTOCOL_VERSION} {instance_id} pid={} state={} active={active} notifications=1\n",
+                "ok {PROTOCOL_VERSION} {instance_id} pid={} generation={generation} state={} active={active} notifications=1\n",
                 std::process::id(),
                 if draining { "draining" } else { "running" }
             ),
-            "shutdown" => format!(
-                "ok {PROTOCOL_VERSION} {instance_id} pid={} state=draining active={active} notifications=1\n",
-                std::process::id()
-            ),
+            "shutdown" => {
+                if let Some(operations) = operations {
+                    operations.begin_draining();
+                }
+                format!(
+                    "ok {PROTOCOL_VERSION} {instance_id} pid={} generation={generation} state=draining active={} notifications=1\n",
+                    std::process::id(),
+                    operations.map_or(0, crate::WorkflowOperations::active_attempt_count)
+                )
+            }
             "subscribe-notifications" if !draining => match stream.try_clone() {
                 Ok(subscriber) => {
                     let _ = subscriber.set_read_timeout(Some(Duration::from_secs(1)));
@@ -772,6 +878,7 @@ enum WorkflowSocketRequest {
     },
     WorkflowLaunch {
         run: SocketRun,
+        #[serde(default)]
         steps: Vec<SocketStep>,
     },
     WorkflowList {
@@ -856,7 +963,13 @@ struct SocketRun {
     definition_snapshot_id: String,
     repository: Option<String>,
     idempotency_key: String,
+    #[serde(default = "empty_json_object")]
+    input_json: String,
     now_unix_ms: i64,
+}
+
+fn empty_json_object() -> String {
+    "{}".into()
 }
 
 #[derive(serde::Deserialize)]
@@ -913,31 +1026,40 @@ fn workflow_socket_response(operations: &crate::WorkflowOperations, request: &st
                 })
                 .await
                 .map(|()| serde_json::json!({"ok": true})),
-            WorkflowSocketRequest::WorkflowLaunch { run, steps } => operations
-                .launch_definition(
-                    crate::LaunchWorkflow {
-                        run_id: &run.run_id,
-                        definition_snapshot_id: &run.definition_snapshot_id,
-                        repository: run.repository.as_deref(),
-                        idempotency_key: &run.idempotency_key,
-                        input_json: "{}",
-                        now_unix_ms: run.now_unix_ms,
-                    },
-                    steps
-                        .into_iter()
-                        .map(|step| crate::WorkflowStep {
-                            id: step.id,
-                            key: step.key,
-                            implementation: step.implementation,
-                            target_id: step.target_id,
-                            input_json: step.input_json,
-                            dependencies: step.dependencies,
-                            resources: step.resources,
-                        })
-                        .collect(),
-                )
-                .await
-                .map(|run_id| serde_json::json!({"ok": true, "run_id": run_id})),
+            WorkflowSocketRequest::WorkflowLaunch { run, steps } => {
+                let command = crate::LaunchWorkflow {
+                    run_id: &run.run_id,
+                    definition_snapshot_id: &run.definition_snapshot_id,
+                    repository: run.repository.as_deref(),
+                    idempotency_key: &run.idempotency_key,
+                    input_json: &run.input_json,
+                    now_unix_ms: run.now_unix_ms,
+                };
+                if steps.is_empty() {
+                    operations.launch(command).await
+                } else {
+                    // Materialized launches remain available to low-level worker contract tests;
+                    // application launches send no Steps and materialize the pinned snapshot.
+                    operations
+                        .launch_definition(
+                            command,
+                            steps
+                                .into_iter()
+                                .map(|step| crate::WorkflowStep {
+                                    id: step.id,
+                                    key: step.key,
+                                    implementation: step.implementation,
+                                    target_id: step.target_id,
+                                    input_json: step.input_json,
+                                    dependencies: step.dependencies,
+                                    resources: step.resources,
+                                })
+                                .collect(),
+                        )
+                        .await
+                }
+                .map(|run_id| serde_json::json!({"ok": true, "run_id": run_id}))
+            }
             WorkflowSocketRequest::WorkflowList { repository, limit } => operations
                 .list(repository.as_deref(), limit)
                 .await
@@ -1555,14 +1677,13 @@ mod tests {
     #[test]
     fn notification_subscription_keeps_a_worker_to_tui_stream() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
-        let active = Arc::new(Mutex::new(BTreeSet::new()));
         let subscriber = Arc::new(Mutex::new(Vec::new()));
         client.write_all(b"subscribe-notifications\n").unwrap();
 
         assert!(!respond(
             &mut server,
             "daemon-test",
-            &active,
+            "generation-test",
             &subscriber,
             None,
             false,
@@ -1804,6 +1925,111 @@ mod tests {
     }
 
     #[test]
+    fn socket_launch_preserves_typed_run_inputs() {
+        use prism_extension_protocol::{
+            ArtifactSchemaDescriptor, ExtensionDescriptor, ImplementationDescriptor,
+            PortDescriptor, StepClass,
+        };
+
+        let mut registry = crate::extension::DescriptorRegistry::default();
+        registry
+            .register(&ExtensionDescriptor {
+                artifact_schemas: vec![ArtifactSchemaDescriptor {
+                    id: "acme.test/text".into(),
+                    schema: serde_json::json!({"type":"string"}),
+                }],
+                implementations: vec![ImplementationDescriptor {
+                    id: "acme.test/action".into(),
+                    class: StepClass::Action,
+                    inputs: vec![PortDescriptor {
+                        name: "subject".into(),
+                        schema: "acme.test/text".into(),
+                        required: true,
+                    }],
+                    outputs: vec![],
+                    capabilities: vec![],
+                    targets: vec!["local".into()],
+                    effect_boundary: Default::default(),
+                }],
+                ..ExtensionDescriptor::default()
+            })
+            .unwrap();
+        let catalog = crate::workflow::definition::DefinitionCatalog::from_sources(
+            [(
+                "workflow.toml".into(),
+                "schema_version=2\nid='acme.test/runtime'\nname='runtime'\nlaunch=['manual']\n[inputs.subject]\ntype='acme.test/text'\nrequired=true\n[[steps]]\nid='action'\nclass='action'\nuse='acme.test/action'\nskippable=false\n[steps.inputs]\nsubject='inputs.subject'\n".into(),
+            )],
+            registry,
+        )
+        .unwrap();
+        let snapshot = catalog.compile("acme.test/runtime").unwrap();
+        let body = serde_json::to_string(&snapshot).unwrap();
+        let temp = crate::compact_runtime::CompactTempDir::new("worker-launch");
+        let database_path = temp.runtime_path().join("workflow.db");
+        let operations =
+            crate::async_runtime::block_on(crate::WorkflowOperations::open(&database_path))
+                .unwrap()
+                .unwrap();
+        crate::async_runtime::block_on(operations.register_definition(crate::DefinitionSnapshot {
+            id: &snapshot.digest,
+            name: "definition",
+            revision: "1",
+            source: "test",
+            trusted: true,
+            body_json: &body,
+            digest: &snapshot.digest,
+            now_unix_ms: 1,
+        }))
+        .unwrap()
+        .unwrap();
+
+        let response = workflow_socket_response(
+            &operations,
+            &serde_json::json!({
+                "type": "workflow_launch",
+                "run": {
+                    "run_id": "run",
+                    "definition_snapshot_id": snapshot.digest,
+                    "repository": "/repo",
+                    "idempotency_key": "run",
+                    "input_json": r#"{"subject":"typed"}"#,
+                    "now_unix_ms": 2
+                }
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&response).unwrap()["ok"],
+            true
+        );
+
+        let database = crate::async_runtime::block_on(
+            crate::persistence::pools::WorkflowDatabase::open(&database_path),
+        )
+        .unwrap()
+        .unwrap();
+        let input: String = crate::async_runtime::block_on(
+            sqlx::query_scalar("select input_json from workflow_run where id = 'run'")
+                .fetch_one(database.readers()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(input, r#"{"subject":"typed"}"#);
+    }
+
+    #[test]
+    fn queued_launch_failure_names_the_durable_run() {
+        assert_eq!(
+            confirm_queued_worker("run-123".into(), Err("connection reset".into())),
+            Err("Workflow Run run-123 is durably queued, but the Prism worker became unavailable: connection reset".into())
+        );
+        assert_eq!(
+            confirm_queued_worker("run-123".into(), Ok("awake".into())),
+            Ok("run-123".into())
+        );
+    }
+
+    #[test]
     fn waiting_for_a_draining_daemon_times_out() {
         assert_eq!(
             wait_for_existing_daemon(Duration::ZERO, || Ok(DaemonHealth {
@@ -1811,6 +2037,7 @@ mod tests {
                 protocol_version: Some(PROTOCOL_VERSION),
                 instance_id: Some("test".to_string()),
                 pid: Some(std::process::id()),
+                binary_generation: Some("generation-test".into()),
                 active: 2,
                 notifications: false,
             })),
@@ -1830,13 +2057,23 @@ mod tests {
     }
 
     #[test]
-    fn pre_cutover_worker_protocol_is_rejected() {
-        let error = parse_health_response(
+    fn stale_protocol_or_executable_generation_is_not_reused() {
+        let legacy = parse_health_response(
             "ok 1 legacy-worker pid=123 state=running active=0 notifications=1",
         )
-        .unwrap_err();
+        .unwrap();
+        let stale_build = parse_health_response(&format!(
+            "ok {PROTOCOL_VERSION} stale-worker pid=123 generation=old state=running active=0 notifications=1"
+        ))
+        .unwrap();
+        let current = parse_health_response(&format!(
+            "ok {PROTOCOL_VERSION} current-worker pid=123 generation=current state=running active=0 notifications=1"
+        ))
+        .unwrap();
 
-        assert_eq!(error, "incompatible Prism daemon protocol 1");
+        assert!(!daemon_is_current(&legacy, "current"));
+        assert!(!daemon_is_current(&stale_build, "current"));
+        assert!(daemon_is_current(&current, "current"));
     }
 
     fn runtime_with_socket_path_len(byte_len: usize) -> PathBuf {

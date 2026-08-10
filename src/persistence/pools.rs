@@ -36,6 +36,16 @@ pub(crate) struct WorkflowDatabase {
     readers: SqlitePool,
 }
 
+pub(crate) struct HostAgentSessionRecord<'a> {
+    pub attempt_id: &'a str,
+    pub worker_id: &'a str,
+    pub target_id: &'a str,
+    pub fencing_token: i64,
+    pub session_id: &'a str,
+    pub session_file: &'a str,
+    pub now_unix_ms: i64,
+}
+
 #[allow(
     dead_code,
     reason = "repository stores are migrated behind this pool incrementally"
@@ -283,6 +293,33 @@ impl WorkflowDatabase {
                     .execute(connection).await.map_err(DatabaseError::Query)?;
             }
             Ok(changed == 1)
+        })).await
+    }
+
+    pub(crate) async fn record_host_agent_session(
+        &self,
+        record: HostAgentSessionRecord<'_>,
+    ) -> Result<bool, DatabaseError> {
+        let attempt_id = record.attempt_id.to_string();
+        let worker_id = record.worker_id.to_string();
+        let target_id = record.target_id.to_string();
+        let fencing_token = record.fencing_token;
+        let session_id = record.session_id.to_string();
+        let session_file = record.session_file.to_string();
+        let now_unix_ms = record.now_unix_ms;
+        self.write_immediate(|connection| Box::pin(async move {
+            let current: i64 = sqlx::query_scalar("select exists(select 1 from step_attempt where id=? and status='claimed' and worker_id=? and target_id=? and fencing_token=? and lease_expires_unix_ms>?)")
+                .bind(&attempt_id).bind(&worker_id).bind(&target_id).bind(fencing_token).bind(now_unix_ms)
+                .fetch_one(&mut *connection).await.map_err(DatabaseError::Query)?;
+            if current == 0 {
+                return Ok(false);
+            }
+            sqlx::query("insert into audit_event (run_id, step_id, attempt_id, sequence, kind, time_unix_ms, data_json) select step.run_id, step.id, attempt.id, coalesce((select max(sequence) from audit_event where run_id=step.run_id),0)+1, 'agent_session_recorded', ?, ? from step_attempt attempt join workflow_step step on step.id=attempt.step_id where attempt.id=?")
+                .bind(now_unix_ms)
+                .bind(serde_json::json!({"adapter":"pi","session_id":session_id,"session_file":session_file}).to_string())
+                .bind(&attempt_id)
+                .execute(connection).await.map_err(DatabaseError::Query)?;
+            Ok(true)
         })).await
     }
 

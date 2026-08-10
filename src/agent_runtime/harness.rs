@@ -200,7 +200,20 @@ fn validate_builtin_arguments(id: &str, adapter: &str, arguments: &[String]) -> 
             "--continue",
             "-c",
         ],
-        "pi" => &["-p", "--print", "--mode", "--session", "-c", "-r"],
+        "pi" => &[
+            "-p",
+            "--print",
+            "--mode",
+            "--session",
+            "-c",
+            "-r",
+            "--name",
+            "-n",
+            "--no-session",
+            "--session-dir",
+            "--model",
+            "--provider",
+        ],
         _ => &[],
     };
     if let Some(argument) = arguments.iter().find(|argument| {
@@ -925,6 +938,10 @@ mod tests {
         assert!(config.validate("codex").is_err());
         config.arguments = vec!["--sandbox".to_string(), "workspace-write".to_string()];
         config.validate("codex").unwrap();
+
+        let mut pi = builtin("pi");
+        pi.arguments = vec!["--no-session".to_string()];
+        assert!(pi.validate("pi").is_err());
     }
 
     #[test]

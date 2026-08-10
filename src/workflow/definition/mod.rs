@@ -184,6 +184,8 @@ pub struct StepDefinition {
     #[serde(default)]
     pub timeout_seconds: Option<u64>,
     #[serde(default)]
+    pub on_timeout: TimeoutPolicy,
+    #[serde(default)]
     pub retry: RetryDefinition,
     #[serde(default)]
     pub repeat: Option<RepeatDefinition>,
@@ -198,11 +200,59 @@ pub enum UnknownConditionPolicy {
     Fail,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimeoutPolicy {
+    #[default]
+    Fail,
+    InputRequired,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryFailure {
+    Transient,
+    Timeout,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RetryDefinition {
-    #[serde(default)]
+    #[serde(default = "one_attempt")]
     pub max_attempts: u32,
+    #[serde(default = "transient_failures")]
+    pub on: BTreeSet<RetryFailure>,
+    #[serde(default = "default_initial_retry_delay")]
+    pub initial_delay_seconds: u64,
+    #[serde(default = "default_max_retry_delay")]
+    pub max_delay_seconds: u64,
+}
+
+impl Default for RetryDefinition {
+    fn default() -> Self {
+        Self {
+            max_attempts: one_attempt(),
+            on: transient_failures(),
+            initial_delay_seconds: default_initial_retry_delay(),
+            max_delay_seconds: default_max_retry_delay(),
+        }
+    }
+}
+
+const fn one_attempt() -> u32 {
+    1
+}
+
+fn transient_failures() -> BTreeSet<RetryFailure> {
+    BTreeSet::from([RetryFailure::Transient])
+}
+
+const fn default_initial_retry_delay() -> u64 {
+    2
+}
+
+const fn default_max_retry_delay() -> u64 {
+    60
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -241,6 +291,8 @@ pub struct CompiledStep {
     pub target: Option<String>,
     pub skippable: bool,
     pub timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub on_timeout: TimeoutPolicy,
     pub retry: RetryDefinition,
     pub repeat: Option<CompiledRepeat>,
 }
@@ -1050,6 +1102,30 @@ impl DefinitionCatalog {
                 unreachable!();
             }
             capabilities.extend(resolved_capabilities.iter().cloned());
+            if step.retry.max_attempts == 0 {
+                return Err(DefinitionError::Step(
+                    step.id.clone(),
+                    "retry.max_attempts is the total Attempt count and must be at least 1".into(),
+                ));
+            }
+            if step.retry.initial_delay_seconds > step.retry.max_delay_seconds {
+                return Err(DefinitionError::Step(
+                    step.id.clone(),
+                    "retry.initial_delay_seconds cannot exceed retry.max_delay_seconds".into(),
+                ));
+            }
+            if step.retry.max_attempts > 1 && effect_boundary == EffectBoundary::Unbrokered {
+                return Err(DefinitionError::Step(
+                    step.id.clone(),
+                    "unbrokered workspace mutations cannot be retried automatically; recover or resume the existing Attempt instead".into(),
+                ));
+            }
+            if step.timeout_seconds.is_none() && step.on_timeout != TimeoutPolicy::Fail {
+                return Err(DefinitionError::Step(
+                    step.id.clone(),
+                    "on_timeout requires timeout_seconds".into(),
+                ));
+            }
             let inputs = compile_bindings(
                 &definition.id,
                 step,
@@ -1147,6 +1223,7 @@ impl DefinitionCatalog {
                     DefinitionError::Step(step.id.clone(), "skippable must be explicit".into())
                 })?,
                 timeout_seconds: step.timeout_seconds,
+                on_timeout: step.on_timeout,
                 retry: step.retry.clone(),
                 repeat,
             });
@@ -2135,9 +2212,9 @@ pub fn schema_json() -> serde_json::Value {
         "$defs": {
           "port":{"type":"object", "required":["type"], "properties":{"type":{"type":"string"},"required":{"type":"boolean"},"from_context":{"type":"boolean"},"from":{"type":"string"}},"additionalProperties":false},
           "budgets":{"type":"object","properties":{"max_child_depth":{"type":"integer","minimum":0},"max_attempts":{"type":"integer","minimum":0},"max_mutations":{"type":"integer","minimum":0},"max_fan_out":{"type":"integer","minimum":0}},"additionalProperties":false},
-          "retry":{"type":"object","properties":{"max_attempts":{"type":"integer","minimum":0}},"additionalProperties":false},
+          "retry":{"type":"object","properties":{"max_attempts":{"type":"integer","minimum":1},"on":{"type":"array","items":{"enum":["transient","timeout"]},"uniqueItems":true},"initial_delay_seconds":{"type":"integer","minimum":0},"max_delay_seconds":{"type":"integer","minimum":0}},"additionalProperties":false},
           "repeat":{"type":"object","required":["until","max_iterations","on_exhausted"],"properties":{"until":{"type":"string"},"max_iterations":{"type":"integer","minimum":1},"on_exhausted":{"enum":["input_required","approval","fail"]},"successor":{"type":"object","additionalProperties":{"type":"string"}}},"additionalProperties":false},
-          "step":{"type":"object","required":["id","class","skippable"],"properties":{"id":{"type":"string"},"class":{"enum":["action","gate","approval","wait","notification","workflow_call"]},"use":{"type":"string"},"workflow":{"type":"string"},"depends_on":{"type":"array","items":{"type":"string"},"uniqueItems":true},"inputs":{"type":"object"},"outputs":{"type":"object","additionalProperties":{"type":"string"}},"settings":{"type":"object"},"condition":{"type":"string"},"on_unknown":{"enum":["wait","skip","fail"]},"capabilities":{"type":"array","items":{"type":"string"},"uniqueItems":true},"resources":{"type":"array","items":{"type":"string"},"uniqueItems":true},"target":{"type":"string"},"skippable":{"type":"boolean"},"timeout_seconds":{"type":"integer","minimum":1},"retry":{"$ref":"#/$defs/retry"},"repeat":{"$ref":"#/$defs/repeat"}},"additionalProperties":false,
+          "step":{"type":"object","required":["id","class","skippable"],"properties":{"id":{"type":"string"},"class":{"enum":["action","gate","approval","wait","notification","workflow_call"]},"use":{"type":"string"},"workflow":{"type":"string"},"depends_on":{"type":"array","items":{"type":"string"},"uniqueItems":true},"inputs":{"type":"object"},"outputs":{"type":"object","additionalProperties":{"type":"string"}},"settings":{"type":"object"},"condition":{"type":"string"},"on_unknown":{"enum":["wait","skip","fail"]},"capabilities":{"type":"array","items":{"type":"string"},"uniqueItems":true},"resources":{"type":"array","items":{"type":"string"},"uniqueItems":true},"target":{"type":"string"},"skippable":{"type":"boolean"},"timeout_seconds":{"type":"integer","minimum":1},"on_timeout":{"enum":["fail","input_required"]},"retry":{"$ref":"#/$defs/retry"},"repeat":{"$ref":"#/$defs/repeat"}},"additionalProperties":false,
             "allOf":[{"if":{"properties":{"class":{"const":"workflow_call"}}},"then":{"required":["workflow"],"not":{"required":["use"]}},"else":{"required":["use"],"not":{"required":["workflow"]}}}]
           }
         }, "additionalProperties": false

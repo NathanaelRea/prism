@@ -401,6 +401,18 @@ impl WorkflowOperations {
         self.database.path()
     }
 
+    pub(crate) fn begin_draining(&self) {
+        if let Some(execution) = &self.execution {
+            execution.begin_draining();
+        }
+    }
+
+    pub(crate) fn active_attempt_count(&self) -> usize {
+        self.execution
+            .as_ref()
+            .map_or(0, super::engine::ExecutionControl::active_count)
+    }
+
     pub async fn register_definition(
         &self,
         definition: DefinitionSnapshot<'_>,

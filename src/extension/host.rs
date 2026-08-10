@@ -483,10 +483,6 @@ impl ExtensionClient {
                     }
                 }
             }
-            _ = tokio::time::sleep(self.limits.request_timeout) => {
-                self.terminate().await;
-                Err(ExtensionHostError::Timeout(format!("Attempt {attempt_id}")))
-            }
         };
         crate::observability::emit(crate::observability::EventInput {
             level: if result.is_ok() {
@@ -795,19 +791,26 @@ fn spawn_protocol_reader<R: AsyncBufRead + Unpin + Send + 'static>(
                 operation,
             } = message
             {
-                let result = dispatcher
-                    .dispatch(&attempt_id, generation, operation)
-                    .await;
-                if let Err(error) = write_message(
-                    &mut *writer.lock().await,
-                    &Message::HostResponse { id, result },
-                    max_frame_bytes,
-                )
-                .await
-                {
-                    fail_pending(&pending, error);
-                    break;
-                }
+                // Host operations may be as long-lived as the enclosing Workflow Step. Dispatch
+                // them independently so the protocol reader can continue servicing heartbeats,
+                // cancellation, and unrelated correlated responses.
+                let dispatcher = dispatcher.clone();
+                let writer = writer.clone();
+                let pending = pending.clone();
+                tokio::spawn(async move {
+                    let result = dispatcher
+                        .dispatch(&attempt_id, generation, operation)
+                        .await;
+                    if let Err(error) = write_message(
+                        &mut *writer.lock().await,
+                        &Message::HostResponse { id, result },
+                        max_frame_bytes,
+                    )
+                    .await
+                    {
+                        fail_pending(&pending, error);
+                    }
+                });
                 continue;
             }
             let Some(id) = message.correlation_id().map(str::to_owned) else {
@@ -1149,7 +1152,7 @@ mod tests {
     fn negotiates_minor_versions_and_rejects_unknown_features() {
         assert!(validate_negotiated_version(ProtocolVersion::CURRENT).is_ok());
         assert!(validate_negotiated_version(ProtocolVersion { major: 2, minor: 0 }).is_err());
-        assert!(validate_negotiated_version(ProtocolVersion { major: 1, minor: 1 }).is_err());
+        assert!(validate_negotiated_version(ProtocolVersion { major: 1, minor: 2 }).is_err());
         assert!(validate_features(&["future.required".into()]).is_err());
     }
 
