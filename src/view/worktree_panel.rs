@@ -1,7 +1,7 @@
 use super::*;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct StabilizationPanelModel {
+pub(crate) struct ChangeRequestPanelModel {
     pub icon_style: IconStyle,
     pub provider_noun: &'static str,
     pub pr_number: String,
@@ -61,7 +61,7 @@ pub(super) fn worktree_detail_lines(model: &crate::view::FrameModel<'_>) -> Vec<
     lines.push(Line::from(""));
     lines.extend(agent_lines(session));
     lines.push(Line::from(""));
-    lines.extend(stabilization_panel_lines(&stabilization_panel_model(
+    lines.extend(change_request_panel_lines(&change_request_panel_model(
         model, session,
     )));
     if let Some(details) = session.pr.details() {
@@ -149,30 +149,14 @@ fn agent_lines(session: &Session) -> Vec<Line<'static>> {
     lines
 }
 
-pub(crate) fn stabilization_panel_model(
+pub(crate) fn change_request_panel_model(
     model: &crate::view::FrameModel<'_>,
     session: &Session,
-) -> StabilizationPanelModel {
-    let run = model
-        .auto_dashboard
-        .as_ref()
-        .map(|dashboard| &dashboard.run.run);
-    let cached_state = run
-        .is_none()
-        .then(|| {
-            crate::auto_flow::stabilization_plan::conservative_cached_state(model.config, session)
-        })
-        .flatten();
-    let blocker = run
-        .and_then(|run| run.stabilization_blocker.clone())
-        .or_else(|| cached_state.as_ref().map(|state| state.blocker.clone()));
-    let next = run
-        .and_then(|run| run.stabilization_next_work.clone())
-        .or_else(|| cached_state.as_ref().map(|state| state.next_work.clone()));
+) -> ChangeRequestPanelModel {
     let summary = session.pr.summary();
 
     if summary.is_none() {
-        return StabilizationPanelModel {
+        return ChangeRequestPanelModel {
             icon_style: model.config.icon_style,
             provider_noun: "CR",
             pr_number: String::new(),
@@ -187,7 +171,7 @@ pub(crate) fn stabilization_panel_model(
         };
     }
 
-    StabilizationPanelModel {
+    ChangeRequestPanelModel {
         icon_style: model.config.icon_style,
         provider_noun: summary
             .map(|summary| summary.provider_noun())
@@ -199,26 +183,20 @@ pub(crate) fn stabilization_panel_model(
         pr_name: summary
             .map(|summary| summary.title.clone())
             .unwrap_or_default(),
-        blocker: blocker
-            .as_ref()
-            .map(blocker_label)
-            .or_else(|| {
-                run.and_then(|run| run.stabilization_status)
-                    .map(|status| pascal_label(status.as_str()))
-            })
+        blocker: summary
+            .map(|summary| summary.state.clone())
             .unwrap_or_default(),
-        next: next.as_ref().map(work_label).unwrap_or_default(),
-        ci: blocker
-            .as_ref()
-            .map(|blocker| ci_gate_label(session, blocker))
+        next: String::new(),
+        ci: summary
+            .map(|summary| summary.check_state().label().to_string())
             .unwrap_or_default(),
         review: review_gate_label(session),
         merge: merge_gate_label(session),
-        policy: blocker.as_ref().map(policy_gate_label).unwrap_or_default(),
+        policy: String::new(),
     }
 }
 
-pub(crate) fn stabilization_panel_lines(model: &StabilizationPanelModel) -> Vec<Line<'static>> {
+pub(crate) fn change_request_panel_lines(model: &ChangeRequestPanelModel) -> Vec<Line<'static>> {
     if model.pr_number.is_empty() {
         return Vec::new();
     }
@@ -226,28 +204,28 @@ pub(crate) fn stabilization_panel_lines(model: &StabilizationPanelModel) -> Vec<
     let mut lines = vec![
         heading_line(model.provider_noun),
         pr_number_line(model),
-        stabilization_value_line("name", &model.pr_name, selected_text_style()),
+        change_request_value_line("name", &model.pr_name, selected_text_style()),
     ];
     lines.extend([
-        stabilization_value_line(
+        change_request_value_line(
             "state",
             &model.blocker,
-            stabilization_state_style(&model.blocker),
+            change_request_state_style(&model.blocker),
         ),
-        stabilization_value_line("next", &model.next, attention_style()),
+        change_request_value_line("next", &model.next, attention_style()),
     ]);
-    lines.push(stabilization_gate_line("ci", &model.ci, model.icon_style));
-    lines.push(stabilization_gate_line(
+    lines.push(change_request_gate_line("ci", &model.ci, model.icon_style));
+    lines.push(change_request_gate_line(
         "review",
         &model.review,
         model.icon_style,
     ));
-    lines.push(stabilization_gate_line(
+    lines.push(change_request_gate_line(
         "merge",
         &model.merge,
         model.icon_style,
     ));
-    lines.push(stabilization_gate_line(
+    lines.push(change_request_gate_line(
         "policy",
         &model.policy,
         model.icon_style,
@@ -255,14 +233,14 @@ pub(crate) fn stabilization_panel_lines(model: &StabilizationPanelModel) -> Vec<
     lines
 }
 
-fn pr_number_line(model: &StabilizationPanelModel) -> Line<'static> {
+fn pr_number_line(model: &ChangeRequestPanelModel) -> Line<'static> {
     let Some(number) = model
         .pr_number
         .parse::<u64>()
         .ok()
         .filter(|_| !model.pr_number.is_empty())
     else {
-        return stabilization_value_line("pr #", "", Style::default());
+        return change_request_value_line("pr #", "", Style::default());
     };
     let style = Style::default()
         .fg(if model.pr_merged {
@@ -282,14 +260,14 @@ fn pr_number_line(model: &StabilizationPanelModel) -> Line<'static> {
     ])
 }
 
-fn stabilization_value_line(label: &'static str, value: &str, style: Style) -> Line<'static> {
+fn change_request_value_line(label: &'static str, value: &str, style: Style) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("{:<16}", label), muted_style()),
         Span::styled(truncate(value, 30), style),
     ])
 }
 
-fn stabilization_gate_line(
+fn change_request_gate_line(
     gate: &'static str,
     status: &str,
     icon_style: IconStyle,
@@ -298,7 +276,7 @@ fn stabilization_gate_line(
     let status_icon = if status.is_empty() {
         ""
     } else {
-        stabilization_status_icon(status, icon_style)
+        change_request_status_icon(status, icon_style)
     };
     Line::from(vec![
         Span::styled(format!("{:<16}", gate), muted_style()),
@@ -308,7 +286,7 @@ fn stabilization_gate_line(
     ])
 }
 
-fn stabilization_status_icon(status: &str, icon_style: IconStyle) -> &'static str {
+fn change_request_status_icon(status: &str, icon_style: IconStyle) -> &'static str {
     let normalized = status.to_ascii_lowercase();
     if normalized.contains("fail") || normalized.contains("blocked") {
         icon(icon_style, "✕", "")
@@ -329,67 +307,6 @@ fn stabilization_status_icon(status: &str, icon_style: IconStyle) -> &'static st
     } else {
         icon(icon_style, "·", "")
     }
-}
-
-fn blocker_label(blocker: &StabilizationBlocker) -> String {
-    pascal_label(blocker.as_str())
-}
-
-fn work_label(work: &StabilizationWorkKind) -> String {
-    pascal_label(work.as_str())
-}
-
-fn pascal_label(value: &str) -> String {
-    value
-        .split('_')
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            let mut chars = part.chars();
-            match chars.next() {
-                Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
-                None => String::new(),
-            }
-        })
-        .collect::<String>()
-}
-
-fn ci_gate_label(session: &Session, blocker: &StabilizationBlocker) -> String {
-    let Some(summary) = session.pr.summary() else {
-        return "unknown".to_string();
-    };
-    let optional_failure_count = session
-        .pr
-        .details()
-        .map(|details| details.failing_checks.len())
-        .unwrap_or(0);
-    if optional_failure_count > 0 && ci_blockers_ruled_out(blocker) {
-        return format!(
-            "required passing ({} optional failing)",
-            optional_failure_count
-        );
-    }
-    if matches!(blocker, StabilizationBlocker::CiMissingRequiredChecks) {
-        return "required missing".to_string();
-    }
-    let mut label = summary.check_state().label().to_string();
-    if let Some(details) = session.pr.details()
-        && !details.failing_checks.is_empty()
-    {
-        label = format!("{label} ({} failing)", details.failing_checks.len());
-    }
-    label
-}
-
-fn ci_blockers_ruled_out(blocker: &StabilizationBlocker) -> bool {
-    matches!(
-        blocker,
-        StabilizationBlocker::ReviewApprovalMissing
-            | StabilizationBlocker::PolicyBlocked
-            | StabilizationBlocker::PolicyUnknown
-            | StabilizationBlocker::ReadyForManualMerge
-            | StabilizationBlocker::ReadyToAutoMerge
-            | StabilizationBlocker::Merged
-    )
 }
 
 fn review_gate_label(session: &Session) -> String {
@@ -424,14 +341,6 @@ fn merge_gate_label(session: &Session) -> String {
     }
 }
 
-fn policy_gate_label(blocker: &StabilizationBlocker) -> String {
-    match blocker {
-        StabilizationBlocker::PolicyBlocked => "blocked".to_string(),
-        StabilizationBlocker::PolicyUnknown => "unknown".to_string(),
-        _ => "satisfied".to_string(),
-    }
-}
-
 fn merge_blocked(summary: &crate::remote::PrSummary) -> bool {
     matches!(
         summary
@@ -452,9 +361,9 @@ fn has_unresolved_review_comments(session: &Session) -> bool {
     })
 }
 
-fn stabilization_state_style(label: &str) -> Style {
+fn change_request_state_style(label: &str) -> Style {
     match label {
-        "ReadyForManualMerge" | "ReadyToAutoMerge" | "Merged" => Style::default().fg(Color::Green),
+        "Merged" => Style::default().fg(Color::Green),
         "CiFailed" | "MergeBlocked" | "PolicyBlocked" | "Escalate" => error_style(),
         "PendingPush" | "PolicyUnknown" | "ReviewFeedbackFound" => attention_style(),
         _ => Style::default(),

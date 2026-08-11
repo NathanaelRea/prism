@@ -1,9 +1,9 @@
-pub mod bundled;
-pub(crate) mod ci;
-pub mod engine;
-pub(crate) mod execution;
-pub(crate) mod operations;
-pub(crate) mod plan;
-pub(crate) mod review;
-pub(crate) mod verify;
-pub(crate) mod worker;
+pub mod agent_phase;
+pub mod kernel;
+pub(crate) mod prompt_daemon;
+pub mod prompt_worker;
+pub mod source;
+pub mod standard_remote;
+pub mod standard_triggers;
+pub mod step_trigger;
+pub(crate) use prompt_daemon as worker;

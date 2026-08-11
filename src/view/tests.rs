@@ -1,31 +1,16 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
-};
+use std::{collections::BTreeMap, path::PathBuf};
 
 use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, layout::Position};
 
 use crate::{
     agent::AgentState,
-    auto_flow::{
-        AutoImplementationSource, AutoOutputKind, AutoOutputLine, AutoRun, AutoRunMode,
-        AutoRunStatus, AutoStepKey, AutoStepRun, AutoStepStatus, PersistedAutoRun,
-        stabilization_model::{
-            PendingPushGuard, RepairKind, StabilizationBlocker, StabilizationWorkKind,
-        },
-    },
     config::Config,
     opencode::{OpencodeState, OpencodeStatus},
-    plan_run::{
-        PersistedPlanRun, PlanOutputKind, PlanOutputLine, PlanRun, PlanRunMode, PlanRunStatus,
-        PlanStepRun, PlanStepStatus,
-    },
     remote::{PrCache, PrDetails, PrReviewComment, PrSummary},
     session::Session,
     view::{
-        AutoDashboard, AutoOutputViewerState, ChoiceList, DialogLine, DialogModel, FrameModel,
-        KeyChoice, PlanDashboard, PlanOutputViewerState, RepoMainView, RepoPrRow, RepoRow,
-        StatusRow, WorktreeKind, WorktreeMainView, WorktreeRow,
+        ChoiceList, DialogLine, DialogModel, FrameModel, KeyChoice, RepoMainView, RepoPrRow,
+        RepoRow, StatusRow, WorktreeKind, WorktreeRow,
     },
 };
 
@@ -602,8 +587,6 @@ fn clean_worktree_git_check_is_green() {
         pr: session.pr.clone(),
         wt_columns: session.wt_columns.clone(),
         development: None,
-        auto_status: None,
-        plan_status: None,
         updated_label: "-".to_string(),
         unseen_comments: session.unseen_comments,
         prompt_summary: session.prompt_summary.clone(),
@@ -815,6 +798,47 @@ fn renders_footer_status_message_and_leader_overlay() {
 }
 
 #[test]
+fn workflow_input_form_renders_types_defaults_and_enum_dropdown() {
+    let config = test_config();
+    let sessions = vec![test_session("feature", AgentState::Idle)];
+    let mut model = test_model(&config, &sessions, PanelFocus::Status, None, None);
+    model.dialog = Some(DialogModel::Form {
+        title: "Run release".into(),
+        fields: vec![
+            FormField {
+                name: "title".into(),
+                value: "Release 1".into(),
+                description: Some("Short release title".into()),
+                constraint: Some("3–80 chars".into()),
+                required: true,
+                kind: FormFieldKind::String,
+            },
+            FormField {
+                name: "mode".into(),
+                value: "safe".into(),
+                description: None,
+                constraint: Some("2 options".into()),
+                required: false,
+                kind: FormFieldKind::Enum {
+                    options: vec!["safe".into(), "fast".into()],
+                },
+            },
+        ],
+        selected: 1,
+        dropdown: Some(FormDropdown { selected: 1 }),
+        error: Some("count must be a number".into()),
+    });
+
+    let rendered = render_to_string(&model, 100, 30);
+    assert!(rendered.contains("Run release"));
+    assert!(rendered.contains("title [required] (string: 3–80 chars): Release 1"));
+    assert!(rendered.contains("mode [default] (enum: 2 options): safe"));
+    assert!(rendered.contains("▶ fast"));
+    assert!(rendered.contains("Error: count must be a number"));
+    assert!(rendered.contains("Enter choose"));
+}
+
+#[test]
 fn renders_dialog_overlays() {
     let config = test_config();
     let sessions = vec![test_session("feature", AgentState::Idle)];
@@ -832,7 +856,7 @@ fn renders_dialog_overlays() {
 
     model.dialog = Some(DialogModel::Choice {
         choices: ChoiceList {
-            title: "Plan Actions".to_string(),
+            title: "Workflow Actions".to_string(),
             choices: vec![
                 KeyChoice::new("u", "pause/resume"),
                 KeyChoice::disabled("f", "retry failed"),
@@ -842,7 +866,7 @@ fn renders_dialog_overlays() {
     let buffer = render_to_buffer(&model, 80, 20);
     let buffer_text = buffer_to_string(&buffer);
 
-    assert!(buffer_text.contains("Plan Actions"));
+    assert!(buffer_text.contains("Workflow Actions"));
     assert!(buffer_text.contains("[u] pause/resume"));
     assert!(buffer_text.contains("[f] retry failed"));
     assert_ne!(find_line(&buffer, "[u]"), find_line(&buffer, "[f]"));
@@ -883,7 +907,7 @@ fn renders_dialog_overlays() {
     );
 
     model.dialog = Some(DialogModel::Confirm {
-        title: "Plan Run: Execution".to_string(),
+        title: "Workflow Run: Execution".to_string(),
         lines: vec![],
         prompt: "Run steps in parallel?".to_string(),
         input: String::new(),
@@ -892,7 +916,7 @@ fn renders_dialog_overlays() {
     });
     let buffer = render_to_string(&model, 80, 20);
 
-    assert!(buffer.contains("Plan Run: Execution"));
+    assert!(buffer.contains("Workflow Run: Execution"));
     assert!(buffer.contains("Run steps in parallel? [y/N]:"));
 
     model.dialog = Some(DialogModel::Confirm {
@@ -934,7 +958,7 @@ fn renders_dialog_overlays() {
         title: "Restart interrupted work".to_string(),
         items: vec![OrderedToggleItem {
             id: "run".to_string(),
-            label: "prism / feature  Auto Flow  FixCi".to_string(),
+            label: "prism / feature  Workflow  Verify".to_string(),
             enabled: false,
         }],
         selected: 0,
@@ -1013,74 +1037,6 @@ fn prompt_dialog_geometry_is_stable_and_tail_truncates_input() {
 
     assert!(visible.contains("ghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ"));
     assert!(!visible.contains("abcdef"));
-}
-
-#[test]
-fn renders_plan_dashboard_compact_step_tails() {
-    let config = test_config();
-    let sessions = vec![test_session("feature", AgentState::Running)];
-    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
-    model.plan_dashboard = Some(test_plan_dashboard(false));
-    let buffer = render_to_string(&model, 120, 37);
-
-    assert!(buffer.contains("Plan Run"));
-    assert!(buffer.contains("current"));
-    assert!(buffer.contains("Steps"));
-    assert!(buffer.contains("[-] Step 1"));
-    assert!(buffer.contains("command output"));
-    assert!(!buffer.contains("Output"));
-    assert!(!buffer.contains("[+]"));
-    assert!(!buffer.contains("L2"));
-}
-
-#[test]
-fn renders_plan_dashboard_ignores_output_block_expansion() {
-    let config = test_config();
-    let sessions = vec![test_session("feature", AgentState::Running)];
-    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
-    model.plan_dashboard = Some(test_plan_dashboard(true));
-    let buffer = render_to_string(&model, 120, 32);
-
-    assert!(buffer.contains("command output"));
-    assert!(!buffer.contains("running command"));
-}
-
-#[test]
-fn renders_plan_run_window_around_selected_run() {
-    let config = test_config();
-    let sessions = vec![test_session("feature", AgentState::Running)];
-    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
-    let mut dashboard = test_plan_dashboard(false);
-    dashboard.runs = (1..=8)
-        .map(|index| crate::view::PlanRunSummary {
-            id: format!("plan-run-{index}"),
-            plan_display: format!("plan-{index}.md"),
-            scope_path: "/repo".to_string(),
-            status: PlanRunStatus::Done,
-            updated_unix_ms: 4_000 + index,
-            selected: index == 7,
-        })
-        .collect();
-    model.plan_dashboard = Some(dashboard);
-
-    let buffer = render_to_string(&model, 120, 40);
-
-    assert!(buffer.contains("plan-7.md"));
-    assert!(buffer.contains("▶ done"));
-    assert!(!buffer.contains("plan-1.md"));
-}
-
-#[test]
-fn renders_auto_dashboard_steps_and_output_cursor() {
-    let config = test_config();
-    let sessions = vec![test_session("feature", AgentState::Running)];
-    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
-    model.auto_dashboard = Some(test_auto_dashboard());
-    let buffer = render_to_string(&model, 120, 32);
-
-    assert!(buffer.contains("Managed Work"));
-    assert!(buffer.contains("headless worker"));
-    assert!(buffer.contains("auto output"));
 }
 
 #[test]
@@ -1279,6 +1235,114 @@ fn worktree_main_panel_renders_opencode_workflow_states() {
 }
 
 #[test]
+fn worktree_main_view_renders_flat_workflow_section_and_trigger_summary() {
+    let config = test_config();
+    let sessions = vec![test_session("feature", AgentState::Running)];
+    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    model.main_focused = true;
+    model.workflow_dashboard = Some(test_workflow_dashboard());
+
+    let buffer = render_to_string(&model, 120, 35);
+
+    assert!(buffer.contains("Workflow · stabilize · running"));
+    assert!(buffer.contains("✓ review comments"));
+    assert!(buffer.contains("… ci failure"));
+    assert!(buffer.contains("3 required checks running; poll in 20s"));
+    assert!(!buffer.contains("overview | workflow"));
+    assert!(!buffer.contains("Dependency graph"));
+    assert!(!buffer.contains("[after"));
+}
+
+#[test]
+fn worktree_main_view_labels_only_authored_dependencies() {
+    let config = test_config();
+    let sessions = vec![test_session("feature", AgentState::Running)];
+    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    let mut dashboard = test_workflow_dashboard();
+    let steps = &mut dashboard.detail.as_mut().unwrap().steps;
+    steps[0].explicit_dependencies = true;
+    steps[0].dependencies = Vec::new();
+    steps[1].explicit_dependencies = true;
+    steps[1].dependencies = vec!["review_comments".into()];
+    model.workflow_dashboard = Some(dashboard);
+
+    let buffer = render_to_string(&model, 120, 35);
+
+    assert!(buffer.contains("[root]"));
+    assert!(buffer.contains("[after review_comments]"));
+}
+
+#[test]
+fn worktree_main_view_explains_workflow_launch_when_there_are_no_runs() {
+    let config = test_config();
+    let sessions = vec![test_session("feature", AgentState::Idle)];
+    let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+
+    let buffer = render_to_string(&model, 120, 25);
+
+    assert!(buffer.contains("Workflow · none · W to run"));
+}
+
+fn test_workflow_dashboard() -> crate::view::WorkflowDashboard {
+    let run = serde_json::from_value(serde_json::json!({
+        "id": "run-1",
+        "workflow_digest": "sha256:test",
+        "workflow_name": "stabilize",
+        "subject": {
+            "repository": "/repo",
+            "worktree": "/repo/feature",
+            "change_request": "github:repo:1",
+            "change_request_head": "abc"
+        },
+        "status": "running",
+        "cycle": 2,
+        "max_agent_runs": 10,
+        "agent_runs_consumed": 1,
+        "cancellation_requested": false,
+        "created_unix_ms": 1000,
+        "updated_unix_ms": 3000,
+        "revision": 1,
+        "steps": [
+            {
+                "key": "review_comments",
+                "phase": "satisfied",
+                "summary": "no unresolved review threads",
+                "wake_at_unix_ms": null,
+                "satisfied_cycle": 2,
+                "unconditional_completed": false,
+                "attempts": []
+            },
+            {
+                "key": "ci_failure",
+                "phase": "waiting",
+                "summary": "3 required checks running; poll in 20s",
+                "wake_at_unix_ms": 23000,
+                "satisfied_cycle": null,
+                "unconditional_completed": false,
+                "attempts": []
+            }
+        ],
+        "events": []
+    }))
+    .unwrap();
+    crate::view::WorkflowDashboard {
+        run_id: "run-1".into(),
+        status: "running".into(),
+        current_step: Some("ci_failure".into()),
+        selected_step: Some("ci_failure".into()),
+        completed_steps: 1,
+        total_steps: 2,
+        run_position: 1,
+        run_count: 1,
+        detail: Some(run),
+        can_pause: true,
+        can_resume: false,
+        can_cancel: true,
+        can_retry: false,
+    }
+}
+
+#[test]
 fn worktree_main_panel_renders_pr_comments_table() {
     let config = test_config();
     let mut session = test_session("feature", AgentState::Idle);
@@ -1338,222 +1402,6 @@ fn worktree_main_panel_styles_open_and_merged_pr_numbers() {
 }
 
 #[test]
-fn renders_stabilization_pending_push_in_worktree_main_panel() {
-    let config = test_config();
-    let mut session = test_session("feature", AgentState::Idle);
-    session.pr = PrCache::observed(test_pr_summary(), None);
-    let sessions = vec![session];
-    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
-    model.auto_dashboard = Some(stabilization_dashboard(
-        StabilizationBlocker::PendingPush,
-        StabilizationWorkKind::PushPendingRepair,
-        Some(test_pending_push_guard()),
-    ));
-
-    let buffer = render_to_string(&model, 120, 40);
-
-    assert!(buffer.contains("PR"));
-    assert!(buffer.contains("pr #"));
-    assert!(buffer.contains("42"));
-    assert!(buffer.contains("name"));
-    assert!(buffer.contains("Feature PR"));
-    assert!(buffer.contains("merge"));
-    assert!(buffer.contains("ci"));
-    assert!(buffer.contains("review"));
-    assert!(!buffer.contains("pending push"));
-    assert!(!buffer.contains("guard"));
-    assert!(buffer.contains("state"));
-    assert!(buffer.contains("PendingPush"));
-    assert!(buffer.contains("next"));
-    assert!(buffer.contains("PushPendingRepair"));
-    assert!(!buffer.contains("state PendingPush"));
-    assert!(!buffer.contains("gate"));
-}
-
-#[test]
-fn worktree_main_panel_renders_review_gate() {
-    let config = test_config();
-    let mut session = test_session("feature", AgentState::Idle);
-    session.pr = PrCache::observed(
-        test_pr_summary(),
-        Some(PrDetails {
-            review_comments: vec![PrReviewComment {
-                body: "please fix this".to_string(),
-                resolved: false,
-                ..PrReviewComment::default()
-            }],
-            ..PrDetails::default()
-        }),
-    );
-    let sessions = vec![session];
-    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
-    model.auto_dashboard = Some(stabilization_dashboard(
-        StabilizationBlocker::ReadyForManualMerge,
-        StabilizationWorkKind::MarkReadyForManualMerge,
-        None,
-    ));
-
-    let buffer = render_to_string(&model, 120, 40);
-
-    assert!(buffer.contains("review"));
-    assert!(buffer.contains("needs review"));
-}
-
-#[test]
-fn worktree_main_panel_passes_review_gate_without_actionable_feedback() {
-    let config = test_config();
-    let mut session = test_session("feature", AgentState::Idle);
-    let mut summary = test_pr_summary();
-    summary.review_decision = "CHANGES_REQUESTED".to_string();
-    session.pr = PrCache::observed(
-        summary,
-        Some(PrDetails {
-            review_comments: vec![PrReviewComment {
-                author: "reviewer".to_string(),
-                body: "resolved suggestion".to_string(),
-                resolved: true,
-                ..PrReviewComment::default()
-            }],
-            ..PrDetails::default()
-        }),
-    );
-    let sessions = vec![session];
-    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
-    model.auto_dashboard = Some(stabilization_dashboard(
-        StabilizationBlocker::ReadyForManualMerge,
-        StabilizationWorkKind::MarkReadyForManualMerge,
-        None,
-    ));
-
-    let buffer = render_to_string(&model, 120, 40);
-
-    assert!(buffer.contains("passed"));
-    assert!(!buffer.contains("disabled"));
-}
-
-#[test]
-fn worktree_main_panel_ignores_provider_review_state_without_unresolved_comments() {
-    let config = test_config();
-    let mut session = test_session("feature", AgentState::Idle);
-    let mut summary = test_pr_summary();
-    summary.review_decision = "REVIEW_REQUIRED".to_string();
-    session.pr = PrCache::observed(summary, None);
-    let sessions = vec![session];
-    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
-    model.auto_dashboard = Some(stabilization_dashboard(
-        StabilizationBlocker::ReadyForManualMerge,
-        StabilizationWorkKind::MarkReadyForManualMerge,
-        None,
-    ));
-
-    let buffer = render_to_string(&model, 120, 40);
-
-    assert!(buffer.contains("passed"));
-}
-
-#[test]
-fn renders_stabilization_ci_failed_in_worktree_main_panel() {
-    let config = test_config();
-    let mut session = test_session("feature", AgentState::Idle);
-    session.pr = PrCache::observed(test_pr_summary(), None);
-    let sessions = vec![session];
-    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
-    model.auto_dashboard = Some(stabilization_dashboard(
-        StabilizationBlocker::CiFailed,
-        StabilizationWorkKind::FixCi,
-        None,
-    ));
-
-    let buffer = render_to_string(&model, 120, 40);
-
-    assert!(buffer.contains("state"));
-    assert!(buffer.contains("CiFailed"));
-    assert!(buffer.contains("next"));
-    assert!(buffer.contains("FixCi"));
-}
-
-#[test]
-fn renders_stabilization_merge_blocked_in_worktree_main_panel() {
-    let config = test_config();
-    let mut session = test_session("feature", AgentState::Idle);
-    let mut summary = test_pr_summary();
-    summary.check_status = "passed".to_string();
-    summary.merge_state_status = "DIRTY".to_string();
-    session.pr = PrCache::observed(summary, None);
-    let sessions = vec![session];
-    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
-    model.auto_dashboard = Some(stabilization_dashboard(
-        StabilizationBlocker::MergeBlocked,
-        StabilizationWorkKind::Escalate,
-        None,
-    ));
-
-    let buffer = render_to_string(&model, 120, 40);
-
-    assert!(buffer.contains("merge"));
-    assert!(buffer.contains("blocked"));
-    assert!(buffer.contains("state"));
-    assert!(buffer.contains("MergeBlocked"));
-    assert!(buffer.contains("next"));
-    assert!(buffer.contains("Escalate"));
-}
-
-#[test]
-fn renders_stabilization_policy_unknown_in_worktree_main_panel() {
-    let config = test_config();
-    let mut session = test_session("feature", AgentState::Idle);
-    let mut summary = test_pr_summary();
-    summary.check_status = "passed".to_string();
-    session.pr = PrCache::observed(summary, None);
-    let sessions = vec![session];
-    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
-    model.auto_dashboard = Some(stabilization_dashboard(
-        StabilizationBlocker::PolicyUnknown,
-        StabilizationWorkKind::Escalate,
-        None,
-    ));
-
-    let buffer = render_to_string(&model, 120, 40);
-
-    assert!(buffer.contains("policy"));
-    assert!(buffer.contains("unknown"));
-    assert!(buffer.contains("state"));
-    assert!(buffer.contains("PolicyUnknown"));
-    assert!(buffer.contains("next"));
-    assert!(buffer.contains("Escalate"));
-}
-
-#[test]
-fn renders_stabilization_ready_for_manual_merge_in_worktree_main_panel() {
-    let config = test_config();
-    let mut session = test_session("feature", AgentState::Idle);
-    let mut summary = test_pr_summary();
-    summary.check_status = "failed".to_string();
-    summary.review_decision = "APPROVED".to_string();
-    session.pr = PrCache::observed(
-        summary,
-        Some(PrDetails {
-            failing_checks: vec!["docs".to_string()],
-            ..PrDetails::default()
-        }),
-    );
-    let sessions = vec![session];
-    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
-    model.auto_dashboard = Some(stabilization_dashboard(
-        StabilizationBlocker::ReadyForManualMerge,
-        StabilizationWorkKind::MarkReadyForManualMerge,
-        None,
-    ));
-
-    let buffer = render_to_string(&model, 120, 40);
-
-    assert!(buffer.contains("state"));
-    assert!(buffer.contains("ReadyForManualMerge"));
-    assert!(buffer.contains("next"));
-    assert!(buffer.contains("MarkReadyForManualMerge"));
-}
-
-#[test]
 fn worktree_main_panel_hides_pr_section_without_pr() {
     let config = test_config();
     let sessions = vec![test_session("feature", AgentState::Idle)];
@@ -1569,23 +1417,6 @@ fn worktree_main_panel_hides_pr_section_without_pr() {
     assert!(!buffer.contains("Description"));
     assert!(!buffer.contains("Activity"));
     assert!(!buffer.contains("refreshed"));
-}
-
-#[test]
-fn worktree_main_panel_hides_stabilization_values_without_pr() {
-    let config = test_config();
-    let sessions = vec![test_session("feature", AgentState::Idle)];
-    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
-    model.auto_dashboard = Some(stabilization_dashboard(
-        StabilizationBlocker::NeedsPullRequest,
-        StabilizationWorkKind::PushInitialAndOpenPr,
-        Some(test_pending_push_guard()),
-    ));
-    let buffer = render_to_string(&model, 120, 30);
-
-    assert!(!buffer.contains("NeedsPullRequest"));
-    assert!(!buffer.contains("PushInitialAndOpenPr"));
-    assert!(!buffer.contains("review repair"));
 }
 
 #[test]
@@ -1813,8 +1644,6 @@ fn test_model<'a>(
                 pr: session.pr.clone(),
                 wt_columns: session.wt_columns.clone(),
                 development: None,
-                auto_status: None,
-                plan_status: None,
                 updated_label: "-".to_string(),
                 unseen_comments: session.unseen_comments,
                 prompt_summary: session.prompt_summary.clone(),
@@ -1840,234 +1669,14 @@ fn test_model<'a>(
         main_focused: false,
         main_scroll: 0,
         repo_main_view: RepoMainView::ChangeRequests,
-        worktree_main_view: WorktreeMainView::Details,
         worktree_list_mode: WorktreeListMode::Repo,
         mode_label: "normal",
         status_message,
         repo_filter: "",
         worktree_filter: "",
         leader_hint,
-        auto_dashboard: None,
-        plan_dashboard: None,
+        workflow_dashboard: None,
         tmux_portal: None,
         dialog: None,
-    }
-}
-
-fn test_plan_dashboard(expanded: bool) -> PlanDashboard {
-    let mut expanded_blocks = BTreeSet::new();
-    if expanded {
-        expanded_blocks.insert("tool:build".to_string());
-    }
-    PlanDashboard {
-        run: PersistedPlanRun {
-            run: PlanRun {
-                harness_id: "opencode".to_string(),
-                adapter_id: "opencode".to_string(),
-                id: "plan-run".to_string(),
-                repo_root: "/repo".to_string(),
-                scope_path: PathBuf::from("/repo"),
-                plan_path: PathBuf::from("plan.md"),
-                plan_display: "plan.md".to_string(),
-                step_name: "phase".to_string(),
-                start_step: 1,
-                total_steps: 2,
-                mode: PlanRunMode::Sequential,
-                status: PlanRunStatus::Running,
-                pause_requested: false,
-                selected_step: 1,
-                created_unix_ms: 1_000,
-                updated_unix_ms: 4_000,
-                archived_unix_ms: None,
-            },
-            steps: vec![
-                PlanStepRun {
-                    run_id: "plan-run".to_string(),
-                    step: 1,
-                    prompt: "do phase one".to_string(),
-                    status: PlanStepStatus::Running,
-                    execution: crate::harness::ExecutionRef {
-                        state: Some("busy".to_string()),
-                        process_id: None,
-                        process_identity: None,
-                    },
-                    session: crate::harness::SessionRef {
-                        adapter_id: Some("opencode".to_string()),
-                        endpoint: None,
-                        id: Some("abcdefgh1234".to_string()),
-                    },
-                    agent_variant: Some("medium".to_string()),
-                    started_unix_ms: Some(1_000),
-                    finished_unix_ms: None,
-                    exit_code: None,
-                    latest_message: Some("working".to_string()),
-                    active_tool: Some("bash".to_string()),
-                    todos: Vec::new(),
-                    summary: None,
-                    error: None,
-                },
-                PlanStepRun {
-                    run_id: "plan-run".to_string(),
-                    step: 2,
-                    prompt: "do phase two".to_string(),
-                    status: PlanStepStatus::Queued,
-                    execution: crate::harness::ExecutionRef::default(),
-                    session: crate::harness::SessionRef::default(),
-                    agent_variant: None,
-                    started_unix_ms: None,
-                    finished_unix_ms: None,
-                    exit_code: None,
-                    latest_message: None,
-                    active_tool: None,
-                    todos: Vec::new(),
-                    summary: None,
-                    error: None,
-                },
-            ],
-        },
-        runs: vec![crate::view::PlanRunSummary {
-            id: "plan-run".to_string(),
-            plan_display: "plan.md".to_string(),
-            scope_path: "/repo".to_string(),
-            status: PlanRunStatus::Running,
-            updated_unix_ms: 4_000,
-            selected: true,
-        }],
-        output_lines: vec![
-            PlanOutputLine {
-                run_id: "plan-run".to_string(),
-                step: 1,
-                line_number: 1,
-                time_unix_ms: 1_000,
-                kind: PlanOutputKind::Assistant,
-                text: "starting".to_string(),
-                block_id: None,
-            },
-            PlanOutputLine {
-                run_id: "plan-run".to_string(),
-                step: 1,
-                line_number: 2,
-                time_unix_ms: 2_000,
-                kind: PlanOutputKind::Tool,
-                text: "running command".to_string(),
-                block_id: Some("build".to_string()),
-            },
-            PlanOutputLine {
-                run_id: "plan-run".to_string(),
-                step: 1,
-                line_number: 3,
-                time_unix_ms: 3_000,
-                kind: PlanOutputKind::ToolOutput,
-                text: "command output".to_string(),
-                block_id: Some("build".to_string()),
-            },
-        ],
-        output_state: PlanOutputViewerState {
-            cursor: 1,
-            follow: false,
-            expanded_blocks,
-        },
-    }
-}
-
-fn test_auto_dashboard() -> AutoDashboard {
-    AutoDashboard {
-        run: PersistedAutoRun {
-            run: AutoRun {
-                harness_id: "opencode".to_string(),
-                adapter_id: "opencode".to_string(),
-                id: "auto-run".to_string(),
-                repo_root: "/repo".to_string(),
-                worktree_path: PathBuf::from("/repo/feature"),
-                worktree_incarnation: None,
-                branch: "feature".to_string(),
-                mode: AutoRunMode::Standard,
-                implementation_source: AutoImplementationSource::Prompt,
-                plan_path: None,
-                plan_run_mode: PlanRunMode::Sequential,
-                variant: "default".to_string(),
-                agent_profile: None,
-                prompt_summary: "implement feature".to_string(),
-                initial_prompt: "implement feature".to_string(),
-                status: AutoRunStatus::Running,
-                pause_requested: false,
-                selected_step_run_id: Some(10),
-                pr_number: Some(42),
-                pr_url: None,
-                current_head_sha: None,
-                review_baseline_json: None,
-                stabilization_status: None,
-                stabilization_blocker: None,
-                stabilization_next_work: None,
-                pending_push: None,
-                created_unix_ms: 1_000,
-                updated_unix_ms: 3_000,
-                archived_unix_ms: None,
-            },
-            steps: vec![AutoStepRun {
-                id: Some(10),
-                run_id: "auto-run".to_string(),
-                sequence: 1,
-                step_key: AutoStepKey::Implement,
-                reason: None,
-                status: AutoStepStatus::Running,
-                attempt: 1,
-                started_unix_ms: Some(1_000),
-                finished_unix_ms: None,
-                execution: crate::harness::ExecutionRef::default(),
-                session: crate::harness::SessionRef {
-                    adapter_id: Some("opencode".to_string()),
-                    endpoint: None,
-                    id: Some("abcdefgh1234".to_string()),
-                },
-                plan_run_id: None,
-                commit_sha: None,
-                head_sha: None,
-                work_guard: None,
-                blocker: None,
-                summary: Some("working".to_string()),
-                error: None,
-            }],
-        },
-        linked_plan_dashboard: None,
-        output_lines: vec![AutoOutputLine {
-            step_run_id: 10,
-            line_number: 1,
-            time_unix_ms: 2_000,
-            kind: AutoOutputKind::Status,
-            text: "auto output".to_string(),
-            block_id: None,
-        }],
-        output_state: AutoOutputViewerState {
-            cursor: 0,
-            follow: true,
-        },
-        worker_status: "healthy".to_string(),
-    }
-}
-
-fn stabilization_dashboard(
-    blocker: StabilizationBlocker,
-    next_work: StabilizationWorkKind,
-    pending_push: Option<PendingPushGuard>,
-) -> AutoDashboard {
-    let mut dashboard = test_auto_dashboard();
-    dashboard.run.run.stabilization_blocker = Some(blocker);
-    dashboard.run.run.stabilization_next_work = Some(next_work);
-    dashboard.run.run.pending_push = pending_push;
-    dashboard
-}
-
-fn test_pending_push_guard() -> PendingPushGuard {
-    PendingPushGuard {
-        change_request_identity: None,
-        repair_kind: RepairKind::Ci,
-        commit_sha: "fedcba9876543210".to_string(),
-        expected_local_head_sha: "abc1234567890000".to_string(),
-        expected_remote_head_sha: Some("1234567890abcdef".to_string()),
-        pr_number: Some(42),
-        expected_pr_head_sha: Some("9999999999999999".to_string()),
-        expected_base_sha: Some("def5678901234567".to_string()),
-        guarded_review_thread_ids: Vec::new(),
     }
 }

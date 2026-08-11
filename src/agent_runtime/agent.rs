@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "harness adapter contract includes non-default prompt modes"
+)]
+
 use crate::config::{AGENT_CANDIDATES, Config};
 use crate::process::command_exists;
 

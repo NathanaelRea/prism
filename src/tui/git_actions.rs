@@ -83,34 +83,12 @@ impl Tui {
                 });
         }
         if matches!(action, GitAction::CiFix | GitAction::ReviewFix) {
-            let supported = self
-                .remote_support_for_action(action, Some(summary))
-                .unwrap_or(crate::remote::SupportLevel::Unknown);
-            let has_input = session.pr.trusted_details().is_ok_and(|details| {
-                details.is_some_and(|details| match action {
-                    GitAction::CiFix => {
-                        !details.ci_failures.is_empty() || !details.failing_checks.is_empty()
-                    }
-                    GitAction::ReviewFix => {
-                        !details.reviews.is_empty() || !details.review_comments.is_empty()
-                    }
-                    _ => unreachable!(),
-                })
-            });
-            let capability_enabled = supported == crate::remote::SupportLevel::Supported
-                || (action == GitAction::CiFix
-                    && supported == crate::remote::SupportLevel::Conditional
-                    && has_input);
-            return capability_enabled
-                && has_input
+            let support = self.remote_support_for_action(action, Some(summary));
+            return matches!(support, Some(crate::remote::SupportLevel::Supported))
                 && context
                     .config
                     .selected_harness()
                     .is_ok_and(|harness| harness.describe().headless);
-        }
-        if action == GitAction::Merge {
-            return self.remote_support_for_action(action, Some(summary))
-                == Some(crate::remote::SupportLevel::Supported);
         }
         true
     }

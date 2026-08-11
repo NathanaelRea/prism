@@ -128,9 +128,6 @@ icon_style = "nerd-font"
 [layout]
 sidebar_width = 50
 
-[auto]
-require_review_approval = true
-
 [worktrees]
 columns = ["url"]
 

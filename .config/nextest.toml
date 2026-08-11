@@ -1,0 +1,17 @@
+# The worker integration tests use an in-process mutex because they share
+# process-level worker resources. Nextest runs each test in its own process, so
+# preserve that mutual exclusion at the runner level.
+[test-groups]
+worker-integration = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary(=worker)'
+test-group = 'worker-integration'
+
+# This process-recovery contract has a five-second scheduling deadline. Reserve
+# the runner while it executes so load from unrelated test processes cannot
+# turn scheduler starvation into a false timeout.
+[[profile.default.overrides]]
+filter = 'test(=workflow::engine::tests::expired_attempt_with_recorded_process_requires_explicit_recovery)'
+priority = 100
+threads-required = "num-test-threads"

@@ -4,9 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::config::{
-    AutoConfig, Checks, Config, EscapeKey, IconStyle, LayoutConfig, MergeMethod, NotificationConfig,
-};
+use crate::config::{Config, EscapeKey, IconStyle, LayoutConfig, MergeMethod, NotificationConfig};
 
 static SHIM_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -28,21 +26,17 @@ pub(crate) fn test_config() -> Config {
         config_errors: Vec::new(),
         default_agent: "ask".to_string(),
         default_base: None,
-        plan_dir: "plans".to_string(),
         review_packet_dir: ".agent/review".to_string(),
         worktree_command: "wt".to_string(),
         opencode_port_base: 41_000,
         opencode_port_span: 1_000,
         opencode_shutdown_owned_servers: false,
-        opencode_plan_plugin: false,
         escape_key: EscapeKey::EscEsc,
         merge_method: MergeMethod::Squash,
         icon_style: IconStyle::Unicode,
         icon_style_configured: false,
-        auto: AutoConfig::default(),
         layout: LayoutConfig::default(),
         notifications: NotificationConfig::default(),
-        checks: Checks::default(),
         worktree_columns: Vec::new(),
         tools,
         remote_hosts: BTreeMap::new(),

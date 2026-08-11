@@ -137,16 +137,30 @@ impl Tui {
                     move |_| {
                         let adapter = crate::remote::dispatcher::capabilities(&path, &config);
                         let github_remote_configured = adapter.is_ok();
-                        let summaries = if github_remote_configured {
-                            let _ = refresh_repo_policy_cache(
-                                &crate::repo::Repository { root: path.clone() },
-                                &path,
-                                &config,
-                            );
-                            fetch_pr_summary_index(&path, &config)
-                        } else {
-                            Err(adapter.as_ref().unwrap_err().clone())
-                        };
+                        let summaries: Result<Vec<crate::remote::PrSummary>, String> =
+                            if github_remote_configured {
+                                let payload =
+                                    crate::workflow::standard_remote::TuiRemoteListPayload {
+                                        repository: path.clone(),
+                                        worktree: path.clone(),
+                                    };
+                                let _ = crate::worker::observe_remote::<bool>(
+                                    &path,
+                                    &path,
+                                    "tui.repository_policy",
+                                    &path.to_string_lossy(),
+                                    &payload,
+                                );
+                                crate::worker::observe_remote(
+                                    &path,
+                                    &path,
+                                    "tui.change_requests",
+                                    &path.to_string_lossy(),
+                                    payload,
+                                )
+                            } else {
+                                Err(adapter.as_ref().unwrap_err().clone())
+                            };
                         let capabilities = if summaries.is_ok() {
                             crate::remote::dispatcher::capabilities(&path, &config)
                                 .ok()
@@ -169,10 +183,22 @@ impl Tui {
                         let remote_branch_heads = reconciliation_refs
                             .into_iter()
                             .filter_map(|(remote, branch)| {
-                                remote_branch_head(&path, &config, &remote, &branch)
-                                    .ok()
-                                    .flatten()
-                                    .map(|head| ((remote, branch), head))
+                                let subject = format!("{}:{remote}:{branch}", path.display());
+                                crate::worker::observe_remote::<Option<String>>(
+                                    &path,
+                                    &path,
+                                    "tui.remote_branch_head",
+                                    &subject,
+                                    crate::workflow::standard_remote::TuiRemoteBranchHeadPayload {
+                                        repository: path.clone(),
+                                        worktree: path.clone(),
+                                        remote: remote.clone(),
+                                        branch: branch.clone(),
+                                    },
+                                )
+                                .ok()
+                                .flatten()
+                                .map(|head| ((remote, branch), head))
                             })
                             .collect();
                         Ok(Some(TuiJobPayload::PrPoll(PrPollResult::Summary {
@@ -207,6 +233,7 @@ impl Tui {
                 .unwrap_or_default();
             let key = pr_poll_key(&managed.identity, generation, session);
             let config = managed.config.clone();
+            let repository = managed.repo.root.clone();
             let details_pollable = pr_details_pollable(session, &config);
             let session = &mut self.sessions[index];
             if !session.hidden && details_pollable && !self.pr_polls_in_flight.contains(&key) {
@@ -222,7 +249,19 @@ impl Tui {
                     Some(TUI_ACTION_JOB_TIMEOUT),
                     format!("prism-pr-details-{index}"),
                     move |_| {
-                        refresh_pr_details_cache_state(&branch, &mut cache, &path, &config);
+                        let snapshot = crate::worker::observe_remote(
+                            &repository,
+                            &path,
+                            "tui.change_request_cache",
+                            &format!("{}:{}:details", path.display(), branch),
+                            crate::workflow::standard_remote::TuiRemoteCachePayload {
+                                repository: repository.clone(),
+                                worktree: path.clone(),
+                                branch,
+                                force_details: true,
+                            },
+                        )?;
+                        cache.apply_worker_snapshot(snapshot);
                         Ok(Some(TuiJobPayload::PrPoll(PrPollResult::Details {
                             key: job_key,
                             cache: Box::new(cache),
@@ -412,7 +451,6 @@ impl Tui {
                     result,
                     remote_update,
                     status_label,
-                    auto_run,
                 } => {
                     if self.pr_persistence_versions.get(&key).copied() != Some(version) {
                         if remote_update
@@ -439,9 +477,6 @@ impl Tui {
                         changed |= before != pr_cache_render_signature(&self.sessions[index].pr);
                     } else if !self.pr_persistence_pending.contains_key(&key) {
                         self.pr_persistence_versions.remove(&key);
-                    }
-                    if let Ok(Some(run)) = auto_run {
-                        changed |= self.remember_auto_run(*run);
                     }
                 }
             }
@@ -490,29 +525,8 @@ impl Tui {
                 remote_update,
                 session: session.background_job_snapshot(),
                 config: managed.config.clone(),
-                auto_run_id: self.active_auto_runs.get(&session.path).cloned(),
             },
         );
-    }
-
-    pub(crate) fn supersede_pr_persistence(&mut self, session_index: usize, details: bool) {
-        let Some(session) = self.sessions.get(session_index) else {
-            return;
-        };
-        let Some(managed) = self.repos.get(session.repo_index) else {
-            return;
-        };
-        let identity = session.identity_key(&managed.identity);
-        let generation = self
-            .worktree_generations
-            .get(&identity)
-            .copied()
-            .unwrap_or_default();
-        let key = pr_poll_key(&managed.identity, generation, session);
-        if self.pr_persistence_versions.contains_key(&key) {
-            self.queue_pr_persistence(session_index, details, false);
-            self.start_pr_persistence_jobs();
-        }
     }
 
     pub(crate) fn queue_pr_cache_removal(&mut self, session_index: usize) {
@@ -547,39 +561,13 @@ impl Tui {
                 move |_| {
                     let result =
                         persist_pr_cache_snapshot(&request.repo, &request.branch, &request.cache);
-                    let (status_label, auto_run) = if result.is_ok() && request.remote_update {
-                        let status_label = Some(crate::git::git_status_label(
+                    let status_label = if result.is_ok() && request.remote_update {
+                        Some(crate::git::git_status_label(
                             &request.session.path,
                             &request.config,
-                        ));
-                        let auto_run = request.auto_run_id.as_deref().map_or(Ok(None), |run_id| {
-                            crate::observability::with_writable_db(&request.repo, |path| {
-                                let store = AutoFlowStore::open(path);
-                                let Some(mut run) = crate::auto_flow::load_auto_run(&store, run_id)?
-                                else {
-                                    return Ok(None);
-                                };
-                                let mut session = request.session;
-                                session.pr = request.cache.clone();
-                                crate::auto_flow::stabilization_execute::observe_cached_plan_and_save(
-                                    &store,
-                                    &request.repo,
-                                    &request.config,
-                                    &session,
-                                    &mut run,
-                                )?;
-                                Ok(Some(Box::new(run)))
-                            })
-                        });
-                        if let Err(error) = &auto_run {
-                            let _ = append_runtime_message(
-                                &request.repo,
-                                &format!("remote gate state refresh failed: {error}"),
-                            );
-                        }
-                        (status_label, auto_run)
+                        ))
                     } else {
-                        (None, Ok(None))
+                        None
                     };
                     Ok(Some(TuiJobPayload::PrPoll(PrPollResult::Persistence {
                         key: request.key,
@@ -588,7 +576,6 @@ impl Tui {
                         result,
                         remote_update: request.remote_update,
                         status_label,
-                        auto_run,
                     })))
                 },
             );
@@ -852,15 +839,6 @@ impl Tui {
         }
         changed
     }
-}
-
-fn remote_branch_head(
-    path: &Path,
-    config: &crate::config::Config,
-    remote: &str,
-    branch: &str,
-) -> Result<Option<String>, String> {
-    crate::git::push_remote_branch_head_sha(path, remote, branch, config)
 }
 
 fn wt_poll_due(

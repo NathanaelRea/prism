@@ -18,28 +18,37 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-          targets: aarch64-apple-darwin
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.143
       - name: Install SQLx CLI 0.8.6
-        run: cargo install sqlx-cli --version 0.8.6 --locked --no-default-features --features sqlite,rustls
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
+        run: >-
+          cargo install sqlx-cli --version 0.8.6 --locked
+          --no-default-features --features sqlite,rustls
+      # v2.9.1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
       - uses: actions/setup-node@v4
         with:
           node-version: 22
       - name: Install OpenCode
         run: npm install --global opencode-ai@1.17.20
-      - name: Install Linux cross-check dependencies
+      - name: Install Linux integration dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang pkg-config libsqlite3-dev tmux
+          sudo apt-get install -y ripgrep tmux
       - name: Install macOS integration dependencies
         if: runner.os == 'macOS'
-        run: brew install tmux
+        run: brew install ripgrep tmux
       - name: Install Worktrunk 0.71.0
         run: |
+          release="https://github.com/max-sixty/worktrunk/releases/download"
+          installer="$(mktemp)"
+          trap 'rm -f "$installer"' EXIT
           curl --proto '=https' --tlsv1.2 -LsSf \
-            https://github.com/max-sixty/worktrunk/releases/download/v0.71.0/worktrunk-installer.sh \
-            | sh
+            "$release/v0.71.0/worktrunk-installer.sh" \
+            --output "$installer"
+          sh "$installer"
           wt --version
       - name: Native macOS platform smoke
         if: runner.os == 'macOS'
@@ -51,20 +60,24 @@ jobs:
           smoke_root="$(mktemp -d)"
           trap 'rm -rf "$smoke_root"' EXIT
           export WORKTRUNK_CONFIG_PATH="$smoke_root/worktrunk.toml"
-          export WORKTRUNK_WORKTREE_PATH="$smoke_root/worktrees/{{ branch | sanitize }}"
+          worktrees="$smoke_root/worktrees"
+          export WORKTRUNK_WORKTREE_PATH="$worktrees/{{ branch | sanitize }}"
           export PRISM_TEST_WORKTRUNK="$(command -v wt)"
-          cargo test repository::worktrunk::tests::real_worktrunk_create_observe_remove_smoke \
-            -- --ignored --exact
+          test_name="repository::worktrunk::tests::"
+          test_name+="real_worktrunk_create_observe_remove_smoke"
+          cargo test "$test_name" -- --ignored --exact
       - name: Test real OpenCode integration
         if: runner.os == 'Linux'
         run: |
+          test_name="agent_runtime::opencode::tests::"
+          test_name+="real_opencode_server_round_trips_prism_session_api"
           PRISM_TEST_OPENCODE="$(command -v opencode)" \
-            cargo test agent_runtime::opencode::tests::real_opencode_server_round_trips_prism_session_api \
-              -- --ignored --exact
+            cargo test "$test_name" -- --ignored --exact
       - name: Test real Prism, OpenCode, and tmux stack
         if: runner.os == 'Linux'
         run: |
           PRISM_TEST_OPENCODE="$(command -v opencode)" \
           PRISM_TEST_TMUX="$(command -v tmux)" \
-            cargo test real_prism_opencode_tmux_stack_ensures_reusable_agent_session \
+            cargo test \
+              real_prism_opencode_tmux_stack_ensures_reusable_agent_session \
               -- --ignored --exact

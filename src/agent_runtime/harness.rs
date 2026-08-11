@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "workflow extensions consume the complete harness contract"
+)]
+
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -177,6 +182,9 @@ fn validate_builtin_arguments(id: &str, adapter: &str, arguments: &[String]) -> 
             "--title",
             "--attach",
             "--session",
+            "--model",
+            "--variant",
+            "--config",
         ],
         "codex" => &[
             "exec",
@@ -185,6 +193,8 @@ fn validate_builtin_arguments(id: &str, adapter: &str, arguments: &[String]) -> 
             "--output-schema",
             "-o",
             "--output-last-message",
+            "--model",
+            "-m",
         ],
         "claude" => &[
             "-p",
@@ -194,8 +204,24 @@ fn validate_builtin_arguments(id: &str, adapter: &str, arguments: &[String]) -> 
             "-r",
             "--continue",
             "-c",
+            "--model",
+            "--effort",
         ],
-        "pi" => &["-p", "--print", "--mode", "--session", "-c", "-r"],
+        "pi" => &[
+            "-p",
+            "--print",
+            "--mode",
+            "--session",
+            "-c",
+            "-r",
+            "--name",
+            "-n",
+            "--no-session",
+            "--session-dir",
+            "--model",
+            "--provider",
+            "--thinking",
+        ],
         _ => &[],
     };
     if let Some(argument) = arguments.iter().find(|argument| {
@@ -574,15 +600,44 @@ impl<'a> Harness<'a> {
         variant: Option<&str>,
         attach: bool,
     ) -> Result<Invocation, String> {
+        self.headless_with_model(
+            prompt,
+            cwd,
+            title,
+            server_url,
+            AgentSelection {
+                model: None,
+                variant,
+            },
+            attach,
+        )
+    }
+
+    /// Build one fresh managed Agent invocation. Explicit model/variant overrides are either
+    /// represented in the adapter argv or rejected; they are never silently ignored.
+    pub fn headless_with_model(
+        &self,
+        prompt: &str,
+        cwd: &Path,
+        title: &str,
+        server_url: Option<&str>,
+        selection: AgentSelection<'_>,
+        attach: bool,
+    ) -> Result<Invocation, String> {
+        let AgentSelection { model, variant } = selection;
+        if self.config.adapter == "generic" && (model.is_some() || variant.is_some()) {
+            return Err(format!(
+                "generic harness '{}' does not declare model or variant override support",
+                self.id
+            ));
+        }
         if self.config.adapter == "opencode" {
             let mut argv = self.builtin_prefix();
             argv.push("run".to_string());
             if attach && let Some(server_url) = server_url {
                 argv.extend(["--attach".to_string(), server_url.to_string()]);
             }
-            if let Some(variant) = variant {
-                argv.extend(["--variant".to_string(), variant.to_string()]);
-            }
+            append_agent_selection(&mut argv, "opencode", model, variant);
             argv.extend([
                 "--format".to_string(),
                 "json".to_string(),
@@ -605,7 +660,10 @@ impl<'a> Harness<'a> {
             let mut argv = self.builtin_prefix();
             let structured_events = match self.config.adapter.as_str() {
                 "codex" => {
-                    argv.extend(["exec".to_string(), "--json".to_string(), prompt.to_string()]);
+                    argv.push("exec".to_string());
+                    argv.push("--json".to_string());
+                    append_agent_selection(&mut argv, "codex", model, variant);
+                    argv.push(prompt.to_string());
                     true
                 }
                 "claude" => {
@@ -614,17 +672,15 @@ impl<'a> Harness<'a> {
                         "--output-format".to_string(),
                         "stream-json".to_string(),
                         "--verbose".to_string(),
-                        prompt.to_string(),
                     ]);
+                    append_agent_selection(&mut argv, "claude", model, variant);
+                    argv.push(prompt.to_string());
                     true
                 }
                 "pi" => {
-                    argv.extend([
-                        "--mode".to_string(),
-                        "json".to_string(),
-                        "--print".to_string(),
-                        prompt.to_string(),
-                    ]);
+                    argv.extend(["--mode".to_string(), "json".to_string()]);
+                    append_agent_selection(&mut argv, "pi", model, variant);
+                    argv.extend(["--print".to_string(), prompt.to_string()]);
                     true
                 }
                 _ => unreachable!("validated built-in adapter"),
@@ -650,6 +706,82 @@ impl<'a> Harness<'a> {
             Some(prompt),
             &self.config.environment,
         )
+    }
+
+    /// Build one managed follow-up turn in an existing native Agent Session.
+    pub fn headless_resume_with_model(
+        &self,
+        prompt: &str,
+        cwd: &Path,
+        session_id: &str,
+        selection: AgentSelection<'_>,
+    ) -> Result<Invocation, String> {
+        if session_id.trim().is_empty() {
+            return Err("Agent Session ID must not be empty".to_string());
+        }
+        if self.config.adapter == "generic" {
+            return Err(format!(
+                "generic harness '{}' does not support managed headless session continuation",
+                self.id
+            ));
+        }
+        let AgentSelection { model, variant } = selection;
+        let mut argv = self.builtin_prefix();
+        match self.config.adapter.as_str() {
+            "opencode" => {
+                argv.push("run".to_string());
+                append_agent_selection(&mut argv, "opencode", model, variant);
+                argv.extend([
+                    "--format".to_string(),
+                    "json".to_string(),
+                    "--dir".to_string(),
+                    cwd.display().to_string(),
+                    "--session".to_string(),
+                    session_id.to_string(),
+                    prompt.to_string(),
+                ]);
+            }
+            "codex" => {
+                argv.extend([
+                    "exec".to_string(),
+                    "resume".to_string(),
+                    "--json".to_string(),
+                ]);
+                append_agent_selection(&mut argv, "codex", model, variant);
+                argv.extend([session_id.to_string(), prompt.to_string()]);
+            }
+            "claude" => {
+                argv.extend([
+                    "--print".to_string(),
+                    "--output-format".to_string(),
+                    "stream-json".to_string(),
+                    "--verbose".to_string(),
+                    "--resume".to_string(),
+                    session_id.to_string(),
+                ]);
+                append_agent_selection(&mut argv, "claude", model, variant);
+                argv.push(prompt.to_string());
+            }
+            "pi" => {
+                argv.extend([
+                    "--mode".to_string(),
+                    "json".to_string(),
+                    "--session".to_string(),
+                    session_id.to_string(),
+                ]);
+                append_agent_selection(&mut argv, "pi", model, variant);
+                argv.extend(["--print".to_string(), prompt.to_string()]);
+            }
+            _ => unreachable!("validated built-in adapter"),
+        }
+        Ok(Invocation {
+            argv,
+            environment: self.config.environment.clone(),
+            stdin: None,
+            prompt_file: None,
+            structured_events: true,
+            attach: true,
+        })
     }
 
     fn builtin_prefix(&self) -> Vec<String> {
@@ -698,6 +830,38 @@ impl<'a> Harness<'a> {
             repo, config, &self.id, branch, worktree, program,
         )
         .map(Some)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AgentSelection<'a> {
+    pub model: Option<&'a str>,
+    pub variant: Option<&'a str>,
+}
+
+fn append_agent_selection(
+    argv: &mut Vec<String>,
+    adapter: &str,
+    model: Option<&str>,
+    variant: Option<&str>,
+) {
+    if let Some(model) = model {
+        argv.extend(["--model".to_string(), model.to_string()]);
+    }
+    if let Some(variant) = variant {
+        let flag = match adapter {
+            "opencode" => "--variant",
+            "codex" => "--config",
+            "claude" => "--effort",
+            "pi" => "--thinking",
+            _ => return,
+        };
+        let value = if adapter == "codex" {
+            format!("model_reasoning_effort={variant}")
+        } else {
+            variant.to_string()
+        };
+        argv.extend([flag.to_string(), value]);
     }
 }
 
@@ -914,12 +1078,158 @@ mod tests {
     }
 
     #[test]
+    fn workflow_agent_selection_is_forwarded_or_rejected_explicitly() {
+        for (adapter, model_flag, variant_flag) in [
+            ("opencode", "--model", "--variant"),
+            ("codex", "--model", "--config"),
+            ("claude", "--model", "--effort"),
+            ("pi", "--model", "--thinking"),
+        ] {
+            let config = builtin(adapter);
+            let invocation = Harness::new(adapter, &config)
+                .headless_with_model(
+                    "prompt",
+                    Path::new("/tmp"),
+                    "title",
+                    None,
+                    AgentSelection {
+                        model: Some("provider/model"),
+                        variant: Some("high"),
+                    },
+                    false,
+                )
+                .unwrap();
+            assert!(
+                invocation.argv.iter().any(|arg| arg == model_flag),
+                "{adapter}"
+            );
+            assert!(
+                invocation.argv.iter().any(|arg| arg == variant_flag),
+                "{adapter}"
+            );
+            assert_eq!(
+                invocation
+                    .argv
+                    .iter()
+                    .filter(|arg| arg.as_str() == "prompt")
+                    .count(),
+                1
+            );
+        }
+
+        let config = generic(vec!["agent", "run"], PromptTransport::Stdin);
+        assert!(
+            Harness::new("generic", &config)
+                .headless_with_model(
+                    "prompt",
+                    Path::new("/tmp"),
+                    "title",
+                    None,
+                    AgentSelection {
+                        model: Some("model"),
+                        variant: None,
+                    },
+                    false
+                )
+                .unwrap_err()
+                .contains("does not declare")
+        );
+    }
+
+    #[test]
+    fn built_in_adapters_own_headless_followup_syntax() {
+        let cases = [
+            (
+                "opencode",
+                vec![
+                    "opencode",
+                    "run",
+                    "--format",
+                    "json",
+                    "--dir",
+                    "/tmp",
+                    "--session",
+                    "session-1",
+                    "follow up",
+                ],
+            ),
+            (
+                "codex",
+                vec![
+                    "codex",
+                    "exec",
+                    "resume",
+                    "--json",
+                    "session-1",
+                    "follow up",
+                ],
+            ),
+            (
+                "claude",
+                vec![
+                    "claude",
+                    "--print",
+                    "--output-format",
+                    "stream-json",
+                    "--verbose",
+                    "--resume",
+                    "session-1",
+                    "follow up",
+                ],
+            ),
+            (
+                "pi",
+                vec![
+                    "pi",
+                    "--mode",
+                    "json",
+                    "--session",
+                    "session-1",
+                    "--print",
+                    "follow up",
+                ],
+            ),
+        ];
+        for (adapter, expected) in cases {
+            let config = builtin(adapter);
+            let invocation = Harness::new(adapter, &config)
+                .headless_resume_with_model(
+                    "follow up",
+                    Path::new("/tmp"),
+                    "session-1",
+                    AgentSelection::default(),
+                )
+                .unwrap();
+            assert_eq!(invocation.argv, expected, "{adapter}");
+            assert!(invocation.structured_events);
+            assert!(invocation.attach);
+        }
+
+        let config = generic(vec!["agent", "run", "{prompt}"], PromptTransport::Argument);
+        assert!(
+            Harness::new("generic", &config)
+                .headless_resume_with_model(
+                    "follow up",
+                    Path::new("/tmp"),
+                    "session-1",
+                    AgentSelection::default(),
+                )
+                .unwrap_err()
+                .contains("does not support")
+        );
+    }
+
+    #[test]
     fn built_in_adapters_reject_protocol_critical_overrides() {
         let mut config = builtin("codex");
         config.arguments = vec!["--json".to_string()];
         assert!(config.validate("codex").is_err());
         config.arguments = vec!["--sandbox".to_string(), "workspace-write".to_string()];
         config.validate("codex").unwrap();
+
+        let mut pi = builtin("pi");
+        pi.arguments = vec!["--no-session".to_string()];
+        assert!(pi.validate("pi").is_err());
     }
 
     #[test]

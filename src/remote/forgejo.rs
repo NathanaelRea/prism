@@ -105,6 +105,12 @@ impl ForgejoAdapter {
             guarded_merge: SupportLevel::Conditional,
             guarded_merge_reason: None,
             merge_queue: SupportLevel::Unsupported,
+            issue_discovery: SupportLevel::Unsupported,
+            provider_events: SupportLevel::Unsupported,
+            issue_labels: SupportLevel::Unsupported,
+            issue_assignment: SupportLevel::Unsupported,
+            issue_comments: SupportLevel::Unsupported,
+            issue_lifecycle: SupportLevel::Unsupported,
         };
         if let Some(instance) = self.cached_instance() {
             match forgejo_major(&instance.version) {

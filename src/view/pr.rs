@@ -392,17 +392,6 @@ pub(super) fn ci_icon_for_status(status: &str, icon_style: IconStyle) -> &'stati
     }
 }
 
-pub(super) fn auto_status_label(status: AutoRunStatus) -> &'static str {
-    match status {
-        AutoRunStatus::Queued => "queued",
-        AutoRunStatus::Running => "running",
-        AutoRunStatus::Paused => "paused",
-        AutoRunStatus::Done => "done",
-        AutoRunStatus::Failed => "failed",
-        AutoRunStatus::Aborted => "aborted",
-    }
-}
-
 pub(super) fn pr_state_style(summary: &crate::remote::PrSummary) -> Style {
     if !pr_lifecycle_is_known(summary) {
         attention_style()

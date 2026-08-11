@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "platform process policy is shared by optional adapters"
+)]
+
 use std::cell::RefCell;
 use std::env;
 use std::error::Error;
@@ -285,7 +290,7 @@ fn probe_process_group(pid: u32) -> io::Result<bool> {
     )
 }
 
-fn send_process_group_signal(pid: u32, signal: libc::c_int) -> io::Result<bool> {
+pub(crate) fn send_process_group_signal(pid: u32, signal: libc::c_int) -> io::Result<bool> {
     let result = unsafe { libc::kill(-native_pid(pid)?, signal) };
     if result == 0 {
         return Ok(true);
@@ -302,7 +307,12 @@ fn send_process_group_signal(pid: u32, signal: libc::c_int) -> io::Result<bool> 
 fn native_process_identity(pid: u32) -> io::Result<Option<ProcessIdentity>> {
     let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
         Ok(stat) => stat,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            return Ok(None);
+        }
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return Ok(None),
         Err(error) => return Err(error),
     };
@@ -728,6 +738,10 @@ impl<R: Read> Read for CountingReader<R> {
 }
 
 impl SupervisedChild {
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
     pub fn spawn(
         command: &mut Command,
         policy: Option<ProcessPolicy>,

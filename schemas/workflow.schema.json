@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://prism.local/schemas/workflow.schema.json",
+  "title": "Prism Prompt Workflow",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["step"],
+  "properties": {
+    "defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "harness": { "type": "string", "minLength": 1 },
+        "model": { "type": "string", "minLength": 1 },
+        "variant": { "type": "string", "minLength": 1 },
+        "max_agent_runs": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "inputs": {
+      "type": "object",
+      "propertyNames": { "pattern": "^[A-Za-z0-9._-]+$", "maxLength": 64 },
+      "additionalProperties": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["glob"],
+            "properties": {
+              "type": { "const": "file" },
+              "description": { "type": "string", "minLength": 1, "maxLength": 256 },
+              "default": { "type": "string", "minLength": 1 },
+              "glob": { "type": "string", "minLength": 1 }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type"],
+            "properties": {
+              "type": { "const": "string" },
+              "description": { "type": "string", "minLength": 1, "maxLength": 256 },
+              "default": { "type": "string", "minLength": 1, "maxLength": 16384 },
+              "min_length": { "type": "integer", "minimum": 1, "maximum": 16384 },
+              "max_length": { "type": "integer", "minimum": 1, "maximum": 16384 }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type"],
+            "properties": {
+              "type": { "const": "bool" },
+              "description": { "type": "string", "minLength": 1, "maxLength": 256 },
+              "default": { "type": "boolean" }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type"],
+            "properties": {
+              "type": { "const": "number" },
+              "description": { "type": "string", "minLength": 1, "maxLength": 256 },
+              "default": { "type": "number" },
+              "min": { "type": "number" },
+              "max": { "type": "number" }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "options"],
+            "properties": {
+              "type": { "const": "enum" },
+              "description": { "type": "string", "minLength": 1, "maxLength": 256 },
+              "default": { "type": "string", "minLength": 1, "maxLength": 256 },
+              "options": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 256,
+                "uniqueItems": true,
+                "items": { "type": "string", "minLength": 1, "maxLength": 256 }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "step": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._-]+$"
+          },
+          "trigger": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._-]+$"
+          },
+          "depends_on": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9._-]+$"
+            }
+          },
+          "context": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9._-]+$"
+            }
+          },
+          "harness": { "type": "string", "minLength": 1 },
+          "model": { "type": "string", "minLength": 1 },
+          "variant": { "type": "string", "minLength": 1 },
+          "prompt": { "type": "string", "minLength": 1 },
+          "followups": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 }
+          }
+        },
+        "anyOf": [
+          { "required": ["prompt"] },
+          { "required": ["trigger"] }
+        ]
+      }
+    }
+  }
+}

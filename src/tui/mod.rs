@@ -1,15 +1,12 @@
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey, AgentSessionWarmupResult};
-use crate::auto_flow::{AutoOutputLine, PersistedAutoRun};
 use crate::config::Config;
 #[cfg(test)]
 use crate::desktop_notification::DesktopNotifier;
 use crate::input::{Key, KeyInput};
-use crate::plan_run::{PersistedPlanRun, PlanOutputLine};
 use crate::repo::Repository;
 use crate::session::{Session, WorktreeRepositoryKey, WorktreeSessionKey};
 use crate::terminal::stdin_is_tty;
@@ -29,6 +26,7 @@ mod job_orchestration;
 mod job_protocol;
 pub(crate) mod jobs;
 mod navigation;
+mod operator;
 mod presentation;
 mod remote_action;
 mod repository;
@@ -52,10 +50,9 @@ use job_orchestration::ShutdownReason;
 pub(crate) use job_orchestration::{TuiJobKey, TuiJobKind, TuiJobPayload};
 use job_protocol::pr_delivery_key;
 pub(crate) use job_protocol::{
-    DashboardOutputKey, DashboardOutputLines, DashboardOutputResult, DefaultBranchPollResult,
-    DeleteSessionKey, DeleteSessionResult, OpencodeEventResult, OpencodeListenerKey,
-    OpencodePollKey, OpencodePollResult, PrDeliveryKey, PrPersistenceRequest, PrPollKey,
-    PrPollResult, PrSummarySessionResult, SessionRefreshResult, SessionRefreshSnapshot,
+    DefaultBranchPollResult, DeleteSessionKey, DeleteSessionResult, OpencodeEventResult,
+    OpencodeListenerKey, OpencodePollKey, OpencodePollResult, PrDeliveryKey, PrPersistenceRequest,
+    PrPollKey, PrPollResult, PrSummarySessionResult, SessionRefreshResult, SessionRefreshSnapshot,
     TmuxPortalCapture, TmuxPortalResult, TmuxPortalSnapshot, TmuxPortalTarget, WorkflowPollResult,
     WorkflowPollSnapshot, WtHookLogObservation, WtHookLogPollResult, WtObservation, WtPollResult,
 };
@@ -63,8 +60,7 @@ pub(crate) use job_protocol::{
 pub(crate) use navigation::{NavigationSnapshot, PanelFocus, WorktreeListMode};
 use navigation::{OpenTmuxSessionTarget, worktree_updated_label};
 pub(crate) use remote_action::{
-    RemoteActionDelivery, RemoteActionRequest, RemoteActionValue, RemoteMergeOutcome,
-    RemoteMutationTarget, RemotePushPrepared,
+    RemoteActionDelivery, RemoteActionRequest, RemoteActionValue, RemoteMutationTarget,
 };
 use remote_action::{
     RemoteActionReconciliationContext, RemoteMutationReconciliationMarker,
@@ -79,7 +75,6 @@ pub(crate) use repository::{
     ManagedRepo, SelectedRepoContext, SelectedWorktreeContext, WtHookLogInventory,
     load_worktree_harness_configs, maintain_workflow_storage,
 };
-use workflow::{auto_status, plan_status};
 
 pub struct Tui {
     pub(crate) repo: Repository,
@@ -110,7 +105,8 @@ pub struct Tui {
     pub(crate) main_focused: bool,
     pub(crate) main_scroll: usize,
     pub(crate) repo_main_view: view::RepoMainView,
-    pub(crate) worktree_main_view: view::WorktreeMainView,
+    pub(crate) selected_workflow_step: Option<String>,
+    pub(crate) workflow_step_selection_manual: bool,
     pub(crate) worktree_list_mode: WorktreeListMode,
     ui_state_path: Option<PathBuf>,
     pub(crate) selected_comment: usize,
@@ -170,19 +166,6 @@ pub struct Tui {
     pub(crate) routing_tui_jobs: bool,
     scheduling_stopped: bool,
     flight_recorder_servers: Vec<crate::flight_recorder::ServerGuard>,
-    pub(crate) plan_runs: BTreeMap<String, PersistedPlanRun>,
-    pub(crate) active_plan_runs: BTreeMap<PathBuf, String>,
-    pub(crate) selected_plan_step_by_run: BTreeMap<String, usize>,
-    pub(crate) manual_plan_step_selection_by_run: BTreeSet<String>,
-    pub(crate) plan_output_state_by_run: BTreeMap<String, view::PlanOutputViewerState>,
-    pub(crate) plan_output_cache: RefCell<BTreeMap<(String, usize), Vec<PlanOutputLine>>>,
-    pub(crate) auto_runs: BTreeMap<String, PersistedAutoRun>,
-    pub(crate) active_auto_runs: BTreeMap<PathBuf, String>,
-    pub(crate) selected_auto_run: Option<String>,
-    pub(crate) selected_auto_step_by_run: BTreeMap<String, i64>,
-    pub(crate) auto_output_state_by_run: BTreeMap<String, view::AutoOutputViewerState>,
-    pub(crate) auto_output_cache:
-        RefCell<BTreeMap<(WorktreeRepositoryKey, i64), Vec<AutoOutputLine>>>,
     workflow_poll_tx: LatestSender<WorktreeRepositoryKey, WorkflowPollResult>,
     workflow_poll_rx: LatestReceiver<WorktreeRepositoryKey, WorkflowPollResult>,
     workflow_polls_in_flight: BTreeSet<WorktreeRepositoryKey>,
@@ -190,11 +173,7 @@ pub struct Tui {
     workflow_revision: u64,
     worker_health: Option<Result<(), String>>,
     workspace_repositories: BTreeMap<WorktreeRepositoryKey, RepositorySnapshot>,
-    linked_plan_runs: BTreeMap<String, PersistedPlanRun>,
-    dashboard_output_tx: LatestSender<DashboardOutputKey, DashboardOutputResult>,
-    dashboard_output_rx: LatestReceiver<DashboardOutputKey, DashboardOutputResult>,
-    dashboard_outputs_in_flight: BTreeSet<DashboardOutputKey>,
-    dashboard_output_last_polled: BTreeMap<DashboardOutputKey, Instant>,
+    selected_workflow_run: Option<String>,
     pub(crate) repo_filter: String,
     pub(crate) worktree_filter: String,
     pub(crate) leader_hint: Option<LeaderHint>,
@@ -231,7 +210,6 @@ pub(crate) struct TuiBackgroundChanges {
     opencode_status: bool,
     opencode_events: bool,
     workflows: bool,
-    dashboard_output: bool,
     pull_requests: bool,
     delete_sessions: bool,
     status_message: bool,
@@ -248,7 +226,6 @@ impl TuiBackgroundChanges {
             || self.opencode_status
             || self.opencode_events
             || self.workflows
-            || self.dashboard_output
             || self.pull_requests
             || self.delete_sessions
             || self.status_message
@@ -279,8 +256,6 @@ impl Tui {
             latest_channel(|result: &RemoteActionDelivery| result.id);
         let (workflow_poll_tx, workflow_poll_rx) =
             latest_channel(|result: &WorkflowPollResult| result.repository.clone());
-        let (dashboard_output_tx, dashboard_output_rx) =
-            latest_channel(|result: &DashboardOutputResult| result.key.clone());
         let (session_refresh_tx, session_refresh_rx) =
             latest_channel(|result: &SessionRefreshResult| result.base_generation);
         let (workflow_maintenance_tx, workflow_maintenance_rx) = latest_channel(|_| ());
@@ -354,7 +329,8 @@ impl Tui {
             main_focused: false,
             main_scroll: 0,
             repo_main_view: view::RepoMainView::ChangeRequests,
-            worktree_main_view: view::WorktreeMainView::Details,
+            selected_workflow_step: None,
+            workflow_step_selection_manual: false,
             worktree_list_mode: WorktreeListMode::Repo,
             ui_state_path: None,
             selected_comment: 0,
@@ -412,18 +388,6 @@ impl Tui {
             routing_tui_jobs: false,
             scheduling_stopped: false,
             flight_recorder_servers: Vec::new(),
-            plan_runs: BTreeMap::new(),
-            active_plan_runs: BTreeMap::new(),
-            selected_plan_step_by_run: BTreeMap::new(),
-            manual_plan_step_selection_by_run: BTreeSet::new(),
-            plan_output_state_by_run: BTreeMap::new(),
-            plan_output_cache: RefCell::new(BTreeMap::new()),
-            auto_runs: BTreeMap::new(),
-            active_auto_runs: BTreeMap::new(),
-            selected_auto_run: None,
-            selected_auto_step_by_run: BTreeMap::new(),
-            auto_output_state_by_run: BTreeMap::new(),
-            auto_output_cache: RefCell::new(BTreeMap::new()),
             workflow_poll_tx,
             workflow_poll_rx,
             workflow_polls_in_flight: BTreeSet::new(),
@@ -431,11 +395,7 @@ impl Tui {
             workflow_revision: 0,
             worker_health: None,
             workspace_repositories: BTreeMap::new(),
-            linked_plan_runs: BTreeMap::new(),
-            dashboard_output_tx,
-            dashboard_output_rx,
-            dashboard_outputs_in_flight: BTreeSet::new(),
-            dashboard_output_last_polled: BTreeMap::new(),
+            selected_workflow_run: None,
             repo_filter: String::new(),
             worktree_filter: String::new(),
             leader_hint: None,
@@ -711,10 +671,12 @@ impl Tui {
                 }
                 Key::PreviousBlock => {
                     self.clear_leader_hint();
+                    self.select_adjacent_workflow(-1);
                     pending_g = false;
                 }
                 Key::NextBlock => {
                     self.clear_leader_hint();
+                    self.select_adjacent_workflow(1);
                     pending_g = false;
                 }
                 Key::PreviousView => {
@@ -736,6 +698,10 @@ impl Tui {
                 Key::OpenTmuxSession => {
                     self.clear_leader_hint();
                     pending_g = false;
+                    if self.handle_workflow_enter() {
+                        self.draw(runtime)?;
+                        continue;
+                    }
                     if self.open_selected_comment_dialog(runtime)? {
                         self.draw(runtime)?;
                         continue;
@@ -744,16 +710,35 @@ impl Tui {
                         OpenTmuxSessionTarget::RepoDefaultAgent(index) => {
                             self.enter_agent_mode_for_index(runtime, index)?
                         }
-                        OpenTmuxSessionTarget::PlanPhaseAgent => {
-                            if let Err(error) = self.open_current_plan_tmux_session(runtime) {
-                                self.show_error("plan phase tmux failed", &error)?;
-                            }
-                        }
                         OpenTmuxSessionTarget::WorktreeAgent => self.enter_agent_mode(runtime)?,
                         OpenTmuxSessionTarget::RepoPr => {
                             self.open_selected_repo_pr_agent(runtime)?
                         }
                         OpenTmuxSessionTarget::Blocked(message) => self.show_message(message)?,
+                    }
+                }
+                Key::WorkflowLauncher => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if let Err(error) = self.launch_workflow(runtime) {
+                        self.show_error("workflow launcher failed", &error)?;
+                    }
+                }
+                Key::WorkflowPauseResume => {
+                    if let Err(error) = self.control_selected_workflow(runtime, "toggle") {
+                        self.show_error("Workflow control failed", &error)?;
+                    }
+                }
+                Key::WorkflowRetry => {
+                    if let Err(error) = self.control_selected_workflow(runtime, "retry") {
+                        self.show_error("Workflow retry failed", &error)?;
+                    }
+                }
+                Key::Configuration => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if let Err(error) = self.show_configuration_tree(runtime) {
+                        self.show_error("configuration failed", &error)?;
                     }
                 }
                 Key::LazyGit => {
@@ -769,16 +754,6 @@ impl Tui {
                         {
                             self.show_error("lazygit failed", &error)?;
                         }
-                    }
-                }
-                Key::AutoFlow => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if self.focused_panel == PanelFocus::Status {
-                    } else if self.focused_panel != PanelFocus::Worktrees {
-                        self.show_message("focus worktrees to start or focus Auto Flow")?;
-                    } else if let Err(error) = self.start_or_focus_selected_auto_run(runtime) {
-                        self.show_error("auto flow failed", &error)?;
                     }
                 }
                 Key::OpenPr => {
@@ -827,13 +802,6 @@ impl Tui {
                         self.show_error("terminal failed", &error)?;
                     }
                 }
-                Key::PlanActions => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if let Err(error) = self.show_plan_actions_dialog(runtime) {
-                        self.show_error("plan actions failed", &error)?;
-                    }
-                }
                 Key::Help => {
                     self.clear_leader_hint();
                     pending_g = false;
@@ -876,33 +844,6 @@ impl Tui {
                         self.show_error("select repository failed", &error)?;
                     }
                 }
-                Key::ReviewFix => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if self.git_action_enabled(GitAction::ReviewFix)
-                        && let Err(error) = self.start_review_fix(runtime)
-                    {
-                        self.show_error("review fix failed", &error)?;
-                    }
-                }
-                Key::CiFix => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if self.git_action_enabled(GitAction::CiFix)
-                        && let Err(error) = self.start_ci_fix(runtime)
-                    {
-                        self.show_error("CI failure prompt failed", &error)?;
-                    }
-                }
-                Key::ResolveAllComments => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if self.git_action_enabled(GitAction::ResolveAllComments)
-                        && let Err(error) = self.resolve_review_comments(runtime)
-                    {
-                        self.show_error("resolve review comments failed", &error)?;
-                    }
-                }
                 Key::Push => {
                     self.clear_leader_hint();
                     pending_g = false;
@@ -916,9 +857,36 @@ impl Tui {
                     self.clear_leader_hint();
                     pending_g = false;
                     if self.git_action_enabled(GitAction::Merge)
-                        && let Err(error) = self.merge_selected_pr(runtime)
+                        && let Err(error) = self.launch_stabilization_workflow(runtime)
                     {
-                        self.show_error("merge failed", &error)?;
+                        self.show_error("merge workflow failed", &error)?;
+                    }
+                }
+                Key::CiFix => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if self.git_action_enabled(GitAction::CiFix)
+                        && let Err(error) = self.launch_stabilization_workflow(runtime)
+                    {
+                        self.show_error("CI repair workflow failed", &error)?;
+                    }
+                }
+                Key::ReviewFix => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if self.git_action_enabled(GitAction::ReviewFix)
+                        && let Err(error) = self.launch_stabilization_workflow(runtime)
+                    {
+                        self.show_error("review repair workflow failed", &error)?;
+                    }
+                }
+                Key::ResolveAllComments => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if self.git_action_enabled(GitAction::ResolveAllComments)
+                        && let Err(error) = self.resolve_review_comments(runtime)
+                    {
+                        self.show_error("resolve review comments failed", &error)?;
                     }
                 }
                 Key::PullDefault => {
@@ -928,16 +896,6 @@ impl Tui {
                         self.show_message("focus repos to pull the default branch")?;
                     } else if let Err(error) = self.pull_default_branch(runtime) {
                         self.show_error("pull failed", &error)?;
-                    }
-                }
-                Key::PlanMode => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if self.focused_panel == PanelFocus::Status {
-                    } else if self.focused_panel != PanelFocus::Worktrees {
-                        self.show_message("focus worktrees to run plan mode")?;
-                    } else if let Err(error) = self.start_selected_worktree_plan_run(runtime) {
-                        self.show_error("plan mode failed", &error)?;
                     }
                 }
                 Key::Create => {
@@ -963,17 +921,17 @@ impl Tui {
                 Key::AbortOpencode => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    if self.focused_panel != PanelFocus::Worktrees {
-                        self.show_message("focus worktrees to abort an agent session")?;
-                    } else if let Err(error) = self.abort_selected_opencode_session(runtime) {
-                        self.show_error("abort failed", &error)?;
-                    }
-                }
-                Key::ManageRepos => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if let Err(error) = self.edit_repositories(runtime) {
-                        self.show_error("edit repositories failed", &error)?;
+                    match self.control_selected_workflow(runtime, "cancel") {
+                        Ok(true) => {}
+                        Ok(false) if self.focused_panel != PanelFocus::Worktrees => {
+                            self.show_message("focus worktrees to abort an agent session")?;
+                        }
+                        Ok(false) => {
+                            if let Err(error) = self.abort_selected_opencode_session(runtime) {
+                                self.show_error("abort failed", &error)?;
+                            }
+                        }
+                        Err(error) => self.show_error("Workflow control failed", &error)?,
                     }
                 }
                 Key::OpenRemotePrs => {
@@ -992,10 +950,7 @@ impl Tui {
                 Key::Delete => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    let handled =
-                        self.dismiss_selected_auto_run()? || self.dismiss_selected_plan_run()?;
-                    if handled {
-                    } else if self.focused_panel == PanelFocus::Status {
+                    if self.focused_panel == PanelFocus::Status {
                         self.show_message("focus worktrees to delete a worktree/session")?;
                     } else if self.focused_panel == PanelFocus::Repos {
                         self.show_message("repository removal is available from r")?;
@@ -1015,50 +970,12 @@ impl Tui {
                 Key::DeletePermanent => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    let handled =
-                        self.dismiss_selected_auto_run()? || self.dismiss_selected_plan_run()?;
-                    if handled {
-                    } else if self.focused_panel != PanelFocus::Worktrees {
+                    if self.focused_panel != PanelFocus::Worktrees {
                         self.show_message(
                             "focus worktrees to permanently delete a worktree/session",
                         )?;
                     } else if let Err(error) = self.delete_session(runtime) {
                         self.show_error("delete failed", &error)?;
-                    }
-                }
-                Key::EditWorktreeColumns => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if let Err(error) = self.edit_worktree_columns(runtime) {
-                        self.show_error("edit worktree columns failed", &error)?;
-                    }
-                }
-                Key::EditConfig => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if let Err(error) = self.edit_config(runtime) {
-                        self.show_error("edit config failed", &error)?;
-                    }
-                }
-                Key::EditUserConfig => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if let Err(error) = self.edit_user_config(runtime) {
-                        self.show_error("edit user config failed", &error)?;
-                    }
-                }
-                Key::EditWorktrunkConfig => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if let Err(error) = self.edit_worktrunk_user_config(runtime) {
-                        self.show_error("edit Worktrunk config failed", &error)?;
-                    }
-                }
-                Key::SelectHarness => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if let Err(error) = self.select_default_harness(runtime) {
-                        self.show_error("select harness failed", &error)?;
                     }
                 }
                 Key::Search => {

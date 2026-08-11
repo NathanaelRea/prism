@@ -5,16 +5,16 @@ use std::time::Instant;
 
 use crate::remote::{PrCache, PrDetails, PrReviewComment};
 use crate::repo::Repository;
-use crate::view::{ChoiceList, RepoMainView};
+use crate::view::RepoMainView;
 
-use super::super::{GitAction, PanelFocus, PrPollResult, Tui, selectable_choice_key};
+use super::super::{GitAction, PanelFocus, PrPollResult, Tui};
 use super::support::{
     test_change_request_identity, test_change_request_identity_for, test_config, test_pr_summary,
     test_session, unique_temp_dir,
 };
 
 #[test]
-fn git_actions_allow_push_before_remote_capabilities_or_a_pr_are_known() {
+fn open_pr_action_requires_an_observed_change_request() {
     let repo = Repository {
         root: PathBuf::from("/tmp/repo"),
     };
@@ -25,50 +25,21 @@ fn git_actions_allow_push_before_remote_capabilities_or_a_pr_are_known() {
     );
     tui.focused_panel = PanelFocus::Worktrees;
 
-    assert!(tui.git_action_enabled(GitAction::Push));
     assert!(!tui.git_action_enabled(GitAction::OpenPr));
-    assert!(!tui.git_action_enabled(GitAction::Merge));
 
     tui.repos[0].remote_capabilities = Some(crate::remote::Capabilities::for_provider(
         crate::remote::ProviderKind::GitHub,
     ));
-    assert!(tui.git_action_enabled(GitAction::Push));
-
     tui.sessions[0].pr = PrCache::observed(test_pr_summary(false), None);
     assert!(tui.git_action_enabled(GitAction::OpenPr));
-    assert!(tui.git_action_enabled(GitAction::Merge));
-    assert!(!tui.git_action_enabled(GitAction::CiFix));
-    tui.sessions[0].pr = PrCache::observed(
-        test_pr_summary(false),
-        Some(PrDetails {
-            failing_checks: vec!["external-ci".to_string()],
-            ..PrDetails::default()
-        }),
-    );
-    assert!(tui.git_action_enabled(GitAction::CiFix));
-    tui.sessions[0].pr = PrCache::observed(
-        test_pr_summary(false),
-        Some(PrDetails {
-            ci_failures: vec![crate::remote::CachedCiFailure {
-                name: "failed".to_string(),
-                ..crate::remote::CachedCiFailure::default()
-            }],
-            ..PrDetails::default()
-        }),
-    );
-    assert!(tui.git_action_enabled(GitAction::CiFix));
 
     tui.sessions[0].pr = PrCache::observed(test_pr_summary(true), None);
     assert!(tui.git_action_enabled(GitAction::OpenPr));
-    assert!(!tui.git_action_enabled(GitAction::Merge));
-    assert!(!tui.git_action_enabled(GitAction::ReviewFix));
 
     let mut closed = test_pr_summary(false);
     closed.state = "CLOSED".to_string();
     tui.sessions[0].pr = PrCache::observed(closed, None);
     assert!(tui.git_action_enabled(GitAction::OpenPr));
-    assert!(!tui.git_action_enabled(GitAction::Merge));
-    assert!(!tui.git_action_enabled(GitAction::CiFix));
 }
 
 #[test]
@@ -185,42 +156,6 @@ fn repository_change_request_selection_uses_canonical_identity_across_reordering
 }
 
 #[test]
-fn conditional_ci_repair_requires_loaded_failure_evidence() {
-    let repo = Repository {
-        root: PathBuf::from("/tmp/repo"),
-    };
-    let mut tui = Tui::new_single(
-        repo,
-        test_config(),
-        vec![test_session(0, "/tmp/repo", "feature")],
-    );
-    tui.focused_panel = PanelFocus::Worktrees;
-    tui.repos[0].remote_capabilities = Some(crate::remote::Capabilities::for_provider(
-        crate::remote::ProviderKind::Forgejo,
-    ));
-    tui.sessions[0].pr = PrCache::observed(test_pr_summary(false), None);
-
-    assert!(!tui.git_action_enabled(GitAction::CiFix));
-
-    tui.sessions[0].pr = PrCache::observed(
-        test_pr_summary(false),
-        Some(PrDetails {
-            ci_failures: vec![crate::remote::CachedCiFailure {
-                name: "failed".to_string(),
-                log_tail: "failure evidence".to_string(),
-                ..crate::remote::CachedCiFailure::default()
-            }],
-            ..PrDetails::default()
-        }),
-    );
-    assert!(tui.git_action_enabled(GitAction::CiFix));
-
-    tui.repos[0].remote_capabilities.as_mut().unwrap().ci_logs =
-        crate::remote::SupportLevel::Unsupported;
-    assert!(!tui.git_action_enabled(GitAction::CiFix));
-}
-
-#[test]
 fn review_resolution_action_requires_main_panel_and_unresolved_threads() {
     let repo = Repository {
         root: PathBuf::from("/tmp/repo"),
@@ -281,62 +216,4 @@ fn review_resolution_action_requires_main_panel_and_unresolved_threads() {
         }),
     );
     assert!(!tui.git_action_enabled(GitAction::ResolveAllComments));
-}
-
-#[test]
-fn conditional_remote_operations_are_disabled_and_not_selectable() {
-    let repo = Repository {
-        root: PathBuf::from("/tmp/repo"),
-    };
-    let mut tui = Tui::new_single(
-        repo,
-        test_config(),
-        vec![test_session(0, "/tmp/repo", "feature")],
-    );
-    tui.focused_panel = PanelFocus::Worktrees;
-    tui.sessions[0].pr = PrCache::observed(test_pr_summary(false), None);
-    let mut capabilities =
-        crate::remote::Capabilities::for_provider(crate::remote::ProviderKind::GitHub);
-    capabilities.guarded_merge = crate::remote::SupportLevel::Conditional;
-    tui.repos[0].remote_capabilities = Some(capabilities);
-
-    let choice = tui.git_choice(GitAction::Merge, "M", "merge");
-    let choices = ChoiceList {
-        title: "Git Actions".to_string(),
-        choices: vec![choice.clone()],
-    };
-
-    assert!(choice.disabled);
-    assert!(choice.label.contains("conditional support not established"));
-    assert_eq!(selectable_choice_key(&choices, "M"), None);
-    assert!(!tui.git_action_enabled(GitAction::Merge));
-}
-
-#[test]
-fn gitlab_rebase_merge_choice_uses_adapter_capability_reason() {
-    let repo = Repository {
-        root: PathBuf::from("/tmp/repo"),
-    };
-    let mut tui = Tui::new_single(
-        repo,
-        test_config(),
-        vec![test_session(0, "/tmp/repo", "feature")],
-    );
-    tui.focused_panel = PanelFocus::Worktrees;
-    tui.sessions[0].pr = PrCache::observed(test_pr_summary(false), None);
-    let mut capabilities =
-        crate::remote::Capabilities::for_provider(crate::remote::ProviderKind::GitLab);
-    capabilities.guarded_merge = crate::remote::SupportLevel::Unsupported;
-    capabilities.guarded_merge_reason =
-        Some("GitLab adapter does not support rebase merges".to_string());
-    tui.repos[0].remote_capabilities = Some(capabilities);
-
-    let choice = tui.git_choice(GitAction::Merge, "M", "merge");
-
-    assert!(choice.disabled);
-    assert!(
-        choice
-            .label
-            .contains("GitLab adapter does not support rebase merges")
-    );
 }

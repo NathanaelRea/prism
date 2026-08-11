@@ -1,0 +1,25 @@
+[defaults]
+model = "gpt-5.6-sol"
+variant = "medium"
+
+[[step]]
+trigger = "merge_conflict"
+prompt = """
+Bring this branch up to date, resolving its merge conflicts, then commit and push.
+"""
+
+[[step]]
+trigger = "needs_review"
+prompt = """
+There are review comments on this PR. Fix them when applicable, commit, and push.
+"""
+
+[[step]]
+trigger = "ci_failure"
+variant = "xhigh"
+prompt = """
+CI is failing. Fix the issues, commit, and push.
+"""
+
+[[step]]
+trigger = "ready_to_merge"

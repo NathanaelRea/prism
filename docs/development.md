@@ -1,8 +1,9 @@
 # Development
 
-Install the pinned SQLx CLI compatible with the crate's SQLx dependency:
+Install the pinned test runner and SQLx CLI used by the local gate:
 
 ```sh
+cargo install cargo-nextest --version 0.9.143 --locked
 cargo install sqlx-cli --version 0.8.6 --locked --no-default-features --features sqlite,rustls
 ```
 
@@ -19,27 +20,28 @@ for migration in migrations/workflow/*.sql; do
   sqlite3 "$db" ".read $migration"
 done
 cargo sqlx prepare --workspace --database-url "sqlite://$db" -- --all-targets
-env DOCS_RS=1 PKG_CONFIG_ALLOW_CROSS=1 LIBSQLITE3_SYS_USE_PKG_CONFIG=1 \
-  CC_aarch64_apple_darwin=clang \
-  cargo sqlx prepare --workspace --database-url "sqlite://$db" \
-    -- --all-targets --target aarch64-apple-darwin
 rm -f "$db" "$db-wal" "$db-shm" "$workflow_db" "$workflow_db-wal" "$workflow_db-shm"
 ```
 
 Review and commit the resulting `.sqlx` changes. `scripts/full-check.sh` verifies
 that this metadata is current and then compiles/tests with `SQLX_OFFLINE=true`.
 
-Run the local CI gate before pushing:
+Run the fast native gate during routine development:
+
+```sh
+scripts/check.sh
+```
+
+Run the exhaustive metadata gate before pushing:
 
 ```sh
 scripts/full-check.sh
 ```
 
-Prism supports Linux and macOS. On Linux, the gate runs native tests and clippy,
-the host-independent policy tests for both supported operating systems, and
-Darwin cross-clippy for Apple Silicon. There are no architecture-specific code
-paths warranting a duplicate Intel cross-check. Cross-compilation does not
-replace native macOS verification.
+Prism supports Linux and macOS. Both gates run native tests and clippy plus the
+host-independent policy tests for both supported operating systems. The full
+gate additionally verifies SQLx metadata freshness. CI runs it natively on both
+Linux and macOS; cross-compilation does not replace native platform verification.
 
 Run the focused native contracts on a prepared macOS host before the complete
 suite:
@@ -154,8 +156,6 @@ Prism stores per-repository runtime state in `prism.db` under the user's Prism c
 
 - `task_metadata`, `hidden_session`, `agent_state`: worktree session metadata and local session state.
 - `opencode_runtime`: OpenCode server/session records associated with worktrees.
-- `plan_run`, `plan_step_run`, `plan_output_line`: persisted Plan Mode runs, step state, and bounded step output.
-- `auto_run`, `auto_step_run`, `auto_output_line`, `auto_event`: persisted Auto Flow runs, attempts, output, and event history.
 - `pr_cache`, `pr_details_cache`: provider-neutral change-request summary and
   detail caches; the historical table names are retained for migration safety.
 - `event`, `startup_run`, `startup_phase`: observability events and startup timing records.
@@ -163,7 +163,7 @@ Prism stores per-repository runtime state in `prism.db` under the user's Prism c
 The generalized worker owns the separate user-scoped `workflow.db` in the Prism
 config directory. It contains definition snapshots, runs, steps, fenced
 attempts, output, artifacts, approvals, effects, triggers, resource claims,
-import journals, audit events, and control-plane metrics. Repository migrations
+audit events, and control-plane metrics. Repository migrations
 must never be run against this database, and workflow migrations must never be
 run against `prism.db`.
 

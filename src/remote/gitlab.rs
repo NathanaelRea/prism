@@ -81,6 +81,12 @@ impl GitLabAdapter {
             guarded_merge: SupportLevel::Supported,
             guarded_merge_reason: None,
             merge_queue: SupportLevel::Conditional,
+            issue_discovery: SupportLevel::Unsupported,
+            provider_events: SupportLevel::Unsupported,
+            issue_labels: SupportLevel::Unsupported,
+            issue_assignment: SupportLevel::Unsupported,
+            issue_comments: SupportLevel::Unsupported,
+            issue_lifecycle: SupportLevel::Unsupported,
         };
         if self.merge_method == crate::config::MergeMethod::Rebase {
             capabilities.guarded_merge = SupportLevel::Unsupported;
@@ -2357,6 +2363,12 @@ fn descriptor_for(operation: RemoteOperation) -> ProcessDescriptor {
         RemoteOperation::MergeChangeRequest => "glab.mr.merge",
         RemoteOperation::ObserveMergeQueue => "glab.mr.merge_train",
         RemoteOperation::DiscoverRepository => "glab.repository.metadata",
+        RemoteOperation::DiscoverIssues => "glab.issue.list",
+        RemoteOperation::ObserveProviderEvents => "glab.events",
+        RemoteOperation::MutateLabels => "glab.issue.labels",
+        RemoteOperation::MutateAssignment => "glab.issue.assignment",
+        RemoteOperation::CreateIssueComment => "glab.issue.comment",
+        RemoteOperation::MutateIssueLifecycle => "glab.issue.lifecycle",
     })
 }
 

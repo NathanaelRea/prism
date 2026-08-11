@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::time::{Duration, Instant};
 
@@ -8,183 +8,14 @@ use crate::remote::{PrCache, PrDetails, PrReview, PrReviewComment};
 use crate::repo::Repository;
 
 use super::super::{
-    RemoteActionDelivery, RemoteActionReconciliationContext, RemoteActionValue, RemoteMergeOutcome,
-    RemoteMutationTarget, RemotePushPrepared, Tui, TuiJobKey, TuiJobKind, TuiJobPayload,
+    RemoteActionDelivery, RemoteActionReconciliationContext, RemoteActionValue,
+    RemoteMutationTarget, Tui, TuiJobKey, TuiJobKind, TuiJobPayload,
     remote_action_abandon_requested, remote_action_timeout, remote_mutation_targets_overlap,
 };
 use super::support::{
     test_change_request_identity, test_config, test_pr_summary, test_session, test_tui,
     unique_temp_dir,
 };
-
-#[test]
-fn cleanup_finishes_and_persists_accepted_remote_mutations() {
-    let temp = unique_temp_dir("prism-tui-mutation-shutdown-test");
-    fs::create_dir_all(&temp).unwrap();
-    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
-    let branches = ["create", "resolve", "push", "merge"];
-    let sessions = branches
-        .iter()
-        .map(|branch| test_session(0, &temp.join(branch).display().to_string(), branch))
-        .collect::<Vec<_>>();
-    let mut tui = Tui::new_single(repo.clone(), test_config(), sessions);
-    let mut releases = Vec::new();
-    let (started_tx, started_rx) = std::sync::mpsc::channel();
-
-    for (index, branch) in branches.iter().enumerate() {
-        let worktree = tui.sessions[index].identity_key(&tui.repos[0].identity);
-        let key = TuiJobKey::Worktree(worktree);
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        releases.push(release_tx);
-        let started_tx = started_tx.clone();
-        let mut summary = test_pr_summary(false);
-        summary.number = index as u64 + 10;
-        summary.head_ref = (*branch).to_string();
-        let change_request = test_change_request_identity(crate::remote::ProviderKind::GitHub);
-        summary.change_request_identity = Some(change_request.clone());
-        let target = match *branch {
-            "create" => RemoteMutationTarget::Create {
-                source_provider: crate::remote::ProviderKind::GitHub,
-                source_host: "github.com".to_string(),
-                source_project: "example/repo".to_string(),
-                source_branch: (*branch).to_string(),
-                expected_head_sha: summary.head_sha.clone(),
-                target_provider: Some(crate::remote::ProviderKind::GitHub),
-                target_host: "github.com".to_string(),
-                target_project: "example/repo".to_string(),
-                target_branch: summary.base_ref.clone(),
-                expected_base_sha: "base123".to_string(),
-            },
-            "resolve" => RemoteMutationTarget::Resolve {
-                change_request: change_request.clone(),
-                thread_ids: vec!["thread-1".to_string()],
-            },
-            "push" => RemoteMutationTarget::Push {
-                remote: "origin".to_string(),
-                branch: (*branch).to_string(),
-                expected_head_sha: summary.head_sha.clone(),
-                repository_provider: None,
-                repository_host: String::new(),
-                repository_project: String::new(),
-            },
-            "merge" => RemoteMutationTarget::Merge {
-                change_request,
-                expected_head_sha: summary.head_sha.clone(),
-            },
-            _ => unreachable!(),
-        };
-        let cache = PrCache::observed(summary, None);
-        let payload_session = if *branch == "merge" {
-            let mut session = test_session(0, &temp.join(branch).display().to_string(), branch);
-            session.pr = cache.clone();
-            Some(session)
-        } else {
-            None
-        };
-        let branch = *branch;
-        let id = tui.spawn_tui_job(
-                TuiJobKind::RemoteAction,
-                key,
-                0,
-                None,
-                format!("accepted-{branch}"),
-                move |context| {
-                    started_tx.send(()).unwrap();
-                    release_rx.recv().unwrap();
-                    let value = match branch {
-                        "create" => RemoteActionValue::Cache(Box::new(cache)),
-                        "resolve" => RemoteActionValue::Resolved {
-                            cache: Box::new(cache),
-                            count: 1,
-                        },
-                        "push" => RemoteActionValue::PushPrepared(Box::new(RemotePushPrepared {
-                            cache,
-                            origin_repository: None,
-                            upstream_repository: None,
-                            push_guard: None,
-                        })),
-                        "merge" => RemoteActionValue::MergeExecution {
-                            session: Box::new(payload_session.unwrap()),
-                            result: Ok(RemoteMergeOutcome {
-                                execution: crate::auto_flow::stabilization_execute::ManualMergeExecution::Blocked(
-                                    crate::auto_flow::stabilization_model::StabilizationState {
-                                        status: crate::auto_flow::stabilization_model::StabilizationStatus::Blocked,
-                                        blocker: crate::auto_flow::stabilization_model::StabilizationBlocker::MergeBlocked,
-                                        next_work: crate::auto_flow::stabilization_model::StabilizationWorkKind::Escalate,
-                                        reason: "test terminal merge payload".to_string(),
-                                    },
-                                ),
-                                verification: None,
-                            }),
-                        },
-                        _ => unreachable!(),
-                    };
-                    Ok(Some(TuiJobPayload::RemoteAction(Box::new(
-                        RemoteActionDelivery {
-                            id: context.id(),
-                            result: Ok(value),
-                        },
-                    ))))
-                },
-            );
-        tui.remote_actions_requiring_reconciliation.insert(id);
-        tui.remote_action_reconciliation_contexts.insert(
-            id,
-            RemoteActionReconciliationContext {
-                key: TuiJobKey::Worktree(tui.sessions[index].identity_key(&tui.repos[0].identity)),
-                target,
-            },
-        );
-    }
-
-    let (ordinary_stopped_tx, ordinary_stopped_rx) = std::sync::mpsc::channel();
-    let ordinary_started_tx = started_tx.clone();
-    tui.spawn_tui_job(
-        TuiJobKind::PrSummary,
-        TuiJobKey::Repository(tui.repos[0].identity.clone()),
-        0,
-        None,
-        "ordinary-shutdown-poll".to_string(),
-        move |context| {
-            ordinary_started_tx.send(()).unwrap();
-            while !context.wait(Duration::from_secs(60)) {}
-            ordinary_stopped_tx.send(()).unwrap();
-            Ok(None)
-        },
-    );
-    drop(started_tx);
-    for _ in 0..=branches.len() {
-        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    }
-    let releaser = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(25));
-        for release in releases {
-            release.send(()).unwrap();
-        }
-    });
-
-    tui.cleanup_tui_jobs(super::super::ShutdownReason::Sigterm)
-        .unwrap();
-    releaser.join().unwrap();
-
-    ordinary_stopped_rx
-        .recv_timeout(Duration::from_secs(1))
-        .unwrap();
-    assert!(tui.remote_actions_requiring_reconciliation.is_empty());
-    assert!(!tui.jobs.has_jobs());
-    let mut delivered = BTreeSet::new();
-    while let Ok(delivery) = tui.remote_action_rx.try_recv() {
-        assert!(delivery.result.is_ok());
-        delivered.insert(delivery.id);
-    }
-    assert_eq!(delivered.len(), 4);
-    for (index, branch) in branches.iter().enumerate() {
-        let persisted = crate::remote::load_pr_cache(&repo, branch);
-        assert_eq!(persisted.summary().unwrap().number, index as u64 + 10);
-    }
-
-    fs::remove_dir_all(temp).unwrap();
-}
 
 #[test]
 fn empty_list_retains_persisted_create_marker_until_matching_summary_is_observed() {
@@ -258,45 +89,6 @@ fn empty_list_retains_persisted_create_marker_until_matching_summary_is_observed
     )
     .unwrap();
     assert!(marker.is_none());
-
-    fs::remove_dir_all(temp).unwrap();
-}
-
-#[test]
-fn accepted_then_transport_error_remains_reconciliation_required() {
-    let temp = unique_temp_dir("prism-tui-accepted-transport-error-test");
-    fs::create_dir_all(&temp).unwrap();
-    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
-    let mut session = test_session(0, &temp.join("worktree").display().to_string(), "feature");
-    session.pr = PrCache::observed(test_pr_summary(false), None);
-    let mut tui = Tui::new_single(repo.clone(), test_config(), vec![session]);
-    let repository = tui.repos[0].identity.clone();
-    let key = TuiJobKey::Worktree(tui.sessions[0].identity_key(&repository));
-    let mut summary = test_pr_summary(false);
-    summary.change_request_identity = Some(test_change_request_identity(
-        crate::remote::ProviderKind::GitHub,
-    ));
-    let target = RemoteMutationTarget::Merge {
-        change_request: summary.change_request_identity.clone().unwrap(),
-        expected_head_sha: summary.head_sha.clone(),
-    };
-    let result = Ok(RemoteActionValue::MergeExecution {
-        session: Box::new(tui.sessions[0].background_job_snapshot()),
-        result: Err("provider accepted mutation before transport failed".to_string()),
-    });
-
-    tui.retain_uncertain_remote_action_result(&key, 17, &result, &target)
-        .unwrap();
-
-    assert!(tui.remote_action_reconciliation_blocked(&key, &target));
-    assert!(tui.sessions[0].pr.trusted_summary().is_err());
-    drop(tui);
-
-    let session = test_session(0, &temp.join("worktree").display().to_string(), "feature");
-    let restarted = Tui::new_single(repo, test_config(), vec![session]);
-    let restarted_key =
-        TuiJobKey::Worktree(restarted.sessions[0].identity_key(&restarted.repos[0].identity));
-    assert!(restarted.remote_action_reconciliation_blocked(&restarted_key, &target));
 
     fs::remove_dir_all(temp).unwrap();
 }
@@ -554,6 +346,31 @@ fn push_remote_action_cannot_be_abandoned_and_reconciles_after_generation_change
     assert_eq!(delivery.id, id);
     assert!(matches!(delivery.result, Ok(RemoteActionValue::Complete)));
     tui.remote_actions_requiring_reconciliation.remove(&id);
+}
+
+#[test]
+fn queued_remote_timing_updates_the_visible_progress_dialog() {
+    let temp = unique_temp_dir("prism-tui-remote-wait-progress-test");
+    fs::create_dir_all(&temp).unwrap();
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let session = test_session(0, &temp.display().to_string(), "feature");
+    let mut tui = Tui::new_single(repo, test_config(), vec![session]);
+    tui.dialog = Some(crate::view::DialogModel::Progress {
+        title: "Remote".into(),
+        message: "Starting".into(),
+    });
+
+    tui.route_tui_job_payload(TuiJobPayload::RemoteActionProgress {
+        id: 42,
+        message: "waiting for github.com request slot; position 2".into(),
+    });
+
+    assert!(matches!(
+        tui.dialog,
+        Some(crate::view::DialogModel::Progress { ref message, .. })
+            if message.contains("position 2")
+    ));
+    let _ = fs::remove_dir_all(temp);
 }
 
 #[test]

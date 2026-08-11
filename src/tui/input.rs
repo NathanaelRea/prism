@@ -68,18 +68,13 @@ impl KeyInput {
             KeyCode::Char('3') if plain_char(event) => Key::FocusWorktrees,
             KeyCode::Char('4'..='9') if plain_char(event) => Key::Other,
             KeyCode::Char('p') if plain_char(event) => Key::PullDefault,
-            KeyCode::Char('P') if plain_char(event) => Key::PlanMode,
+            KeyCode::Char('W') if plain_char(event) => Key::WorkflowLauncher,
+            KeyCode::Char('u') if plain_char(event) => Key::WorkflowPauseResume,
+            KeyCode::Char('f') if plain_char(event) => Key::WorkflowRetry,
             KeyCode::Char('c') if plain_char(event) => Key::Create,
             KeyCode::Char('x') if plain_char(event) => Key::AbortOpencode,
             KeyCode::Char('X') if plain_char(event) => Key::DeletePermanent,
-            KeyCode::Char('A') if plain_char(event) => Key::AutoFlow,
             KeyCode::Char('C') if plain_char(event) => Key::OpenRemotePrs,
-            KeyCode::Char('W') if plain_char(event) => Key::EditWorktreeColumns,
-            KeyCode::Char('R') if plain_char(event) => Key::ManageRepos,
-            KeyCode::Char('e') if plain_char(event) => Key::EditConfig,
-            KeyCode::Char('E') if plain_char(event) => Key::EditUserConfig,
-            KeyCode::Char('w') if plain_char(event) => Key::EditWorktrunkConfig,
-            KeyCode::Char('H') if plain_char(event) => Key::SelectHarness,
             KeyCode::Char('D') if plain_char(event) => Key::Delete,
             KeyCode::Char('U') if plain_char(event) => Key::Unarchive,
             KeyCode::Char('M') if plain_char(event) => Key::MigrateHarness,
@@ -95,9 +90,13 @@ impl KeyInput {
                 self.state = KeyInputState::Normal;
                 Key::OpenTmuxSession
             }
-            KeyCode::Char('p') if plain_char(event) => {
+            KeyCode::Char('W') if plain_char(event) => {
                 self.state = KeyInputState::Normal;
-                Key::PlanActions
+                Key::WorkflowLauncher
+            }
+            KeyCode::Char('c') if plain_char(event) => {
+                self.state = KeyInputState::Normal;
+                Key::Configuration
             }
             KeyCode::Enter => {
                 self.state = KeyInputState::Normal;
@@ -174,9 +173,11 @@ pub enum Key {
     Leader,
     LeaderGit,
     OpenTmuxSession,
-    PlanActions,
+    WorkflowLauncher,
+    WorkflowPauseResume,
+    WorkflowRetry,
+    Configuration,
     LazyGit,
-    AutoFlow,
     OpenPr,
     OpenDevelopmentUrl,
     WorktrunkLogs,
@@ -187,26 +188,19 @@ pub enum Key {
     VisibilityUp,
     VisibilityDown,
     RepoShortcut(char),
-    ManageRepos,
     OpenRemotePrs,
-    EditWorktreeColumns,
+    Push,
+    Merge,
     CiFix,
     ReviewFix,
     ResolveAllComments,
-    Push,
-    Merge,
     PullDefault,
-    PlanMode,
     Create,
     AbortOpencode,
     Delete,
     Unarchive,
     MigrateHarness,
     DeletePermanent,
-    EditConfig,
-    EditUserConfig,
-    EditWorktrunkConfig,
-    SelectHarness,
     Search,
     Quit,
     Other,
@@ -311,31 +305,19 @@ mod tests {
     }
 
     #[test]
-    fn key_input_handles_auto_flow() {
+    fn key_input_maps_unified_workflow_and_configuration_surfaces() {
         let mut input = KeyInput::default();
         assert_eq!(
-            map(&mut input, shift_key(KeyCode::Char('A'))),
-            Key::AutoFlow
+            map(&mut input, shift_key(KeyCode::Char('W'))),
+            Key::WorkflowLauncher
         );
-    }
-
-    #[test]
-    fn key_input_handles_leader_plan_actions() {
-        let mut input = KeyInput::default();
         assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
-        assert_eq!(map(&mut input, key(KeyCode::Char('p'))), Key::PlanActions);
-
-        let mut input = KeyInput::default();
+        assert_eq!(
+            map(&mut input, shift_key(KeyCode::Char('W'))),
+            Key::WorkflowLauncher
+        );
         assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
-        assert_eq!(map(&mut input, shift_key(KeyCode::Char('P'))), Key::Other);
-    }
-
-    #[test]
-    fn key_input_does_not_keep_leader_auto_flow_alias() {
-        let mut input = KeyInput::default();
-        assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
-        assert_eq!(map(&mut input, key(KeyCode::Char('g'))), Key::LeaderGit);
-        assert_eq!(map(&mut input, key(KeyCode::Char('a'))), Key::Other);
+        assert_eq!(map(&mut input, key(KeyCode::Char('c'))), Key::Configuration);
     }
 
     #[test]
@@ -359,11 +341,18 @@ mod tests {
     }
 
     #[test]
-    fn key_input_handles_leader_ci_fix() {
+    fn key_input_handles_restored_git_actions() {
         let mut input = KeyInput::default();
-        assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
-        assert_eq!(map(&mut input, key(KeyCode::Char('g'))), Key::LeaderGit);
-        assert_eq!(map(&mut input, key(KeyCode::Char('c'))), Key::CiFix);
+        for (code, expected) in [
+            ('P', Key::Push),
+            ('M', Key::Merge),
+            ('c', Key::CiFix),
+            ('f', Key::ReviewFix),
+        ] {
+            assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
+            assert_eq!(map(&mut input, key(KeyCode::Char('g'))), Key::LeaderGit);
+            assert_eq!(map(&mut input, key(KeyCode::Char(code))), expected);
+        }
     }
 
     #[test]
@@ -375,14 +364,6 @@ mod tests {
             map(&mut input, shift_key(KeyCode::Char('R'))),
             Key::ResolveAllComments
         );
-    }
-
-    #[test]
-    fn key_input_handles_merge() {
-        let mut input = KeyInput::default();
-        assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
-        assert_eq!(map(&mut input, key(KeyCode::Char('g'))), Key::LeaderGit);
-        assert_eq!(map(&mut input, shift_key(KeyCode::Char('M'))), Key::Merge);
     }
 
     #[test]
@@ -425,25 +406,11 @@ mod tests {
         );
         assert_eq!(
             map(&mut input, shift_key(KeyCode::Char('W'))),
-            Key::EditWorktreeColumns
+            Key::WorkflowLauncher
         );
-        assert_eq!(map(&mut input, key(KeyCode::Char('e'))), Key::EditConfig);
-        assert_eq!(
-            map(&mut input, key(KeyCode::Char('w'))),
-            Key::EditWorktrunkConfig
-        );
-        assert_eq!(
-            map(&mut input, shift_key(KeyCode::Char('E'))),
-            Key::EditUserConfig
-        );
-        assert_eq!(
-            map(&mut input, shift_key(KeyCode::Char('H'))),
-            Key::SelectHarness
-        );
-        assert_eq!(
-            map(&mut input, shift_key(KeyCode::Char('P'))),
-            Key::PlanMode
-        );
+        for removed in ['e', 'w', 'E', 'H', 'P'] {
+            assert_eq!(map(&mut input, key(KeyCode::Char(removed))), Key::Other);
+        }
         assert_eq!(
             map(&mut input, shift_key(KeyCode::Char('M'))),
             Key::MigrateHarness
@@ -476,13 +443,13 @@ mod tests {
             Key::MigrateHarness
         );
         assert_eq!(map(&mut input, key(KeyCode::Char('n'))), Key::Other);
-        assert_eq!(
-            map(&mut input, shift_key(KeyCode::Char('R'))),
-            Key::ManageRepos
-        );
+        assert_eq!(map(&mut input, shift_key(KeyCode::Char('R'))), Key::Other);
         assert_eq!(map(&mut input, key(KeyCode::Char('x'))), Key::AbortOpencode);
         assert_eq!(map(&mut input, key(KeyCode::Char('m'))), Key::Other);
-        assert_eq!(map(&mut input, key(KeyCode::Char('u'))), Key::Other);
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char('u'))),
+            Key::WorkflowPauseResume
+        );
         assert_eq!(map(&mut input, key(KeyCode::Char('a'))), Key::Other);
     }
 

@@ -40,9 +40,9 @@ and path. Branch names and paths may be reused after deletion, but the new
 worktree is a new session and cannot inherit the old session's active state.
 
 Prism may attach metadata to a session, including prompt summary, agent state,
-logs, hidden markers, change-request cache data, and workflow history. Deleting a
-session retires it from active use while retaining historical Plan and Auto Flow
-runs under that session identity.
+logs, hidden markers, change-request cache data, and links to Workflow Runs. A
+run is bound to one selected worktree for mutation while it is active; deleting
+that worktree retires the link without making the session the owner of history.
 
 Each Worktree Session records the Harness used by its tmux Agent Session. A
 global Harness change does not silently reinterpret an existing worktree;
@@ -88,6 +88,22 @@ Prism does not poll or display change-request state for the default branch. Star
 setup also uses the default branch to decide whether the current checkout should
 be moved into a separate worktree.
 
+### Provider Item
+
+A Provider Item is a provider-hosted Issue or Change Request with canonical
+provider, host, repository, native identity, and an Observation Revision. Its
+externally controlled fields are untrusted workflow input.
+
+An Issue tracks proposed or ongoing work. A Change Request tracks a proposed
+change to repository history. They remain distinct even when a Provider Adapter
+obtains both through the same endpoint or data shape.
+
+An Observation Revision identifies the exact provider state Prism evaluated. It
+uses a provider-native revision only when that revision changes for every field
+available to Trigger selection, admission, conditions, prompts, and effects,
+including relevant comments and provenance. Otherwise Prism uses a composite
+digest covering that complete field set.
+
 ### Change Request Cache
 
 The Change Request Cache is Prism's local snapshot of provider-hosted
@@ -108,9 +124,10 @@ signature, default-branch, or optional-detail rules.
 ### Provider Adapter
 
 A Provider Adapter owns one hosting protocol: GitHub, GitLab, or Forgejo. It
-discovers and normalizes change-request facts while retaining provider-native
-identity and state. Codeberg uses the Forgejo adapter with a built-in Host
-Profile; it is not a fourth adapter.
+discovers and normalizes supported Issue, Change Request, review, CI, policy,
+and mutation facts while retaining provider-native identity and state. Codeberg
+uses the Forgejo adapter with a built-in Host Profile; it is not a fourth
+adapter.
 
 Adapters declare each optional operation as supported, unsupported, conditional,
 or unknown. Capability does not imply fresh evidence. Callers must separately
@@ -124,50 +141,106 @@ bases. GitHub.com, GitLab.com, and Codeberg have built-in profiles. Every other
 host requires explicit configuration before Prism probes it or consults a
 credential source.
 
-### Plan Mode
+### Workflow
 
-Plan mode is Prism's workflow for executing Markdown implementation plans as
-numbered steps through a recorded harness adapter. The user selects or passes a plan file, Prism
-infers phase count from headings like `Phase 1`, and then builds each step as a
-task such as `Implement plan-better.md phase 6`.
+A Workflow is a prompt-first TOML file whose filename stem is its default
+identity. It declares optional Agent defaults and an acyclic graph of Agent
+Steps. A plain `[[step]]` list is linear; explicit `id` and `depends_on` values
+create roots, branches, and joins.
 
-Plan runs are modeled as persistent Prism state: a `PlanRun` owns the selected
-repository or worktree scope, plan file, mode, and aggregate status, while
-`PlanStepRun` records track per-phase prompts, neutral session/process
-metadata, latest message/tool/todo state, and bounded output lines. Prism stores
-that state in its own SQLite database under the user's Prism config directory,
-not in the project repository.
+Workflow source has no required schema version, qualified package ID, launch
+mode, capability list, typed port, Step class, implementation ID, or
+`skippable` declaration. It may declare typed file, string, boolean, number, and
+enum inputs with optional defaults. Canonical values are substituted into Agent
+turns; files use normalized worktree-relative paths and are never read into a
+prompt implicitly. First setup copies
+editable defaults into the user's workflow directory once. Installed and trusted
+repository packages may also
+provide files through the same conventional `workflows/` layout.
 
-OpenCode Plan phases use its `medium` agent variant by default. The selected
-variant is persisted on each `PlanStepRun` and shown in the plan dashboard so
-historical phase output remains explainable.
+### Step Trigger
 
-The TUI `P` launcher creates a persisted plan run for the selected repository or
-worktree, starts sequential execution in the background, and renders the active
-run in the main panel from SQLite snapshots. Managed Plan execution belongs to
-the per-user Prism Worker; tmux remains reserved for interactive sessions and
-terminal tools.
+A Step Trigger is a reusable lifecycle adapter attached to one Agent Step. Its
+observational check returns Run, Satisfied, Wait, or Fail. Optional prepare and
+finalize hooks run immediately before and after a successful Agent and can
+perform mutations. Persisted prepared state remains opaque and never becomes
+prompt text.
 
-### Workflow Execution
+Built-in and fake Triggers use the same in-process interface. External Triggers
+are full-trust shebang executables invoked once per phase through a small
+versioned process protocol. They have the user's OS authority; content-addressed
+retention stabilizes active runs but is not a sandbox.
 
-Workflow Execution is the durable ownership record shared by managed Plan and
-Auto Flow runs. A workflow is `queued`, `claimed`, `recovery_pending`, `paused`,
-or `terminal`. A claim records the daemon and worker identities, a renewable
-lease, and a monotonically increasing fencing token. SQLite is authoritative;
-the worker socket only provides health checks and wakeups.
+### Prism Package
 
-An expired or foreign claim means ownership was lost. It becomes
-`recovery_pending`, never automatically `queued`. Interactive Prism startup asks
-which interrupted runs to restart, with every item unchecked. A confirmed
-unselected run becomes paused, while cancelling leaves the decision pending.
+A Prism Package may distribute Workflows and Triggers using conventional
+`workflows/` and `triggers/` directories, plus unrelated Prism resources. The
+Workflow kernel does not resolve package closures, typed Artifact schemas,
+implementation descriptors, or capability envelopes. Active runs pin the exact
+Workflow source and external Trigger executable bytes they use.
+
+### Trigger And Launcher
+
+Trigger is the short form of Step Trigger: it decides whether one existing
+Workflow Step should run and owns that Step's optional prepare/finalize hooks.
+Waiting in a Trigger does not occupy an Agent slot.
+
+A Launcher creates Workflow Runs from a schedule, provider event, or other
+automatic source. Launchers are a separate future module; run creation is never
+a Step Trigger responsibility.
+
+### Workflow Run
+
+A Workflow Run is one durable execution of a compiled Workflow snapshot. It owns
+its exact repository, Worktree Session and Change Request association, repeated
+evaluation cycle, Agent-run budget, lifecycle attempts, Trigger decisions and
+wakes, Agent sessions and completed turns, controls, and aggregate outcome.
+
+The immutable snapshot pins source bytes, dependencies, typed input declarations
+and canonical bound values, initial prompts and follow-ups, harness/model/variant
+choices, context selections, and external Trigger executable revisions. Editing
+or deleting source changes future runs only.
+
+### Workflow Step
+
+A Workflow Step is one Agent lifecycle node with an initial prompt, optional
+authored follow-ups, and an optional Trigger. A Step without a Trigger runs once;
+a triggered Step can run repeatedly as fresh observations start new evaluation
+cycles. A check-only triggered Step has no Agent prompt.
+
+A Step Attempt records checking, preparing, Agent, and finalizing boundaries,
+persisted prepared state, one fresh Agent Session identity, each completed turn,
+final text, timing, and terminal reason. Follow-ups resume only that Attempt's
+session. Retry appends an Attempt and never erases history or restores consumed
+Agent budget.
+
+### Prepared State
+
+Prepared State is opaque Trigger-owned data persisted after a successful
+pre-Step hook and before Agent start. It lets the Worker resume at a known phase
+boundary and lets a finalize hook mutate only the exact provider or repository
+subjects captured during prepare. It is not prompt context or Agent authority.
+
+### Remote Request Coordinator
+
+The Remote Request Coordinator is the Worker-owned queue through which every
+Prism-owned provider observation and mutation passes. It owns per-host and
+credential-profile pacing, durable cooldowns, retries, coalescing, fairness,
+and bounded evidence freshness. Agent and full-trust custom-Trigger traffic is
+outside this boundary.
 
 ### Prism Worker
 
-The Prism Worker is one on-demand per-user daemon that discovers tracked
-repository databases, claims queued workflows transactionally, renews their
-leases, and supervises execution. Closing the TUI does not stop it. It is not a
-login service and does not automatically restart interrupted work after the
-daemon or machine stops.
+The Prism Worker is one on-demand per-user daemon and local coordinator. It
+hot-discovers Workflow and Trigger files, evaluates repeated DAG cycles, claims
+lifecycle phases with leases/fencing, supervises fresh Agent Sessions and their
+authored follow-up turns, preserves durable wakes, and serializes mutations to
+one worktree. Closing the TUI does not stop it.
+
+The Worker also owns one Remote Request Coordinator used by TUI refreshes,
+interactive provider actions, and Workflow Triggers. Provider lanes, cooldowns,
+backoff, coalesced observations, and subscriber wakes are user-wide rather than
+per process.
 
 The Prism Worker also observes interactive Agent Sessions and owns desktop
 notification transition state, durable delivery intent, supersession, expiry,
@@ -175,62 +248,16 @@ and retry policy. Platform delivery remains behind adapters: Linux uses the
 desktop notification service, while macOS forwards semantic notifications to
 an active TUI terminal subscription.
 
-Managed executor database connections install claim-bound SQLite guards. The
-guards reject run, step, output, event, and process writes unless the connection
-still owns the current unexpired fencing token; linked Plan writes use their
-parent Auto Flow claim. Executor loops also revalidate ownership before harness,
-verification, Git, remote-provider, and cleanup effects. Resume and retry requests made
-while an executor is releasing persist a requeue intent so runnable work cannot
-be stranded by the release race.
-
-### Auto Flow
-
-Auto Flow is Prism's persisted workflow for taking one clean, non-default
-Worktree Session through implementation, local verification, PR creation, review
-repair, CI repair, and eventual merge or cleanup. Implementation can come from a
-prompt, an existing Markdown plan, or a drafted `plan.md` that pauses for user
-approval before execution.
-
-An Auto Flow run is stored in Prism's per-repository SQLite database as an
-`AutoRun` plus ordered `AutoStepRun` attempts. The `step_key` identifies the
-conceptual boundary, while each attempt gets its own monotonic sequence and
-output rows so repeated verification, review, and CI repairs remain auditable
-after restart.
-
-Plan-backed Auto Flow delegates implementation to a linked Plan Mode run instead
-of duplicating each phase as an Auto Flow step. The Auto pipeline records one
-`RunPlan` step with a linked `PlanRun`, waits for that plan run to finish, and
-then continues with local verification and the rest of the PR pipeline.
-
 ### Change Request Stabilization
 
-Change Request Stabilization is Prism's core workflow for taking an existing change request
-from its current observed state to all required gates passing. It starts after
-Auto Flow creates or updates a change request, or when a user asks Prism to manage
-a review, CI, or mergeability repair for an existing Worktree Session. Auto Flow
-delegates change-request gate decisions to stabilization instead of owning a
-separate linear PR checklist.
-
-Prism treats Change Request Stabilization as derived work rather than a fixed checklist. It
-observes local Git state, cached change-request state, repository policy, and the
-configured Auto Flow goal, derives the current blocker, and chooses one safe next
-work item such as review repair, CI repair, waiting for checks, or ready for
-manual merge.
-
-Managed repair work remains auditable in Prism state. A managed repair may ask an
-agent to prepare a change, verify it, and create a local repair commit. The
-commit can then wait in a pending-push state for user review. If a guarded review
-repair is pushed, Prism may resolve only the exact provider conversation IDs that
-the repair recorded, and only when that adapter supports resolution.
+Change Request Stabilization is the default linear Workflow of merge-conflict,
+review, CI, and final ready-to-merge Triggers. Repeated graph evaluation lets an
+earlier blocker react while a later Trigger waits. Stabilization stops at fresh
+exact-head provider readiness; it does not merge or clean up the worktree.
 
 Actionable review feedback means feedback submitted through provider review
 mechanisms, such as review bodies and inline review-thread comments. Top-level
-pull request comments are not treated as review feedback by default.
-
-A pending repair push is guarded by the repair commit and observed branch state.
-If the commit is pushed outside Prism, Prism can mark the push satisfied and
-re-observe. If the branch moves away from the guarded commit, Prism invalidates
-the pending push and replans instead of pushing blindly.
+change-request comments are not treated as review feedback by default.
 
 ### Startup Setup
 
@@ -245,8 +272,9 @@ that the branch can be moved, and refuses to move a dirty checkout.
 ## Review Expectations
 
 - Use the terms above in code, docs, and reviews.
-- Keep product behavior centered on repositories, worktree sessions, agent
-  sessions, and cached change-request state.
+- Keep product behavior centered on repositories, provider items, Worktree
+  Sessions, Agent Sessions, prompt Workflow Runs, lifecycle Attempts, and cached
+  Change Request state.
 - Prefer changes that preserve local state outside project repositories unless a
   feature explicitly needs repository-owned files.
 - Treat default-branch behavior as a product boundary: task branch workflows

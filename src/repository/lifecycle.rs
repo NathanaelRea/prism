@@ -3,8 +3,8 @@ use std::process::Command;
 
 use crate::config::Config;
 use crate::process::{
-    ProcessDescriptor, ProcessPolicy, run_capture, run_capture_named, run_configured_commands,
-    run_output_allow_failure, run_status,
+    ProcessDescriptor, ProcessPolicy, run_capture, run_capture_named, run_output_allow_failure,
+    run_status,
 };
 use crate::repo::Repository;
 pub(crate) use crate::worktrunk::ApprovalStatus as WorktrunkApprovalStatus;
@@ -178,14 +178,9 @@ pub(crate) fn push_branch(
     set_upstream: bool,
 ) -> Result<(), String> {
     let args = if set_upstream {
-        vec![
-            "push".to_string(),
-            "-u".to_string(),
-            "origin".to_string(),
-            branch.to_string(),
-        ]
+        vec!["push", "-u", "origin", branch]
     } else {
-        vec!["push".to_string()]
+        vec!["push"]
     };
     run_capture_named(
         Command::new(config.tool("git"))
@@ -196,14 +191,6 @@ pub(crate) fn push_branch(
         ProcessDescriptor::new("git.push"),
     )?;
     Ok(())
-}
-
-pub(crate) fn run_pre_push_checks(config: &Config, path: &Path) -> Result<(), String> {
-    run_configured_commands(&config.checks.pre_push, path, "pre_push")
-}
-
-pub(crate) fn run_pre_pr_checks(config: &Config, path: &Path) -> Result<(), String> {
-    run_configured_commands(&config.checks.pre_pr, path, "pre_pr")
 }
 
 fn switch_checkout_args(repo_root: &Path, branch: &str) -> Vec<String> {
@@ -615,7 +602,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_delete_removes_all_owned_state_and_preserves_auto_flow_audit() {
+    fn complete_delete_removes_all_owned_session_state() {
         let temp = unique_temp_dir("prism-delete-kills-tmux-test");
         fs::create_dir_all(&temp).unwrap();
         let tmux_log = temp.join("tmux.log");
@@ -768,18 +755,6 @@ exit 0
             .join(format!("{}.log", crate::util::safe_branch_filename(branch)));
         fs::create_dir_all(agent_log.parent().unwrap()).unwrap();
         fs::write(&agent_log, "owned Agent Session log\n").unwrap();
-        let mut audit =
-            crate::auto_flow::AutoLaunch::new(&repo.root, &path, branch, "preserve deletion audit")
-                .unwrap()
-                .create_run();
-        with_test_database(&repo, |conn| {
-            crate::auto_flow::save_auto_run(
-                &crate::auto_flow::AutoFlowStore::open(conn.path()),
-                &mut audit,
-            )
-        })
-        .unwrap();
-
         crate::session::delete_worktree_session_if_current(&repo, &config, &path, branch, None)
             .unwrap();
 
@@ -810,15 +785,6 @@ exit 0
             );
         }
         assert!(!agent_log.exists());
-        let audit_preserved = with_test_database(&repo, |conn| {
-            crate::auto_flow::load_auto_run(
-                &crate::auto_flow::AutoFlowStore::open(conn.path()),
-                &audit.run.id,
-            )
-        })
-        .unwrap();
-        assert!(audit_preserved.is_some());
-
         let _ = fs::remove_dir_all(temp);
     }
 

@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "session persistence supports optional prompt restoration"
+)]
+
 use std::path::{Path, PathBuf};
 
 use sqlx::{Connection, FromRow, SqliteConnection};

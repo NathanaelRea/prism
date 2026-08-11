@@ -20,8 +20,9 @@
   startup may offer to restore the Default Branch there and move the active
   branch into a Worktrunk worktree. It does not make this offer non-interactively
   and refuses to move a dirty checkout.
-- **Default**: GitHub polling for an inactive repository is reduced to no more
-  often than once every 60 seconds.
+- **Default**: Presentation-driven provider polling for an inactive repository
+  is reduced to no more often than once every 60 seconds. TUI refreshes and
+  Workflow Trigger observations use the same Worker-owned remote coordinator.
 - **Behavior**: Users can pull the selected repository's configured Default
   Branch. Before creating a Worktree Session, Prism detects when that branch is
   behind its remote and offers to update it; declining does not block creation.
@@ -29,6 +30,24 @@
   open it as a Worktree Session. Prism reuses an existing matching worktree or
   fetches the pull request into a deterministic local branch, then retains the
   selected pull request summary on the focused session.
+
+## Workflow And Intake Views
+
+- **Behavior**: Repository context exposes discovered prompt Workflows and their
+  provenance, active and waiting runs, Agent-run budgets, and recent outcomes
+  without requiring each run to have an interactive Agent Session.
+- **Behavior**: Workflow Run detail renders the compiled dependency graph, each
+  Step's Trigger summary and lifecycle phase, durable wake time, Attempt history,
+  fresh Agent Session identity/final text, and concise events. Parallel branches
+  remain distinguishable from repeated evaluation cycles and retries.
+- **Behavior**: Waiting and input-required surfaces explain provider queue waits,
+  pending CI/review facts, budget exhaustion, failures, and recovery-required
+  effects across tracked repositories.
+- **Behavior**: Source list and detail views expose whether a Workflow comes from
+  installed, user, or trusted repository scope and can open the editable file.
+- **Invariant**: Provider Items, Workflow Runs, Worktree Sessions, and Change
+  Requests retain separate identities in navigation. Opening or admitting one
+  can create or link another, but does not collapse their histories.
 
 ## Navigation
 
@@ -72,7 +91,7 @@
   review comments, merge conflicts, and Worktrunk data. Success indicators are
   green and merge conflicts have a distinct recognizable indicator.
 - **Behavior**: The Default Branch sorts first when present in `[3]`, suppresses
-  task-only activity and GitHub indicators, and is not an attach target from that
+  task-only activity and worktree-scoped provider indicators, and is not an attach target from that
   panel. Suppressed indicators retain their column width so other rows remain
   aligned.
 - **Behavior**: Contextual help for repository and worktree views explains their

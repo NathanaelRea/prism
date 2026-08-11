@@ -1,5 +1,8 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::hash::{Hash, Hasher};
+
+use sha2::{Digest as _, Sha256};
 
 use serde::{Deserialize, Serialize};
 
@@ -42,6 +45,136 @@ impl ProviderKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProviderItemKind {
+    Issue,
+    ChangeRequest,
+}
+
+/// Canonical provider work-item identity. Issue-shaped API responses retain
+/// their actual kind, so a change request can never be admitted as an Issue.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Hash, Serialize)]
+pub(crate) struct ProviderItemId {
+    repository: RemoteRepositoryId,
+    native_id: String,
+    kind: ProviderItemKind,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Hash, Serialize)]
+pub(crate) struct IssueId(ProviderItemId);
+
+impl ProviderItemId {
+    pub(crate) fn new(
+        repository: RemoteRepositoryId,
+        native_id: impl Into<String>,
+        kind: ProviderItemKind,
+    ) -> Result<Self, IdentityError> {
+        let native_id = native_id.into();
+        if native_id.trim().is_empty() || native_id.chars().any(char::is_control) {
+            return Err(IdentityError::new("provider item native ID is invalid"));
+        }
+        Ok(Self {
+            repository,
+            native_id,
+            kind,
+        })
+    }
+
+    pub(crate) fn kind(&self) -> ProviderItemKind {
+        self.kind
+    }
+    pub(crate) fn repository(&self) -> &RemoteRepositoryId {
+        &self.repository
+    }
+    pub(crate) fn native_id(&self) -> &str {
+        &self.native_id
+    }
+    pub(crate) fn as_issue(&self) -> Option<IssueId> {
+        (self.kind == ProviderItemKind::Issue).then(|| IssueId(self.clone()))
+    }
+
+    pub(crate) fn canonical_key(&self) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            self.repository.provider.config_label(),
+            self.repository.host,
+            self.repository.project_path,
+            match self.kind {
+                ProviderItemKind::Issue => format!("issue:{}", self.native_id),
+                ProviderItemKind::ChangeRequest => format!("change_request:{}", self.native_id),
+            }
+        )
+    }
+}
+
+impl IssueId {
+    pub(crate) fn item(&self) -> &ProviderItemId {
+        &self.0
+    }
+}
+
+/// Complete normalized provider facts consumed by intake. The revision covers
+/// all fields, including free-form content and authenticated relationship facts.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct ProviderItemObservation {
+    pub id: ProviderItemId,
+    pub title: String,
+    pub body: String,
+    pub lifecycle: String,
+    pub author: String,
+    pub author_relationship: Option<String>,
+    pub labels: BTreeMap<String, String>,
+    pub assignees: Vec<String>,
+    pub updated_at: Option<String>,
+}
+
+impl ProviderItemObservation {
+    pub(crate) fn revision(&self) -> String {
+        let bytes = serde_json::to_vec(&(
+            self.id.canonical_key(),
+            &self.title,
+            &self.body,
+            &self.lifecycle,
+            &self.author,
+            &self.author_relationship,
+            &self.labels,
+            &self.assignees,
+            &self.updated_at,
+        ))
+        .expect("normalized Provider Item serializes");
+        let digest = Sha256::digest(bytes);
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+}
+
+/// Cache state for provider intake. A failed refresh retains the last exact
+/// observation as `Stale`; partial responses are never eligible to trigger or
+/// authorize work.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", content = "value", rename_all = "snake_case")]
+pub(crate) enum ProviderItemObservationState {
+    NeverLoaded,
+    Current(ProviderItemObservation),
+    Stale(ProviderItemObservation),
+    Partial(ProviderItemObservation),
+    Failed { safe_error: String },
+    ConfirmedAbsent,
+}
+
+impl ProviderItemObservationState {
+    pub(crate) fn authoritative_present(&self) -> Option<&ProviderItemObservation> {
+        match self {
+            Self::Current(value) => Some(value),
+            Self::NeverLoaded
+            | Self::Stale(_)
+            | Self::Partial(_)
+            | Self::Failed { .. }
+            | Self::ConfirmedAbsent => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct IdentityError(String);
 
@@ -59,7 +192,7 @@ impl fmt::Display for IdentityError {
 
 impl std::error::Error for IdentityError {}
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub(crate) struct HostIdentity {
     hostname: String,
     port: Option<u16>,
@@ -257,7 +390,7 @@ fn canonical_path_prefix(path: &str) -> Result<String, IdentityError> {
     Ok(format!("/{path}"))
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct RemoteRepositoryId {
     provider: ProviderKind,
     host: HostIdentity,
@@ -926,7 +1059,8 @@ pub(crate) struct ResolveReviewThread {
     pub(crate) expected_head_sha: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum ReviewSubmissionKind {
     Approve,
     Comment,

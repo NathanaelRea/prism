@@ -8,7 +8,8 @@ use crate::session::Session;
 pub const PR_SUMMARY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 pub(super) const PR_DETAIL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum PrObservationQuality {
     #[default]
     Unknown,
@@ -502,7 +503,7 @@ pub(super) enum PrCacheSummaryMutation {
     RemoveSummary,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PrSummary {
     pub number: u64,
     pub(crate) change_request_identity: Option<crate::remote::CanonicalChangeRequestIdentity>,
@@ -593,7 +594,7 @@ impl PrCheckState {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PrDetails {
     pub comments: Vec<PrComment>,
     pub reviews: Vec<PrReview>,
@@ -602,6 +603,53 @@ pub struct PrDetails {
     pub failing_checks: Vec<String>,
     pub check_contexts: Vec<PrCheckContext>,
     pub ci_failures: Vec<CiFailure>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct WorkerPrCacheSnapshot {
+    pub summary: Option<PrSummary>,
+    pub details: Option<PrDetails>,
+    pub last_refreshed: Option<String>,
+    pub summary_quality: PrObservationQuality,
+    pub details_quality: PrObservationQuality,
+    pub summary_error: Option<String>,
+    pub details_errors: Vec<String>,
+    pub details_warnings: Vec<String>,
+}
+
+impl WorkerPrCacheSnapshot {
+    pub(crate) fn capture(cache: &PrCache) -> Self {
+        Self {
+            summary: cache.summary.clone(),
+            details: cache.details.clone(),
+            last_refreshed: cache.last_refreshed.clone(),
+            summary_quality: cache.summary_quality,
+            details_quality: cache.details_quality,
+            summary_error: cache.summary_error.clone(),
+            details_errors: cache.details_errors.clone(),
+            details_warnings: cache.details_warnings.clone(),
+        }
+    }
+}
+
+impl PrCache {
+    pub(crate) fn apply_worker_snapshot(&mut self, snapshot: WorkerPrCacheSnapshot) {
+        self.summary = snapshot.summary;
+        self.details = snapshot.details;
+        self.last_refreshed = snapshot.last_refreshed;
+        self.summary_quality = snapshot.summary_quality;
+        self.details_quality = snapshot.details_quality;
+        self.summary_error = snapshot.summary_error;
+        self.details_errors = snapshot.details_errors;
+        self.details_warnings = snapshot.details_warnings;
+        self.signature = self.summary.as_ref().map(PrSummary::signature);
+        self.details_association = self
+            .summary
+            .as_ref()
+            .map(PrDetailsAssociation::from_summary);
+        self.summary_observed_in_process = true;
+        self.rebuild_error();
+    }
 }
 
 #[derive(Debug)]

@@ -302,10 +302,6 @@ pub(crate) fn fetch_origin(path: &std::path::Path, config: &Config) -> Result<()
     )
 }
 
-pub fn selected_dirty(path: &std::path::Path, config: &Config) -> Result<bool, String> {
-    Ok(inspect_dirty(path, config)?.dirty)
-}
-
 pub fn has_upstream(path: &std::path::Path, config: &Config) -> Result<bool, String> {
     let upstream = run_output_allow_failure(
         Command::new(config.tool("git")).arg("-C").arg(path).args([

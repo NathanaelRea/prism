@@ -136,14 +136,6 @@ pub fn yes(value: &str) -> bool {
     matches!(value.trim(), "y" | "Y" | "yes" | "YES")
 }
 
-pub fn empty_dash(value: &str) -> &str {
-    if value.trim().is_empty() {
-        "-"
-    } else {
-        value.trim()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::Path;
