@@ -88,6 +88,7 @@ fn opencode_in_flight_clears_after_panic_and_spawn_failure_then_restarts() {
     assert!(!tui.opencode_polls_in_flight.contains(&key));
 
     let deadline = Instant::now() + Duration::from_secs(1);
+    let key_fragment = format!("{temp:?}");
     let mut terminal_events = Vec::new();
     while terminal_events.len() < 3 && Instant::now() < deadline {
         terminal_events.extend(
@@ -100,7 +101,7 @@ fn opencode_in_flight_clears_after_panic_and_spawn_failure_then_restarts() {
                 .filter(|data| {
                     data["key"]
                         .as_str()
-                        .is_some_and(|key| key.contains(&temp.display().to_string()))
+                        .is_some_and(|key| key.contains(&key_fragment))
                 }),
         );
         if terminal_events.len() < 3 {

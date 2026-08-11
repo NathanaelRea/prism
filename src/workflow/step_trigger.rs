@@ -616,7 +616,9 @@ impl TriggerSnapshotStore {
             #[cfg(windows)]
             crate::system::windows_security::secure_path(&temporary, false)
                 .map_err(TriggerError::Io)?;
-            std::fs::File::open(&temporary)
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&temporary)
                 .and_then(|file| file.sync_all())
                 .map_err(TriggerError::Io)?;
             match std::fs::rename(&temporary, &path) {
@@ -1060,11 +1062,11 @@ fn main() {
         std::thread::sleep(std::time::Duration::from_secs(60));
         let _ = child.kill();
     } else if request.contains("should_run_step") {
-        println!(r#"{"response":"decision","protocol_version":1,"decision":{"decision":"run","summary":"work found"}}"#);
+        println!("{}", r#"{"response":"decision","protocol_version":1,"decision":{"decision":"run","summary":"work found"}}"#);
     } else if request.contains("pre_step_run") {
-        println!(r#"{"response":"prepared","protocol_version":1,"prepared_state":{"captured":["T1"]}}"#);
+        println!("{}", r#"{"response":"prepared","protocol_version":1,"prepared_state":{"captured":["T1"]}}"#);
     } else if request.contains("post_step_run") {
-        println!(r#"{"response":"completed","protocol_version":1,"completion":{"result":"success","summary":"done"}}"#);
+        println!("{}", r#"{"response":"completed","protocol_version":1,"completion":{"result":"success","summary":"done"}}"#);
     } else {
         std::process::exit(4);
     }

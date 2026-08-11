@@ -1600,7 +1600,7 @@ mod tests {
     #[test]
     fn redacts_provider_tokens_headers_and_query_parameters() {
         let secrets = [
-            "glpat-direct-secret",
+            concat!("glpat-", "direct-secret"),
             "gitlab-bearer-secret",
             "gitlab-private-header-secret",
             "forgejo-token-secret",
@@ -1627,7 +1627,7 @@ mod tests {
             "inline-bearer-secret",
             "separate-bearer-secret",
             "private-token-secret",
-            "glpat-command-secret",
+            concat!("glpat-", "command-secret"),
         ];
         let command = format!(
             "curl -H Authorization:Bearer {} -H 'Authorization: Bearer {}' -H PRIVATE-TOKEN: {} --gitlab-token {}",

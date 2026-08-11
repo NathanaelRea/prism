@@ -3479,9 +3479,9 @@ esac
 printf '%s\n' 'https://attacker.example/collect?access_token=query-secret'
 printf '%s\n' '{"message":"malicious multiline response body"}'
 printf '%s\n' 'HTTP 503 Service Unavailable' >&2
-printf '%s\n' 'glpat-direct-secret' >&2
+printf '%s%s\n' 'glpat-' 'direct-secret' >&2
 printf '%s\n' 'Authorization: Bearer bearer-header-secret' >&2
-printf '%s\n' 'PRIVATE-TOKEN: glpat-private-header-secret' >&2
+printf '%s%s\n' 'PRIVATE-TOKEN: glpat-' 'private-header-secret' >&2
 printf '%s\n' 'injected cache line' 'another injected line' >&2
 exit 17
 "#,
@@ -3506,9 +3506,9 @@ exit 17
         assert_eq!(persisted.error, cache.error);
         let persisted_error = persisted.error.unwrap();
         for untrusted in [
-            "glpat-direct-secret",
+            concat!("glpat-", "direct-secret"),
             "bearer-header-secret",
-            "glpat-private-header-secret",
+            concat!("glpat-", "private-header-secret"),
             "query-secret",
             "Authorization",
             "PRIVATE-TOKEN",

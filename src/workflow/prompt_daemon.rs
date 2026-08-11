@@ -226,8 +226,6 @@ fn serve_socket(
     loop {
         match worker_ipc::accept(&listener) {
             Ok(mut stream) => {
-                worker_ipc::set_write_timeout(&stream, RESPONSE_WRITE_TIMEOUT)
-                    .map_err(|error| format!("configure worker response timeout: {error}"))?;
                 draining |= respond(
                     runtime,
                     service,
@@ -262,12 +260,16 @@ fn respond(
     draining: bool,
 ) -> bool {
     let Ok(request) = read_request_line(stream) else {
-        let _ = stream.write_all(b"error invalid-request\n");
+        let _ = write_with_deadline(stream, b"error invalid-request\n", RESPONSE_WRITE_TIMEOUT);
         return false;
     };
     let request = request.trim();
     let Some(request) = authenticate_command(secret, request) else {
-        let _ = stream.write_all(b"error authentication-failed\n");
+        let _ = write_with_deadline(
+            stream,
+            b"error authentication-failed\n",
+            RESPONSE_WRITE_TIMEOUT,
+        );
         return false;
     };
     let active = runtime
@@ -284,11 +286,12 @@ fn respond(
         request if request.starts_with('{') => prompt_response(runtime, service, request),
         _ => "error unknown-command\n".into(),
     };
-    let _ = stream.write_all(response.as_bytes());
+    let _ = write_with_deadline(stream, response.as_bytes(), RESPONSE_WRITE_TIMEOUT);
     request == "shutdown"
 }
 
 fn read_request_line(stream: &mut WorkerStream) -> io::Result<String> {
+    worker_ipc::set_stream_nonblocking(stream, true)?;
     let deadline = Instant::now() + REQUEST_READ_TIMEOUT;
     let mut request = Vec::new();
     let mut buffer = [0_u8; 4096];
@@ -300,7 +303,6 @@ fn read_request_line(stream: &mut WorkerStream) -> io::Result<String> {
                 "worker request deadline exceeded",
             ));
         }
-        worker_ipc::set_read_timeout(stream, remaining)?;
         let available = MAX_REQUEST_BYTES + 1 - request.len();
         if available == 0 {
             return Err(io::Error::new(
@@ -309,7 +311,14 @@ fn read_request_line(stream: &mut WorkerStream) -> io::Result<String> {
             ));
         }
         let read_len = available.min(buffer.len());
-        let count = stream.read(&mut buffer[..read_len])?;
+        let count = match stream.read(&mut buffer[..read_len]) {
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                wait_for_io(deadline)?;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if count == 0 {
             break;
         }
@@ -329,6 +338,41 @@ fn read_request_line(stream: &mut WorkerStream) -> io::Result<String> {
         }
     }
     String::from_utf8(request).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn write_with_deadline(
+    stream: &mut WorkerStream,
+    bytes: &[u8],
+    timeout: Duration,
+) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut written = 0;
+    while written < bytes.len() {
+        match stream.write(&bytes[written..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "worker endpoint stopped accepting response bytes",
+                ));
+            }
+            Ok(count) => written += count,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => wait_for_io(deadline)?,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn wait_for_io(deadline: Instant) -> io::Result<()> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "worker endpoint I/O deadline exceeded",
+        ));
+    }
+    thread::sleep(remaining.min(Duration::from_millis(5)));
+    Ok(())
 }
 
 fn health_line(instance: &str, generation: &str, draining: bool, active: usize) -> String {
@@ -722,18 +766,28 @@ fn authenticate_command<'a>(secret: &str, command: &'a str) -> Option<&'a str> {
 }
 
 fn request_stream(mut stream: WorkerStream, command: &str) -> Result<String, String> {
-    worker_ipc::set_read_timeout(&stream, Duration::from_secs(30))
+    worker_ipc::set_stream_nonblocking(&stream, true)
         .map_err(|error| format!("configure Prism worker endpoint: {error}"))?;
-    worker_ipc::set_write_timeout(&stream, Duration::from_secs(30))
-        .map_err(|error| format!("configure Prism worker endpoint: {error}"))?;
-    stream
-        .write_all(format!("{command}\n").as_bytes())
+    let request = format!("{command}\n");
+    write_with_deadline(&mut stream, request.as_bytes(), Duration::from_secs(30))
         .map_err(|error| format!("write Prism worker request: {error}"))?;
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .map_err(|error| format!("read Prism worker response: {error}"))?;
-    Ok(response.trim().to_string())
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => response.extend_from_slice(&buffer[..count]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                wait_for_io(deadline)
+                    .map_err(|error| format!("read Prism worker response: {error}"))?;
+            }
+            Err(error) => return Err(format!("read Prism worker response: {error}")),
+        }
+    }
+    String::from_utf8(response)
+        .map(|response| response.trim().to_string())
+        .map_err(|error| format!("read Prism worker response: {error}"))
 }
 
 fn parse_health(response: &str) -> Result<DaemonHealth, String> {

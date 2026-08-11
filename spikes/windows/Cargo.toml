@@ -38,3 +38,5 @@ windows = { version = "0.62.2", features = [
   "Win32_System_SystemServices",
   "Win32_System_Threading",
 ] }
+
+[workspace]

@@ -1,9 +1,8 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 #[cfg(windows)]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
@@ -175,18 +174,8 @@ pub(super) fn set_listener_nonblocking(listener: &WorkerListener) -> io::Result<
     return listener.set_nonblocking(ListenerNonblockingMode::Accept);
 }
 
-pub(super) fn set_read_timeout(stream: &WorkerStream, timeout: Duration) -> io::Result<()> {
-    #[cfg(unix)]
-    return stream.set_read_timeout(Some(timeout));
-    #[cfg(windows)]
-    return stream.set_recv_timeout(Some(timeout));
-}
-
-pub(super) fn set_write_timeout(stream: &WorkerStream, timeout: Duration) -> io::Result<()> {
-    #[cfg(unix)]
-    return stream.set_write_timeout(Some(timeout));
-    #[cfg(windows)]
-    return stream.set_send_timeout(Some(timeout));
+pub(super) fn set_stream_nonblocking(stream: &WorkerStream, nonblocking: bool) -> io::Result<()> {
+    stream.set_nonblocking(nonblocking)
 }
 
 pub(super) fn prepare_runtime(runtime: &Path) -> Result<(), String> {
@@ -239,7 +228,14 @@ pub(super) fn create_secret(endpoint: &WorkerEndpoint) -> Result<String, String>
     #[cfg(unix)]
     options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     #[cfg(windows)]
-    options.custom_flags(windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT.0);
+    options
+        .access_mode(
+            (windows::Win32::Storage::FileSystem::FILE_GENERIC_READ
+                | windows::Win32::Storage::FileSystem::FILE_GENERIC_WRITE
+                | windows::Win32::Storage::FileSystem::WRITE_DAC)
+                .0,
+        )
+        .custom_flags(windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT.0);
     let mut file = options
         .open(&path)
         .map_err(|error| format!("create worker authentication secret: {error}"))?;
@@ -262,7 +258,13 @@ pub(super) fn read_secret(endpoint: &WorkerEndpoint) -> Result<String, String> {
     #[cfg(unix)]
     options.custom_flags(libc::O_NOFOLLOW);
     #[cfg(windows)]
-    options.custom_flags(windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT.0);
+    options
+        .access_mode(
+            (windows::Win32::Storage::FileSystem::FILE_GENERIC_READ
+                | windows::Win32::Storage::FileSystem::WRITE_DAC)
+                .0,
+        )
+        .custom_flags(windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT.0);
     let mut file = options
         .open(endpoint.secret_path())
         .map_err(|error| format!("read worker authentication secret: {error}"))?;
@@ -348,7 +350,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_named_pipe_read_timeout_is_bounded() {
+    fn windows_named_pipe_nonblocking_read_is_bounded() {
         let runtime = runtime("read-timeout");
         prepare_runtime(&runtime).unwrap();
         let endpoint = WorkerEndpoint::for_runtime(&runtime).unwrap();
@@ -359,10 +361,13 @@ mod tests {
             thread::sleep(Duration::from_millis(500));
         });
         let mut stream = accept(&listener).unwrap();
-        set_read_timeout(&stream, Duration::from_millis(100)).unwrap();
+        set_stream_nonblocking(&stream, true).unwrap();
         let started = Instant::now();
         let mut request = String::new();
-        assert!(BufReader::new(&mut stream).read_line(&mut request).is_err());
+        let error = BufReader::new(&mut stream)
+            .read_line(&mut request)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
         assert!(started.elapsed() < Duration::from_secs(2));
         drop(stream);
         drop(listener);

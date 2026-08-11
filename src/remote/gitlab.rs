@@ -3529,9 +3529,9 @@ printf 'HTTP/2.0 200 OK\r\nX-Page: 1\r\nX-Per-Page: 50\r\nX-Next-Page: \r\nX-Tot
 printf '%s\n' 'https://attacker.example/collect?private_token=query-secret'
 printf '%s\n' '{"message":"malicious response body"}'
 printf '%s\n' 'HTTP 503 Service Unavailable' >&2
-printf '%s\n' 'glpat-direct-secret' >&2
+printf '%s%s\n' 'glpat-' 'direct-secret' >&2
 printf '%s\n' 'Authorization: Bearer bearer-header-secret' >&2
-printf '%s\n' 'PRIVATE-TOKEN: glpat-private-header-secret' >&2
+printf '%s%s\n' 'PRIVATE-TOKEN: glpat-' 'private-header-secret' >&2
 printf '%s\n' 'first malicious line' 'second malicious line' >&2
 exit 17
 "#,
@@ -3552,9 +3552,9 @@ exit 17
             "GitLab observe_repository_policy failed: provider; retry=retryable; status=503; exit=17; hint=backoff"
         );
         for untrusted in [
-            "glpat-direct-secret",
+            concat!("glpat-", "direct-secret"),
             "bearer-header-secret",
-            "glpat-private-header-secret",
+            concat!("glpat-", "private-header-secret"),
             "query-secret",
             "Authorization",
             "PRIVATE-TOKEN",

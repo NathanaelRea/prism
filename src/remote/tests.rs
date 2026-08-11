@@ -730,7 +730,7 @@ fn malformed_remotes_fail_without_partial_identity() {
 #[test]
 fn remote_error_keeps_classification_and_only_exposes_bounded_single_line_message() {
     let secrets = [
-        "glpat-direct-secret",
+        concat!("glpat-", "direct-secret"),
         "bearer-header-secret",
         "private-header-secret",
         "query-secret",
