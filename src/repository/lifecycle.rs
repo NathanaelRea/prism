@@ -326,6 +326,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    #[cfg(unix)]
     fn create_worktree_session_clears_stale_hidden_marker() {
         let temp = unique_temp_dir("prism-create-clears-hidden-test");
         fs::create_dir_all(&temp).unwrap();

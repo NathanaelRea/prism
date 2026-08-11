@@ -3490,14 +3490,18 @@ mod tests {
             .env("PRISM_DESCENDANT_PID", &marker);
         let child = SupervisedChild::spawn(&mut command, Some(ProcessPolicy::Test), None).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !marker.exists() && Instant::now() < deadline {
+        let descendant = loop {
+            if let Ok(contents) = std::fs::read_to_string(&marker)
+                && let Ok(descendant) = contents.trim().parse::<u32>()
+            {
+                break descendant;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "PowerShell fixture did not report its descendant"
+            );
             std::thread::sleep(Duration::from_millis(10));
-        }
-        let descendant = std::fs::read_to_string(&marker)
-            .unwrap()
-            .trim()
-            .parse::<u32>()
-            .unwrap();
+        };
 
         drop(child);
 

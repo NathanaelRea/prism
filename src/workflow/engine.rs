@@ -1869,10 +1869,20 @@ mod tests {
                             key: "step".into(),
                             implementation: "command".into(),
                             target_id: "local".into(),
-                            input_json: serde_json::json!({
-                                "program": "/bin/sh",
-                                "args": ["-c", "sleep 30"]
-                            })
+                            input_json: if cfg!(windows) {
+                                serde_json::json!({
+                                    "program": "pwsh.exe",
+                                    "args": [
+                                        "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+                                        "Start-Sleep -Seconds 30"
+                                    ]
+                                })
+                            } else {
+                                serde_json::json!({
+                                    "program": "/bin/sh",
+                                    "args": ["-c", "sleep 30"]
+                                })
+                            }
                             .to_string(),
                             dependencies: vec![],
                             resources: vec![],

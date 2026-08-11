@@ -2401,7 +2401,7 @@ review = "fix\nreview"
             "other-agent".to_string(),
             HarnessConfig {
                 adapter: "generic".to_string(),
-                interactive_command: vec!["/bin/sh".to_string()],
+                interactive_command: vec![std::env::current_exe().unwrap().display().to_string()],
                 arguments: Vec::new(),
                 interactive_prompt_transport: None,
                 headless_command: None,

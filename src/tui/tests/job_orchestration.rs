@@ -87,18 +87,26 @@ fn opencode_in_flight_clears_after_panic_and_spawn_failure_then_restarts() {
     wait_for_opencode_job(&mut tui, &key);
     assert!(!tui.opencode_polls_in_flight.contains(&key));
 
-    let terminal_events = crate::observability::take_captured_events()
-        .into_iter()
-        .filter(|event| event.target == "tui_job" && event.action == "terminal")
-        .filter_map(|event| event.data_json)
-        .map(|data| serde_json::from_str::<serde_json::Value>(&data).unwrap())
-        .filter(|data| data["kind"] == "opencode_poll")
-        .filter(|data| {
-            data["key"]
-                .as_str()
-                .is_some_and(|key| key.contains(&temp.display().to_string()))
-        })
-        .collect::<Vec<_>>();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut terminal_events = Vec::new();
+    while terminal_events.len() < 3 && Instant::now() < deadline {
+        terminal_events.extend(
+            crate::observability::take_captured_events()
+                .into_iter()
+                .filter(|event| event.target == "tui_job" && event.action == "terminal")
+                .filter_map(|event| event.data_json)
+                .map(|data| serde_json::from_str::<serde_json::Value>(&data).unwrap())
+                .filter(|data| data["kind"] == "opencode_poll")
+                .filter(|data| {
+                    data["key"]
+                        .as_str()
+                        .is_some_and(|key| key.contains(&temp.display().to_string()))
+                }),
+        );
+        if terminal_events.len() < 3 {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
     for (job_id, outcome) in [(1, "panicked"), (2, "spawn_failed"), (3, "completed")] {
         let matching = terminal_events
             .iter()

@@ -2,6 +2,8 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+#[cfg(windows)]
+use std::time::Instant;
 
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
@@ -122,13 +124,26 @@ impl WorkerEndpoint {
         return WorkerListener::bind(&self.address);
         #[cfg(windows)]
         {
-            let name = self.address.clone().to_ns_name::<GenericNamespaced>()?;
-            let descriptor = crate::system::windows_security::private_pipe_security_descriptor()
-                .map_err(io::Error::other)?;
-            ListenerOptions::new()
-                .name(name)
-                .security_descriptor(descriptor)
-                .create_sync()
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                let name = self.address.clone().to_ns_name::<GenericNamespaced>()?;
+                let descriptor =
+                    crate::system::windows_security::private_pipe_security_descriptor()
+                        .map_err(io::Error::other)?;
+                match ListenerOptions::new()
+                    .name(name)
+                    .security_descriptor(descriptor)
+                    .create_sync()
+                {
+                    Err(error)
+                        if error.kind() == io::ErrorKind::PermissionDenied
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    result => return result,
+                }
+            }
         }
     }
 

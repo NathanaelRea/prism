@@ -1568,6 +1568,7 @@ mod tests {
 
         let result = rx.recv_timeout(Duration::from_secs(1));
         execute_on(&mut blocker, "rollback").unwrap();
+        drop(blocker);
         reader.join().unwrap();
 
         assert_eq!(result.unwrap().unwrap(), "committed");

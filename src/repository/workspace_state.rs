@@ -1459,7 +1459,10 @@ mod tests {
         let workflows = load_ledger_workflows(&[run], Path::new("/repo")).unwrap();
         let workflow = &workflows[0];
         assert_eq!(workflow.identity.kind, WorkflowKind::Coding);
-        assert_eq!(workflow.worktree.path, PathBuf::from("/repo/worktree"));
+        assert_eq!(
+            workflow.worktree.path,
+            absolute_path(Path::new("/repo/worktree"))
+        );
         assert_eq!(workflow.lifecycle, WorkflowLifecycle::Running);
         assert_eq!(
             workflow.current_step.as_ref().unwrap().state,

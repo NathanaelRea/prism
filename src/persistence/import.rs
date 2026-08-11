@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::str::FromStr;
 
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Connection, FromRow, SqliteConnection};
@@ -55,11 +54,8 @@ pub(crate) async fn import_legacy_repository(
             path: source_path.to_path_buf(),
             source: sqlx::Error::Io(source),
         })?;
-    let options = SqliteConnectOptions::from_str(&canonical.to_string_lossy())
-        .map_err(|source| DatabaseError::Connect {
-            path: canonical.clone(),
-            source,
-        })?
+    let options = SqliteConnectOptions::new()
+        .filename(&canonical)
         .read_only(true)
         .create_if_missing(false)
         .foreign_keys(true);

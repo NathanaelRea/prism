@@ -1652,6 +1652,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn ready_manual_merge_authorization_invokes_gh_merge() {
         let (temp, config, log) = manual_merge_test_config();
         let snapshot = ready_manual_merge_snapshot();

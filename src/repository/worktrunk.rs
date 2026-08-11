@@ -1225,10 +1225,10 @@ mod tests {
                     .contains("symlink")
             );
         }
+        let directory_error = read_hook_log_tail(&repo, &logs).unwrap_err();
         assert!(
-            read_hook_log_tail(&repo, &logs)
-                .unwrap_err()
-                .contains("regular file")
+            directory_error.contains("regular file")
+                || (cfg!(windows) && directory_error.contains("open Worktrunk log"))
         );
         let _ = fs::remove_dir_all(temp);
     }
@@ -1757,6 +1757,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn switch_process_classifies_hook_and_git_failures() {
         assert_eq!(
             run_failure_fixture("printf '%s\\n' 'pre-start hook failed' >&2\nexit 1\n"),

@@ -1323,8 +1323,18 @@ mod tests {
         let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
         let path = temp.join("worktree");
         let branch = "feature/replaced";
-        let tmux = temp.join("tmux");
-        write_executable(&tmux, "#!/bin/sh\nexit 0\n");
+        #[cfg(unix)]
+        let tmux = {
+            let tmux = temp.join("tmux");
+            write_executable(&tmux, "#!/bin/sh\nexit 0\n");
+            tmux
+        };
+        #[cfg(windows)]
+        let tmux = {
+            let tmux = temp.join("tmux.cmd");
+            fs::write(&tmux, "@exit /b 0\r\n").unwrap();
+            tmux
+        };
         let mut config = test_config();
         config
             .tools

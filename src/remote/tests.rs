@@ -36,9 +36,10 @@ fn provider_implementations_stay_behind_remote_boundary() {
                 }
             }
 
-            let production = source
+            let normalized_source = source.replace("\r\n", "\n");
+            let production = normalized_source
                 .split_once("#[cfg(test)]\nmod tests")
-                .map_or(source.as_str(), |(production, _)| production);
+                .map_or(normalized_source.as_str(), |(production, _)| production);
             let compact_production: String = production
                 .chars()
                 .filter(|character| !character.is_whitespace())

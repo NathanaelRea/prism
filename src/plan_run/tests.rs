@@ -272,6 +272,7 @@ fn plan_plugin_config_is_generated_under_prism_state() {
 }
 
 #[test]
+#[cfg(unix)]
 fn executor_passes_plugin_environment_only_when_enabled() {
     let conn = test_connection();
     let temp = unique_temp_dir("prism-plan-plugin-env");
@@ -323,6 +324,7 @@ echo '{"type":"message","text":"plugin env observed"}'
 }
 
 #[test]
+#[cfg(unix)]
 fn sequential_executor_updates_steps_from_fake_opencode() {
     let conn = test_connection();
     let temp = unique_temp_dir("prism-plan-executor-success");
@@ -390,6 +392,7 @@ echo '{"type":"todo.updated","todos":[{"title":"write tests","status":"done"}]}'
 }
 
 #[test]
+#[cfg(unix)]
 fn sequential_executor_stops_on_failed_step() {
     let conn = test_connection();
     let temp = unique_temp_dir("prism-plan-executor-failure");
@@ -447,6 +450,7 @@ fi
 }
 
 #[test]
+#[cfg(unix)]
 fn parallel_executor_runs_all_steps_and_waits_for_failures() {
     let conn = test_connection();
     let temp = unique_temp_dir("prism-plan-executor-parallel-failure");
@@ -517,6 +521,7 @@ fi
 }
 
 #[test]
+#[cfg(unix)]
 fn parallel_executor_marks_success_after_all_steps_finish() {
     let conn = test_connection();
     let temp = unique_temp_dir("prism-plan-executor-parallel-success");
@@ -1008,13 +1013,10 @@ fn reconcile_marks_running_steps_failed_after_restart() {
             .as_deref()
             .is_some_and(|error| error.contains("Prism restarted"))
     );
-    assert!(
-        load_output_lines(&conn, &persisted.run.id, 1)
-            .unwrap()
-            .iter()
-            .any(|line| line.kind == PlanOutputKind::Error
-                && line.text.contains("Prism restarted"))
-    );
+    assert!(load_output_lines(&conn, &persisted.run.id, 1)
+        .unwrap()
+        .iter()
+        .any(|line| line.kind == PlanOutputKind::Error && line.text.contains("Prism restarted")));
 }
 
 #[test]

@@ -3,7 +3,6 @@ use std::future::Future;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
@@ -263,29 +262,23 @@ pub(super) fn options(
     create: bool,
     readonly: bool,
 ) -> Result<SqliteConnectOptions, DatabaseError> {
-    SqliteConnectOptions::from_str(&path.to_string_lossy())
-        .map_err(|source| DatabaseError::Connect {
-            path: path.into(),
-            source,
-        })
-        .map(|options| {
-            let options = options
-                .create_if_missing(create)
-                .read_only(readonly)
-                .foreign_keys(true)
-                .busy_timeout(if readonly {
-                    Duration::ZERO
-                } else {
-                    WRITER_BUSY_TIMEOUT
-                });
-            if readonly {
-                options
-            } else {
-                options
-                    .journal_mode(SqliteJournalMode::Wal)
-                    .synchronous(SqliteSynchronous::Full)
-            }
-        })
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(create)
+        .read_only(readonly)
+        .foreign_keys(true)
+        .busy_timeout(if readonly {
+            Duration::ZERO
+        } else {
+            WRITER_BUSY_TIMEOUT
+        });
+    Ok(if readonly {
+        options
+    } else {
+        options
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Full)
+    })
 }
 
 fn prepare_parent(path: &Path) -> Result<(), DatabaseError> {

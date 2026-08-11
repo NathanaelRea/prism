@@ -156,7 +156,17 @@ fn plan_first_prompts_create_and_review_plan_file() {
         &persisted.run,
         &AutoStepRun::queued(&persisted.run.id, 3, AutoStepKey::ReviewPlan, 1, None),
     );
-    assert!(create_prompt.contains("/repo/prism/feature/plan.md"));
+    assert!(
+        create_prompt.contains(
+            &persisted
+                .run
+                .plan_path
+                .as_ref()
+                .unwrap()
+                .display()
+                .to_string()
+        )
+    );
     assert!(create_prompt.contains("Do not implement"));
     assert!(create_prompt.contains("Variant: intensive"));
     assert!(create_prompt.contains("Agent profile: planner"));
@@ -1921,8 +1931,22 @@ fn initial_change_request_push_runs_pre_pr_then_pre_push_checks() {
     let pre_pr = temp.path().join("pre-pr-ran");
     let pre_push = temp.path().join("pre-push-ran");
     let mut config = test_config();
-    config.checks.pre_pr = vec![format!("touch {}", pre_pr.display())];
-    config.checks.pre_push = vec![format!("touch {}", pre_push.display())];
+    #[cfg(unix)]
+    {
+        config.checks.pre_pr = vec![format!("touch {}", pre_pr.display())];
+        config.checks.pre_push = vec![format!("touch {}", pre_push.display())];
+    }
+    #[cfg(windows)]
+    {
+        config.checks.pre_pr = vec![format!(
+            "New-Item -ItemType File -Force -LiteralPath '{}' | Out-Null",
+            pre_pr.display().to_string().replace('\'', "''")
+        )];
+        config.checks.pre_push = vec![format!(
+            "New-Item -ItemType File -Force -LiteralPath '{}' | Out-Null",
+            pre_push.display().to_string().replace('\'', "''")
+        )];
+    }
 
     non_agent::run_initial_push_checks(&config, temp.path(), true).unwrap();
 

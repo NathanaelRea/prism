@@ -405,7 +405,10 @@ key = "8"
         let expected_repo_path = fs::canonicalize(&repo_path).unwrap();
 
         assert_eq!(discovered.len(), 1);
-        assert_eq!(discovered[0].repo.root, expected_repo_path);
+        assert_eq!(
+            discovered[0].repo.root.canonicalize().unwrap(),
+            expected_repo_path
+        );
         assert_eq!(discovered[0].key, Some('1'));
         assert_eq!(discovered[0].source_index, 0);
 
