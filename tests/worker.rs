@@ -1,34 +1,10 @@
 #![cfg(unix)]
 
-use std::path::{Path, PathBuf};
+mod common;
+
 use std::process::{Command, Output};
 
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(label: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "prism-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&path).unwrap();
-        Self(path)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+use common::CompactTempDir as TempDir;
 
 fn prism(temp: &TempDir, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_prism"))
@@ -36,7 +12,7 @@ fn prism(temp: &TempDir, args: &[&str]) -> Output {
         .env("HOME", temp.path())
         .env("XDG_CONFIG_HOME", temp.path().join("config"))
         .env("XDG_RUNTIME_DIR", temp.path().join("runtime"))
-        .env("PRISM_RUNTIME_DIR", temp.path().join("runtime/prism"))
+        .env("PRISM_RUNTIME_DIR", temp.runtime_path())
         .output()
         .unwrap()
 }

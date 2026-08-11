@@ -307,7 +307,12 @@ pub(crate) fn send_process_group_signal(pid: u32, signal: libc::c_int) -> io::Re
 fn native_process_identity(pid: u32) -> io::Result<Option<ProcessIdentity>> {
     let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
         Ok(stat) => stat,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            return Ok(None);
+        }
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return Ok(None),
         Err(error) => return Err(error),
     };
