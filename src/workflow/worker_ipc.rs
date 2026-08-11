@@ -232,7 +232,8 @@ pub(super) fn create_secret(endpoint: &WorkerEndpoint) -> Result<String, String>
         .access_mode(
             (windows::Win32::Storage::FileSystem::FILE_GENERIC_READ
                 | windows::Win32::Storage::FileSystem::FILE_GENERIC_WRITE
-                | windows::Win32::Storage::FileSystem::WRITE_DAC)
+                | windows::Win32::Storage::FileSystem::WRITE_DAC
+                | windows::Win32::Storage::FileSystem::WRITE_OWNER)
                 .0,
         )
         .custom_flags(windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT.0);
@@ -261,7 +262,8 @@ pub(super) fn read_secret(endpoint: &WorkerEndpoint) -> Result<String, String> {
     options
         .access_mode(
             (windows::Win32::Storage::FileSystem::FILE_GENERIC_READ
-                | windows::Win32::Storage::FileSystem::WRITE_DAC)
+                | windows::Win32::Storage::FileSystem::WRITE_DAC
+                | windows::Win32::Storage::FileSystem::WRITE_OWNER)
                 .0,
         )
         .custom_flags(windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT.0);
@@ -364,10 +366,10 @@ mod tests {
         set_stream_nonblocking(&stream, true).unwrap();
         let started = Instant::now();
         let mut request = String::new();
-        let error = BufReader::new(&mut stream)
-            .read_line(&mut request)
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            BufReader::new(&mut stream).read_line(&mut request).unwrap(),
+            0
+        );
         assert!(started.elapsed() < Duration::from_secs(2));
         drop(stream);
         drop(listener);

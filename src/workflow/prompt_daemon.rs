@@ -320,6 +320,12 @@ fn read_request_line(stream: &mut WorkerStream) -> io::Result<String> {
             Err(error) => return Err(error),
         };
         if count == 0 {
+            #[cfg(windows)]
+            {
+                wait_for_io(deadline)?;
+                continue;
+            }
+            #[cfg(unix)]
             break;
         }
         let line_end = buffer[..count]
@@ -350,6 +356,12 @@ fn write_with_deadline(
     while written < bytes.len() {
         match stream.write(&bytes[written..]) {
             Ok(0) => {
+                #[cfg(windows)]
+                {
+                    wait_for_io(deadline)?;
+                    continue;
+                }
+                #[cfg(unix)]
                 return Err(io::Error::new(
                     io::ErrorKind::WriteZero,
                     "worker endpoint stopped accepting response bytes",
@@ -776,8 +788,19 @@ fn request_stream(mut stream: WorkerStream, command: &str) -> Result<String, Str
     let mut buffer = [0_u8; 4096];
     loop {
         match stream.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(count) => response.extend_from_slice(&buffer[..count]),
+            Ok(0) => {
+                #[cfg(windows)]
+                wait_for_io(deadline)
+                    .map_err(|error| format!("read Prism worker response: {error}"))?;
+                #[cfg(unix)]
+                break;
+            }
+            Ok(count) => {
+                response.extend_from_slice(&buffer[..count]);
+                if response.contains(&b'\n') {
+                    break;
+                }
+            }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 wait_for_io(deadline)
                     .map_err(|error| format!("read Prism worker response: {error}"))?;
