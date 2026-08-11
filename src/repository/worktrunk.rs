@@ -1179,8 +1179,6 @@ fn safe_summary(output: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(windows)]
-    use crate::test_support::PermissionsExt;
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -1945,6 +1943,7 @@ mod tests {
         parse_remove_output(&command, &output, expected_path, expected_path)
     }
 
+    #[cfg(unix)]
     fn run_failure_fixture(body: &str) -> FailureKind {
         let temp = unique_temp_dir("prism-wt-failure");
         fs::create_dir_all(&temp).unwrap();
@@ -1979,6 +1978,7 @@ mod tests {
         std::process::ExitStatus::from_raw(0)
     }
 
+    #[cfg(unix)]
     fn write_executable(path: &Path, contents: &str) {
         fs::write(path, contents).unwrap();
         let mut permissions = fs::metadata(path).unwrap().permissions();

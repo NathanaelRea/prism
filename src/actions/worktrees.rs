@@ -894,7 +894,7 @@ impl Tui {
         changed
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn start_delete_session_for_test(&mut self) -> Result<(), String> {
         let context = self
             .selected_worktree_context()

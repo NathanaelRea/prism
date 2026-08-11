@@ -1,4 +1,7 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write as _;
+use std::path::Path;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -91,6 +94,133 @@ pub(super) fn choice_list(title: &str, choices: &[(&str, &str)]) -> view::Choice
     }
 }
 
+fn toggle_bool_field(value: &mut String) {
+    *value = if value == "true" { "false" } else { "true" }.into();
+}
+
+fn selected_option(options: &[String], value: &str) -> usize {
+    options
+        .iter()
+        .position(|option| option == value)
+        .unwrap_or(0)
+}
+
+fn cycle_enum_field(value: &mut String, options: &[String], forward: bool) {
+    if options.is_empty() {
+        return;
+    }
+    if !options.iter().any(|option| option == value) {
+        *value = options[0].clone();
+        return;
+    }
+    let selected = selected_option(options, value);
+    let next = if forward {
+        (selected + 1).min(options.len() - 1)
+    } else {
+        selected.saturating_sub(1)
+    };
+    *value = options[next].clone();
+}
+
+fn validate_workflow_form(
+    workflow: &crate::CompiledWorkflow,
+    worktree: &Path,
+    fields: &mut [view::FormField],
+) -> Result<BTreeMap<String, String>, (usize, String)> {
+    let mut supplied = BTreeMap::new();
+    for (index, field) in fields.iter_mut().enumerate() {
+        let input = workflow
+            .inputs
+            .get(&field.name)
+            .expect("Workflow form fields come from the compiled input map");
+        let raw = if field.value.is_empty() {
+            let Some(default) = input.default_value() else {
+                return Err((
+                    index,
+                    format!("Workflow input '{}' is required", field.name),
+                ));
+            };
+            default
+        } else {
+            field.value.clone()
+        };
+        match crate::validate_workflow_input(worktree, input, &raw) {
+            Ok(value) => {
+                field.value = value.clone();
+                supplied.insert(field.name.clone(), value);
+            }
+            Err(problem) => {
+                return Err((index, format!("Workflow input '{}': {problem}", field.name)));
+            }
+        }
+    }
+    crate::bind_workflow_inputs(workflow, worktree, &supplied)
+        .map(|bound| bound.input_values)
+        .map_err(|problem| (0, problem.to_string()))
+}
+
+fn pick_workflow_file(
+    fzf: &str,
+    name: &str,
+    worktree: &Path,
+    workflow: &crate::CompiledWorkflow,
+) -> Result<Option<String>, String> {
+    let input = workflow
+        .inputs
+        .get(name)
+        .ok_or_else(|| format!("unknown Workflow input '{name}'"))?;
+    let candidates = crate::workflow_file_input_candidates(worktree, input)
+        .map_err(|error| error.to_string())?;
+    let glob = input.file_glob().unwrap_or_default();
+    if candidates.is_empty() {
+        return Err(format!(
+            "no files match '{glob}' under {}",
+            worktree.display()
+        ));
+    }
+    let mut child = Command::new(fzf)
+        .args([
+            &format!("--prompt={name}> "),
+            &format!("--header=Select a file matching {glob}"),
+            "--height=80%",
+            "--reverse",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("start fzf '{fzf}' for Workflow input '{name}': {error}"))?;
+    {
+        let stdin = child.stdin.as_mut().expect("fzf stdin is piped");
+        for candidate in candidates {
+            writeln!(stdin, "{candidate}")
+                .map_err(|error| format!("write Workflow input candidates: {error}"))?;
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("wait for Workflow input picker: {error}"))?;
+    if output
+        .status
+        .code()
+        .is_some_and(|code| matches!(code, 1 | 130))
+    {
+        return Ok(None);
+    }
+    if !output.status.success() {
+        return Err(format!(
+            "Workflow input picker exited with {}",
+            output.status
+        ));
+    }
+    let selected = String::from_utf8(output.stdout)
+        .map_err(|error| format!("Workflow input picker returned invalid UTF-8: {error}"))?;
+    let selected = selected.trim_end_matches(['\r', '\n']);
+    if selected.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(selected.to_string()))
+}
+
 impl Tui {
     pub(super) fn show_keybindings_dialog(
         &mut self,
@@ -100,26 +230,23 @@ impl Tui {
             "1 / 2 / 3    focus status / repos / worktrees sidebars; 3 toggles repo/all worktrees",
             "0            focus main panel for the selected sidebar",
             "Tab / Shift-Tab  move focus between panels",
-            "h/l, left/right arrows  repos: switch view; status plan: switch phase",
-            "Enter       repos: open default-branch tmux; worktrees: open agent or selected plan phase; main comments: details",
+            "[ / ]        switch repository views or worktree list scope",
+            "h/l, left/right arrows  repos: switch view",
+            "Enter       repos: open default-branch tmux; worktrees: open agent; main comments: details",
             "Ctrl-/       open tmux window 3: terminal",
             "p            repos: pull default branch",
-            "P            worktrees: start or focus a plan run dashboard",
-            "j/k          main comments: move comment selection; status dashboard: move plan output or phase selection",
-            "A            worktrees: start/focus Auto Flow; choose prompt, plan file, or draft plan",
+            "W / Space W  open the flat Workflow run/edit picker",
+            "Space c      open the unified configuration tree",
+            "{ / }        cycle Workflow Runs for the selected worktree",
+            "u / f        pause or resume the selected Workflow Run / retry its failed Step",
+            "j/k          move the selection in the focused dashboard or comments panel",
             "Space g R    main comments: resolve all inline review conversations",
             "r            repos: reorder or remove repositories",
-            "R            edit repositories/order/keys/remove in repos.toml",
             "C            repos: open a worktree for a remote pull request",
             "c            repos: create worktree session in selected repo",
             "> / <        worktrees: raise/lower priority",
-            "x            worktrees: abort selected agent session when supported",
+            "x            cancel selected Workflow Run, otherwise abort selected agent session",
             "M            worktrees: migrate selected worktree to the default harness",
-            "H            choose the global default harness or add a generic harness",
-            "e            edit selected repository config, then reload",
-            "E            edit user config, then reload",
-            "w            edit Worktrunk user config; affects Prism and standalone wt",
-            "W            repos: edit visible worktree columns in repo config",
             "o            worktrees: open the selected Worktrunk development URL",
             "L            worktrees: inspect bounded Worktrunk hook logs",
             "/            search/filter focused panel",
@@ -347,6 +474,265 @@ impl Tui {
         }
     }
 
+    pub(crate) fn prompt_workflow_input_form(
+        &mut self,
+        runtime: &mut TerminalRuntime,
+        workflow: &crate::CompiledWorkflow,
+        worktree: &Path,
+        fzf: &str,
+    ) -> Result<Option<BTreeMap<String, String>>, String> {
+        if workflow.inputs.is_empty() {
+            return Ok(Some(BTreeMap::new()));
+        }
+        let mut fields = workflow
+            .inputs
+            .iter()
+            .map(|(name, input)| view::FormField {
+                name: name.clone(),
+                value: input.default_value().unwrap_or_default(),
+                description: input.description().map(str::to_string),
+                constraint: match input {
+                    crate::CompiledWorkflowInput::String {
+                        min_length,
+                        max_length,
+                        ..
+                    } => match (min_length, max_length) {
+                        (Some(min), Some(max)) => Some(format!("{min}–{max} chars")),
+                        (Some(min), None) => Some(format!("at least {min} chars")),
+                        (None, Some(max)) => Some(format!("at most {max} chars")),
+                        (None, None) => None,
+                    },
+                    crate::CompiledWorkflowInput::Number { min, max, .. } => match (min, max) {
+                        (Some(min), Some(max)) => Some(format!("{min}–{max}")),
+                        (Some(min), None) => Some(format!("at least {min}")),
+                        (None, Some(max)) => Some(format!("at most {max}")),
+                        (None, None) => None,
+                    },
+                    crate::CompiledWorkflowInput::Enum { options, .. } => {
+                        Some(format!("{} options", options.len()))
+                    }
+                    _ => None,
+                },
+                required: input.is_required(),
+                kind: match input {
+                    crate::CompiledWorkflowInput::File { glob, .. } => {
+                        view::FormFieldKind::File { glob: glob.clone() }
+                    }
+                    crate::CompiledWorkflowInput::String { .. } => view::FormFieldKind::String,
+                    crate::CompiledWorkflowInput::Bool { .. } => view::FormFieldKind::Bool,
+                    crate::CompiledWorkflowInput::Number { .. } => view::FormFieldKind::Number,
+                    crate::CompiledWorkflowInput::Enum { options, .. } => {
+                        view::FormFieldKind::Enum {
+                            options: options.clone(),
+                        }
+                    }
+                },
+            })
+            .collect::<Vec<_>>();
+        let mut selected = 0usize;
+        let mut dropdown = None;
+        let mut error = None;
+        loop {
+            self.dialog = Some(view::DialogModel::Form {
+                title: format!("Run {}", workflow.name),
+                fields: fields.clone(),
+                selected,
+                dropdown,
+                error: error.clone(),
+            });
+            self.draw(runtime)?;
+            if self.tick_tui_action_jobs().any() {
+                self.draw(runtime)?;
+            }
+            let Some(event) = runtime.poll_event(Duration::from_millis(100))? else {
+                continue;
+            };
+            let RuntimeEvent::Key(event) = event else {
+                continue;
+            };
+            if event.kind != KeyEventKind::Press {
+                continue;
+            }
+            error = None;
+
+            if let Some(mut menu) = dropdown {
+                let Some(view::FormField {
+                    kind: view::FormFieldKind::Enum { options },
+                    ..
+                }) = fields.get_mut(selected)
+                else {
+                    dropdown = None;
+                    continue;
+                };
+                match event.code {
+                    KeyCode::Esc => dropdown = None,
+                    KeyCode::Enter if plain_key(event) => {
+                        if let Some(value) = options.get(menu.selected) {
+                            fields[selected].value = value.clone();
+                        }
+                        dropdown = None;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') if plain_key(event) => {
+                        menu.selected = menu.selected.saturating_sub(1);
+                        dropdown = Some(menu);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') if plain_key(event) => {
+                        menu.selected = menu
+                            .selected
+                            .saturating_add(1)
+                            .min(options.len().saturating_sub(1));
+                        dropdown = Some(menu);
+                    }
+                    KeyCode::Home if plain_key(event) => {
+                        menu.selected = 0;
+                        dropdown = Some(menu);
+                    }
+                    KeyCode::End if plain_key(event) => {
+                        menu.selected = options.len().saturating_sub(1);
+                        dropdown = Some(menu);
+                    }
+                    KeyCode::Char('c') if ctrl_key(event) => {
+                        self.dialog = None;
+                        self.draw(runtime)?;
+                        return Ok(None);
+                    }
+                    _ => dropdown = Some(menu),
+                }
+                continue;
+            }
+
+            let field_kind = fields.get(selected).map(|field| field.kind.clone());
+            match event.code {
+                KeyCode::Esc | KeyCode::Char('c')
+                    if event.code == KeyCode::Esc || ctrl_key(event) =>
+                {
+                    self.dialog = None;
+                    self.draw(runtime)?;
+                    return Ok(None);
+                }
+                KeyCode::Tab | KeyCode::Down if plain_key(event) => {
+                    selected = selected.saturating_add(1).min(fields.len());
+                }
+                KeyCode::BackTab | KeyCode::Up if plain_key(event) => {
+                    selected = selected.saturating_sub(1);
+                }
+                KeyCode::Enter if plain_key(event) && selected == fields.len() => {
+                    match validate_workflow_form(workflow, worktree, &mut fields) {
+                        Ok(values) => {
+                            self.dialog = None;
+                            self.draw(runtime)?;
+                            return Ok(Some(values));
+                        }
+                        Err((field, problem)) => {
+                            selected = field;
+                            error = Some(problem);
+                        }
+                    }
+                }
+                KeyCode::Enter if plain_key(event) => match field_kind {
+                    Some(view::FormFieldKind::String | view::FormFieldKind::Number) => {
+                        selected = selected.saturating_add(1).min(fields.len());
+                    }
+                    Some(view::FormFieldKind::Bool) => {
+                        toggle_bool_field(&mut fields[selected].value);
+                    }
+                    Some(view::FormFieldKind::Enum { ref options }) => {
+                        dropdown = Some(view::FormDropdown {
+                            selected: selected_option(options, &fields[selected].value),
+                        });
+                    }
+                    Some(view::FormFieldKind::File { .. }) => {
+                        let picked = runtime.suspend_for(|| {
+                            Ok(pick_workflow_file(
+                                fzf,
+                                &fields[selected].name,
+                                worktree,
+                                workflow,
+                            ))
+                        })?;
+                        match picked {
+                            Ok(Some(value)) => fields[selected].value = value,
+                            Ok(None) => {}
+                            Err(problem) => error = Some(problem),
+                        }
+                    }
+                    None => {}
+                },
+                KeyCode::Char(' ') if plain_key(event) => match field_kind {
+                    Some(view::FormFieldKind::Bool) => {
+                        toggle_bool_field(&mut fields[selected].value);
+                    }
+                    Some(view::FormFieldKind::Enum { ref options }) => {
+                        dropdown = Some(view::FormDropdown {
+                            selected: selected_option(options, &fields[selected].value),
+                        });
+                    }
+                    Some(view::FormFieldKind::File { .. }) => {
+                        let picked = runtime.suspend_for(|| {
+                            Ok(pick_workflow_file(
+                                fzf,
+                                &fields[selected].name,
+                                worktree,
+                                workflow,
+                            ))
+                        })?;
+                        match picked {
+                            Ok(Some(value)) => fields[selected].value = value,
+                            Ok(None) => {}
+                            Err(problem) => error = Some(problem),
+                        }
+                    }
+                    Some(view::FormFieldKind::String) => fields[selected].value.push(' '),
+                    _ => {}
+                },
+                KeyCode::Left | KeyCode::Right if plain_key(event) => match field_kind {
+                    Some(view::FormFieldKind::Bool) => {
+                        fields[selected].value = if event.code == KeyCode::Left {
+                            "false".into()
+                        } else {
+                            "true".into()
+                        };
+                    }
+                    Some(view::FormFieldKind::Enum { ref options }) => {
+                        cycle_enum_field(
+                            &mut fields[selected].value,
+                            options,
+                            event.code == KeyCode::Right,
+                        );
+                    }
+                    _ => {}
+                },
+                KeyCode::Backspace if plain_key(event) => {
+                    if let Some(field) = fields.get_mut(selected) {
+                        match field.kind {
+                            view::FormFieldKind::String | view::FormFieldKind::Number => {
+                                field.value.pop();
+                            }
+                            view::FormFieldKind::File { .. } => field.value.clear(),
+                            _ => {}
+                        }
+                    }
+                }
+                KeyCode::Delete if plain_key(event) => {
+                    if let Some(field) = fields.get_mut(selected) {
+                        field.value.clear();
+                    }
+                }
+                KeyCode::Char(ch) if plain_key(event) && !ch.is_control() => {
+                    if let Some(field) = fields.get_mut(selected)
+                        && matches!(
+                            field.kind,
+                            view::FormFieldKind::String | view::FormFieldKind::Number
+                        )
+                    {
+                        field.value.push(ch);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     pub(crate) fn prompt_choice_dialog(
         &mut self,
         runtime: &mut TerminalRuntime,
@@ -546,7 +932,11 @@ impl Tui {
         if candidates.is_empty() {
             return Ok(());
         }
-        let now = crate::execution::now_ms();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
         let items = candidates
             .iter()
             .enumerate()
@@ -561,20 +951,16 @@ impl Tui {
                 } else {
                     format!("{}s ago", age_ms / 1_000)
                 };
-                let kind = match workflow.identity.kind.as_str() {
-                    "auto" => "Auto Flow",
-                    _ => "Plan",
-                };
                 let step = workflow
                     .current_step
                     .as_ref()
                     .map(|step| step.label.as_str())
-                    .unwrap_or(kind);
+                    .unwrap_or("Workflow");
                 view::OrderedToggleItem {
                     id: index.to_string(),
                     label: format!(
                         "{} / {}  {}  {}  {}",
-                        repository.label, workflow.worktree.display, kind, step, age
+                        repository.label, workflow.worktree.display, "Workflow", step, age
                     ),
                     enabled: false,
                 }

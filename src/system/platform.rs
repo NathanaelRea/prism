@@ -7,6 +7,7 @@ pub(crate) enum SupportedOs {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) enum DesktopNotificationPolicy {
     NativeWorker,
     TerminalSubscriber,
@@ -79,6 +80,7 @@ pub(crate) const fn default_worktrunk_command(os: SupportedOs) -> &'static str {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) const fn desktop_notification_policy(os: SupportedOs) -> DesktopNotificationPolicy {
     match os {
         SupportedOs::Linux => DesktopNotificationPolicy::NativeWorker,

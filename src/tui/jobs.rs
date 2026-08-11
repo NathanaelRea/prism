@@ -142,7 +142,7 @@ impl<K: Ord + Clone, T> LatestReceiver<K, T> {
         values.remove(&key).ok_or(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn recv_timeout(&self, timeout: Duration) -> Result<T, ()> {
         let started = Instant::now();
         loop {

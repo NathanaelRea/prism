@@ -599,6 +599,12 @@ fn operation_label(operation: RemoteOperation) -> &'static str {
         RemoteOperation::SubmitReview => "submit_review",
         RemoteOperation::MergeChangeRequest => "merge_change_request",
         RemoteOperation::ObserveMergeQueue => "observe_merge_queue",
+        RemoteOperation::DiscoverIssues => "discover_issues",
+        RemoteOperation::ObserveProviderEvents => "observe_provider_events",
+        RemoteOperation::MutateLabels => "mutate_labels",
+        RemoteOperation::MutateAssignment => "mutate_assignment",
+        RemoteOperation::CreateIssueComment => "create_issue_comment",
+        RemoteOperation::MutateIssueLifecycle => "mutate_issue_lifecycle",
     }
 }
 

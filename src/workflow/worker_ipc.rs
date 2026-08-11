@@ -11,9 +11,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener as NativeListener, UnixStream as NativeStream};
-
 #[cfg(windows)]
-use interprocess::TryClone;
+use std::os::windows::fs::OpenOptionsExt as _;
+
 #[cfg(windows)]
 use interprocess::local_socket::traits::{Listener as _, Stream as _};
 #[cfg(windows)]
@@ -77,11 +77,6 @@ impl WorkerEndpoint {
     #[cfg(unix)]
     pub(super) fn path(&self) -> &Path {
         &self.address
-    }
-
-    #[cfg(all(test, unix))]
-    pub(super) fn as_path(&self) -> &Path {
-        self.path()
     }
 
     pub(super) fn display(&self) -> String {
@@ -157,37 +152,12 @@ impl WorkerEndpoint {
         #[cfg(windows)]
         Ok(())
     }
-
-    pub(super) fn address_exists(&self) -> io::Result<bool> {
-        #[cfg(unix)]
-        return match fs::symlink_metadata(&self.address) {
-            Ok(_) => Ok(true),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(error),
-        };
-        #[cfg(windows)]
-        return match self.connect() {
-            Ok(_) => Ok(true),
-            Err(error) if endpoint_unavailable(&error) => Ok(false),
-            Err(error) => Err(error),
-        };
-    }
 }
 
 pub(super) fn endpoint_unavailable(error: &io::Error) -> bool {
     matches!(
         error.kind(),
         io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
-    )
-}
-
-pub(super) fn connection_closed(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::BrokenPipe
-            | io::ErrorKind::ConnectionReset
-            | io::ErrorKind::NotConnected
-            | io::ErrorKind::UnexpectedEof
     )
 }
 
@@ -203,13 +173,6 @@ pub(super) fn set_listener_nonblocking(listener: &WorkerListener) -> io::Result<
     return listener.set_nonblocking(true);
     #[cfg(windows)]
     return listener.set_nonblocking(ListenerNonblockingMode::Accept);
-}
-
-pub(super) fn try_clone_stream(stream: &WorkerStream) -> io::Result<WorkerStream> {
-    #[cfg(unix)]
-    return stream.try_clone();
-    #[cfg(windows)]
-    return TryClone::try_clone(stream);
 }
 
 pub(super) fn set_read_timeout(stream: &WorkerStream, timeout: Duration) -> io::Result<()> {
@@ -272,28 +235,42 @@ pub(super) fn create_secret(endpoint: &WorkerEndpoint) -> Result<String, String>
         .collect::<String>();
     let path = endpoint.secret_path();
     let mut options = OpenOptions::new();
-    options.create(true).truncate(true).write(true);
+    options.create(true).read(true).write(true);
     #[cfg(unix)]
-    options.mode(0o600);
+    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    #[cfg(windows)]
+    options.custom_flags(windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT.0);
     let mut file = options
         .open(&path)
         .map_err(|error| format!("create worker authentication secret: {error}"))?;
-    file.write_all(secret.as_bytes())
-        .and_then(|()| file.sync_all())
-        .map_err(|error| format!("write worker authentication secret: {error}"))?;
     #[cfg(unix)]
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+    file.set_permissions(fs::Permissions::from_mode(0o600))
         .map_err(|error| format!("secure worker authentication secret: {error}"))?;
     #[cfg(windows)]
-    crate::system::windows_security::secure_path(&path, false)
+    crate::system::windows_security::secure_file(&file, false)
         .map_err(|error| format!("secure worker authentication secret: {error}"))?;
+    file.set_len(0)
+        .and_then(|()| file.write_all(secret.as_bytes()))
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("write worker authentication secret: {error}"))?;
     Ok(secret)
 }
 
 pub(super) fn read_secret(endpoint: &WorkerEndpoint) -> Result<String, String> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    #[cfg(windows)]
+    options.custom_flags(windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT.0);
+    let mut file = options
+        .open(endpoint.secret_path())
+        .map_err(|error| format!("read worker authentication secret: {error}"))?;
+    #[cfg(windows)]
+    crate::system::windows_security::secure_file(&file, false)
+        .map_err(|error| format!("secure worker authentication secret: {error}"))?;
     let mut secret = String::new();
-    fs::File::open(endpoint.secret_path())
-        .and_then(|mut file| file.read_to_string(&mut secret))
+    file.read_to_string(&mut secret)
         .map_err(|error| format!("read worker authentication secret: {error}"))?;
     let secret = secret.trim();
     if secret.len() != SECRET_BYTES * 2 || !secret.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -371,6 +348,29 @@ mod tests {
     }
 
     #[test]
+    fn windows_named_pipe_read_timeout_is_bounded() {
+        let runtime = runtime("read-timeout");
+        prepare_runtime(&runtime).unwrap();
+        let endpoint = WorkerEndpoint::for_runtime(&runtime).unwrap();
+        let listener = endpoint.bind().unwrap();
+        let client_endpoint = endpoint.clone();
+        let client = thread::spawn(move || {
+            let _stream = client_endpoint.connect().unwrap();
+            thread::sleep(Duration::from_millis(500));
+        });
+        let mut stream = accept(&listener).unwrap();
+        set_read_timeout(&stream, Duration::from_millis(100)).unwrap();
+        let started = Instant::now();
+        let mut request = String::new();
+        assert!(BufReader::new(&mut stream).read_line(&mut request).is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(stream);
+        drop(listener);
+        client.join().unwrap();
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
     fn windows_secret_is_random_and_validated() {
         let runtime = runtime("secret");
         prepare_runtime(&runtime).unwrap();
@@ -381,5 +381,28 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(second.len(), SECRET_BYTES * 2);
         fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn windows_secret_reparse_target_is_rejected_before_truncation() {
+        use std::os::windows::fs::symlink_file;
+
+        let runtime = runtime("secret-reparse");
+        let target = runtime.with_extension("target");
+        prepare_runtime(&runtime).unwrap();
+        fs::write(&target, b"sentinel").unwrap();
+        let endpoint = WorkerEndpoint::for_runtime(&runtime).unwrap();
+        if let Err(error) = symlink_file(&target, endpoint.secret_path()) {
+            if error.kind() == io::ErrorKind::PermissionDenied {
+                fs::remove_dir_all(runtime).unwrap();
+                fs::remove_file(target).unwrap();
+                return;
+            }
+            panic!("create worker secret symlink: {error}");
+        }
+        assert!(create_secret(&endpoint).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"sentinel");
+        fs::remove_dir_all(runtime).unwrap();
+        fs::remove_file(target).unwrap();
     }
 }

@@ -3,8 +3,8 @@ use std::process::Command;
 
 use crate::config::Config;
 use crate::process::{
-    ProcessDescriptor, ProcessPolicy, run_capture, run_capture_named, run_configured_commands,
-    run_output_allow_failure, run_status,
+    ProcessDescriptor, ProcessPolicy, run_capture, run_capture_named, run_output_allow_failure,
+    run_status,
 };
 use crate::repo::Repository;
 pub(crate) use crate::worktrunk::ApprovalStatus as WorktrunkApprovalStatus;
@@ -178,14 +178,9 @@ pub(crate) fn push_branch(
     set_upstream: bool,
 ) -> Result<(), String> {
     let args = if set_upstream {
-        vec![
-            "push".to_string(),
-            "-u".to_string(),
-            "origin".to_string(),
-            branch.to_string(),
-        ]
+        vec!["push", "-u", "origin", branch]
     } else {
-        vec!["push".to_string()]
+        vec!["push"]
     };
     run_capture_named(
         Command::new(config.tool("git"))
@@ -196,14 +191,6 @@ pub(crate) fn push_branch(
         ProcessDescriptor::new("git.push"),
     )?;
     Ok(())
-}
-
-pub(crate) fn run_pre_push_checks(config: &Config, path: &Path) -> Result<(), String> {
-    run_configured_commands(&config.checks.pre_push, path, "pre_push")
-}
-
-pub(crate) fn run_pre_pr_checks(config: &Config, path: &Path) -> Result<(), String> {
-    run_configured_commands(&config.checks.pre_pr, path, "pre_pr")
 }
 
 fn switch_checkout_args(repo_root: &Path, branch: &str) -> Vec<String> {
@@ -310,19 +297,27 @@ pub(crate) fn prune_worktrees(repo: &Repository, config: &Config) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
-    use super::{WorktrunkApprovalStatus, check_worktrunk_approval_status, switch_checkout_args};
+    use super::switch_checkout_args;
+    #[cfg(unix)]
+    use super::{WorktrunkApprovalStatus, check_worktrunk_approval_status};
+    #[cfg(unix)]
     use crate::config::Config;
+    #[cfg(unix)]
     use crate::observability;
+    #[cfg(unix)]
     use crate::persistence::database::TestDatabase;
+    #[cfg(unix)]
     use crate::repo::Repository;
+    #[cfg(unix)]
     use crate::sqlx_test_params as params;
-    #[cfg(windows)]
-    use crate::test_support::PermissionsExt;
+    #[cfg(unix)]
     use crate::test_support::write_executable;
+    #[cfg(unix)]
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    #[cfg(unix)]
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -626,7 +621,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn complete_delete_removes_all_owned_state_and_preserves_auto_flow_audit() {
+    fn complete_delete_removes_all_owned_session_state() {
         let temp = unique_temp_dir("prism-delete-kills-tmux-test");
         fs::create_dir_all(&temp).unwrap();
         let tmux_log = temp.join("tmux.log");
@@ -779,18 +774,6 @@ exit 0
             .join(format!("{}.log", crate::util::safe_branch_filename(branch)));
         fs::create_dir_all(agent_log.parent().unwrap()).unwrap();
         fs::write(&agent_log, "owned Agent Session log\n").unwrap();
-        let mut audit =
-            crate::auto_flow::AutoLaunch::new(&repo.root, &path, branch, "preserve deletion audit")
-                .unwrap()
-                .create_run();
-        with_test_database(&repo, |conn| {
-            crate::auto_flow::save_auto_run(
-                &crate::auto_flow::AutoFlowStore::open(conn.path()),
-                &mut audit,
-            )
-        })
-        .unwrap();
-
         crate::session::delete_worktree_session_if_current(&repo, &config, &path, branch, None)
             .unwrap();
 
@@ -821,15 +804,6 @@ exit 0
             );
         }
         assert!(!agent_log.exists());
-        let audit_preserved = with_test_database(&repo, |conn| {
-            crate::auto_flow::load_auto_run(
-                &crate::auto_flow::AutoFlowStore::open(conn.path()),
-                &audit.run.id,
-            )
-        })
-        .unwrap();
-        assert!(audit_preserved.is_some());
-
         let _ = fs::remove_dir_all(temp);
     }
 
@@ -1465,10 +1439,12 @@ exit 0
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[cfg(unix)]
     fn test_config() -> Config {
         crate::test_support::test_config()
     }
 
+    #[cfg(unix)]
     fn unique_temp_dir(prefix: &str) -> PathBuf {
         let id = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1477,6 +1453,7 @@ exit 0
         std::env::temp_dir().join(format!("{prefix}-{id}"))
     }
 
+    #[cfg(unix)]
     fn count_rows(repo: &Repository, table: &str, branch: &str) -> i64 {
         with_test_database(repo, |conn| {
             conn.query_row(
@@ -1489,6 +1466,7 @@ exit 0
         .unwrap()
     }
 
+    #[cfg(unix)]
     fn with_test_database<T>(
         repo: &Repository,
         run: impl FnOnce(&TestDatabase) -> Result<T, String>,
@@ -1496,6 +1474,7 @@ exit 0
         observability::with_writable_db(repo, |path| run(&TestDatabase::open(path)?))
     }
 
+    #[cfg(unix)]
     fn write_successful_remove_wt(
         wt: &std::path::Path,
         log: &std::path::Path,

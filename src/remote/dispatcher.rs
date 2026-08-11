@@ -1,6 +1,9 @@
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
+
+use sha2::{Digest as _, Sha256};
 
 use crate::config::Config;
 use crate::repo::Repository;
@@ -19,9 +22,10 @@ use super::gitlab::GitLabAdapter;
 use super::{
     CanonicalChangeRequestIdentity, Capabilities, ChangeRequest, ChangeRequestDetails,
     ChangeRequestId, ChangeRequestSummary, CheckState, CreateChangeRequest, DiscoveredRemote,
-    GuardedMerge, LifecycleState, MergeMethod, MergeMutationResult, MergeabilityState,
-    NativeReviewThreadId, Observation, ProviderKind, QueueState, RemoteError, RemoteRepositoryId,
-    RemoteUrlKind, RepositoryPolicy, ResolveReviewThread, ReviewDecision, ReviewSubmissionKind,
+    GuardedMerge, LifecycleState, MergeMethod, MergeMutationOutcome, MergeMutationResult,
+    MergeabilityState, NativeReviewThreadId, Observation, ProviderItemObservation, ProviderKind,
+    QueueState, RemoteError, RemoteErrorClass, RemoteOperation, RemoteRepositoryId, RemoteUrlKind,
+    RepositoryPolicy, ResolveReviewThread, Retryability, ReviewDecision, ReviewSubmissionKind,
     SubmitReview, discover_git_remote,
 };
 
@@ -93,6 +97,127 @@ impl<'a> Adapter<'a> {
                     .map(|adapter| Self::Forgejo(Box::new(adapter)))
                     .map_err(|error| error.to_string())
             }
+        }
+    }
+
+    fn discover_issues(&self) -> Result<Vec<ProviderItemObservation>, RemoteError> {
+        match self {
+            Self::GitHub(adapter) => adapter.discover_issues("all"),
+            Self::GitLab(_) => Err(RemoteError::new(
+                ProviderKind::GitLab,
+                RemoteOperation::DiscoverIssues,
+                RemoteErrorClass::Unsupported,
+                Retryability::NotRetryable,
+                "GitLab issue discovery is not implemented",
+            )),
+            Self::Forgejo(_) => Err(RemoteError::new(
+                ProviderKind::Forgejo,
+                RemoteOperation::DiscoverIssues,
+                RemoteErrorClass::Unsupported,
+                Retryability::NotRetryable,
+                "Forgejo issue discovery is not implemented",
+            )),
+        }
+    }
+
+    fn observe_issue(&self, native_id: &str) -> Result<ProviderItemObservation, RemoteError> {
+        match self {
+            Self::GitHub(adapter) => adapter.observe_issue(native_id),
+            Self::GitLab(_) => Err(unsupported_issue_operation(
+                ProviderKind::GitLab,
+                RemoteOperation::DiscoverIssues,
+            )),
+            Self::Forgejo(_) => Err(unsupported_issue_operation(
+                ProviderKind::Forgejo,
+                RemoteOperation::DiscoverIssues,
+            )),
+        }
+    }
+
+    fn set_issue_labels(
+        &self,
+        native_id: &str,
+        labels: &[String],
+    ) -> Result<ProviderItemObservation, RemoteError> {
+        match self {
+            Self::GitHub(adapter) => adapter.set_issue_labels(native_id, labels),
+            Self::GitLab(_) => Err(unsupported_issue_operation(
+                ProviderKind::GitLab,
+                RemoteOperation::MutateLabels,
+            )),
+            Self::Forgejo(_) => Err(unsupported_issue_operation(
+                ProviderKind::Forgejo,
+                RemoteOperation::MutateLabels,
+            )),
+        }
+    }
+
+    fn set_issue_assignees(
+        &self,
+        native_id: &str,
+        assignees: &[String],
+    ) -> Result<ProviderItemObservation, RemoteError> {
+        match self {
+            Self::GitHub(adapter) => adapter.set_issue_assignees(native_id, assignees),
+            Self::GitLab(_) => Err(unsupported_issue_operation(
+                ProviderKind::GitLab,
+                RemoteOperation::MutateAssignment,
+            )),
+            Self::Forgejo(_) => Err(unsupported_issue_operation(
+                ProviderKind::Forgejo,
+                RemoteOperation::MutateAssignment,
+            )),
+        }
+    }
+
+    fn set_issue_lifecycle(
+        &self,
+        native_id: &str,
+        lifecycle: &str,
+    ) -> Result<ProviderItemObservation, RemoteError> {
+        match self {
+            Self::GitHub(adapter) => adapter.set_issue_lifecycle(native_id, lifecycle),
+            Self::GitLab(_) => Err(unsupported_issue_operation(
+                ProviderKind::GitLab,
+                RemoteOperation::MutateIssueLifecycle,
+            )),
+            Self::Forgejo(_) => Err(unsupported_issue_operation(
+                ProviderKind::Forgejo,
+                RemoteOperation::MutateIssueLifecycle,
+            )),
+        }
+    }
+
+    fn issue_has_comment_marker(&self, native_id: &str, marker: &str) -> Result<bool, RemoteError> {
+        match self {
+            Self::GitHub(adapter) => adapter.issue_has_comment_marker(native_id, marker),
+            Self::GitLab(_) => Err(unsupported_issue_operation(
+                ProviderKind::GitLab,
+                RemoteOperation::CreateIssueComment,
+            )),
+            Self::Forgejo(_) => Err(unsupported_issue_operation(
+                ProviderKind::Forgejo,
+                RemoteOperation::CreateIssueComment,
+            )),
+        }
+    }
+
+    fn create_issue_comment(
+        &self,
+        native_id: &str,
+        body: &str,
+        marker: &str,
+    ) -> Result<(), RemoteError> {
+        match self {
+            Self::GitHub(adapter) => adapter.create_issue_comment(native_id, body, marker),
+            Self::GitLab(_) => Err(unsupported_issue_operation(
+                ProviderKind::GitLab,
+                RemoteOperation::CreateIssueComment,
+            )),
+            Self::Forgejo(_) => Err(unsupported_issue_operation(
+                ProviderKind::Forgejo,
+                RemoteOperation::CreateIssueComment,
+            )),
         }
     }
 
@@ -194,6 +319,106 @@ impl<'a> Adapter<'a> {
 
 pub(crate) fn configured(path: &Path, config: &Config) -> bool {
     Adapter::resolve(path, config).is_ok()
+}
+
+/// Discovers authoritative open Issues through the provider seam. Unsupported
+/// providers return an explicit capability error, never an empty collection.
+fn unsupported_issue_operation(provider: ProviderKind, operation: RemoteOperation) -> RemoteError {
+    RemoteError::new(
+        provider,
+        operation,
+        RemoteErrorClass::Unsupported,
+        Retryability::NotRetryable,
+        "provider Issue operation is not implemented",
+    )
+}
+
+pub(crate) fn discover_issues(
+    path: &Path,
+    config: &Config,
+) -> Result<Vec<ProviderItemObservation>, RemoteError> {
+    let (adapter, _) = Adapter::resolve(path, config).map_err(|message| {
+        RemoteError::new(
+            ProviderKind::GitHub,
+            RemoteOperation::DiscoverIssues,
+            RemoteErrorClass::Configuration,
+            Retryability::NotRetryable,
+            message,
+        )
+    })?;
+    adapter.discover_issues()
+}
+
+pub(crate) fn observe_issue(
+    path: &Path,
+    config: &Config,
+    repository: &RemoteRepositoryId,
+    native_id: &str,
+) -> Result<ProviderItemObservation, String> {
+    Adapter::for_repository(path, config, repository)?
+        .observe_issue(native_id)
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn set_issue_labels(
+    path: &Path,
+    config: &Config,
+    repository: &RemoteRepositoryId,
+    native_id: &str,
+    labels: &[String],
+) -> Result<ProviderItemObservation, String> {
+    Adapter::for_repository(path, config, repository)?
+        .set_issue_labels(native_id, labels)
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn set_issue_assignees(
+    path: &Path,
+    config: &Config,
+    repository: &RemoteRepositoryId,
+    native_id: &str,
+    assignees: &[String],
+) -> Result<ProviderItemObservation, String> {
+    Adapter::for_repository(path, config, repository)?
+        .set_issue_assignees(native_id, assignees)
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn set_issue_lifecycle(
+    path: &Path,
+    config: &Config,
+    repository: &RemoteRepositoryId,
+    native_id: &str,
+    lifecycle: &str,
+) -> Result<ProviderItemObservation, String> {
+    Adapter::for_repository(path, config, repository)?
+        .set_issue_lifecycle(native_id, lifecycle)
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn issue_has_comment_marker(
+    path: &Path,
+    config: &Config,
+    repository: &RemoteRepositoryId,
+    native_id: &str,
+    marker: &str,
+) -> Result<bool, String> {
+    Adapter::for_repository(path, config, repository)?
+        .issue_has_comment_marker(native_id, marker)
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn create_issue_comment(
+    path: &Path,
+    config: &Config,
+    repository: &RemoteRepositoryId,
+    native_id: &str,
+    body: &str,
+    marker: &str,
+) -> Result<(), String> {
+    Adapter::for_repository(path, config, repository)?
+        .create_issue_comment(native_id, body, marker)
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) fn provider(path: &Path, config: &Config) -> Result<ProviderKind, String> {
@@ -637,7 +862,7 @@ pub(crate) struct CreateChangeRequestGuard {
     pub(crate) expected_base_sha: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub(crate) struct PushGuard {
     pub(crate) repository: RemoteRepositoryId,
     pub(crate) remote: String,
@@ -1260,6 +1485,414 @@ fn observe_exact_change_request(
         return Err("change request head changed during merge verification".to_string());
     }
     Ok(observed)
+}
+
+/// Resolve an opaque workflow Change Request reference through the repository's configured
+/// provider adapter and return one current, exact-head Gate observation. Extensions receive only
+/// the normalized value; provider credentials and adapter identities remain inside Prism.
+pub(crate) fn observe_workflow_change_request(
+    path: &Path,
+    config: &Config,
+    subject_id: &str,
+    expected_head: &str,
+    operation: &str,
+) -> Result<serde_json::Value, String> {
+    let (adapter, discovered) = Adapter::resolve(path, config)?;
+    let marker = ":change_request:";
+    let (repository_key, native_id) = subject_id
+        .rsplit_once(marker)
+        .ok_or_else(|| "opaque subject is not a Change Request identity".to_string())?;
+    let expected_repository_key = format!(
+        "{}:{}:{}",
+        discovered.repository.id.provider().config_label(),
+        discovered.repository.id.host(),
+        discovered.repository.id.project_path()
+    );
+    if repository_key != expected_repository_key {
+        return Err("opaque Change Request belongs to a different repository".into());
+    }
+    let native_id = super::NativeChangeRequestId::new(native_id.to_string())
+        .map_err(|error| error.to_string())?;
+    let summary = adapter
+        .list_change_requests(&discovered.repository.id, None)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|summary| summary.change_request.id.native_id() == &native_id)
+        .ok_or_else(|| "opaque Change Request is not open in the target repository".to_string())?;
+    if summary.change_request.head_sha != expected_head {
+        return Err("Change Request head changed before workflow observation".into());
+    }
+
+    let details = matches!(operation, "review" | "policy")
+        .then(|| adapter.change_request_details(&summary.change_request))
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let policy = (operation == "policy")
+        .then(|| {
+            adapter.repository_policy(
+                &summary.change_request.target_repository,
+                &summary.change_request.target_branch,
+            )
+        })
+        .transpose()
+        .map_err(|error| error.to_string())?;
+
+    let satisfied = match operation {
+        "ci" => matches!(
+            summary.check_state,
+            CheckState::Passed | CheckState::Skipped
+        ),
+        "review" => {
+            let no_rejection = !matches!(summary.review_decision, ReviewDecision::ChangesRequested);
+            let all_threads_resolved = details
+                .as_ref()
+                .map(|details| match &details.review_threads {
+                    Observation::Known(threads) => threads.iter().all(|thread| thread.resolved),
+                    Observation::EmptyKnown | Observation::AuthoritativelyAbsent => true,
+                    _ => false,
+                })
+                .unwrap_or(false);
+            no_rejection && all_threads_resolved
+        }
+        "policy" => {
+            let policy = policy
+                .as_ref()
+                .ok_or_else(|| "repository policy was not observed".to_string())?;
+            let details = details
+                .as_ref()
+                .ok_or_else(|| "Change Request details were not observed".to_string())?;
+            policy_satisfied(policy, details, &summary)
+        }
+        "mergeability" => matches!(summary.mergeability, MergeabilityState::Mergeable),
+        "merge_relation" => !matches!(
+            summary.mergeability,
+            MergeabilityState::Behind | MergeabilityState::Conflicting
+        ),
+        other => return Err(format!("unsupported provider observation '{other}'")),
+    };
+    let revision_source =
+        format!("{subject_id}\n{expected_head}\n{operation}\n{summary:?}\n{details:?}\n{policy:?}");
+    let revision = format!("sha256:{:x}", Sha256::digest(revision_source.as_bytes()));
+    let threads = details.as_ref().and_then(|details| match &details.review_threads {
+        Observation::Known(threads) => Some(threads.iter().filter(|thread| thread.resolvable).map(|thread| {
+            let comment = thread.comments.last();
+            let thread_revision = format!("sha256:{:x}", Sha256::digest(format!("{expected_head}\n{thread:?}").as_bytes()));
+            serde_json::json!({
+                "id": thread.native_id.to_string(),
+                "revision": thread_revision,
+                "resolved": thread.resolved,
+                "body": comment.map(|comment| comment.body.as_str()).unwrap_or_default(),
+                "author": comment.map(|comment| comment.author.as_str()),
+                "created_at": comment.and_then(|comment| comment.created_at.as_deref()),
+                "path": comment.and_then(|comment| comment.path.as_deref()),
+                "line": comment.and_then(|comment| comment.line),
+            })
+        }).collect::<Vec<_>>()),
+        Observation::EmptyKnown | Observation::AuthoritativelyAbsent => Some(Vec::new()),
+        _ => None,
+    });
+    Ok(serde_json::json!({
+        "quality": "current",
+        "satisfied": satisfied,
+        "head": expected_head,
+        "subject": {"id": subject_id, "revision": expected_head},
+        "revision": revision,
+        "policy_revision": (operation == "policy").then_some(revision.clone()),
+        "threads": (operation == "review").then_some(threads).flatten(),
+    }))
+}
+
+/// Resolve one exact review thread for an opaque workflow Change Request identity. The current
+/// head is reobserved immediately before mutation.
+pub(crate) fn resolve_workflow_review_thread(
+    path: &Path,
+    config: &Config,
+    subject_id: &str,
+    expected_head: &str,
+    thread_id: &str,
+    expected_thread_revision: &str,
+) -> Result<(), String> {
+    let (adapter, discovered) = Adapter::resolve(path, config)?;
+    let (repository_key, native_id) = subject_id
+        .rsplit_once(":change_request:")
+        .ok_or_else(|| "opaque subject is not a Change Request identity".to_string())?;
+    let expected_repository_key = format!(
+        "{}:{}:{}",
+        discovered.repository.id.provider().config_label(),
+        discovered.repository.id.host(),
+        discovered.repository.id.project_path()
+    );
+    if repository_key != expected_repository_key {
+        return Err("opaque Change Request belongs to a different repository".into());
+    }
+    let native_id = super::NativeChangeRequestId::new(native_id.to_string())
+        .map_err(|error| error.to_string())?;
+    let summary = adapter
+        .list_change_requests(&discovered.repository.id, None)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|summary| summary.change_request.id.native_id() == &native_id)
+        .ok_or_else(|| "opaque Change Request is not open in the target repository".to_string())?;
+    if summary.change_request.head_sha != expected_head {
+        return Err("Change Request head changed before review-thread resolution".into());
+    }
+    let details = adapter
+        .change_request_details(&summary.change_request)
+        .map_err(|error| error.to_string())?;
+    let native_thread =
+        NativeReviewThreadId::new(thread_id.to_string()).map_err(|error| error.to_string())?;
+    let current = match details.review_threads {
+        Observation::Known(threads) => threads
+            .into_iter()
+            .find(|thread| thread.native_id == native_thread),
+        Observation::EmptyKnown | Observation::AuthoritativelyAbsent => None,
+        other => return known(other, "review threads").map(|_: Vec<super::ReviewThread>| ()),
+    }
+    .ok_or_else(|| "review thread is no longer present".to_string())?;
+    let current_revision = format!(
+        "sha256:{:x}",
+        Sha256::digest(format!("{expected_head}\n{current:?}").as_bytes())
+    );
+    if current_revision != expected_thread_revision {
+        return Err("review thread changed after the resolution intent was prepared".into());
+    }
+    if current.resolved {
+        return Ok(());
+    }
+    if !current.resolvable {
+        return Err("review thread is not provider-resolvable".into());
+    }
+    adapter
+        .resolve_review_thread(&ResolveReviewThread {
+            id: summary.change_request.id,
+            thread_id: native_thread,
+            expected_head_sha: expected_head.to_string(),
+        })
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn merge_workflow_change_request(
+    path: &Path,
+    config: &Config,
+    subject_id: &str,
+    expected_head: &str,
+) -> Result<serde_json::Value, String> {
+    let (adapter, discovered) = Adapter::resolve(path, config)?;
+    let marker = ":change_request:";
+    let (repository_key, native_id) = subject_id
+        .rsplit_once(marker)
+        .ok_or_else(|| "opaque subject is not a Change Request identity".to_string())?;
+    let expected_repository_key = format!(
+        "{}:{}:{}",
+        discovered.repository.id.provider().config_label(),
+        discovered.repository.id.host(),
+        discovered.repository.id.project_path()
+    );
+    if repository_key != expected_repository_key {
+        return Err("opaque Change Request belongs to a different repository".into());
+    }
+    let native_id = super::NativeChangeRequestId::new(native_id.to_string())
+        .map_err(|error| error.to_string())?;
+    let summary = adapter
+        .list_change_requests(&discovered.repository.id, None)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|summary| summary.change_request.id.native_id() == &native_id)
+        .ok_or_else(|| "opaque Change Request is not open in the target repository".to_string())?;
+    if summary.change_request.head_sha != expected_head {
+        return Err("Change Request identity or head changed before squash merge".into());
+    }
+    let request = GuardedMerge {
+        id: summary.change_request.id.clone(),
+        target_repository: summary.change_request.target_repository.clone(),
+        target_branch: summary.change_request.target_branch.clone(),
+        expected_source_sha: expected_head.to_string(),
+        method: MergeMethod::Squash,
+        native_guard: None,
+    };
+    request
+        .validate_observation(&summary)
+        .map_err(|error| error.to_string())?;
+    let result = adapter
+        .merge_change_request(&request)
+        .map_err(|error| error.to_string())?;
+    Ok(serde_json::json!({
+        "status": match result.outcome {
+            MergeMutationOutcome::Merged => "merged",
+            MergeMutationOutcome::Pending => "pending",
+            MergeMutationOutcome::Uncertain => "uncertain",
+        },
+        "head": expected_head,
+        "native_state": result.native_state,
+    }))
+}
+
+fn policy_satisfied(
+    policy: &RepositoryPolicy,
+    details: &ChangeRequestDetails,
+    summary: &ChangeRequestSummary,
+) -> bool {
+    let required_checks = match &policy.facts.required_checks {
+        Observation::Known(checks) => checks.as_slice(),
+        Observation::EmptyKnown | Observation::AuthoritativelyAbsent => &[],
+        _ => return false,
+    };
+    let observed_checks = match &details.checks {
+        Observation::Known(checks) => checks.as_slice(),
+        Observation::EmptyKnown | Observation::AuthoritativelyAbsent => &[],
+        _ => return false,
+    };
+    let checks_pass = required_checks.iter().all(|required| {
+        observed_checks.iter().any(|check| {
+            check.name == *required
+                && matches!(check.state, CheckState::Passed | CheckState::Skipped)
+        })
+    });
+    let required_approvals = match policy.facts.required_approvals {
+        Observation::Known(value) => value,
+        Observation::EmptyKnown | Observation::AuthoritativelyAbsent => 0,
+        _ => return false,
+    };
+    let approvals = match &details.reviews {
+        Observation::Known(reviews) => reviews
+            .iter()
+            .filter(|review| matches!(review.decision, ReviewDecision::Approved))
+            .map(|review| review.author.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len() as u32,
+        Observation::EmptyKnown | Observation::AuthoritativelyAbsent => 0,
+        _ => return false,
+    };
+    let conversations_resolved = match policy.facts.conversations_must_be_resolved {
+        Observation::Known(true) => match &details.review_threads {
+            Observation::Known(threads) => threads.iter().all(|thread| thread.resolved),
+            Observation::EmptyKnown | Observation::AuthoritativelyAbsent => true,
+            _ => false,
+        },
+        Observation::Known(false)
+        | Observation::EmptyKnown
+        | Observation::AuthoritativelyAbsent => true,
+        _ => false,
+    };
+    let up_to_date = match policy.facts.source_must_be_up_to_date {
+        Observation::Known(true) => !matches!(summary.mergeability, MergeabilityState::Behind),
+        Observation::Known(false)
+        | Observation::EmptyKnown
+        | Observation::AuthoritativelyAbsent => true,
+        _ => false,
+    };
+    let queue_ready = match policy.facts.queue_required {
+        Observation::Known(true) => !matches!(summary.queue_state, QueueState::Blocked),
+        Observation::Known(false)
+        | Observation::EmptyKnown
+        | Observation::AuthoritativelyAbsent => true,
+        _ => false,
+    };
+    checks_pass
+        && approvals >= required_approvals
+        && conversations_resolved
+        && up_to_date
+        && queue_ready
+}
+
+pub(crate) fn observe_change_request_identity(
+    path: &Path,
+    config: &Config,
+    identity: &CanonicalChangeRequestIdentity,
+    display_number: u64,
+) -> Result<ChangeRequestSummary, String> {
+    let id = identity
+        .change_request_id(Some(display_number))
+        .map_err(|error| error.to_string())?;
+    let target = identity
+        .target_repository()
+        .map_err(|error| error.to_string())?;
+    configured_remote_repositories(path, config)?
+        .validate_target_repository(&target)
+        .map_err(|_| "change request repository changed since authorization".to_string())?;
+    let observed = Adapter::for_repository(path, config, &target)?
+        .observe_change_request(&id)
+        .map_err(|error| error.to_string())?;
+    if observed.change_request.id != id {
+        return Err("provider returned a different change request identity".to_string());
+    }
+    Ok(observed)
+}
+
+pub(crate) fn observe_change_request_for_source(
+    path: &Path,
+    config: &Config,
+    target: &RemoteRepositoryId,
+    source_branch: &str,
+    expected_head: &str,
+) -> Result<Option<ChangeRequestSummary>, String> {
+    configured_remote_repositories(path, config)?
+        .validate_target_repository(target)
+        .map_err(|_| "change request target repository is not configured".to_string())?;
+    let matches = Adapter::for_repository(path, config, target)?
+        .list_change_requests(target, Some(source_branch))
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|summary| {
+            summary.change_request.source_branch == source_branch
+                && summary.change_request.head_sha == expected_head
+        })
+        .collect::<Vec<_>>();
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.into_iter().next()),
+        _ => Err("multiple change requests match the exact source branch and head".to_string()),
+    }
+}
+
+pub(crate) fn review_thread_resolution_state(
+    path: &Path,
+    config: &Config,
+    identity: &CanonicalChangeRequestIdentity,
+    display_number: u64,
+    expected_head: &str,
+    thread_id: &str,
+) -> Result<Option<bool>, String> {
+    let summary = observe_change_request_identity(path, config, identity, display_number)?;
+    if summary.change_request.head_sha != expected_head {
+        return Err("change request head changed before review-thread observation".to_string());
+    }
+    let native_id =
+        NativeReviewThreadId::new(thread_id.to_string()).map_err(|error| error.to_string())?;
+    let details = Adapter::for_repository(path, config, summary.change_request.id.repository())?
+        .change_request_details(&summary.change_request)
+        .map_err(|error| error.to_string())?;
+    match details.review_threads {
+        Observation::Known(threads) => Ok(threads
+            .into_iter()
+            .find(|thread| thread.native_id == native_id)
+            .map(|thread| thread.resolved)),
+        Observation::EmptyKnown | Observation::AuthoritativelyAbsent => Ok(None),
+        other => known(other, "review threads").map(|_: Vec<super::ReviewThread>| None),
+    }
+}
+
+pub(crate) fn resolve_review_thread_identity(
+    path: &Path,
+    config: &Config,
+    identity: &CanonicalChangeRequestIdentity,
+    display_number: u64,
+    expected_head: &str,
+    thread_id: &str,
+) -> Result<(), String> {
+    let summary = observe_change_request_identity(path, config, identity, display_number)?;
+    if summary.change_request.head_sha != expected_head {
+        return Err("change request head changed before review-thread resolution".to_string());
+    }
+    let request = ResolveReviewThread {
+        id: summary.change_request.id.clone(),
+        thread_id: NativeReviewThreadId::new(thread_id.to_string())
+            .map_err(|error| error.to_string())?,
+        expected_head_sha: expected_head.to_string(),
+    };
+    Adapter::for_repository(path, config, request.id.repository())?
+        .resolve_review_thread(&request)
+        .map_err(|error| error.to_string())
 }
 
 fn known<T>(observation: Observation<T>, label: &str) -> Result<T, String> {

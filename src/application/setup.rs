@@ -9,6 +9,18 @@ use crate::repo::Repository;
 use crate::terminal::stdin_is_tty;
 use crate::util::yes;
 
+pub(crate) fn ensure_user_owned_resources(config: &Config) -> Result<bool, String> {
+    let root = config.user_path.parent().ok_or_else(|| {
+        format!(
+            "user configuration path {} has no parent",
+            config.user_path.display()
+        )
+    })?;
+    let defaults_seeded = crate::seed_editable_defaults(root).map_err(|error| error.to_string())?;
+    crate::resource::ensure_global_drop_in_directories(root).map_err(|error| error.to_string())?;
+    Ok(defaults_seeded)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct StartupSetup {
     pub current_branch: Option<String>,

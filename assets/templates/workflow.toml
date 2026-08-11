@@ -1,0 +1,42 @@
+# Prism prompt-first Workflow
+[defaults]
+# harness = "pi"
+# model = "provider/model"
+# variant = "medium"
+# max_agent_runs = 10
+
+# Inputs without a default are required at launch. `glob` is shorthand for type = "file".
+# [inputs.plan]
+# description = "Markdown plan to implement"
+# glob = "*.md"
+#
+# [inputs.mode]
+# type = "enum"
+# options = ["safe", "fast"]
+# default = "safe"
+#
+# [inputs.publish]
+# type = "bool"
+# default = false
+#
+# [inputs.attempts]
+# type = "number"
+# min = 1
+# max = 5
+# default = 2
+#
+# [inputs.title]
+# type = "string"
+# min_length = 3
+# max_length = 80
+
+[[step]]
+# Prompt placeholders use {{plan}}, {{mode}}, etc. after declaring each input.
+prompt = """
+Describe the work for a fresh Agent Session.
+"""
+# followups = [
+#   """
+# Continue in the same Agent Session after the initial turn.
+# """,
+# ]

@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "harness adapters expose optional resume capabilities"
+)]
+
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -103,24 +108,6 @@ pub fn attach_or_create_window(
     match attach(config, &runtime, window) {
         Ok(()) => Ok(()),
         Err(_) if matches!(session_exists(config, runtime.name()), Ok(false)) => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-#[allow(dead_code)]
-pub fn attach_or_create_plan_mode(
-    config: &Config,
-    name: &str,
-    cwd: &Path,
-    command: &str,
-) -> Result<(), String> {
-    if !session_exists(config, name)? {
-        create_detached_plan_mode_session(config, name, cwd, command)?;
-        configure_detach_on_destroy(config, name)?;
-    }
-    match attach_session(config, name) {
-        Ok(()) => Ok(()),
-        Err(_) if matches!(session_exists(config, name), Ok(false)) => Ok(()),
         Err(error) => Err(error),
     }
 }
@@ -621,25 +608,6 @@ fn configure_detach_on_destroy(config: &Config, name: &str) -> Result<(), String
         "detach-on-destroy",
         "on",
     ]))
-}
-
-#[allow(dead_code)]
-fn create_detached_plan_mode_session(
-    config: &Config,
-    name: &str,
-    cwd: &Path,
-    command: &str,
-) -> Result<(), String> {
-    run_tmux_status(
-        Command::new(config.tool("tmux"))
-            .env_remove("TMUX")
-            .args(["new-session", "-d", "-s"])
-            .arg(name)
-            .args(["-n", "plan"])
-            .arg("-c")
-            .arg(cwd)
-            .arg(command),
-    )
 }
 
 fn ensure_companion_windows(
@@ -1218,9 +1186,9 @@ mod tests {
     use crate::session::Session;
 
     use super::{
-        TmuxAgentSession, TmuxWindow, attach_or_create_agent, attach_or_create_plan_mode,
-        attach_or_create_window, capture_agent_pane, ensure_agent_session,
-        latest_agent_session_generation, migrate_legacy_agent_sessions, pane_command_matches_agent,
+        TmuxAgentSession, TmuxWindow, attach_or_create_agent, attach_or_create_window,
+        capture_agent_pane, ensure_agent_session, latest_agent_session_generation,
+        migrate_legacy_agent_sessions, pane_command_matches_agent,
         pane_start_command_matches_agent, paste_agent_prompt, session_exists,
     };
 
@@ -1272,60 +1240,6 @@ mod tests {
             runtime.prompt_buffer_name(),
             format!("{}-prompt", runtime.name())
         );
-    }
-
-    #[test]
-    fn plan_mode_runs_in_detachable_tmux_session() {
-        let temp = unique_temp_dir("prism-tmux-plan-mode-test");
-        fs::create_dir_all(&temp).unwrap();
-        let log = temp.join("tmux.log");
-        let tmux = temp.join("tmux");
-        fs::write(
-            &tmux,
-            format!(
-                r#"#!/bin/sh
-printf '%s\n' "$*" >> '{}'
-case "$1" in
-  has-session)
-    exit 1
-    ;;
-  new-session|set-option|attach-session)
-    exit 0
-    ;;
-esac
-exit 1
-"#,
-                log.display()
-            ),
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&tmux).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&tmux, permissions).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(10));
-
-        let mut config = test_config();
-        config
-            .tools
-            .insert("tmux".to_string(), tmux.display().to_string());
-
-        attach_or_create_plan_mode(
-            &config,
-            "prism-plan-test",
-            &temp,
-            "prism --repo /repo plan; status=$?",
-        )
-        .unwrap();
-
-        let commands = fs::read_to_string(&log).unwrap_or_default();
-        assert!(commands.contains("new-session -d -s prism-plan-test"));
-        assert!(commands.contains("-n plan"));
-        assert!(commands.contains("prism --repo /repo plan; status=$?"));
-        assert!(commands.contains("set-option -t prism-plan-test"));
-        assert!(commands.contains("detach-on-destroy on"));
-        assert!(commands.contains("attach-session -t prism-plan-test"));
-
-        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]

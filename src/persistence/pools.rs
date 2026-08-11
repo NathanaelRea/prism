@@ -1,228 +1,21 @@
-use std::future::Future;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
-use std::pin::Pin;
-use std::time::{Duration, Instant};
+use std::path::Path;
+use std::time::Duration;
 
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
-use sqlx::{Connection, SqliteConnection, SqlitePool};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
+use sqlx::{Connection, SqliteConnection};
 
 use super::error::DatabaseError;
 
 pub(super) const WRITER_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 static REPOSITORY_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/repository");
-static WORKFLOW_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/workflow");
-
-type WriteFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, DatabaseError>> + Send + 'a>>;
-
-/// Async owner of a canonical repository database. Clones share the same pools.
-#[allow(
-    dead_code,
-    reason = "repository stores are migrated behind this pool incrementally"
-)]
-#[derive(Clone)]
-pub(crate) struct RepositoryDatabase {
-    path: PathBuf,
-    writer: SqlitePool,
-    readers: SqlitePool,
-}
-
-/// Async owner of the user-scoped workflow control-plane database.
-#[derive(Clone)]
-pub(crate) struct WorkflowDatabase {
-    path: PathBuf,
-    writer: SqlitePool,
-    readers: SqlitePool,
-}
-
-#[allow(
-    dead_code,
-    reason = "repository stores are migrated behind this pool incrementally"
-)]
-impl RepositoryDatabase {
-    pub(crate) async fn open(path: &Path) -> Result<Self, DatabaseError> {
-        initialize_repository_database(path).await?;
-        let (writer, readers) = open_pools(path).await?;
-        Ok(Self {
-            path: path.into(),
-            writer,
-            readers,
-        })
-    }
-
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
-    }
-    pub(crate) fn readers(&self) -> &SqlitePool {
-        &self.readers
-    }
-
-    pub(crate) async fn close(&self) {
-        self.readers.close().await;
-        self.writer.close().await;
-    }
-
-    pub(crate) async fn write_immediate<T>(
-        &self,
-        operation: impl for<'c> FnOnce(&'c mut SqliteConnection) -> WriteFuture<'c, T>,
-    ) -> Result<T, DatabaseError> {
-        write_immediate(&self.writer, false, operation).await
-    }
-}
 
 pub(super) async fn initialize_repository_database(path: &Path) -> Result<(), DatabaseError> {
     prepare_parent(path)?;
-    super::adoption::adopt_historical_repository_database(path, &REPOSITORY_MIGRATOR).await?;
+    secure_existing_database(path)?;
     migrate(path, &REPOSITORY_MIGRATOR).await?;
-    super::adoption::validate_canonical_repository_database(path, &REPOSITORY_MIGRATOR).await?;
     set_owner_only(path)
-}
-
-impl WorkflowDatabase {
-    pub(crate) async fn open(path: &Path) -> Result<Self, DatabaseError> {
-        prepare_parent(path)?;
-        reject_wrong_workflow_database(path).await?;
-        migrate(path, &WORKFLOW_MIGRATOR).await?;
-        set_owner_only(path)?;
-        let (writer, readers) = open_pools(path).await?;
-        let database = Self {
-            path: path.into(),
-            writer,
-            readers,
-        };
-        database.validate().await?;
-        Ok(database)
-    }
-
-    pub(crate) async fn open_default() -> Result<Self, DatabaseError> {
-        Self::open(&crate::util::prism_config_dir().join("workflow.db")).await
-    }
-
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
-    }
-    pub(crate) fn readers(&self) -> &SqlitePool {
-        &self.readers
-    }
-
-    pub(crate) fn pool_utilization(&self) -> (u32, usize, u32, usize) {
-        (
-            self.writer.size(),
-            self.writer.num_idle(),
-            self.readers.size(),
-            self.readers.num_idle(),
-        )
-    }
-
-    pub(crate) async fn close(&self) {
-        self.readers.close().await;
-        self.writer.close().await;
-    }
-
-    pub(crate) async fn write_immediate<T>(
-        &self,
-        operation: impl for<'c> FnOnce(&'c mut SqliteConnection) -> WriteFuture<'c, T>,
-    ) -> Result<T, DatabaseError> {
-        write_immediate(&self.writer, true, operation).await
-    }
-
-    pub(crate) async fn validate(&self) -> Result<(), DatabaseError> {
-        let identity: Option<String> =
-            sqlx::query_scalar("select kind from workflow_database_identity where singleton = 1")
-                .fetch_optional(&self.readers)
-                .await
-                .map_err(DatabaseError::Query)?;
-        if identity.as_deref() != Some("workflow") {
-            return Err(DatabaseError::WrongDatabase {
-                path: self.path.clone(),
-                expected: "workflow",
-            });
-        }
-        Ok(())
-    }
-}
-
-async fn open_pools(path: &Path) -> Result<(SqlitePool, SqlitePool), DatabaseError> {
-    let writer_options = options(path, false, false)?;
-    let writer = SqlitePoolOptions::new()
-        .max_connections(1)
-        .acquire_timeout(WRITER_BUSY_TIMEOUT)
-        .connect_with(writer_options)
-        .await
-        .map_err(|source| DatabaseError::Connect {
-            path: path.into(),
-            source,
-        })?;
-
-    let reader_options = options(path, false, true)?;
-    let readers = SqlitePoolOptions::new()
-        .max_connections(4)
-        .acquire_timeout(Duration::from_secs(1))
-        .after_connect(|connection, _| {
-            Box::pin(async move {
-                sqlx::query("pragma query_only = on")
-                    .execute(connection)
-                    .await?;
-                Ok(())
-            })
-        })
-        .connect_with(reader_options)
-        .await
-        .map_err(|source| DatabaseError::Connect {
-            path: path.into(),
-            source,
-        })?;
-    Ok((writer, readers))
-}
-
-async fn write_immediate<T>(
-    pool: &SqlitePool,
-    observe: bool,
-    operation: impl for<'c> FnOnce(&'c mut SqliteConnection) -> WriteFuture<'c, T>,
-) -> Result<T, DatabaseError> {
-    let waiting = Instant::now();
-    let mut connection = pool.acquire().await.map_err(DatabaseError::Query)?;
-    let wait_micros = i64::try_from(waiting.elapsed().as_micros()).unwrap_or(i64::MAX);
-    let transaction = Instant::now();
-    sqlx::query("begin immediate")
-        .execute(&mut *connection)
-        .await
-        .map_err(DatabaseError::Query)?;
-    match operation(&mut connection).await {
-        Ok(value) => {
-            if observe {
-                let transaction_micros =
-                    i64::try_from(transaction.elapsed().as_micros()).unwrap_or(i64::MAX);
-                let now_unix_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .ok()
-                    .and_then(|duration| i64::try_from(duration.as_millis()).ok())
-                    .unwrap_or(0);
-                for (name, metric) in [
-                    ("writer_wait_us", wait_micros),
-                    ("writer_transaction_us", transaction_micros),
-                ] {
-                    sqlx::query("insert into control_plane_metric (name, value, labels_json, time_unix_ms) values (?, ?, '{}', ?)")
-                        .bind(name)
-                        .bind(metric)
-                        .bind(now_unix_ms)
-                        .execute(&mut *connection)
-                        .await
-                        .map_err(DatabaseError::Query)?;
-                }
-            }
-            sqlx::query("commit")
-                .execute(&mut *connection)
-                .await
-                .map_err(DatabaseError::Query)?;
-            Ok(value)
-        }
-        Err(error) => {
-            let _ = sqlx::query("rollback").execute(&mut *connection).await;
-            Err(error)
-        }
-    }
 }
 
 async fn migrate(path: &Path, migrator: &sqlx::migrate::Migrator) -> Result<(), DatabaseError> {
@@ -257,7 +50,7 @@ pub(super) async fn close_connection<T>(
     }
 }
 
-pub(super) fn options(
+pub(crate) fn options(
     path: &Path,
     create: bool,
     readonly: bool,
@@ -298,52 +91,40 @@ fn prepare_parent(path: &Path) -> Result<(), DatabaseError> {
     Ok(())
 }
 
-pub(super) fn set_owner_only(path: &Path) -> Result<(), DatabaseError> {
-    #[cfg(unix)]
-    let result = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    #[cfg(windows)]
-    let result = crate::system::windows_security::secure_path(path, false);
-    result.map_err(|source| DatabaseError::SetPermissions {
-        path: path.into(),
-        source,
-    })
-}
-
-async fn reject_wrong_workflow_database(path: &Path) -> Result<(), DatabaseError> {
-    if !path.exists()
-        || std::fs::metadata(path)
-            .map(|m| m.len() == 0)
-            .unwrap_or(false)
-    {
-        return Ok(());
-    }
-    // Opening is a bounded startup operation, not a latency-sensitive projection read. A prior
-    // process or pool may still be releasing its WAL lock, so classification must tolerate that
-    // transient handoff while remaining read-only.
-    let inspection_options = options(path, false, true)?.busy_timeout(WRITER_BUSY_TIMEOUT);
-    let mut connection = SqliteConnection::connect_with(&inspection_options)
-        .await
-        .map_err(|source| DatabaseError::Connect {
+fn secure_existing_database(path: &Path) -> Result<(), DatabaseError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(DatabaseError::SetPermissions {
+            path: path.into(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "database path is a symbolic link",
+            ),
+        }),
+        Ok(_) => set_owner_only(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(DatabaseError::SetPermissions {
             path: path.into(),
             source,
-        })?;
-    let result = async {
-        let workflow_identity: i64 = sqlx::query_scalar(
-            "select count(*) from sqlite_master where type = 'table' and name = 'workflow_database_identity'",
-        ).fetch_one(&mut connection).await.map_err(DatabaseError::Query)?;
-        let repository_marker: i64 = sqlx::query_scalar(
-            "select count(*) from sqlite_master where type = 'table' and name in ('workflow_execution','plan_run')",
-        ).fetch_one(&mut connection).await.map_err(DatabaseError::Query)?;
-        if workflow_identity == 0 && repository_marker > 0 {
-            return Err(DatabaseError::WrongDatabase {
-                path: path.into(),
-                expected: "workflow",
-            });
-        }
-        Ok(())
+        }),
     }
-    .await;
-    close_connection(connection, result).await
+}
+
+pub(super) fn set_owner_only(path: &Path) -> Result<(), DatabaseError> {
+    #[cfg(unix)]
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|source| {
+        DatabaseError::SetPermissions {
+            path: path.into(),
+            source,
+        }
+    })?;
+    #[cfg(windows)]
+    crate::system::windows_security::secure_path(path, false).map_err(|source| {
+        DatabaseError::SetPermissions {
+            path: path.into(),
+            source,
+        }
+    })?;
+    Ok(())
 }
 
 pub(super) async fn validate_integrity(
@@ -373,69 +154,31 @@ pub(super) async fn validate_integrity(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
     use super::*;
-
-    static SEQUENCE: AtomicU64 = AtomicU64::new(1);
+    use std::os::windows::fs::symlink_file;
 
     #[test]
-    fn workflow_open_waits_for_a_transient_classification_lock() {
-        let directory = std::env::temp_dir().join(format!(
-            "prism-workflow-open-lock-{}-{}",
+    fn windows_database_reparse_target_is_rejected_before_migration() {
+        let root = std::env::temp_dir().join(format!(
+            "prism-database-reparse-{}-{}",
             std::process::id(),
-            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            crate::util::timestamp_nanos()
         ));
-        let path = directory.join("workflow.db");
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                prepare_parent(&path).unwrap();
-                migrate(&path, &WORKFLOW_MIGRATOR).await.unwrap();
-
-                let mut blocker =
-                    SqliteConnection::connect_with(&options(&path, false, false).unwrap())
-                        .await
-                        .unwrap();
-                let locking_mode: String = sqlx::query_scalar("pragma locking_mode = exclusive")
-                    .fetch_one(&mut blocker)
-                    .await
-                    .unwrap();
-                assert_eq!(locking_mode, "exclusive");
-                sqlx::query("begin exclusive")
-                    .execute(&mut blocker)
-                    .await
-                    .unwrap();
-                sqlx::query("insert into control_plane_metric (name, value, labels_json, time_unix_ms) values ('lock', 1, '{}', 1)")
-                    .execute(&mut blocker)
-                    .await
-                    .unwrap();
-
-                let mut reopening = Box::pin(WorkflowDatabase::open(&path));
-                assert!(
-                    tokio::time::timeout(Duration::from_millis(50), &mut reopening)
-                        .await
-                        .is_err(),
-                    "workflow open should remain pending while the SQLite lock is held"
-                );
-
-                sqlx::query("commit")
-                    .execute(&mut blocker)
-                    .await
-                    .unwrap();
-                blocker.close().await.unwrap();
-
-                let reopened = tokio::time::timeout(WRITER_BUSY_TIMEOUT, reopening)
-                    .await
-                    .expect("workflow open should finish after the SQLite lock is released")
-                    .expect("workflow open should wait for a transient SQLite lock");
-                reopened.close().await;
-            });
-        let _ = std::fs::remove_dir_all(directory);
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("target.sqlite");
+        let database = root.join("repository.sqlite");
+        std::fs::write(&target, b"sentinel").unwrap();
+        if let Err(error) = symlink_file(&target, &database) {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                std::fs::remove_dir_all(root).unwrap();
+                return;
+            }
+            panic!("create database symlink: {error}");
+        }
+        assert!(secure_existing_database(&database).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"sentinel");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

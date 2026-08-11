@@ -17,8 +17,8 @@ that are risky to keep hand-rolled during the Ratatui migration:
 - String-based render tests instead of terminal buffer assertions.
 
 The migration is not an application-framework adoption. Prism's repositories,
-tracked repositories, worktree sessions, agent sessions, PR cache state, Plan
-mode, Auto Flow, view models, and action dispatch remain local domain code.
+tracked repositories, worktree sessions, agent sessions, provider cache state,
+generalized Workflow projections, view models, and action dispatch remain local domain code.
 
 ## Decision
 

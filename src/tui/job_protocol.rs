@@ -4,10 +4,8 @@ use std::time::Instant;
 use ratatui::text::Line;
 
 use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey};
-use crate::auto_flow::{AutoOutputLine, PersistedAutoRun};
 use crate::config::Config;
 use crate::opencode::{OpencodeEvent, OpencodeStatus};
-use crate::plan_run::PlanOutputLine;
 use crate::remote::{PrCache, PrSummary};
 use crate::repo::Repository;
 use crate::session::{Session, WorktreeRepositoryKey, WorktreeSessionKey};
@@ -42,7 +40,6 @@ pub(crate) enum PrPollResult {
         result: Result<(), String>,
         remote_update: bool,
         status_label: Option<String>,
-        auto_run: Result<Option<Box<PersistedAutoRun>>, String>,
     },
 }
 
@@ -61,7 +58,6 @@ pub(crate) struct PrPersistenceRequest {
     pub(crate) remote_update: bool,
     pub(crate) session: Session,
     pub(crate) config: Config,
-    pub(crate) auto_run_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -69,19 +65,6 @@ pub(crate) enum PrDeliveryKey {
     Summary(WorktreeRepositoryKey),
     Details(PrPollKey),
     Persistence(PrPollKey),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum DashboardOutputKey {
-    Plan {
-        repository: WorktreeRepositoryKey,
-        run_id: String,
-        step: usize,
-    },
-    Auto {
-        repository: WorktreeRepositoryKey,
-        step_run_id: i64,
-    },
 }
 
 pub(crate) struct WorkflowPollSnapshot {
@@ -93,17 +76,6 @@ pub(crate) struct WorkflowPollResult {
     pub(super) repository: WorktreeRepositoryKey,
     pub(super) revision: u64,
     pub(super) snapshot: Result<WorkflowPollSnapshot, String>,
-}
-
-pub(crate) enum DashboardOutputLines {
-    Plan(Vec<PlanOutputLine>),
-    Auto(Vec<AutoOutputLine>),
-}
-
-pub(crate) struct DashboardOutputResult {
-    pub(super) key: DashboardOutputKey,
-    pub(super) revision: u64,
-    pub(super) lines: Result<DashboardOutputLines, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]

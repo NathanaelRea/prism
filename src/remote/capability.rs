@@ -25,6 +25,12 @@ pub(crate) struct Capabilities {
     pub(crate) guarded_merge: SupportLevel,
     pub(crate) guarded_merge_reason: Option<String>,
     pub(crate) merge_queue: SupportLevel,
+    pub(crate) issue_discovery: SupportLevel,
+    pub(crate) provider_events: SupportLevel,
+    pub(crate) issue_labels: SupportLevel,
+    pub(crate) issue_assignment: SupportLevel,
+    pub(crate) issue_comments: SupportLevel,
+    pub(crate) issue_lifecycle: SupportLevel,
 }
 
 impl Capabilities {
@@ -45,6 +51,12 @@ impl Capabilities {
                 guarded_merge: SupportLevel::Supported,
                 guarded_merge_reason: None,
                 merge_queue: SupportLevel::Unknown,
+                issue_discovery: SupportLevel::Supported,
+                provider_events: SupportLevel::Supported,
+                issue_labels: SupportLevel::Supported,
+                issue_assignment: SupportLevel::Supported,
+                issue_comments: SupportLevel::Supported,
+                issue_lifecycle: SupportLevel::Supported,
             },
             super::ProviderKind::GitLab => Self {
                 list_change_requests: SupportLevel::Supported,
@@ -61,6 +73,12 @@ impl Capabilities {
                 guarded_merge: SupportLevel::Conditional,
                 guarded_merge_reason: None,
                 merge_queue: SupportLevel::Conditional,
+                issue_discovery: SupportLevel::Unsupported,
+                provider_events: SupportLevel::Unsupported,
+                issue_labels: SupportLevel::Unsupported,
+                issue_assignment: SupportLevel::Unsupported,
+                issue_comments: SupportLevel::Unsupported,
+                issue_lifecycle: SupportLevel::Unsupported,
             },
             super::ProviderKind::Forgejo => Self {
                 list_change_requests: SupportLevel::Supported,
@@ -77,6 +95,12 @@ impl Capabilities {
                 guarded_merge: SupportLevel::Conditional,
                 guarded_merge_reason: None,
                 merge_queue: SupportLevel::Unsupported,
+                issue_discovery: SupportLevel::Unsupported,
+                provider_events: SupportLevel::Unsupported,
+                issue_labels: SupportLevel::Unsupported,
+                issue_assignment: SupportLevel::Unsupported,
+                issue_comments: SupportLevel::Unsupported,
+                issue_lifecycle: SupportLevel::Unsupported,
             },
         }
     }
@@ -97,6 +121,12 @@ impl Capabilities {
             RemoteOperation::SubmitReview => self.submit_review,
             RemoteOperation::MergeChangeRequest => self.guarded_merge,
             RemoteOperation::ObserveMergeQueue => self.merge_queue,
+            RemoteOperation::DiscoverIssues => self.issue_discovery,
+            RemoteOperation::ObserveProviderEvents => self.provider_events,
+            RemoteOperation::MutateLabels => self.issue_labels,
+            RemoteOperation::MutateAssignment => self.issue_assignment,
+            RemoteOperation::CreateIssueComment => self.issue_comments,
+            RemoteOperation::MutateIssueLifecycle => self.issue_lifecycle,
         }
     }
 }

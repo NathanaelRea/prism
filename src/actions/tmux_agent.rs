@@ -6,7 +6,7 @@ use crate::session::Session;
 const TMUX_ATTACH_RESIZE_SETTLE: Duration = Duration::from_millis(100);
 
 impl Tui {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn attach_selected_tmux_session(&mut self) -> Result<(), String> {
         let Some(index) = self.selected_worktree_index() else {
             return Ok(());

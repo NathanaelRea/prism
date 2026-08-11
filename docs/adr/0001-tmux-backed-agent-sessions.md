@@ -23,8 +23,8 @@ Window 1 runs the configured interactive agent command, window 2 is
 lazygit, and window 3 is a shell in the same worktree. Prism attaches to these
 windows instead of embedding the interactive agent inside the TUI process.
 
-Plan mode also uses a dedicated tmux session so long-running plan execution can
-detach from the board and keep terminal ownership simple.
+Generalized Workflow Agent Steps may also use dedicated tmux sessions so long-running execution
+can detach from the board and keep terminal ownership simple.
 
 ## Consequences
 

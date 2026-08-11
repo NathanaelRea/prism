@@ -54,6 +54,11 @@ pub(super) fn render_dialog(frame: &mut Frame<'_>, area: Rect, dialog: &crate::v
     frame.render_widget(paragraph, geometry.popup);
     if let crate::view::DialogModel::Prompt { prompt, input, .. } = dialog {
         set_prompt_cursor(frame, geometry.inner, prompt, input);
+    } else if let crate::view::DialogModel::Form {
+        fields, selected, ..
+    } = dialog
+    {
+        set_form_cursor(frame, geometry.inner, fields, *selected);
     } else if let crate::view::DialogModel::Confirm {
         prompt,
         input,
@@ -78,6 +83,13 @@ pub(super) fn dialog_geometry(area: Rect, dialog: &crate::view::DialogModel) -> 
         crate::view::DialogModel::Prompt { prompt, .. } => {
             prompt_dialog_content_width(prompt, title_width)
         }
+        crate::view::DialogModel::Form { .. } => raw_lines
+            .iter()
+            .map(|line| line.width() as u16)
+            .max()
+            .unwrap_or(0)
+            .max(64)
+            .max(title_width),
         crate::view::DialogModel::Help {
             items, info_lines, ..
         } => help_dialog_content_width(items, info_lines, title_width).max(
@@ -180,6 +192,7 @@ pub(super) fn dialog_title(dialog: &crate::view::DialogModel) -> String {
         crate::view::DialogModel::Confirm { title, .. }
         | crate::view::DialogModel::Notice { title, .. }
         | crate::view::DialogModel::Prompt { title, .. }
+        | crate::view::DialogModel::Form { title, .. }
         | crate::view::DialogModel::OrderedToggle { title, .. }
         | crate::view::DialogModel::Choice {
             choices: crate::view::ChoiceList { title, .. },
@@ -298,6 +311,13 @@ pub(super) fn dialog_lines(dialog: &crate::view::DialogModel) -> Vec<Line<'stati
             )));
             lines
         }
+        crate::view::DialogModel::Form {
+            fields,
+            selected,
+            dropdown,
+            error,
+            ..
+        } => form_lines(fields, *selected, *dropdown, error.as_deref()),
         crate::view::DialogModel::OrderedToggle {
             items,
             selected,
@@ -314,6 +334,157 @@ pub(super) fn dialog_lines(dialog: &crate::view::DialogModel) -> Vec<Line<'stati
             lines
         }
     }
+}
+
+fn form_field_window(field_count: usize, selected: usize) -> (usize, usize) {
+    const VISIBLE_FIELDS: usize = 8;
+    let focused_field = selected.min(field_count.saturating_sub(1));
+    let start = focused_field
+        .saturating_sub(VISIBLE_FIELDS / 2)
+        .min(field_count.saturating_sub(VISIBLE_FIELDS));
+    (start, start.saturating_add(VISIBLE_FIELDS).min(field_count))
+}
+
+fn set_form_cursor(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    fields: &[crate::view::FormField],
+    selected: usize,
+) {
+    let Some(field) = fields.get(selected) else {
+        return;
+    };
+    if !matches!(
+        field.kind,
+        crate::view::FormFieldKind::String | crate::view::FormFieldKind::Number
+    ) {
+        return;
+    }
+    let prefix = form_field_prefix(field, true);
+    let input_width = area.width.saturating_sub(prefix.chars().count() as u16 + 1);
+    let cursor = field.value.chars().count().min(input_width as usize) as u16;
+    let (start, _) = form_field_window(fields.len(), selected);
+    let line = 2 + usize::from(start > 0) + selected.saturating_sub(start);
+    frame.set_cursor_position((
+        area.x
+            + (prefix.chars().count() as u16)
+                .saturating_add(cursor)
+                .min(area.width.saturating_sub(1)),
+        area.y + (line as u16).min(area.height.saturating_sub(1)),
+    ));
+}
+
+fn form_field_prefix(field: &crate::view::FormField, focused: bool) -> String {
+    format!(
+        "{} {} [{}] ({}): ",
+        if focused { "▶" } else { " " },
+        field.name,
+        if field.required {
+            "required"
+        } else {
+            "default"
+        },
+        match field.constraint.as_deref() {
+            Some(constraint) => format!("{}: {constraint}", field.kind.label()),
+            None => field.kind.label(),
+        }
+    )
+}
+
+pub(super) fn form_lines(
+    fields: &[crate::view::FormField],
+    selected: usize,
+    dropdown: Option<crate::view::FormDropdown>,
+    error: Option<&str>,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Complete the Workflow inputs",
+            title_style(true),
+        )),
+        Line::from(""),
+    ];
+    let (field_start, field_end) = form_field_window(fields.len(), selected);
+    if field_start > 0 {
+        lines.push(Line::from(Span::styled("  …", muted_style())));
+    }
+    for (index, field) in fields.iter().enumerate().take(field_end).skip(field_start) {
+        let focused = index == selected;
+        lines.push(Line::from(vec![
+            Span::styled(form_field_prefix(field, focused), title_style(focused)),
+            Span::raw(visible_prompt_input(
+                if field.value.is_empty() {
+                    "—"
+                } else {
+                    &field.value
+                },
+                PROMPT_INPUT_DISPLAY_WIDTH,
+            )),
+        ]));
+        if focused
+            && let (Some(dropdown), crate::view::FormFieldKind::Enum { options }) =
+                (dropdown, &field.kind)
+        {
+            const VISIBLE_OPTIONS: usize = 7;
+            let start = dropdown
+                .selected
+                .saturating_sub(VISIBLE_OPTIONS / 2)
+                .min(options.len().saturating_sub(VISIBLE_OPTIONS));
+            let end = start.saturating_add(VISIBLE_OPTIONS).min(options.len());
+            if start > 0 {
+                lines.push(Line::from(Span::styled("      …", muted_style())));
+            }
+            for (option_index, option) in options.iter().enumerate().take(end).skip(start) {
+                let option_focused = option_index == dropdown.selected;
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        if option_focused { "    ▶ " } else { "      " },
+                        title_style(option_focused),
+                    ),
+                    Span::styled(option.clone(), selected_style(option_focused)),
+                ]));
+            }
+            if end < options.len() {
+                lines.push(Line::from(Span::styled("      …", muted_style())));
+            }
+        }
+    }
+    if field_end < fields.len() {
+        lines.push(Line::from(Span::styled("  …", muted_style())));
+    }
+    lines.push(Line::from(""));
+    let launch_focused = selected == fields.len();
+    lines.push(Line::from(Span::styled(
+        if launch_focused {
+            "▶ Launch Workflow"
+        } else {
+            "  Launch Workflow"
+        },
+        title_style(launch_focused),
+    )));
+    if let Some(description) = fields
+        .get(selected)
+        .and_then(|field| field.description.as_deref())
+    {
+        lines.push(Line::from(""));
+        lines.extend(styled_text_lines(description, muted_style()));
+    }
+    if let Some(error) = error {
+        lines.push(Line::from(Span::styled(
+            format!("Error: {error}"),
+            attention_style(),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        if dropdown.is_some() {
+            "j/k select  Enter choose  Esc close"
+        } else {
+            "Tab/↑/↓ move  Type to edit  Space/Enter choose  Esc cancel"
+        },
+        muted_style(),
+    )));
+    lines
 }
 
 fn set_confirmation_cursor(

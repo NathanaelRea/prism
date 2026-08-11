@@ -13,27 +13,21 @@ pub(super) fn render_main(frame: &mut Frame<'_>, area: Rect, model: &crate::view
             .split(area)
     };
     let main_area = areas[0];
-    let block = panel_block(
-        Line::from(Span::styled("0 Main", title_style(model.main_focused))),
-        model.main_focused,
-    );
+    let main_title = Line::from(Span::styled("0 Main", title_style(model.main_focused)));
+    let block = panel_block(main_title, model.main_focused);
     let inner_area = block.inner(main_area);
     let content_area = inner_area.height as usize;
     let width = inner_area.width as usize;
-    let mut lines = match model.focus {
+    let lines = match model.focus {
         PanelFocus::Status => status_dashboard_lines(model),
         PanelFocus::Repos => repo_overview_lines(model, width, content_area),
-        PanelFocus::Worktrees => worktree_detail_lines(model),
-    };
-    if model.focus == PanelFocus::Worktrees {
-        if let Some(dashboard) = &model.auto_dashboard {
+        PanelFocus::Worktrees => {
+            let mut lines = worktree_detail_lines(model);
             lines.push(Line::from(""));
-            lines.extend(auto_dashboard_lines(dashboard, width, content_area));
-        } else if let Some(dashboard) = &model.plan_dashboard {
-            lines.push(Line::from(""));
-            lines.extend(plan_dashboard_lines(dashboard, width, content_area));
+            lines.extend(workflow_dashboard_lines(model));
+            lines
         }
-    }
+    };
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     let rendered_lines = paragraph.line_count(inner_area.width);
     let scroll = model
@@ -64,6 +58,107 @@ pub(super) fn render_main(frame: &mut Frame<'_>, area: Rect, model: &crate::view
 
     if let Some(portal) = &model.tmux_portal {
         render_tmux_portal(frame, areas[1], portal);
+    }
+}
+
+fn workflow_dashboard_lines(model: &crate::view::FrameModel<'_>) -> Vec<Line<'static>> {
+    let Some(dashboard) = &model.workflow_dashboard else {
+        return vec![Line::from(vec![
+            Span::styled("Workflow", title_style(false)),
+            Span::styled(" · none · W to run", muted_style()),
+        ])];
+    };
+    let workflow_name = dashboard
+        .detail
+        .as_ref()
+        .map_or("Workflow", |run| run.workflow_name.as_str());
+    let mut lines = vec![Line::from(vec![
+        Span::styled("Workflow", title_style(false)),
+        Span::styled(
+            format!(" · {workflow_name} · {}", dashboard.status),
+            muted_style(),
+        ),
+    ])];
+    let Some(run) = &dashboard.detail else {
+        lines.push(Line::from(Span::styled("  loading…", muted_style())));
+        return lines;
+    };
+    for step in &run.steps {
+        let (icon, style) = match step.phase {
+            crate::PromptStepPhase::Satisfied | crate::PromptStepPhase::Completed => {
+                ("✓", Style::default().fg(Color::Green))
+            }
+            crate::PromptStepPhase::Checking
+            | crate::PromptStepPhase::Preparing
+            | crate::PromptStepPhase::Prepared
+            | crate::PromptStepPhase::RunningAgent
+            | crate::PromptStepPhase::AgentSucceeded
+            | crate::PromptStepPhase::Finalizing => ("…", highlight_style()),
+            crate::PromptStepPhase::Waiting => ("…", attention_style()),
+            crate::PromptStepPhase::Failed | crate::PromptStepPhase::RecoveryRequired => {
+                ("✕", error_style())
+            }
+            crate::PromptStepPhase::Cancelled => ("×", disabled_style()),
+            crate::PromptStepPhase::Pending => ("○", muted_style()),
+        };
+        let summary = step
+            .summary
+            .as_deref()
+            .unwrap_or_else(|| prompt_phase_label(step.phase));
+        let dependency = if step.explicit_dependencies {
+            if step.dependencies.is_empty() {
+                "  [root]".to_string()
+            } else {
+                format!("  [after {}]", step.dependencies.join(", "))
+            }
+        } else {
+            String::new()
+        };
+        let text = format!(
+            "{icon} {:<18}  {summary}{dependency}",
+            step.key.replace(['_', '-'], " ")
+        );
+        let selected = dashboard.selected_step.as_deref() == Some(step.key.as_str());
+        lines.push(Line::from(Span::styled(
+            text,
+            if selected {
+                selected_style(model.main_focused)
+            } else {
+                style
+            },
+        )));
+    }
+    if let Some(selected) = dashboard.selected_step.as_deref()
+        && let Some(step) = run.steps.iter().find(|step| step.key == selected)
+    {
+        lines.push(Line::from(""));
+        lines.push(labelled_line(
+            "phase",
+            prompt_phase_label(step.phase).to_string(),
+        ));
+        if let Some(wake) = step.wake_at_unix_ms {
+            lines.push(labelled_line("next check", wake.to_string()));
+        }
+        if let Some(final_text) = step.final_text() {
+            lines.push(labelled_line("Agent", final_text.to_string()));
+        }
+    }
+    lines
+}
+
+fn prompt_phase_label(phase: crate::PromptStepPhase) -> &'static str {
+    match phase {
+        crate::PromptStepPhase::Pending => "pending",
+        crate::PromptStepPhase::Checking => "checking",
+        crate::PromptStepPhase::Preparing | crate::PromptStepPhase::Prepared => "preparing",
+        crate::PromptStepPhase::RunningAgent => "running Agent",
+        crate::PromptStepPhase::AgentSucceeded | crate::PromptStepPhase::Finalizing => "finalizing",
+        crate::PromptStepPhase::Waiting => "waiting",
+        crate::PromptStepPhase::Satisfied => "satisfied",
+        crate::PromptStepPhase::Completed => "completed",
+        crate::PromptStepPhase::Failed => "failed",
+        crate::PromptStepPhase::Cancelled => "cancelled",
+        crate::PromptStepPhase::RecoveryRequired => "recovery required",
     }
 }
 

@@ -77,9 +77,99 @@ fn help_prints_usage_without_repo() {
 
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(stdout(&output).contains("Usage:\n  prism"));
-    assert!(stdout(&output).contains("auto run-plan <plan.md>"));
+    assert!(!stdout(&output).contains("run-plan"));
     assert!(stdout(&output).contains("debug --help"));
     assert!(stderr(&output).is_empty());
+}
+
+#[test]
+fn workflow_and_resource_lists_use_stable_json_envelopes() {
+    let temp = TempDir::new("workflow-resource-json");
+    for (family, expected_kind, minimum) in [
+        ("workflow", "workflow.list", 1),
+        ("skill", "skill.list", 0),
+        ("template", "template.list", 0),
+    ] {
+        let output = run([family, "list", "--json"], temp.path(), temp.path());
+        assert!(output.status.success(), "{family}: {}", stderr(&output));
+        let value: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["kind"], expected_kind);
+        assert!(value["data"].as_array().unwrap().len() >= minimum);
+    }
+}
+
+#[test]
+fn repository_workflows_require_explicit_revision_trust() {
+    let temp = TempDir::new("workflow-repository-trust");
+    let repo = temp.path().join("repo");
+    let config_home = temp.path().join("xdg");
+    init_repo(&repo);
+    fs::create_dir_all(repo.join(".prism/workflows")).unwrap();
+    let source = repo.join(".prism/workflows/repository-review.toml");
+    fs::write(&source, "[[step]]\nprompt='review'\n").unwrap();
+
+    let before = run(["workflow", "list", "--json"], &repo, &config_home);
+    assert!(before.status.success(), "{}", stderr(&before));
+    let before: serde_json::Value = serde_json::from_str(&stdout(&before)).unwrap();
+    assert!(
+        !before["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"] == "repository-review")
+    );
+
+    let preview = run(["workflow", "trust-repository"], &repo, &config_home);
+    assert!(preview.status.success(), "{}", stderr(&preview));
+    assert!(stdout(&preview).contains("Preview trust"));
+
+    let apply = run(
+        ["workflow", "trust-repository", "--apply"],
+        &repo,
+        &config_home,
+    );
+    assert!(apply.status.success(), "{}", stderr(&apply));
+    let trusted = run(["workflow", "list", "--json"], &repo, &config_home);
+    let trusted: serde_json::Value = serde_json::from_str(&stdout(&trusted)).unwrap();
+    assert!(
+        trusted["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"] == "repository-review")
+    );
+
+    fs::write(&source, "[[step]]\nprompt='changed'\n").unwrap();
+    let changed = run(["workflow", "list", "--json"], &repo, &config_home);
+    let changed: serde_json::Value = serde_json::from_str(&stdout(&changed)).unwrap();
+    assert!(
+        !changed["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"] == "repository-review")
+    );
+}
+
+#[test]
+fn workflow_json_errors_keep_the_versioned_envelope() {
+    let temp = TempDir::new("workflow-json-error");
+    let output = run(
+        ["workflow", "show", "missing/workflow", "--json"],
+        temp.path(),
+        temp.path(),
+    );
+    assert!(!output.status.success());
+    let value: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["kind"], "workflow.error");
+    assert!(
+        value["data"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unknown workflow")
+    );
 }
 
 #[test]
@@ -349,31 +439,6 @@ fn daemon_status_with_long_tmpdir_uses_the_explicit_compact_runtime() {
 }
 
 #[test]
-fn list_does_not_project_or_control_legacy_repository_runs() {
-    let temp = TempDir::new("managed-plan-control");
-    let repo = temp.path().join("repo");
-    let config_home = temp.path().join("xdg");
-    init_repo(&repo);
-    let repo = fs::canonicalize(repo).unwrap();
-    let path_output = run(["db", "path"], &repo, &config_home);
-    assert!(path_output.status.success(), "{}", stderr(&path_output));
-    let db_path = PathBuf::from(stdout(&path_output).trim());
-    persistence_test_support::install_plan_control_fixture(&db_path, &repo).unwrap();
-
-    let listed = run(["list", "--all", "--json"], &repo, &config_home);
-    assert!(listed.status.success(), "{}", stderr(&listed));
-    let value: serde_json::Value = serde_json::from_str(&stdout(&listed)).unwrap();
-    assert_eq!(value["repositories"][0]["workflows"], serde_json::json!([]));
-
-    let paused = run(["pause", "plan:plan-control-12345678"], &repo, &config_home);
-    assert!(!paused.status.success());
-    assert_eq!(
-        persistence_test_support::plan_control_state(&db_path).unwrap(),
-        ("queued".to_string(), 0, "queued".to_string())
-    );
-}
-
-#[test]
 fn config_prints_effective_repo_config() {
     let temp = TempDir::new("config");
     let repo = temp.path().join("repo");
@@ -406,7 +471,7 @@ fn config_discovery_commands_print_templates_schema_and_paths() {
     assert!(example_stdout.contains("completed = false"));
     assert!(example_stdout.contains("default_harness = \"opencode\""));
     assert!(example_stdout.contains("[worktrees]"));
-    assert!(example_stdout.contains("auto_implement ="));
+    assert!(!example_stdout.contains("auto_implement ="));
 
     let schema = run(["config", "schema"], &repo, &config_home);
     assert!(schema.status.success(), "{}", stderr(&schema));
@@ -460,7 +525,7 @@ fn doctor_reports_repository_and_tool_status() {
     assert!(stdout.contains("Prism doctor"));
     assert!(stdout.contains(&format!("repo: {}", canonical_display(&repo))));
     assert!(stdout.contains("selected harness: opencode"));
-    assert!(stdout.contains("checks: pre_pr=0 pre_push=0 review_fix=0"));
+    assert!(stdout.contains("workflow definitions:"));
 }
 
 #[test]
@@ -732,31 +797,6 @@ fn unknown_argument_fails_with_stderr() {
     assert!(!output.status.success());
     assert!(stdout(&output).is_empty());
     assert!(stderr(&output).contains("prism: unknown argument: --definitely-not-real"));
-}
-
-#[test]
-fn auto_run_plan_without_path_fails_before_repo_discovery() {
-    let temp = TempDir::new("auto-run-plan-missing-path");
-    let output = run(["auto", "run-plan"], temp.path(), temp.path());
-
-    assert!(!output.status.success());
-    assert!(stdout(&output).is_empty());
-    assert!(stderr(&output).contains("prism: auto run-plan requires a plan path"));
-}
-
-#[test]
-fn auto_run_plan_without_phase_headings_fails_before_launch_gates() {
-    let temp = TempDir::new("auto-run-plan-no-phases");
-    let repo = temp.path().join("repo");
-    let config_home = temp.path().join("xdg");
-    init_repo(&repo);
-    fs::write(repo.join("plan.md"), "# Notes\n\nNo phases yet.\n").expect("write plan");
-
-    let output = run(["auto", "run-plan", "plan.md"], &repo, &config_home);
-
-    assert!(!output.status.success());
-    assert!(stdout(&output).is_empty());
-    assert!(stderr(&output).contains("could not infer phases"));
 }
 
 #[test]

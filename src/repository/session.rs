@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "session queries support optional prompt restoration"
+)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1306,10 +1311,9 @@ mod tests {
     use crate::config::Config;
     use crate::persistence::database::TestDatabase;
     use crate::sqlx_test_params as params;
+    #[cfg(unix)]
     use crate::test_support::write_executable;
 
-    #[cfg(windows)]
-    use crate::test_support::PermissionsExt;
     use std::collections::BTreeMap;
     use std::fs;
     #[cfg(unix)]

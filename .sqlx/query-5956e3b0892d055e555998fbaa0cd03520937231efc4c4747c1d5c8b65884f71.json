@@ -1,0 +1,92 @@
+{
+  "db_name": "SQLite",
+  "query": "select\n  id as \"id!: String\",\n  producing_attempt_id,\n  revision as \"revision!: i64\",\n  digest as \"digest!: String\",\n  size_bytes as \"size_bytes!: i64\",\n  sensitivity as \"sensitivity!: String\",\n  inline_body,\n  file_path,\n  artifact.created_unix_ms as \"created_unix_ms!: i64\",\n  provenance.provider_item_id,\n  provenance.observation_revision,\n  provenance.trigger_occurrence_id,\n  provenance.admission_decision_id\nfrom artifact\nleft join artifact_provenance provenance on provenance.artifact_id=artifact.id\nwhere artifact.run_id = ?\norder by artifact.id, artifact.revision\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!: String",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "producing_attempt_id",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "revision!: i64",
+        "ordinal": 2,
+        "type_info": "Integer"
+      },
+      {
+        "name": "digest!: String",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "size_bytes!: i64",
+        "ordinal": 4,
+        "type_info": "Integer"
+      },
+      {
+        "name": "sensitivity!: String",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "inline_body",
+        "ordinal": 6,
+        "type_info": "Blob"
+      },
+      {
+        "name": "file_path",
+        "ordinal": 7,
+        "type_info": "Text"
+      },
+      {
+        "name": "created_unix_ms!: i64",
+        "ordinal": 8,
+        "type_info": "Integer"
+      },
+      {
+        "name": "provider_item_id",
+        "ordinal": 9,
+        "type_info": "Text"
+      },
+      {
+        "name": "observation_revision",
+        "ordinal": 10,
+        "type_info": "Text"
+      },
+      {
+        "name": "trigger_occurrence_id",
+        "ordinal": 11,
+        "type_info": "Text"
+      },
+      {
+        "name": "admission_decision_id",
+        "ordinal": 12,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "5956e3b0892d055e555998fbaa0cd03520937231efc4c4747c1d5c8b65884f71"
+}

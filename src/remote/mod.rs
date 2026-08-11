@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![allow(dead_code, unused_imports)]
 
 mod cache;
 mod capability;
@@ -11,15 +11,15 @@ mod github;
 mod gitlab;
 mod http;
 mod model;
+pub mod request_coordinator;
 mod store;
 
-#[cfg(test)]
 pub(crate) use cache::PrCheckContext;
 pub(crate) use cache::{
     CiFailure as CachedCiFailure, PR_SUMMARY_POLL_INTERVAL, PrCache, PrCheckState, PrComment,
-    PrDetails, PrReview, PrReviewComment, PrSummary, RepoPolicyCache, apply_pr_details_poll_result,
-    apply_pr_summary_poll_result, pr_cache_comment_count, pr_cache_render_signature,
-    pr_summary_or_error, trusted_pr_for_session,
+    PrDetails, PrReview, PrReviewComment, PrSummary, RepoPolicyCache, WorkerPrCacheSnapshot,
+    apply_pr_details_poll_result, apply_pr_summary_poll_result, pr_cache_comment_count,
+    pr_cache_render_signature, pr_summary_or_error, trusted_pr_for_session,
 };
 pub(crate) use capability::{Capabilities, SupportLevel};
 pub(crate) use coordinator::{
@@ -36,9 +36,10 @@ pub(crate) use model::{
     ChangeRequestSummary, CheckContext, CheckState, CiFailure, Comment, CreateChangeRequest,
     FetchChangeRequest, GuardedMerge, HostIdentity, IdentityError, LifecycleState, MergeMethod,
     MergeMutationOutcome, MergeMutationResult, MergeabilityState, NativeChangeRequestId,
-    NativeReviewThreadId, NativeStateEvidence, Observation, PolicyFacts, ProviderKind, QueueState,
-    RemoteBase, RemoteRepository, RemoteRepositoryId, RepositoryPolicy, ResolveReviewThread,
-    Review, ReviewDecision, ReviewSubmissionKind, ReviewThread, SubmitReview, WebScheme,
+    NativeReviewThreadId, NativeStateEvidence, Observation, PolicyFacts, ProviderItemId,
+    ProviderItemKind, ProviderItemObservation, ProviderKind, QueueState, RemoteBase,
+    RemoteRepository, RemoteRepositoryId, RepositoryPolicy, ResolveReviewThread, Review,
+    ReviewDecision, ReviewSubmissionKind, ReviewThread, SubmitReview, WebScheme,
 };
 #[cfg(test)]
 pub(crate) use model::{HeadAssociation, NativeMergeGuard};

@@ -12,8 +12,14 @@ OpenCode keeps its structured events, server-backed sessions, observation, submi
 
 Commands are argument arrays. Generic startup prompts use only explicitly configured argument, stdin (headless only), or temporary-file transport. Prism retains local process ownership for cancellation and output limits.
 
-Plan and Auto Flow runs persist the harness ID selected when each run is created. Resume and retry resolve that recorded harness, preventing a global default change from reinterpreting historical session identity.
+Workflow Attempts persist the exact implementation, executable revision, and harness inputs
+selected when each run is created. Resume and retry resolve those pinned bytes, preventing a
+global default change from reinterpreting historical execution identity.
 
 ## Consequences
 
-Harnesses degrade explicitly rather than pretending to have OpenCode-like session semantics. New named adapters remain compiled into Prism and require deterministic contract coverage before being advertised. Generic commands are the extension mechanism; there is no external plugin compatibility promise.
+Harnesses degrade explicitly rather than pretending to have OpenCode-like session semantics. New
+interactive harness adapters remain compiled into Prism and require deterministic contract
+coverage before being advertised. Workflow Step Implementations use the public, versioned
+extension process protocol; capability declarations are disclosure and policy inputs, not a
+sandbox boundary.

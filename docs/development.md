@@ -1,8 +1,9 @@
 # Development
 
-Install the pinned SQLx CLI compatible with the crate's SQLx dependency:
+Install the pinned test runner and SQLx CLI used by the local gate:
 
 ```sh
+cargo install cargo-nextest --version 0.9.143 --locked
 cargo install sqlx-cli --version 0.8.6 --locked --no-default-features --features sqlite,rustls
 ```
 
@@ -19,23 +20,30 @@ for migration in migrations/workflow/*.sql; do
   sqlite3 "$db" ".read $migration"
 done
 cargo sqlx prepare --workspace --database-url "sqlite://$db" -- --all-targets
-env DOCS_RS=1 PKG_CONFIG_ALLOW_CROSS=1 LIBSQLITE3_SYS_USE_PKG_CONFIG=1 \
-  CC_aarch64_apple_darwin=clang \
-  cargo sqlx prepare --workspace --database-url "sqlite://$db" \
-    -- --all-targets --target aarch64-apple-darwin
 rm -f "$db" "$db-wal" "$db-shm" "$workflow_db" "$workflow_db-wal" "$workflow_db-shm"
 ```
 
 Review and commit the resulting `.sqlx` changes. `scripts/full-check.sh` verifies
 that this metadata is current and then compiles/tests with `SQLX_OFFLINE=true`.
 
-Run the local CI gate before pushing:
+Run the fast native gate during routine development:
+
+```sh
+scripts/check.sh
+```
+
+Run the exhaustive metadata gate before pushing:
 
 ```sh
 scripts/full-check.sh
 ```
 
-Prism supports Linux, macOS, and native `x86_64-pc-windows-msvc`. On Linux, the gate runs native tests and Clippy, host-independent platform-policy tests, Darwin cross-Clippy for Apple Silicon, and Windows MSVC cross-Clippy. There are no architecture-specific macOS code paths warranting a duplicate Intel cross-check. Cross-compilation does not replace native macOS or Windows verification.
+Prism supports Linux, macOS, and native `x86_64-pc-windows-msvc`. On Linux and
+macOS, both gates run native tests and Clippy plus the host-independent platform
+policy tests. The full gate additionally verifies SQLx metadata freshness. CI
+runs those gates natively on Linux and macOS and runs `scripts/windows-check.ps1`
+natively on Windows; cross-compilation does not replace native platform
+verification.
 
 Run the focused native contracts on a prepared macOS host before the complete
 suite:
@@ -52,17 +60,6 @@ OpenCode, and tmux contracts without invoking a model. Deterministic policy,
 errno classification, and fault-injection tests remain in the full suite except
 where a staging test also proves a native durability primitive.
 
-On native Windows with PowerShell 7, run the required root gate and pinned compatibility smoke:
-
-```powershell
-scripts/windows-check.ps1
-scripts/install-windows-smoke-tools.ps1
-npm install --global opencode-ai@1.17.20
-scripts/windows-platform-smoke.ps1
-```
-
-The Windows gate covers formatting, SQLx-offline compilation, Clippy, normal tests, native process/IPC/security/persistence/storage contracts, and release-zip installation. The compatibility smoke uses native Git, psmux 3.3.7, Worktrunk 0.71.0 through `git-wt.exe`, and a real no-model OpenCode server. Interactive attach/detach, input, resize, restoration, and rendering remain a focused real-terminal check documented in [Windows interactive smoke](windows-interactive-smoke.md).
-
 To synchronize the current worktree, including uncommitted files, to an
 SSH-accessible Mac and run that smoke command without pushing a branch:
 
@@ -75,7 +72,7 @@ The destination must already be a Git checkout or worktree. Its working files
 are treated as a dedicated mirror: rsync deletes stale files while excluding
 `.git` and `target`.
 
-CI also runs no-model smoke coverage against a pinned real OpenCode binary on Linux, macOS, and Windows. To run the portable API test locally with an installed OpenCode:
+CI also runs a no-model smoke test against a pinned real OpenCode binary on Linux and macOS. To run it locally with an installed OpenCode:
 
 ```sh
 PRISM_TEST_OPENCODE="$(command -v opencode)" \
@@ -85,7 +82,7 @@ PRISM_TEST_OPENCODE="$(command -v opencode)" \
 
 The smoke test starts `opencode serve`, waits for its health endpoint, and verifies Prism can create, list, retrieve, and persist a prompt in a session. It does not require provider credentials.
 
-CI also exercises the full headless stack with the real Prism binary, OpenCode, and tmux or psmux in isolated runtime state. To run the Unix test locally:
+CI also exercises the full headless stack with the real Prism binary, OpenCode, and tmux on an isolated socket. To run it locally:
 
 ```sh
 PRISM_TEST_OPENCODE="$(command -v opencode)" \
@@ -94,7 +91,7 @@ PRISM_TEST_TMUX="$(command -v tmux)" \
     -- --ignored --exact
 ```
 
-The full-stack test creates a Git worktree, runs `prism agent ensure`, verifies the OpenCode-backed session, runs ensure again to check reuse, and cleans up the isolated server and runtime state. The Windows equivalent is `scripts/windows-platform-smoke.ps1`. Neither path invokes a model.
+The full-stack test creates a Git worktree, runs `prism agent ensure`, verifies the OpenCode-backed tmux session, runs ensure again to check reuse, and cleans up the isolated server and socket. It does not invoke a model.
 
 ## Remote Compatibility
 
@@ -124,7 +121,7 @@ the recorded metadata and security boundaries.
 
 ## Worktrunk Compatibility
 
-Prism's Worktrunk support floor is 0.58.0. CI installs and smoke-tests the pinned current version 0.71.0 on Linux, macOS, and Windows. The Windows gate verifies the upstream archive checksum and installs its executable as `git-wt.exe` to avoid collision with Windows Terminal's `wt.exe`. The smoke creates a repository whose path contains spaces, creates the `ci/real-smoke` branch, reads machine JSON from Worktrunk, and removes the worktree while preserving the branch. It sets `WORKTRUNK_CONFIG_PATH` and `WORKTRUNK_WORKTREE_PATH` under a temporary directory so it never reads or mutates user configuration or approvals.
+Prism's Worktrunk support floor is 0.58.0. CI installs and smoke-tests the pinned current version 0.71.0 on Linux and macOS using the versioned installer published with that upstream release. The smoke creates a repository whose path contains spaces, creates the `ci/real-smoke` branch, reads `wt list --format=json`, and removes the worktree while preserving the branch. It sets `WORKTRUNK_CONFIG_PATH` and `WORKTRUNK_WORKTREE_PATH` under a temporary directory so it never reads or mutates user configuration or approvals.
 
 `PRISM_TEST_WORKTRUNK` is the real-tool smoke selector and contains the absolute path to `wt`. To exercise the same binary selection locally:
 
@@ -134,7 +131,7 @@ test -x "$PRISM_TEST_WORKTRUNK"
 "$PRISM_TEST_WORKTRUNK" --version
 ```
 
-On Windows, use `$env:PRISM_TEST_WORKTRUNK = (Get-Command git-wt.exe).Source` instead. Parser coverage does not require Worktrunk. Redacted fixtures under `tests/fixtures/worktrunk` cover the 0.58.0 schema-1 floor and the schema-1/schema-2 output documented for 0.71.0, including absent and null observations. Unknown schemas must fail closed.
+Parser coverage does not require Worktrunk. Redacted fixtures under `tests/fixtures/worktrunk` cover the 0.58.0 schema-1 floor and the schema-1/schema-2 output documented for 0.71.0, including absent and null observations. Unknown schemas must fail closed.
 
 To enforce the same gate as a pre-push hook, opt into the versioned hooks:
 
@@ -161,8 +158,6 @@ Prism stores per-repository runtime state in `prism.db` under the user's Prism c
 
 - `task_metadata`, `hidden_session`, `agent_state`: worktree session metadata and local session state.
 - `opencode_runtime`: OpenCode server/session records associated with worktrees.
-- `plan_run`, `plan_step_run`, `plan_output_line`: persisted Plan Mode runs, step state, and bounded step output.
-- `auto_run`, `auto_step_run`, `auto_output_line`, `auto_event`: persisted Auto Flow runs, attempts, output, and event history.
 - `pr_cache`, `pr_details_cache`: provider-neutral change-request summary and
   detail caches; the historical table names are retained for migration safety.
 - `event`, `startup_run`, `startup_phase`: observability events and startup timing records.
@@ -170,7 +165,7 @@ Prism stores per-repository runtime state in `prism.db` under the user's Prism c
 The generalized worker owns the separate user-scoped `workflow.db` in the Prism
 config directory. It contains definition snapshots, runs, steps, fenced
 attempts, output, artifacts, approvals, effects, triggers, resource claims,
-import journals, audit events, and control-plane metrics. Repository migrations
+audit events, and control-plane metrics. Repository migrations
 must never be run against this database, and workflow migrations must never be
 run against `prism.db`.
 

@@ -19,6 +19,12 @@ pub(crate) enum RemoteOperation {
     SubmitReview,
     MergeChangeRequest,
     ObserveMergeQueue,
+    DiscoverIssues,
+    ObserveProviderEvents,
+    MutateLabels,
+    MutateAssignment,
+    CreateIssueComment,
+    MutateIssueLifecycle,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -188,6 +194,12 @@ impl RemoteOperation {
             Self::SubmitReview => "submit_review",
             Self::MergeChangeRequest => "merge_change_request",
             Self::ObserveMergeQueue => "observe_merge_queue",
+            Self::DiscoverIssues => "discover_issues",
+            Self::ObserveProviderEvents => "observe_provider_events",
+            Self::MutateLabels => "mutate_labels",
+            Self::MutateAssignment => "mutate_assignment",
+            Self::CreateIssueComment => "create_issue_comment",
+            Self::MutateIssueLifecycle => "mutate_issue_lifecycle",
         }
     }
 }

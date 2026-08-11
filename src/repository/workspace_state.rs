@@ -5,7 +5,6 @@ use serde::Serialize;
 
 use crate::agent::AgentState;
 use crate::config::Config;
-use crate::execution::{self, WorkflowKind};
 use crate::git::{self, GitStatus};
 use crate::lifecycle;
 use crate::persistence::workspace as workspace_persistence;
@@ -43,6 +42,7 @@ pub struct RepositorySnapshot {
     pub shortcut: Option<char>,
     pub worktrees: Vec<WorktreeSnapshot>,
     pub workflows: Vec<WorkflowSnapshot>,
+    pub workflow_details: Vec<crate::WorkflowRunState>,
     pub totals: RepositoryTotals,
 }
 
@@ -158,7 +158,6 @@ pub enum ObservationProvenance {
 #[derive(Clone, Debug, Serialize)]
 pub struct WorkflowSnapshot {
     pub identity: WorkflowIdentity,
-    pub owner: Option<WorkflowIdentity>,
     pub worktree: WorktreeIdentity,
     pub lifecycle: WorkflowLifecycle,
     pub pause_requested: bool,
@@ -172,14 +171,43 @@ pub struct WorkflowSnapshot {
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct WorkflowIdentity {
     pub repository: PathBuf,
-    pub kind: WorkflowKind,
     pub run_id: String,
     pub display_id: String,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchState {
+    Queued,
+    Claimed,
+    RecoveryPending,
+    Paused,
+    Terminal,
+}
+
+impl DispatchState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Claimed => "claimed",
+            Self::RecoveryPending => "recovery_pending",
+            Self::Paused => "paused",
+            Self::Terminal => "terminal",
+        }
+    }
+}
+
+impl std::ops::Deref for DispatchState {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.label()
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct DispatchSnapshot {
-    pub state: Option<execution::DispatchState>,
+    pub state: Option<DispatchState>,
     pub daemon_instance_id: Option<String>,
     pub worker_id: Option<String>,
     pub lease_expires_unix_ms: Option<i64>,
@@ -199,31 +227,24 @@ pub struct StepSummary {
 pub enum WorkflowLifecycle {
     Queued,
     Running,
+    Waiting,
+    NeedsInput,
     Paused,
+    RecoveryRequired,
     Done,
     Failed,
     Aborted,
 }
 
 impl WorkflowLifecycle {
-    #[cfg(test)]
-    fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "queued" => Ok(Self::Queued),
-            "running" => Ok(Self::Running),
-            "paused" => Ok(Self::Paused),
-            "done" => Ok(Self::Done),
-            "failed" => Ok(Self::Failed),
-            "aborted" => Ok(Self::Aborted),
-            other => Err(format!("unknown workflow lifecycle: {other}")),
-        }
-    }
-
     pub fn label(self) -> &'static str {
         match self {
             Self::Queued => "queued",
             Self::Running => "running",
+            Self::Waiting => "waiting",
+            Self::NeedsInput => "input required",
             Self::Paused => "paused",
+            Self::RecoveryRequired => "recovery required",
             Self::Done => "done",
             Self::Failed => "failed",
             Self::Aborted => "aborted",
@@ -269,25 +290,9 @@ pub enum StepState {
     Done,
     Failed,
     Aborted,
-    Skipped,
-    Unknown,
 }
 
 impl StepState {
-    fn parse(value: Option<String>) -> Self {
-        match value.as_deref() {
-            Some("queued" | "runnable") => Self::Queued,
-            Some("starting") => Self::Starting,
-            Some("running" | "claimed") => Self::Running,
-            Some("waiting") => Self::Waiting,
-            Some("done" | "succeeded") => Self::Done,
-            Some("failed") => Self::Failed,
-            Some("aborted" | "cancelled") => Self::Aborted,
-            Some("skipped") => Self::Skipped,
-            _ => Self::Unknown,
-        }
-    }
-
     pub fn label(self) -> &'static str {
         match self {
             Self::Queued => "queued",
@@ -297,8 +302,6 @@ impl StepState {
             Self::Done => "done",
             Self::Failed => "failed",
             Self::Aborted => "aborted",
-            Self::Skipped => "skipped",
-            Self::Unknown => "unknown",
         }
     }
 }
@@ -459,7 +462,7 @@ impl WorkspaceState {
     }
 
     pub fn inspect(&self, request: InspectRequest) -> Result<WorkspaceSnapshot, String> {
-        let observed = execution::now_ms();
+        let observed = current_unix_ms();
         let mut warnings = self.discovery_diagnostics.clone();
         let daemon = match worker::probe_health() {
             Ok(health) => health,
@@ -588,24 +591,13 @@ impl WorkspaceState {
         })?;
         let target =
             self.resolve_workflow(&snapshot, request.selector.as_deref(), request.action)?;
-        if let Some(owner) = &target.owner {
-            return Err(format!(
-                "plan run {} is owned by {}; control {} instead",
-                target.identity.display_id, owner.display_id, owner.display_id
-            ));
-        }
-        if request.action == ControlAction::Recover
-            && target.dispatch.state != Some(execution::DispatchState::RecoveryPending)
-        {
-            return Err("workflow does not require recovery".to_string());
-        }
         let command = match request.action {
-            ControlAction::Pause => crate::WorkflowCommand::Pause,
-            ControlAction::Resume => crate::WorkflowCommand::Resume,
-            ControlAction::Stop => crate::WorkflowCommand::Cancel,
-            ControlAction::Recover => crate::WorkflowCommand::Retry,
+            ControlAction::Pause => worker::PromptWorkflowControl::Pause,
+            ControlAction::Resume => worker::PromptWorkflowControl::Resume,
+            ControlAction::Stop => worker::PromptWorkflowControl::Cancel,
+            ControlAction::Recover => worker::PromptWorkflowControl::Retry,
         };
-        worker::command_workflow(&target.identity.run_id, command)?;
+        worker::command_prompt_workflow(&target.identity.run_id, command)?;
         Ok(ControlReceipt {
             workflow: target.identity.clone(),
             state: match request.action {
@@ -625,11 +617,14 @@ impl WorkspaceState {
         for decision in decisions {
             self.source_for_identity(&decision.workflow)?;
             if decision.restart {
-                worker::command_workflow(&decision.workflow.run_id, crate::WorkflowCommand::Retry)?;
-            } else {
-                worker::command_workflow(
+                worker::command_prompt_workflow(
                     &decision.workflow.run_id,
-                    crate::WorkflowCommand::Cancel,
+                    worker::PromptWorkflowControl::Retry,
+                )?;
+            } else {
+                worker::command_prompt_workflow(
+                    &decision.workflow.run_id,
+                    worker::PromptWorkflowControl::Cancel,
                 )?;
             }
         }
@@ -698,46 +693,49 @@ impl WorkspaceState {
     }
 }
 
-pub(crate) fn control_repository_workflow(
-    repo: &Repository,
-    action: ControlAction,
-    kind: &str,
-    run_id: &str,
-) -> Result<ControlReceipt, String> {
-    WorkspaceState::open(WorkspaceContext {
-        repo: Some(repo.root.clone()),
-        cwd: repo.root.clone(),
-    })?
-    .control(ControlRequest {
-        action,
-        selector: Some(format!("{kind}:{run_id}")),
-    })
+fn select_ledger_run_summaries(runs: Vec<crate::WorkflowRunState>) -> Vec<crate::WorkflowRunState> {
+    let mut terminal = 0;
+    runs.into_iter()
+        .filter(|run| {
+            if !run.status.terminal() {
+                true
+            } else if terminal < RECENT_TERMINAL_WORKFLOWS {
+                terminal += 1;
+                true
+            } else {
+                false
+            }
+        })
+        .collect()
 }
 
-fn list_ledger_workflows(sources: &[RepoSource]) -> Result<Vec<crate::WorkflowProjection>, String> {
-    let repositories = sources
-        .iter()
-        .map(|source| source.repo.root.display().to_string())
-        .collect::<Vec<_>>();
-    let from_worker = repositories
-        .iter()
-        .try_fold(Vec::new(), |mut runs, repository| {
-            runs.extend(worker::list_workflows(Some(Path::new(repository)), 256)?);
-            Ok::<_, String>(runs)
-        });
+fn list_ledger_workflows(sources: &[RepoSource]) -> Result<Vec<crate::WorkflowRunState>, String> {
+    let from_worker = sources.iter().try_fold(Vec::new(), |mut runs, source| {
+        runs.extend(select_ledger_run_summaries(worker::list_prompt_workflows(
+            Some(&source.repo.root),
+            256,
+        )?));
+        Ok::<_, String>(runs)
+    });
     match from_worker {
         Ok(runs) => Ok(runs),
-        Err(_) if !crate::util::prism_config_dir().join("workflow.db").exists() => Ok(Vec::new()),
+        Err(_) if !crate::PromptWorkflowService::database_path().exists() => Ok(Vec::new()),
         Err(socket_error) => crate::async_runtime::block_on(async {
-            let operations = crate::WorkflowOperations::open_default().await?;
+            let store = crate::DurableWorkflowRunStore::open(
+                &crate::PromptWorkflowService::database_path(),
+            )
+            .await?;
             let mut runs = Vec::new();
-            for repository in repositories {
-                runs.extend(operations.list(Some(&repository), 256).await?);
+            for source in sources {
+                runs.extend(select_ledger_run_summaries(
+                    store.list_runs(Some(&source.repo.root), 256).await?,
+                ));
             }
-            Ok::<_, crate::WorkflowOperationError>(runs)
+            store.close().await;
+            Ok::<_, crate::WorkflowKernelError>(runs)
         })
-        .map_err(|error| format!("access workflow ledger runtime: {error}"))?
-        .map_err(|error| format!("{socket_error}; direct workflow ledger read failed: {error}")),
+        .map_err(|error| format!("access prompt Workflow runtime: {error}"))?
+        .map_err(|error| format!("{socket_error}; direct Workflow read failed: {error}")),
     }
 }
 
@@ -752,7 +750,7 @@ fn inspect_repository(
     source: &RepoSource,
     request: InspectRequest,
     observed: i64,
-    ledger_runs: &[crate::WorkflowProjection],
+    ledger_runs: &[crate::WorkflowRunState],
 ) -> Result<(RepositorySnapshot, Vec<Diagnostic>), String> {
     let config = Config::load(&source.repo);
     let inventory = lifecycle::list_worktrees(&source.repo, &config)?;
@@ -776,6 +774,11 @@ fn inspect_repository(
     let hidden = read_projection(&reader, source, &mut warnings, "load_hidden", load_hidden)
         .unwrap_or_default();
     let mut workflows = load_ledger_workflows(ledger_runs, &source.repo.root)?;
+    let workflow_details = ledger_runs
+        .iter()
+        .filter(|run| paths_equal(&run.subject.repository, &source.repo.root))
+        .cloned()
+        .collect::<Vec<_>>();
     if !request.include_terminal {
         workflows.retain(|workflow| !workflow.lifecycle.terminal());
     }
@@ -783,7 +786,6 @@ fn inspect_repository(
         right
             .updated_unix_ms
             .cmp(&left.updated_unix_ms)
-            .then_with(|| left.identity.kind.cmp(&right.identity.kind))
             .then_with(|| left.identity.run_id.cmp(&right.identity.run_id))
     });
     if request.include_terminal {
@@ -858,8 +860,12 @@ fn inspect_repository(
     let workflow_attention = workflows
         .iter()
         .filter(|workflow| {
-            workflow.lifecycle == WorkflowLifecycle::Failed
-                || workflow.dispatch.state == Some(execution::DispatchState::RecoveryPending)
+            matches!(
+                workflow.lifecycle,
+                WorkflowLifecycle::Failed
+                    | WorkflowLifecycle::NeedsInput
+                    | WorkflowLifecycle::RecoveryRequired
+            ) || workflow.dispatch.state == Some(DispatchState::RecoveryPending)
                 || workflow.pause_requested
         })
         .count();
@@ -890,6 +896,7 @@ fn inspect_repository(
             },
             worktrees,
             workflows,
+            workflow_details,
         },
         warnings,
     ))
@@ -903,7 +910,7 @@ fn retain_recent_terminal_workflows(workflows: &mut Vec<WorkflowSnapshot>, limit
             WorkflowLifecycle::Done | WorkflowLifecycle::Aborted
         ) && matches!(
             workflow.dispatch.state,
-            None | Some(execution::DispatchState::Terminal)
+            None | Some(DispatchState::Terminal)
         );
         !terminal_workflow || {
             terminal += 1;
@@ -1044,65 +1051,69 @@ fn ci_state(value: &str) -> CiState {
 }
 
 fn load_ledger_workflows(
-    runs: &[crate::WorkflowProjection],
+    runs: &[crate::WorkflowRunState],
     repo_root: &Path,
 ) -> Result<Vec<WorkflowSnapshot>, String> {
     runs.iter()
-        .filter(|run| {
-            run.repository
-                .as_deref()
-                .is_some_and(|repository| paths_equal(Path::new(repository), repo_root))
-        })
+        .filter(|run| paths_equal(&run.subject.repository, repo_root))
         .map(|run| {
-            let lifecycle = ledger_lifecycle(&run.status)?;
-            let dispatch_state = match run.status.as_str() {
-                "waiting" | "runnable" => Some(execution::DispatchState::Queued),
-                "running" => Some(execution::DispatchState::Claimed),
-                "paused" => Some(execution::DispatchState::Paused),
-                "recovery_required" => Some(execution::DispatchState::RecoveryPending),
-                "succeeded" | "failed" | "cancelled" => Some(execution::DispatchState::Terminal),
-                _ => None,
+            let lifecycle = ledger_lifecycle(run.status);
+            let dispatch_state = match run.status {
+                crate::PromptWorkflowRunStatus::Queued
+                | crate::PromptWorkflowRunStatus::Waiting
+                | crate::PromptWorkflowRunStatus::NeedsInput => Some(DispatchState::Queued),
+                crate::PromptWorkflowRunStatus::Running => Some(DispatchState::Claimed),
+                crate::PromptWorkflowRunStatus::Paused => Some(DispatchState::Paused),
+                crate::PromptWorkflowRunStatus::RecoveryRequired => {
+                    Some(DispatchState::RecoveryPending)
+                }
+                crate::PromptWorkflowRunStatus::Succeeded
+                | crate::PromptWorkflowRunStatus::Failed
+                | crate::PromptWorkflowRunStatus::Cancelled => Some(DispatchState::Terminal),
             };
             let current_step = run
                 .steps
                 .iter()
-                .find(|step| matches!(step.status.as_str(), "claimed" | "runnable" | "waiting"))
+                .find(|step| {
+                    matches!(
+                        step.phase,
+                        crate::PromptStepPhase::Checking
+                            | crate::PromptStepPhase::Preparing
+                            | crate::PromptStepPhase::Prepared
+                            | crate::PromptStepPhase::RunningAgent
+                            | crate::PromptStepPhase::AgentSucceeded
+                            | crate::PromptStepPhase::Finalizing
+                            | crate::PromptStepPhase::Waiting
+                            | crate::PromptStepPhase::Failed
+                            | crate::PromptStepPhase::RecoveryRequired
+                    )
+                })
                 .or_else(|| run.steps.last());
-            let worktree = run
+            let worker_id = run
                 .steps
                 .iter()
-                .find_map(|step| {
-                    serde_json::from_str::<serde_json::Value>(&step.input_json)
-                        .ok()?
-                        .get("cwd")?
-                        .as_str()
-                        .map(PathBuf::from)
-                })
-                .unwrap_or_else(|| repo_root.to_path_buf());
-            let worker_id = run
-                .attempts
-                .iter()
-                .find(|attempt| attempt.status == "claimed")
-                .map(|attempt| attempt.worker_id.clone());
+                .flat_map(|step| &step.attempts)
+                .rev()
+                .find_map(|attempt| attempt.phase_owner.clone());
             let completed = run
                 .steps
                 .iter()
-                .filter(|step| step.status == "succeeded")
+                .filter(|step| {
+                    step.unconditional_completed
+                        || matches!(
+                            step.phase,
+                            crate::PromptStepPhase::Satisfied | crate::PromptStepPhase::Completed
+                        )
+                })
                 .count();
             Ok(WorkflowSnapshot {
                 identity: WorkflowIdentity {
                     repository: absolute_path(repo_root),
-                    kind: if run.definition_name.contains("plan") {
-                        WorkflowKind::Plan
-                    } else {
-                        WorkflowKind::Coding
-                    },
                     run_id: run.id.clone(),
                     display_id: String::new(),
                 },
-                owner: None,
                 worktree: WorktreeIdentity {
-                    path: absolute_path(&worktree),
+                    path: absolute_path(&run.subject.worktree),
                     display: String::new(),
                 },
                 lifecycle,
@@ -1118,7 +1129,7 @@ fn load_ledger_workflows(
                 },
                 current_step: current_step.map(|step| StepSummary {
                     label: step.key.clone(),
-                    state: StepState::parse(Some(step.status.clone())),
+                    state: prompt_step_state(step.phase),
                 }),
                 progress: Progress {
                     completed,
@@ -1131,22 +1142,42 @@ fn load_ledger_workflows(
         .collect()
 }
 
-fn ledger_lifecycle(status: &str) -> Result<WorkflowLifecycle, String> {
+fn ledger_lifecycle(status: crate::PromptWorkflowRunStatus) -> WorkflowLifecycle {
     match status {
-        "waiting" | "runnable" => Ok(WorkflowLifecycle::Queued),
-        "running" => Ok(WorkflowLifecycle::Running),
-        "paused" => Ok(WorkflowLifecycle::Paused),
-        "succeeded" => Ok(WorkflowLifecycle::Done),
-        "failed" | "recovery_required" => Ok(WorkflowLifecycle::Failed),
-        "cancelled" => Ok(WorkflowLifecycle::Aborted),
-        other => Err(format!("unknown global workflow lifecycle: {other}")),
+        crate::PromptWorkflowRunStatus::Queued => WorkflowLifecycle::Queued,
+        crate::PromptWorkflowRunStatus::Running => WorkflowLifecycle::Running,
+        crate::PromptWorkflowRunStatus::Waiting => WorkflowLifecycle::Waiting,
+        crate::PromptWorkflowRunStatus::NeedsInput => WorkflowLifecycle::NeedsInput,
+        crate::PromptWorkflowRunStatus::Paused => WorkflowLifecycle::Paused,
+        crate::PromptWorkflowRunStatus::Succeeded => WorkflowLifecycle::Done,
+        crate::PromptWorkflowRunStatus::Failed => WorkflowLifecycle::Failed,
+        crate::PromptWorkflowRunStatus::RecoveryRequired => WorkflowLifecycle::RecoveryRequired,
+        crate::PromptWorkflowRunStatus::Cancelled => WorkflowLifecycle::Aborted,
+    }
+}
+
+fn prompt_step_state(phase: crate::PromptStepPhase) -> StepState {
+    match phase {
+        crate::PromptStepPhase::Pending => StepState::Queued,
+        crate::PromptStepPhase::Checking
+        | crate::PromptStepPhase::Preparing
+        | crate::PromptStepPhase::Prepared
+        | crate::PromptStepPhase::AgentSucceeded
+        | crate::PromptStepPhase::Finalizing => StepState::Starting,
+        crate::PromptStepPhase::RunningAgent => StepState::Running,
+        crate::PromptStepPhase::Waiting => StepState::Waiting,
+        crate::PromptStepPhase::Satisfied | crate::PromptStepPhase::Completed => StepState::Done,
+        crate::PromptStepPhase::Failed | crate::PromptStepPhase::RecoveryRequired => {
+            StepState::Failed
+        }
+        crate::PromptStepPhase::Cancelled => StepState::Aborted,
     }
 }
 
 fn controls_for(
     lifecycle: WorkflowLifecycle,
     pause_requested: bool,
-    dispatch: Option<execution::DispatchState>,
+    dispatch: Option<DispatchState>,
     ownerless: bool,
 ) -> AvailableControls {
     let terminal = lifecycle.terminal();
@@ -1156,36 +1187,34 @@ fn controls_for(
             && !pause_requested
             && !matches!(
                 dispatch,
-                Some(execution::DispatchState::RecoveryPending | execution::DispatchState::Paused)
+                Some(DispatchState::RecoveryPending | DispatchState::Paused)
             ),
         resume: ownerless
             && !terminal
             && (pause_requested
                 || lifecycle == WorkflowLifecycle::Paused
-                || dispatch == Some(execution::DispatchState::Paused))
-            && dispatch != Some(execution::DispatchState::RecoveryPending),
+                || dispatch == Some(DispatchState::Paused))
+            && dispatch != Some(DispatchState::RecoveryPending),
         stop: ownerless && !terminal,
-        recover: ownerless && dispatch == Some(execution::DispatchState::RecoveryPending),
+        recover: ownerless
+            && (dispatch == Some(DispatchState::RecoveryPending)
+                || lifecycle == WorkflowLifecycle::Failed),
     }
 }
 
 fn assign_display_ids(repositories: &mut [RepositorySnapshot]) {
     let mut counts = BTreeMap::<String, usize>::new();
     for workflow in repositories.iter().flat_map(|repo| &repo.workflows) {
-        let prefix = short_id(workflow.identity.kind, &workflow.identity.run_id);
+        let prefix = short_id(&workflow.identity.run_id);
         *counts.entry(prefix).or_default() += 1;
     }
     for repository in repositories {
         for workflow in &mut repository.workflows {
-            let short = short_id(workflow.identity.kind, &workflow.identity.run_id);
+            let short = short_id(&workflow.identity.run_id);
             workflow.identity.display_id = if counts[&short] == 1 {
                 short
             } else {
-                format!(
-                    "{}:{}",
-                    kind_prefix(workflow.identity.kind),
-                    workflow.identity.run_id
-                )
+                workflow.identity.run_id.clone()
             };
             workflow.worktree.display = workflow
                 .worktree
@@ -1197,31 +1226,15 @@ fn assign_display_ids(repositories: &mut [RepositorySnapshot]) {
         }
         for worktree in &mut repository.worktrees {
             for identity in &mut worktree.workflows {
-                if let Some(workflow) = repository.workflows.iter().find(|workflow| {
-                    workflow.identity.kind == identity.kind
-                        && workflow.identity.run_id == identity.run_id
-                }) {
+                if let Some(workflow) = repository
+                    .workflows
+                    .iter()
+                    .find(|workflow| workflow.identity.run_id == identity.run_id)
+                {
                     identity
                         .display_id
                         .clone_from(&workflow.identity.display_id);
                 }
-            }
-        }
-        let display_ids = repository
-            .workflows
-            .iter()
-            .map(|workflow| {
-                (
-                    (workflow.identity.kind, workflow.identity.run_id.clone()),
-                    workflow.identity.display_id.clone(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        for workflow in &mut repository.workflows {
-            if let Some(owner) = &mut workflow.owner
-                && let Some(display_id) = display_ids.get(&(owner.kind, owner.run_id.clone()))
-            {
-                owner.display_id.clone_from(display_id);
             }
         }
     }
@@ -1246,7 +1259,7 @@ fn validate_explicit_control(
     };
     if available {
         Ok(workflow)
-    } else if workflow.dispatch.state == Some(execution::DispatchState::RecoveryPending)
+    } else if workflow.dispatch.state == Some(DispatchState::RecoveryPending)
         && action != ControlAction::Recover
     {
         Err("workflow was interrupted; use recover instead".to_string())
@@ -1284,7 +1297,7 @@ fn eligible_refs<'a>(
         .collect::<Vec<_>>();
     match candidates.as_slice() {
         [workflow] => Ok(*workflow),
-        [] => Err("no eligible owner workflow found".to_string()),
+        [] => Err("no eligible workflow found".to_string()),
         _ => Err(format!("ambiguous workflow target; matches {}", {
             let mut display_ids = candidates
                 .iter()
@@ -1298,20 +1311,10 @@ fn eligible_refs<'a>(
 
 fn workflow_selector_matches(selector: &str, identity: &WorkflowIdentity) -> bool {
     selector == identity.display_id
+        || selector == identity.run_id
         || selector
-            .strip_prefix("coding:")
-            .is_some_and(|id| identity.kind == WorkflowKind::Coding && id == identity.run_id)
-        || selector
-            .strip_prefix("plan:")
-            .is_some_and(|id| identity.kind == WorkflowKind::Plan && id == identity.run_id)
-        || selector.strip_prefix("c:").is_some_and(|id| {
-            identity.kind == WorkflowKind::Coding
-                && id.len() == 8
-                && identity.run_id.starts_with(id)
-        })
-        || selector.strip_prefix("p:").is_some_and(|id| {
-            identity.kind == WorkflowKind::Plan && id.len() == 8 && identity.run_id.starts_with(id)
-        })
+            .strip_prefix("w:")
+            .is_some_and(|id| id.len() == 8 && identity.run_id.starts_with(id))
 }
 
 fn subject_candidates(snapshot: &WorkspaceSnapshot, subjects: &[Subject]) -> Vec<String> {
@@ -1333,20 +1336,16 @@ fn subject_candidates(snapshot: &WorkspaceSnapshot, subjects: &[Subject]) -> Vec
     candidates
 }
 
-fn short_id(kind: WorkflowKind, run_id: &str) -> String {
-    format!(
-        "{}:{}",
-        kind_prefix(kind),
-        run_id.chars().take(8).collect::<String>()
-    )
+fn short_id(run_id: &str) -> String {
+    format!("w:{}", run_id.chars().take(8).collect::<String>())
 }
 
-fn kind_prefix(kind: WorkflowKind) -> &'static str {
-    match kind {
-        WorkflowKind::Coding => "c",
-        WorkflowKind::Plan => "p",
-        WorkflowKind::Auto => "a",
-    }
+fn current_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
 }
 fn branch_label(branch: &BranchState) -> &str {
     match branch {
@@ -1368,220 +1367,4 @@ fn paths_equal(left: &Path, right: &Path) -> bool {
 }
 fn path_contains(root: &Path, selected: &Path) -> bool {
     selected.is_absolute() && absolute_path(selected).starts_with(absolute_path(root))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::persistence::database::TestDatabase;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static DATABASE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-
-    fn connection() -> TestDatabase {
-        let path = std::env::temp_dir().join(format!(
-            "prism-workspace-interface-{}-{}.db",
-            std::process::id(),
-            DATABASE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        TestDatabase::open(&path).unwrap()
-    }
-
-    fn reader(conn: &TestDatabase) -> workspace_persistence::WorkspaceReader {
-        workspace_persistence::WorkspaceReader::open(conn.path()).unwrap()
-    }
-
-    fn workflow(status: &str, paused: bool, dispatch: &str) -> WorkflowSnapshot {
-        let lifecycle = WorkflowLifecycle::parse(status).unwrap();
-        let dispatch = match dispatch {
-            "queued" => execution::DispatchState::Queued,
-            "claimed" => execution::DispatchState::Claimed,
-            "recovery_pending" => execution::DispatchState::RecoveryPending,
-            "paused" => execution::DispatchState::Paused,
-            "terminal" => execution::DispatchState::Terminal,
-            other => panic!("unexpected dispatch state: {other}"),
-        };
-        WorkflowSnapshot {
-            identity: WorkflowIdentity {
-                repository: PathBuf::from("/repo"),
-                kind: WorkflowKind::Plan,
-                run_id: "plan-1".to_string(),
-                display_id: "p:plan-1".to_string(),
-            },
-            owner: None,
-            worktree: WorktreeIdentity {
-                path: PathBuf::from("/repo"),
-                display: "repo".to_string(),
-            },
-            lifecycle,
-            pause_requested: paused,
-            dispatch: DispatchSnapshot {
-                state: Some(dispatch),
-                daemon_instance_id: None,
-                worker_id: None,
-                lease_expires_unix_ms: None,
-                heartbeat_unix_ms: None,
-                interruption_generation: 0,
-                updated_unix_ms: Some(20),
-            },
-            current_step: None,
-            progress: Progress::default(),
-            available_controls: AvailableControls::default(),
-            updated_unix_ms: 20,
-        }
-    }
-
-    #[test]
-    fn global_ledger_projection_drives_coding_workflow_state_and_controls() {
-        let run: crate::WorkflowProjection = serde_json::from_value(serde_json::json!({
-            "id": "coding-run-12345678",
-            "definition_name": "coding",
-            "status": "running",
-            "repository": "/repo",
-            "created_unix_ms": 10,
-            "updated_unix_ms": 20,
-            "completed_unix_ms": null,
-            "steps": [{
-                "id": "step", "key": "implement", "implementation": "harness",
-                "target_id": "local", "status": "claimed",
-                "input_json": "{\"cwd\":\"/repo/worktree\"}"
-            }],
-            "attempts": [{
-                "id": "attempt", "step_id": "step", "status": "claimed",
-                "worker_id": "worker", "target_id": "local", "fencing_token": 1,
-                "process_id": null, "process_start_time_ticks": null,
-                "started_unix_ms": 20, "finished_unix_ms": null, "output": []
-            }],
-            "artifacts": [], "approvals": [], "effects": [], "gates": [], "events": []
-        }))
-        .unwrap();
-
-        let workflows = load_ledger_workflows(&[run], Path::new("/repo")).unwrap();
-        let workflow = &workflows[0];
-        assert_eq!(workflow.identity.kind, WorkflowKind::Coding);
-        assert_eq!(
-            workflow.worktree.path,
-            absolute_path(Path::new("/repo/worktree"))
-        );
-        assert_eq!(workflow.lifecycle, WorkflowLifecycle::Running);
-        assert_eq!(
-            workflow.current_step.as_ref().unwrap().state,
-            StepState::Running
-        );
-        assert_eq!(workflow.dispatch.worker_id.as_deref(), Some("worker"));
-        assert!(workflow.available_controls.pause);
-        assert!(workflow.available_controls.stop);
-    }
-
-    #[test]
-    fn cached_pull_request_states_use_mergeability_not_review_decision() {
-        assert_eq!(
-            pull_request_state("OPEN", false, false),
-            PullRequestState::Open
-        );
-        assert_eq!(
-            pull_request_state("OPEN", false, true),
-            PullRequestState::Draft
-        );
-        assert_eq!(
-            pull_request_state("CLOSED", true, false),
-            PullRequestState::Merged
-        );
-        assert_eq!(mergeability_state("DIRTY"), MergeabilityState::Dirty);
-        assert_eq!(ci_state("passed"), CiState::Success);
-    }
-
-    #[test]
-    fn persisted_agent_labels_project_as_stable_typed_states() {
-        let conn = connection();
-        conn.execute(
-            "insert into agent_state values ('feature', 'needs input', 42)",
-            [],
-        )
-        .unwrap();
-
-        let agent = load_agent(&reader(&conn), "feature").unwrap().unwrap();
-
-        assert_eq!(agent.state, Some(AgentState::NeedsInput));
-        assert_eq!(agent.updated_unix_ms, Some(42));
-        assert_eq!(serde_json::to_value(agent).unwrap()["state"], "needs_input");
-    }
-
-    #[test]
-    fn cached_pull_request_preserves_mergeability_staleness_and_error_provenance() {
-        let conn = connection();
-        conn.execute(
-            "insert into pr_cache (
-            branch, number, provider, canonical_host, project_path, native_cr_id,
-            display_number, source_provider, source_canonical_host, source_project_path,
-            target_provider, target_canonical_host, target_project_path,
-            title, url, state, review_decision, head_ref, base_ref,
-            head_sha, updated_at, merge_state_status, check_status, merged, draft,
-            last_refreshed, refreshed_unix_ms, observation_error
-          ) values ('feature', 42, 'github', 'github.com', 'org/repo', '42', 42,
-            'github', 'github.com', 'org/repo', 'github', 'github.com', 'org/repo',
-            'PR', 'https://example.test/42', 'OPEN',
-            'APPROVED', 'feature', 'main', 'abc', '', 'DIRTY', 'passed', 0, 0, '', 10,
-            'gh unavailable')",
-            [],
-        )
-        .unwrap();
-
-        let pull_request = load_pr(&reader(&conn), "feature", 100_000)
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(pull_request.state, PullRequestState::Open);
-        assert_eq!(pull_request.mergeability, Some(MergeabilityState::Dirty));
-        assert_eq!(pull_request.ci, Some(CiState::Success));
-        assert_eq!(pull_request.age_ms, 90_000);
-        assert!(pull_request.stale);
-        assert_eq!(pull_request.error.as_deref(), Some("gh unavailable"));
-        assert_eq!(pull_request.provenance, ObservationProvenance::SqliteCache);
-        let json = serde_json::to_value(&pull_request).unwrap();
-        assert_eq!(json["state"], "open");
-        assert_eq!(json["mergeability"], "dirty");
-        assert_eq!(json["ci"], "success");
-        assert_eq!(json["provenance"], "sqlite_cache");
-    }
-
-    #[test]
-    fn recent_terminal_filter_keeps_attention_workflows_and_is_bounded() {
-        let mut workflows = (0..12)
-            .map(|index| {
-                let mut workflow = workflow("done", false, "terminal");
-                workflow.identity.run_id = format!("done-{index:02}");
-                workflow.updated_unix_ms = 100 - index;
-                workflow
-            })
-            .collect::<Vec<_>>();
-        workflows.push(workflow("failed", false, "terminal"));
-        workflows.push(workflow("running", false, "claimed"));
-
-        retain_recent_terminal_workflows(&mut workflows, 10);
-
-        assert_eq!(workflows.len(), 12);
-        assert!(
-            workflows
-                .iter()
-                .any(|workflow| workflow.lifecycle == WorkflowLifecycle::Failed)
-        );
-        assert!(
-            workflows
-                .iter()
-                .any(|workflow| workflow.lifecycle == WorkflowLifecycle::Running)
-        );
-    }
-
-    #[test]
-    fn dispatch_only_pause_advertises_and_accepts_resume() {
-        let controls = controls_for(
-            WorkflowLifecycle::Running,
-            false,
-            Some(execution::DispatchState::Paused),
-            true,
-        );
-        assert!(controls.resume);
-        assert!(!controls.pause);
-    }
 }

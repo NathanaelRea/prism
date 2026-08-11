@@ -25,7 +25,6 @@ pub(crate) enum WorktreeListMode {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum OpenTmuxSessionTarget {
-    PlanPhaseAgent,
     WorktreeAgent,
     RepoPr,
     RepoDefaultAgent(usize),
@@ -81,18 +80,15 @@ fn point_in_rect(x: u16, y: u16, rect: Rect) -> bool {
 impl Tui {
     pub(super) fn move_down(&mut self) {
         if self.main_focused {
-            if self.move_repo_pr_selection(1) {
-                return;
-            }
-            if self.move_auto_step_selection(1) {
+            if self.move_workflow_step_selection(1) {
                 self.main_scroll = self.main_scroll.saturating_add(1);
                 return;
             }
-            let moved_comment = self.move_comment_selection(1);
-            self.main_scroll = self.main_scroll.saturating_add(1);
-            if !moved_comment {
-                self.move_plan_step_selection(1);
+            if self.move_repo_pr_selection(1) {
+                return;
             }
+            self.move_comment_selection(1);
+            self.main_scroll = self.main_scroll.saturating_add(1);
             return;
         }
         match self.focused_panel {
@@ -104,18 +100,15 @@ impl Tui {
 
     pub(super) fn move_up(&mut self) {
         if self.main_focused {
-            if self.move_repo_pr_selection(-1) {
-                return;
-            }
-            if self.move_auto_step_selection(-1) {
+            if self.move_workflow_step_selection(-1) {
                 self.main_scroll = self.main_scroll.saturating_sub(1);
                 return;
             }
-            let moved_comment = self.move_comment_selection(-1);
-            self.main_scroll = self.main_scroll.saturating_sub(1);
-            if !moved_comment {
-                self.move_plan_step_selection(-1);
+            if self.move_repo_pr_selection(-1) {
+                return;
             }
+            self.move_comment_selection(-1);
+            self.main_scroll = self.main_scroll.saturating_sub(1);
             return;
         }
         match self.focused_panel {
@@ -130,9 +123,7 @@ impl Tui {
             return;
         }
         match self.focused_panel {
-            PanelFocus::Status => {
-                self.move_plan_step_selection(-1);
-            }
+            PanelFocus::Status => {}
             PanelFocus::Repos => {
                 self.repo_main_view = view::RepoMainView::ChangeRequests;
             }
@@ -145,9 +136,7 @@ impl Tui {
             return;
         }
         match self.focused_panel {
-            PanelFocus::Status => {
-                self.move_plan_step_selection(1);
-            }
+            PanelFocus::Status => {}
             PanelFocus::Repos => {
                 self.repo_main_view = view::RepoMainView::Kanban;
             }
@@ -243,9 +232,6 @@ impl Tui {
                 }
             }
             PanelFocus::Worktrees => {
-                if self.main_focused && self.current_plan_dashboard().is_some() {
-                    return OpenTmuxSessionTarget::PlanPhaseAgent;
-                }
                 if self.selected_worktree_context().is_none() {
                     return OpenTmuxSessionTarget::Blocked(
                         "selected repository has no visible worktrees",
@@ -499,6 +485,9 @@ impl Tui {
         let path = session.path.clone();
         self.selected = index;
         self.selected_comment = 0;
+        self.selected_workflow_run = None;
+        self.selected_workflow_step = None;
+        self.workflow_step_selection_manual = false;
         if let Some(repo) = self.repos.get(repo_index) {
             let repo_root = repo.repo.root.clone();
             self.current_repo = repo_index;

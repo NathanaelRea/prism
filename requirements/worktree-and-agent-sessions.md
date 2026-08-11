@@ -52,25 +52,29 @@
 - **Invariant**: Agent completion is derived from the final assistant message's
   completion timestamp. A newer user prompt invalidates prior completion; errors
   supplement rather than redefine completion.
-- **Behavior**: Users can enter a selected Plan step's corresponding agent
-  session in tmux when its recorded adapter supports interactive resume.
+- **Invariant**: Managed Workflow Agent invocations always use fresh headless
+  native sessions. Interactive Worktree Sessions remain separate and are never
+  resumed as Workflow Step context.
 
 ## Hiding And Deletion
 
 - **Behavior**: Users can hide/archive a worktree without deleting its branch,
   files, dirty changes, or runtime history. Hidden worktrees sort below active
-  worktrees and are excluded from automatic GitHub polling.
+  worktrees and are excluded from automatic worktree-scoped provider polling.
 - **Behavior**: Unarchive presents a discoverable picker; users do not need to
   remember the archived worktree name.
 - **Behavior**: Deletion presents a confirmation and clearly highlights dirty
   state and other risks. On confirmation, Prism removes active session
   associations, the worktree, branch when applicable, tmux session, and other
   Prism-owned runtime resources as one coherent operation.
-- **Invariant**: Deletion retires the Worktree Session identity but retains its
-  Plan and Auto Flow runs as historical records. Historical runs are visibly
-  retired and cannot become active or attach to a later Worktree Session.
+- **Invariant**: Deletion retires the Worktree Session identity and its run links
+  without deleting Workflow Runs, lifecycle attempts, or Agent final text. A
+  pending Attempt scoped to that exact incarnation cannot start; an active
+  scoped Attempt must reach a cancelled or recovery-required boundary before
+  physical deletion proceeds. Unrelated run branches can continue.
 - **Invariant**: Reusing a deleted worktree path or branch name creates a fresh
-  Worktree Session identity and cannot resurrect old PR or Agent Session state.
+  Worktree Session identity and cannot resurrect old Change Request, Workflow
+  Run, or Agent Session state.
 - **Behavior**: Deletion preflights risks, records progress, and is retryable.
   Partial failure reports which resources were removed or preserved and retains
   enough identity and history to retry without applying cleanup to a new session.
@@ -93,8 +97,8 @@
 - **Behavior**: Quitting is immediate. Detached Agent Sessions and the per-user
   Prism Worker continue running; permanent deletion in progress blocks quitting.
 - **Invariant**: Tmux hosts interactive Agent Sessions and terminal tools, not
-  managed Plan or Auto Flow workers.
-- **Behavior**: Long-running creation, deletion, Git, GitHub, tmux, and agent
-  operations expose progress, cancellation where safe, and an actionable retry
-  path. Cancellation and restart do not silently duplicate external side
-  effects.
+  managed Workflow Step workers.
+- **Behavior**: Long-running creation, deletion, Git, provider, tmux, Trigger,
+  and Workflow Step operations expose progress, cancellation where safe, and an
+  actionable retry path. Cancellation and restart do not silently duplicate
+  external side effects.

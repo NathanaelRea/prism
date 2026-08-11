@@ -1,7 +1,5 @@
 #[cfg(test)]
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(target_os = "macos")]
-use std::io::Write;
 #[cfg(test)]
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 #[cfg(test)]
@@ -290,28 +288,7 @@ impl DesktopNotifier {
     }
 }
 
-#[cfg(target_os = "linux")]
-pub(crate) fn deliver_native_notification(title: &str, body: &str) -> Result<(), &'static str> {
-    notify_rust::Notification::new()
-        .summary(title)
-        .body(body)
-        .show()
-        .map(|_| ())
-        .map_err(|_| "backend")
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn deliver_terminal_notification(title: &str, body: &str) -> Result<(), &'static str> {
-    let mut terminal = std::fs::OpenOptions::new()
-        .write(true)
-        .open("/dev/tty")
-        .map_err(|_| "terminal_open")?;
-    terminal
-        .write_all(&terminal_notification_payload(title, body))
-        .map_err(|_| "terminal_write")
-}
-
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
 fn terminal_notification_payload(title: &str, body: &str) -> Vec<u8> {
     let text = format!("{title}: {body}");
     let sanitized = text
@@ -602,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn macos_delivery_uses_a_sanitized_terminal_notification() {
+    fn terminal_notification_payload_sanitizes_control_characters() {
         let payload =
             terminal_notification_payload("Prism: Failed", "repo: branch failed\u{1b}]9;injected");
 

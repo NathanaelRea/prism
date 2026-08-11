@@ -3,7 +3,6 @@ pub(crate) mod desktop_notification;
 pub(crate) mod durability;
 pub mod file_persistence;
 pub(crate) mod json;
-pub(crate) mod notification;
 pub(crate) mod platform;
 pub(crate) mod process;
 pub mod storage;
