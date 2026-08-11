@@ -2110,12 +2110,11 @@ fn signal_term(process_id: u32) -> Result<TerminationStage, ProcessError> {
 }
 
 #[cfg(windows)]
-fn signal_term(process_id: u32) -> Result<TerminationStage, ProcessError> {
-    use windows::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
-    // Detached and GUI commands have no compatible console group. A failed graceful attempt is
-    // not a supervision failure because force_kill still terminates the Job Object.
-    let _ = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, process_id) };
-    Ok(TerminationStage::Term)
+fn signal_term(_process_id: u32) -> Result<TerminationStage, ProcessError> {
+    // GenerateConsoleCtrlEvent must run from a helper attached only to the child's console.
+    // Calling it from Prism's console can interrupt the parent shell on headless Windows hosts.
+    // Graceful delivery is conditional on Windows, so defer to bounded Job Object termination.
+    Ok(TerminationStage::None)
 }
 
 #[cfg(unix)]

@@ -452,10 +452,13 @@ fn update_inner_with_fault<T>(
         .map_err(|error| PersistenceError::new(Stage::Write, &staging_path, false, error))?;
     fault(Stage::Write)
         .map_err(|error| PersistenceError::new(Stage::Write, &staging_path, false, error))?;
-    if let Some(permissions) = permissions {
-        staging_file.set_permissions(permissions).map_err(|error| {
-            PersistenceError::new(Stage::ApplyPermissions, &staging_path, false, error)
-        })?;
+    #[cfg(unix)]
+    if let Some(permissions) = permissions.as_ref() {
+        staging_file
+            .set_permissions(permissions.clone())
+            .map_err(|error| {
+                PersistenceError::new(Stage::ApplyPermissions, &staging_path, false, error)
+            })?;
     }
     crate::durability::sync_file(&staging_file, options.durability).map_err(|error| {
         let stage = match error.stage() {
@@ -472,20 +475,39 @@ fn update_inner_with_fault<T>(
     })?;
     fault(Stage::SyncFile)
         .map_err(|error| PersistenceError::new(Stage::SyncFile, &staging_path, false, error))?;
+    // ReplaceFileW opens the replacement path without sharing, so Windows must close every
+    // staging handle before committing it.
+    #[cfg(windows)]
+    drop(staging_file);
     commit_staging(&staging_path, &target)
         .map_err(|error| PersistenceError::new(Stage::Rename, &target, false, error))?;
     staging.renamed = true;
     fault(Stage::Rename)
         .map_err(|error| PersistenceError::new(Stage::Rename, &target, true, error))?;
+    #[cfg(unix)]
+    let committed_file = staging_file;
+    #[cfg(windows)]
+    let committed_file = {
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&target)
+            .map_err(|error| {
+                PersistenceError::new(Stage::SyncCommittedFile, &target, true, error)
+            })?;
+        if let Some(permissions) = permissions {
+            file.set_permissions(permissions).map_err(|error| {
+                PersistenceError::new(Stage::ApplyPermissions, &target, true, error)
+            })?;
+        }
+        file
+    };
     // On Windows this is the explicit FlushFileBuffers after ReplaceFileW/MoveFileExW.
-    // Keeping the staging handle open also works when preserved attributes make the new path
-    // read-only immediately after replacement.
-    staging_file
+    committed_file
         .sync_all()
         .map_err(|error| PersistenceError::new(Stage::SyncCommittedFile, &target, true, error))?;
     fault(Stage::SyncCommittedFile)
         .map_err(|error| PersistenceError::new(Stage::SyncCommittedFile, &target, true, error))?;
-    drop(staging_file);
+    drop(committed_file);
     crate::durability::sync_directory(target_parent, options.durability).map_err(|error| {
         let kind = if error.kind() == io::ErrorKind::Unsupported {
             PersistenceErrorKind::Unsupported
