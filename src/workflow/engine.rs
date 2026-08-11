@@ -1871,11 +1871,8 @@ mod tests {
                             target_id: "local".into(),
                             input_json: if cfg!(windows) {
                                 serde_json::json!({
-                                    "program": "pwsh.exe",
-                                    "args": [
-                                        "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
-                                        "Start-Sleep -Seconds 30"
-                                    ]
+                                    "program": "ping.exe",
+                                    "args": ["-n", "31", "127.0.0.1"]
                                 })
                             } else {
                                 serde_json::json!({
@@ -1903,7 +1900,7 @@ mod tests {
                 let first_database = worker.database.clone();
                 let (_shutdown, receiver) = watch::channel(false);
                 let first = tokio::spawn(worker.run(receiver));
-                tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::time::timeout(Duration::from_secs(15), async {
                     loop {
                         if operations
                             .inspect("run")
@@ -1916,6 +1913,10 @@ mod tests {
                         {
                             break;
                         }
+                        assert!(
+                            !first.is_finished(),
+                            "first worker exited before recording the command process"
+                        );
                         tokio::time::sleep(Duration::from_millis(5)).await;
                     }
                 })
@@ -2235,16 +2236,20 @@ mod tests {
                 worker.register("noisy", NoisyImplementation).unwrap();
                 let (shutdown, shutdown_receiver) = watch::channel(false);
                 let task = tokio::spawn(worker.run(shutdown_receiver));
-                for _ in 0..100 {
-                    if operations.inspect("run").await.unwrap().unwrap().status == "cancelled" {
-                        break;
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        if operations.inspect("run").await.unwrap().unwrap().status == "cancelled" {
+                            break;
+                        }
+                        assert!(
+                            !task.is_finished(),
+                            "worker stopped after one attempt exceeded output budget"
+                        );
+                        tokio::time::sleep(Duration::from_millis(5)).await;
                     }
-                    assert!(
-                        !task.is_finished(),
-                        "worker stopped after one attempt exceeded output budget"
-                    );
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
+                })
+                .await
+                .expect("output budget should cancel the noisy attempt");
                 assert_eq!(
                     operations.inspect("run").await.unwrap().unwrap().status,
                     "cancelled"

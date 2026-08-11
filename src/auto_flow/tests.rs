@@ -1939,11 +1939,11 @@ fn initial_change_request_push_runs_pre_pr_then_pre_push_checks() {
     #[cfg(windows)]
     {
         config.checks.pre_pr = vec![format!(
-            "New-Item -ItemType File -Force -LiteralPath '{}' | Out-Null",
+            "pwsh.exe -NoLogo -NoProfile -NonInteractive -Command \"New-Item -ItemType File -Force -LiteralPath '{}' | Out-Null\"",
             pre_pr.display().to_string().replace('\'', "''")
         )];
         config.checks.pre_push = vec![format!(
-            "New-Item -ItemType File -Force -LiteralPath '{}' | Out-Null",
+            "pwsh.exe -NoLogo -NoProfile -NonInteractive -Command \"New-Item -ItemType File -Force -LiteralPath '{}' | Out-Null\"",
             pre_push.display().to_string().replace('\'', "''")
         )];
     }

@@ -473,6 +473,7 @@ fn cleanup_applies_a_mutation_payload_routed_before_shutdown_started() {
         42
     );
     drop(tui);
+    drop(repo);
     fs::remove_dir_all(temp).unwrap();
 }
 

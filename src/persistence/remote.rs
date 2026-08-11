@@ -89,6 +89,20 @@ async fn rollback(connection: &mut SqliteConnection) {
     let _ = super::database::rollback_query().execute(connection).await;
 }
 
+async fn finish_connection<T>(
+    connection: SqliteConnection,
+    result: Result<T, sqlx::Error>,
+) -> Result<T, sqlx::Error> {
+    let close = connection.close().await;
+    match result {
+        Err(error) => Err(error),
+        Ok(value) => {
+            close?;
+            Ok(value)
+        }
+    }
+}
+
 pub(crate) fn load_snapshot(
     path: &Path,
     branch: &str,
@@ -97,10 +111,10 @@ pub(crate) fn load_snapshot(
     let options = writable_options(path, false)?;
     block_on(async {
         let mut connection = SqliteConnection::connect_with(&options).await?;
-        super::database::begin_immediate_query()
-            .execute(&mut connection)
-            .await?;
         let result = async {
+            super::database::begin_immediate_query()
+                .execute(&mut connection)
+                .await?;
             let summary =
                 sqlx::query_file_as!(SummaryRecord, "sql/remote/load_pr_summary.sql", branch)
                     .fetch_optional(&mut connection)
@@ -118,7 +132,7 @@ pub(crate) fn load_snapshot(
         if result.is_err() {
             rollback(&mut connection).await;
         }
-        result
+        finish_connection(connection, result).await
     })
 }
 
@@ -215,10 +229,10 @@ pub(crate) fn save_snapshot(
     let options = writable_options(path, false)?;
     block_on(async {
         let mut connection = SqliteConnection::connect_with(&options).await?;
-        super::database::begin_immediate_query()
-            .execute(&mut connection)
-            .await?;
         let result = async {
+            super::database::begin_immediate_query()
+                .execute(&mut connection)
+                .await?;
             upsert_summary(&mut connection, summary, refreshed_unix_ms).await?;
             if let Some(details) = details {
                 upsert_details(&mut connection, details, refreshed_unix_ms).await?;
@@ -236,7 +250,7 @@ pub(crate) fn save_snapshot(
         if result.is_err() {
             rollback(&mut connection).await;
         }
-        result
+        finish_connection(connection, result).await
     })
 }
 
@@ -249,7 +263,8 @@ pub(crate) fn save_summary(
     let options = writable_options(path, false)?;
     block_on(async {
         let mut connection = SqliteConnection::connect_with(&options).await?;
-        upsert_summary(&mut connection, summary, refreshed_unix_ms).await
+        let result = upsert_summary(&mut connection, summary, refreshed_unix_ms).await;
+        finish_connection(connection, result).await
     })
 }
 
@@ -262,7 +277,8 @@ pub(crate) fn save_details(
     let options = writable_options(path, false)?;
     block_on(async {
         let mut connection = SqliteConnection::connect_with(&options).await?;
-        upsert_details(&mut connection, details, refreshed_unix_ms).await
+        let result = upsert_details(&mut connection, details, refreshed_unix_ms).await;
+        finish_connection(connection, result).await
     })
 }
 
@@ -271,10 +287,10 @@ pub(crate) fn remove_snapshot(path: &Path, branch: &str) -> Result<(), DatabaseE
     let options = writable_options(path, false)?;
     block_on(async {
         let mut connection = SqliteConnection::connect_with(&options).await?;
-        super::database::begin_immediate_query()
-            .execute(&mut connection)
-            .await?;
         let result = async {
+            super::database::begin_immediate_query()
+                .execute(&mut connection)
+                .await?;
             sqlx::query_file!("sql/remote/delete_pr_details.sql", branch)
                 .execute(&mut connection)
                 .await?;
@@ -290,7 +306,7 @@ pub(crate) fn remove_snapshot(path: &Path, branch: &str) -> Result<(), DatabaseE
         if result.is_err() {
             rollback(&mut connection).await;
         }
-        result
+        finish_connection(connection, result).await
     })
 }
 
@@ -303,10 +319,14 @@ pub(crate) fn update_summary_error(
     let options = writable_options(path, false)?;
     block_on(async {
         let mut connection = SqliteConnection::connect_with(&options).await?;
-        sqlx::query_file!("sql/remote/update_pr_observation_error.sql", error, branch)
-            .execute(&mut connection)
-            .await?;
-        Ok(())
+        let result = async {
+            sqlx::query_file!("sql/remote/update_pr_observation_error.sql", error, branch)
+                .execute(&mut connection)
+                .await?;
+            Ok(())
+        }
+        .await;
+        finish_connection(connection, result).await
     })
 }
 
@@ -321,7 +341,7 @@ pub(crate) fn load_policy(
     let options = writable_options(path, false)?;
     block_on(async {
         let mut connection = SqliteConnection::connect_with(&options).await?;
-        sqlx::query_file_as!(
+        let result = sqlx::query_file_as!(
             PolicyRecord,
             "sql/remote/load_policy.sql",
             provider,
@@ -330,7 +350,8 @@ pub(crate) fn load_policy(
             target_branch,
         )
         .fetch_optional(&mut connection)
-        .await
+        .await;
+        finish_connection(connection, result).await
     })
 }
 
@@ -339,24 +360,28 @@ pub(crate) fn save_policy(path: &Path, policy: &PolicyRecord) -> Result<(), Data
     let options = writable_options(path, false)?;
     block_on(async {
         let mut connection = SqliteConnection::connect_with(&options).await?;
-        sqlx::query_file!(
-            "sql/remote/upsert_policy.sql",
-            policy.provider,
-            policy.canonical_host,
-            policy.project_path,
-            policy.project_path_key,
-            policy.target_branch,
-            policy.default_branch,
-            policy.required_approvals,
-            policy.require_conversation_resolution,
-            policy.require_branch_up_to_date,
-            policy.required_checks,
-            policy.merge_queue_required,
-            policy.refreshed_unix_ms,
-            policy.error,
-        )
-        .execute(&mut connection)
-        .await?;
-        Ok(())
+        let result = async {
+            sqlx::query_file!(
+                "sql/remote/upsert_policy.sql",
+                policy.provider,
+                policy.canonical_host,
+                policy.project_path,
+                policy.project_path_key,
+                policy.target_branch,
+                policy.default_branch,
+                policy.required_approvals,
+                policy.require_conversation_resolution,
+                policy.require_branch_up_to_date,
+                policy.required_checks,
+                policy.merge_queue_required,
+                policy.refreshed_unix_ms,
+                policy.error,
+            )
+            .execute(&mut connection)
+            .await?;
+            Ok(())
+        }
+        .await;
+        finish_connection(connection, result).await
     })
 }

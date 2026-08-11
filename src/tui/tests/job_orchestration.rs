@@ -51,7 +51,7 @@ fn opencode_in_flight_clears_after_panic_and_spawn_failure_then_restarts() {
     );
 
     tui.opencode_polls_in_flight.insert(key.clone());
-    tui.spawn_tui_job(
+    let panicked_id = tui.spawn_tui_job(
         TuiJobKind::OpencodePoll,
         TuiJobKey::Opencode(key.clone()),
         key.generation,
@@ -64,7 +64,7 @@ fn opencode_in_flight_clears_after_panic_and_spawn_failure_then_restarts() {
 
     tui.opencode_polls_in_flight.insert(key.clone());
     tui.jobs.fail_next_spawn();
-    tui.spawn_tui_job(
+    let spawn_failed_id = tui.spawn_tui_job(
         TuiJobKind::OpencodePoll,
         TuiJobKey::Opencode(key.clone()),
         key.generation,
@@ -76,7 +76,7 @@ fn opencode_in_flight_clears_after_panic_and_spawn_failure_then_restarts() {
     assert!(!tui.opencode_polls_in_flight.contains(&key));
 
     tui.opencode_polls_in_flight.insert(key.clone());
-    tui.spawn_tui_job(
+    let completed_id = tui.spawn_tui_job(
         TuiJobKind::OpencodePoll,
         TuiJobKey::Opencode(key.clone()),
         key.generation,
@@ -107,7 +107,11 @@ fn opencode_in_flight_clears_after_panic_and_spawn_failure_then_restarts() {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
-    for (job_id, outcome) in [(1, "panicked"), (2, "spawn_failed"), (3, "completed")] {
+    for (job_id, outcome) in [
+        (panicked_id, "panicked"),
+        (spawn_failed_id, "spawn_failed"),
+        (completed_id, "completed"),
+    ] {
         let matching = terminal_events
             .iter()
             .filter(|data| data["job_id"] == job_id && data["outcome"] == outcome)
