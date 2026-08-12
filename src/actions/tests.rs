@@ -1,9 +1,9 @@
 use crate::agent::AgentState;
 use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey, AgentSessionWarmupResult};
 use crate::config::Config;
-use crate::opencode::{OpencodeState, OpencodeStatus, parse_event_payload};
+use crate::opencode::{parse_event_payload, OpencodeState, OpencodeStatus};
 use crate::platform::CommandCandidate;
-use crate::remote::{PrCache, PrDetails, PrSummary, pr_summary_or_error};
+use crate::remote::{pr_summary_or_error, PrCache, PrDetails, PrSummary};
 use crate::repo::Repository;
 use crate::session::{DeleteWorktreeOutcome, Session};
 use crate::tui::{
@@ -647,7 +647,7 @@ case "$*" in
     fi
     exit 0
     ;;
-  *"branch -D feature/delete"*)
+  *"branch -D -- feature/delete"*)
     exit 0
     ;;
 esac
@@ -724,16 +724,12 @@ exit 0
 
     assert!(tui.delete_sessions_in_flight.is_empty());
     assert!(tui.sessions.is_empty());
-    assert!(
-        fs::read_to_string(&wt_log)
-            .unwrap()
-            .contains("--no-delete-branch")
-    );
-    assert!(
-        fs::read_to_string(&git_log)
-            .unwrap()
-            .contains("branch -D feature/delete")
-    );
+    assert!(fs::read_to_string(&wt_log)
+        .unwrap()
+        .contains("--no-delete-branch"));
+    assert!(fs::read_to_string(&git_log)
+        .unwrap()
+        .contains("branch -D -- feature/delete"));
 
     let _ = fs::remove_dir_all(temp);
 }
@@ -778,11 +774,9 @@ fn completed_delete_schedules_inventory_refresh_without_tui_thread_io() {
 
     tui.pr_persistence_in_flight.remove(&pr_key);
     wait_for_pr_persistence(&mut tui);
-    assert!(
-        crate::remote::load_pr_cache(&repo, "feature/delete")
-            .summary()
-            .is_none()
-    );
+    assert!(crate::remote::load_pr_cache(&repo, "feature/delete")
+        .summary()
+        .is_none());
 
     drop(tui);
     let _ = fs::remove_dir_all(temp);
@@ -894,7 +888,7 @@ fn phase_1_branch_delete_failure_reconciles_without_vanished_worktree_path() {
 case "$*" in
   *"rev-parse --verify refs/heads/feature/delete"*) echo branch-oid; exit 0 ;;
   *"worktree remove --force"*) exit 0 ;;
-  *"branch -D feature/delete"*) exit 1 ;;
+  *"branch -D -- feature/delete"*) exit 1 ;;
   *"worktree list --porcelain"*)
     if [ -d '{}' ]; then
       printf 'worktree %s\nHEAD branch-oid\nbranch refs/heads/feature/delete\n\n' '{}'
@@ -1053,11 +1047,9 @@ fn missing_github_remote_clears_hidden_non_pollable_pr_cache_state() {
 
     assert!(tui.sessions[0].pr.summary().is_none());
     wait_for_pr_persistence(&mut tui);
-    assert!(
-        crate::remote::load_pr_cache(&repo, "feature")
-            .summary()
-            .is_none()
-    );
+    assert!(crate::remote::load_pr_cache(&repo, "feature")
+        .summary()
+        .is_none());
     let _ = fs::remove_dir_all(temp);
 }
 
