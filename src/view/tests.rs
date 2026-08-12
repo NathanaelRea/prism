@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, path::PathBuf};
 
-use ratatui::{backend::TestBackend, buffer::Buffer, layout::Position, Terminal};
+use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, layout::Position};
 
 use crate::{
     agent::AgentState,
@@ -1202,9 +1202,11 @@ fn worktree_main_panel_renders_five_agent_messages_without_indenting_user_messag
     assert!(lines[agent + 1].to_string().contains("● busy  bash"));
     assert!(lines[agent + 2].to_string().contains("user"));
     assert!(lines[agent + 2].to_string().starts_with("user please"));
-    assert!(lines[agent + 2]
-        .to_string()
-        .contains("please update the panel"));
+    assert!(
+        lines[agent + 2]
+            .to_string()
+            .contains("please update the panel")
+    );
     assert_eq!(lines[agent + 2].spans[1].style.fg, Some(Color::White));
     assert_eq!(lines[agent + 3].to_string(), "third message");
     assert_eq!(lines[agent + 4].to_string(), "second message");
@@ -1287,9 +1289,11 @@ fn worktree_main_panel_renders_unknown_status_with_active_tool_as_running() {
         .position(|line| line.to_string().contains("Agent"))
         .unwrap();
 
-    assert!(lines[agent + 1]
-        .to_string()
-        .contains("● running  bash running"));
+    assert!(
+        lines[agent + 1]
+            .to_string()
+            .contains("● running  bash running")
+    );
 }
 
 #[test]
@@ -1317,9 +1321,11 @@ fn worktree_main_panel_renders_idle_status_with_active_tool_as_running() {
         .position(|line| line.to_string().contains("Agent"))
         .unwrap();
 
-    assert!(lines[agent + 1]
-        .to_string()
-        .contains("● running  task running"));
+    assert!(
+        lines[agent + 1]
+            .to_string()
+            .contains("● running  task running")
+    );
 }
 
 #[test]
