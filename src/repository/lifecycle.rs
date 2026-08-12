@@ -419,11 +419,13 @@ mod tests {
         let mut config = test_config();
         config.tools.insert("git".to_string(), "git".to_string());
         let inventory = super::list_worktrees(&repo, &config).unwrap();
-        let feature_branch = inventory
+        let feature_worktree_path = inventory
             .iter()
-            .find(|entry| entry.path == worktree)
-            .map(|entry| entry.branch.as_str());
-        assert_eq!(feature_branch, Some("feature"));
+            .find(|entry| entry.branch == "feature")
+            .and_then(|entry| fs::canonicalize(&entry.path).ok());
+        let expected_worktree_path = fs::canonicalize(&worktree);
+        assert!(expected_worktree_path.is_ok());
+        assert_eq!(feature_worktree_path, expected_worktree_path.ok());
 
         let _ = fs::remove_dir_all(temp);
     }
