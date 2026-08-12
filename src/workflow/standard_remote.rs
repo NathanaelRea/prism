@@ -62,9 +62,9 @@ impl StandardTriggerRemote for ProductionStandardTriggerRemote {
             let key =
                 RemoteObservationKey::new(lane, "change_request.stabilization", change_request)
                     .map_err(|error| TriggerError::Protocol(error.to_string()))?;
-            let freshness = ObservationFreshness::any(OBSERVATION_MAX_AGE_MS)
-                .not_before(context.cycle_started_unix_ms);
-            let payload = serde_json::to_value(observation_subject(context))
+            let subject = observation_subject(context);
+            let freshness = observation_freshness(&subject, context.cycle_started_unix_ms);
+            let payload = serde_json::to_value(subject)
                 .map_err(|error| TriggerError::Protocol(error.to_string()))?;
             // Subscribe before requesting so a fast coalesced completion cannot race the wake
             // registration.
@@ -158,10 +158,24 @@ impl StandardTriggerRemote for ProductionStandardTriggerRemote {
 
 fn observation_subject(context: &TriggerContext) -> TriggerSubject {
     let mut subject = context.subject.clone();
-    if context.cycle > 0 {
+    if context.cycle > 1 {
         subject.change_request_head = None;
     }
     subject
+}
+
+fn observation_freshness(
+    subject: &TriggerSubject,
+    cycle_started_unix_ms: i64,
+) -> ObservationFreshness {
+    subject
+        .change_request_head
+        .as_ref()
+        .map_or_else(
+            || ObservationFreshness::any(OBSERVATION_MAX_AGE_MS),
+            |head| ObservationFreshness::exact(head, OBSERVATION_MAX_AGE_MS),
+        )
+        .not_before(cycle_started_unix_ms)
 }
 
 fn lane_for_subject(
@@ -824,6 +838,7 @@ fn classify_failure(reason: String) -> RemoteOperationFailure {
         && !normalized.contains("authentication")
         && !normalized.contains("no open change request")
         && !normalized.contains("different change request")
+        && !normalized.contains("change request head changed")
         && !normalized.contains("detached head")
         && !normalized.contains("configuration");
     RemoteOperationFailure {
@@ -874,12 +889,29 @@ mod tests {
     #[test]
     fn launch_head_is_checked_only_during_the_initial_observation_cycle() {
         assert_eq!(
-            observation_subject(&context(0))
+            observation_subject(&context(1))
                 .change_request_head
                 .as_deref(),
             Some("launch-head")
         );
-        assert_eq!(observation_subject(&context(1)).change_request_head, None);
+        assert_eq!(observation_subject(&context(2)).change_request_head, None);
+    }
+
+    #[test]
+    fn initial_observation_requires_the_launch_head_revision() {
+        let context = context(1);
+        let subject = observation_subject(&context);
+        let freshness = observation_freshness(&subject, context.cycle_started_unix_ms);
+        assert_eq!(freshness.subject_revision.as_deref(), Some("launch-head"));
+        assert_eq!(freshness.not_before_unix_ms, Some(1));
+    }
+
+    #[test]
+    fn launch_head_mismatch_is_permanent() {
+        assert!(
+            !classify_failure("Change Request head changed before workflow observation".into())
+                .retryable
+        );
     }
 
     #[test]
