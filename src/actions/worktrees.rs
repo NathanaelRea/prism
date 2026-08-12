@@ -353,14 +353,18 @@ impl Tui {
         if branch.trim().is_empty() {
             return Ok(false);
         }
-        let Some(initial_prompt) =
-            self.prompt_line_dialog(raw, "Create Session", "Initial prompt (optional): ", "")?
-        else {
+        let harness_config = context
+            .config
+            .harness_config(&context.config.default_harness)?;
+        let harness =
+            crate::harness::Harness::new(&context.config.default_harness, &harness_config);
+        self.show_loading_dialog(raw, "Create Session", "Loading model options")?;
+        let selection_options = harness.selection_options();
+        let Some(session_input) = self.prompt_create_session_form(raw, &selection_options)? else {
             return Ok(false);
         };
-        if !initial_prompt.trim().is_empty()
-            && !context.config.selected_harness()?.describe().initial_prompt
-        {
+        let initial_prompt = session_input.initial_prompt;
+        if !initial_prompt.trim().is_empty() && !harness.describe().initial_prompt {
             return Err(format!(
                 "harness '{}' does not support an initial prompt; configure a reliable interactive_prompt_transport or create the session without a prompt",
                 context.config.default_harness
@@ -444,7 +448,15 @@ impl Tui {
         }
         if !initial_prompt.trim().is_empty() {
             self.show_loading_dialog(raw, "Create Session", "Starting agent session")?;
-            self.paste_prompt_into_tmux_agent(index, &initial_prompt, false)?;
+            self.paste_prompt_into_tmux_agent_with_selection(
+                index,
+                &initial_prompt,
+                false,
+                crate::harness::AgentSelection {
+                    model: session_input.model.as_deref(),
+                    variant: session_input.variant.as_deref(),
+                },
+            )?;
             self.show_message("submitted initial prompt to agent session")?;
         } else {
             self.start_tmux_agent_warmup();

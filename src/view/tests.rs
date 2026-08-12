@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, path::PathBuf};
 
-use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, layout::Position};
+use ratatui::{backend::TestBackend, buffer::Buffer, layout::Position, Terminal};
 
 use crate::{
     agent::AgentState,
@@ -804,6 +804,8 @@ fn workflow_input_form_renders_types_defaults_and_enum_dropdown() {
     let mut model = test_model(&config, &sessions, PanelFocus::Status, None, None);
     model.dialog = Some(DialogModel::Form {
         title: "Run release".into(),
+        instructions: "Complete the Workflow inputs".into(),
+        submit_label: "Launch Workflow".into(),
         fields: vec![
             FormField {
                 name: "title".into(),
@@ -836,6 +838,133 @@ fn workflow_input_form_renders_types_defaults_and_enum_dropdown() {
     assert!(rendered.contains("▶ fast"));
     assert!(rendered.contains("Error: count must be a number"));
     assert!(rendered.contains("Enter choose"));
+}
+
+#[test]
+fn create_session_form_renders_multiline_prompt_model_and_variant() {
+    let config = test_config();
+    let sessions = vec![test_session("feature", AgentState::Idle)];
+    let mut model = test_model(&config, &sessions, PanelFocus::Status, None, None);
+    model.dialog = Some(DialogModel::Form {
+        title: "Create Session".into(),
+        instructions: "Configure the first Agent turn".into(),
+        submit_label: "Create Session".into(),
+        fields: vec![
+            FormField {
+                name: "Initial prompt".into(),
+                value: "First line\nSecond line".into(),
+                description: None,
+                constraint: None,
+                required: false,
+                kind: FormFieldKind::TextArea { height: 6 },
+            },
+            FormField {
+                name: "Model".into(),
+                value: "provider/model".into(),
+                description: None,
+                constraint: Some("1 available".into()),
+                required: false,
+                kind: FormFieldKind::Enum {
+                    options: vec!["Harness default".into(), "provider/model".into()],
+                },
+            },
+            FormField {
+                name: "Variant / thinking".into(),
+                value: "high".into(),
+                description: None,
+                constraint: Some("1 available".into()),
+                required: false,
+                kind: FormFieldKind::Enum {
+                    options: vec!["Harness default".into(), "high".into()],
+                },
+            },
+        ],
+        selected: 0,
+        dropdown: None,
+        error: None,
+    });
+
+    let rendered = render_to_string(&model, 100, 30);
+    assert!(rendered.contains("Configure the first Agent turn"));
+    assert!(rendered.contains("First line"));
+    assert!(rendered.contains("Second line"));
+    assert!(rendered.contains("Model [default]"));
+    assert!(rendered.contains("provider/model"));
+    assert!(rendered.contains("Variant / thinking [default]"));
+    assert!(rendered.contains("Create Session"));
+    assert!(rendered.contains("Enter newline"));
+}
+
+#[test]
+fn create_session_form_scrolls_focus_into_view_and_wraps_unicode_prompt() {
+    let config = test_config();
+    let sessions = vec![test_session("feature", AgentState::Idle)];
+    let fields = vec![
+        FormField {
+            name: "Initial prompt".into(),
+            value: "🙂界".repeat(30),
+            description: None,
+            constraint: None,
+            required: false,
+            kind: FormFieldKind::TextArea { height: 6 },
+        },
+        FormField {
+            name: "Model".into(),
+            value: "provider/model".into(),
+            description: None,
+            constraint: None,
+            required: false,
+            kind: FormFieldKind::Enum {
+                options: vec!["Harness default".into(), "provider/model".into()],
+            },
+        },
+        FormField {
+            name: "Variant / thinking".into(),
+            value: "high".into(),
+            description: None,
+            constraint: None,
+            required: false,
+            kind: FormFieldKind::Enum {
+                options: vec!["Harness default".into(), "high".into()],
+            },
+        },
+    ];
+    let mut model = test_model(&config, &sessions, PanelFocus::Status, None, None);
+    model.dialog = Some(DialogModel::Form {
+        title: "Create Session".into(),
+        instructions: "Configure the first Agent turn".into(),
+        submit_label: "Create Session".into(),
+        fields,
+        selected: 3,
+        dropdown: None,
+        error: None,
+    });
+
+    let rendered = render_to_string(&model, 50, 12);
+    assert!(rendered.contains("▶ Create Session"));
+
+    if let Some(DialogModel::Form {
+        fields,
+        selected,
+        dropdown,
+        ..
+    }) = &mut model.dialog
+    {
+        *selected = 2;
+        fields[2].kind = FormFieldKind::Enum {
+            options: (0..12).map(|index| format!("thinking-{index}")).collect(),
+        };
+        fields[2].value = "thinking-10".into();
+        *dropdown = Some(FormDropdown { selected: 10 });
+    }
+    let rendered = render_to_string(&model, 50, 12);
+    assert!(rendered.contains("▶ thinking-10"));
+
+    if let Some(DialogModel::Form { dropdown, .. }) = &mut model.dialog {
+        *dropdown = None;
+    }
+    let rendered = render_to_string(&model, 50, 12);
+    assert!(rendered.contains("Variant / thinking: thinking-10"));
 }
 
 #[test]
@@ -1073,11 +1202,9 @@ fn worktree_main_panel_renders_five_agent_messages_without_indenting_user_messag
     assert!(lines[agent + 1].to_string().contains("● busy  bash"));
     assert!(lines[agent + 2].to_string().contains("user"));
     assert!(lines[agent + 2].to_string().starts_with("user please"));
-    assert!(
-        lines[agent + 2]
-            .to_string()
-            .contains("please update the panel")
-    );
+    assert!(lines[agent + 2]
+        .to_string()
+        .contains("please update the panel"));
     assert_eq!(lines[agent + 2].spans[1].style.fg, Some(Color::White));
     assert_eq!(lines[agent + 3].to_string(), "third message");
     assert_eq!(lines[agent + 4].to_string(), "second message");
@@ -1160,11 +1287,9 @@ fn worktree_main_panel_renders_unknown_status_with_active_tool_as_running() {
         .position(|line| line.to_string().contains("Agent"))
         .unwrap();
 
-    assert!(
-        lines[agent + 1]
-            .to_string()
-            .contains("● running  bash running")
-    );
+    assert!(lines[agent + 1]
+        .to_string()
+        .contains("● running  bash running"));
 }
 
 #[test]
@@ -1192,11 +1317,9 @@ fn worktree_main_panel_renders_idle_status_with_active_tool_as_running() {
         .position(|line| line.to_string().contains("Agent"))
         .unwrap();
 
-    assert!(
-        lines[agent + 1]
-            .to_string()
-            .contains("● running  task running")
-    );
+    assert!(lines[agent + 1]
+        .to_string()
+        .contains("● running  task running"));
 }
 
 #[test]

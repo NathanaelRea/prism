@@ -1,9 +1,51 @@
-use crate::view::{ChoiceList, KeyChoice, OrderedToggleItem};
+use crate::view::{ChoiceList, FormFieldKind, KeyChoice, OrderedToggleItem};
 
 use super::super::{
-    confirmation_result, move_enabled_ordered_item, selectable_choice_key, toggle_item_in_place,
-    toggle_ordered_item,
+    confirmation_result, create_session_fields, move_enabled_ordered_item, selectable_choice_key,
+    toggle_item_in_place, toggle_ordered_item, update_create_session_variant_field,
 };
+
+#[test]
+fn create_session_fields_include_multiline_prompt_and_harness_defaults() {
+    let fields = create_session_fields(&crate::harness::AgentSelectionOptions {
+        models: vec![crate::harness::AgentModelOption {
+            id: "provider/model".into(),
+            variants: vec!["low".into(), "high".into()],
+        }],
+        variants: Vec::new(),
+    });
+
+    assert_eq!(fields.len(), 3);
+    assert!(matches!(
+        fields[0].kind,
+        FormFieldKind::TextArea { height: 6 }
+    ));
+    let FormFieldKind::Enum { options } = &fields[1].kind else {
+        panic!("model field must be an enum");
+    };
+    assert_eq!(options, &["Harness default", "provider/model"]);
+    let FormFieldKind::Enum { options } = &fields[2].kind else {
+        panic!("variant field must be an enum");
+    };
+    assert_eq!(options, &["Harness default"]);
+
+    let mut fields = fields;
+    fields[1].value = "provider/model".into();
+    update_create_session_variant_field(
+        &mut fields,
+        &crate::harness::AgentSelectionOptions {
+            models: vec![crate::harness::AgentModelOption {
+                id: "provider/model".into(),
+                variants: vec!["low".into(), "high".into()],
+            }],
+            variants: Vec::new(),
+        },
+    );
+    let FormFieldKind::Enum { options } = &fields[2].kind else {
+        panic!("variant field must be an enum");
+    };
+    assert_eq!(options, &["Harness default", "low", "high"]);
+}
 
 #[test]
 fn confirmation_empty_answer_uses_the_passed_default() {

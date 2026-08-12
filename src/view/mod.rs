@@ -106,6 +106,8 @@ pub(crate) enum DialogModel {
     },
     Form {
         title: String,
+        instructions: String,
+        submit_label: String,
         fields: Vec<FormField>,
         selected: usize,
         dropdown: Option<FormDropdown>,
@@ -145,6 +147,7 @@ pub(crate) struct FormField {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FormFieldKind {
     String,
+    TextArea { height: usize },
     Bool,
     Number,
     Enum { options: Vec<String> },
@@ -155,6 +158,7 @@ impl FormFieldKind {
     pub fn label(&self) -> String {
         match self {
             Self::String => "string".into(),
+            Self::TextArea { .. } => "multiline".into(),
             Self::Bool => "bool".into(),
             Self::Number => "number".into(),
             Self::Enum { .. } => "enum".into(),

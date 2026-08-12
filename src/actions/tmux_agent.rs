@@ -399,11 +399,27 @@ impl Tui {
         changed
     }
 
+    #[cfg(test)]
     pub(super) fn paste_prompt_into_tmux_agent(
         &mut self,
         index: usize,
         prompt: &str,
         force_new_generation: bool,
+    ) -> Result<(), String> {
+        self.paste_prompt_into_tmux_agent_with_selection(
+            index,
+            prompt,
+            force_new_generation,
+            crate::harness::AgentSelection::default(),
+        )
+    }
+
+    pub(super) fn paste_prompt_into_tmux_agent_with_selection(
+        &mut self,
+        index: usize,
+        prompt: &str,
+        force_new_generation: bool,
+        selection: crate::harness::AgentSelection<'_>,
     ) -> Result<(), String> {
         let session = self
             .sessions
@@ -439,8 +455,14 @@ impl Tui {
         }
 
         self.finish_tmux_warmup_for_key(&use_.warmup_key);
-        let running =
-            crate::agent_session::submit_prompt(&repo, &config, &session, use_.generation, prompt)?;
+        let running = crate::agent_session::submit_prompt_with_selection(
+            &repo,
+            &config,
+            &session,
+            use_.generation,
+            prompt,
+            selection,
+        )?;
         let previous_agent_state = self.sessions[index].agent_state;
         if crate::agent_session::apply_running_result(
             &self.repos,

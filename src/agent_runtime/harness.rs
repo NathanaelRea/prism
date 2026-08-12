@@ -485,6 +485,154 @@ pub struct Harness<'a> {
     config: &'a HarnessConfig,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgentModelOption {
+    pub id: String,
+    pub variants: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgentSelectionOptions {
+    pub models: Vec<AgentModelOption>,
+    pub variants: Vec<String>,
+}
+
+fn fallback_variants(adapter: &str) -> Vec<String> {
+    let variants: &[&str] = match adapter {
+        "opencode" => &["minimal", "low", "medium", "high", "max"],
+        "codex" => &["none", "minimal", "low", "medium", "high", "xhigh"],
+        "claude" => &["low", "medium", "high"],
+        "pi" => &["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+        _ => &[],
+    };
+    variants
+        .iter()
+        .map(|variant| (*variant).to_string())
+        .collect()
+}
+
+fn normalized_unique_lines(output: &str) -> Vec<String> {
+    let mut models = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    models.sort();
+    models.dedup();
+    models
+}
+
+fn parse_opencode_options(output: &str) -> AgentSelectionOptions {
+    let mut options = AgentSelectionOptions::default();
+    let mut model_id = None;
+    let mut record = String::new();
+    let mut finish_record = |model_id: &mut Option<String>, record: &mut String| {
+        let variants = serde_json::from_str::<serde_json::Value>(record)
+            .ok()
+            .and_then(|value| value.get("variants")?.as_object().cloned())
+            .map(|variants| variants.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        if let Some(id) = model_id.take() {
+            options.models.push(AgentModelOption { id, variants });
+        }
+        record.clear();
+    };
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if !line.starts_with(char::is_whitespace)
+            && !trimmed.chars().any(char::is_whitespace)
+            && trimmed.contains('/')
+        {
+            finish_record(&mut model_id, &mut record);
+            model_id = Some(trimmed.to_string());
+        } else if model_id.is_some() {
+            record.push_str(line);
+            record.push('\n');
+        }
+    }
+    finish_record(&mut model_id, &mut record);
+    for model in &mut options.models {
+        model.variants.sort();
+        model.variants.dedup();
+    }
+    options.models.sort_by(|a, b| a.id.cmp(&b.id));
+    options.models.dedup_by(|a, b| a.id == b.id);
+    options
+}
+
+fn parse_codex_options(output: &str) -> AgentSelectionOptions {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(output) else {
+        return AgentSelectionOptions::default();
+    };
+    let mut options = AgentSelectionOptions::default();
+    for model in value
+        .get("models")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(slug) = model.get("slug").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let mut variants = model
+            .get("supported_reasoning_levels")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|level| level.get("effort")?.as_str().map(str::to_string))
+            .collect::<Vec<_>>();
+        variants.sort();
+        variants.dedup();
+        options.models.push(AgentModelOption {
+            id: slug.to_string(),
+            variants,
+        });
+    }
+    options.models.sort_by(|a, b| a.id.cmp(&b.id));
+    options.models.dedup_by(|a, b| a.id == b.id);
+    options
+}
+
+fn parse_pi_models(output: &str) -> Vec<AgentModelOption> {
+    let mut lines = output.lines();
+    let Some(header) = lines.next() else {
+        return Vec::new();
+    };
+    let header = header.split_whitespace().collect::<Vec<_>>();
+    let Some(provider_index) = header.iter().position(|column| *column == "provider") else {
+        return Vec::new();
+    };
+    let Some(model_index) = header.iter().position(|column| *column == "model") else {
+        return Vec::new();
+    };
+    let thinking_index = header.iter().position(|column| *column == "thinking");
+    let thinking_variants = fallback_variants("pi");
+    let mut models = lines
+        .filter_map(|line| {
+            let columns = line.split_whitespace().collect::<Vec<_>>();
+            let provider = columns.get(provider_index)?;
+            let model = columns.get(model_index)?;
+            let supports_thinking = thinking_index
+                .and_then(|index| columns.get(index))
+                .is_some_and(|value| {
+                    value.eq_ignore_ascii_case("yes") || value.eq_ignore_ascii_case("true")
+                });
+            Some(AgentModelOption {
+                id: format!("{provider}/{model}"),
+                variants: if supports_thinking {
+                    thinking_variants.clone()
+                } else {
+                    Default::default()
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    models.dedup_by(|a, b| a.id == b.id);
+    models
+}
+
 impl<'a> Harness<'a> {
     pub fn new(id: &str, config: &'a HarnessConfig) -> Self {
         Self {
@@ -527,6 +675,31 @@ impl<'a> Harness<'a> {
         session_id: Option<&str>,
         cwd: &Path,
     ) -> Result<Invocation, String> {
+        self.interactive_argv_with_model(
+            prompt,
+            server_url,
+            session_id,
+            cwd,
+            AgentSelection::default(),
+        )
+    }
+
+    pub fn interactive_argv_with_model(
+        &self,
+        prompt: Option<&str>,
+        server_url: Option<&str>,
+        session_id: Option<&str>,
+        cwd: &Path,
+        selection: AgentSelection<'_>,
+    ) -> Result<Invocation, String> {
+        if self.config.adapter == "generic"
+            && (selection.model.is_some() || selection.variant.is_some())
+        {
+            return Err(format!(
+                "generic harness '{}' does not declare model or variant override support",
+                self.id
+            ));
+        }
         if self.config.adapter == "opencode" {
             if prompt.is_some() {
                 return Err(
@@ -565,6 +738,12 @@ impl<'a> Harness<'a> {
                     }
                 }
             }
+            append_agent_selection(
+                &mut argv,
+                &self.config.adapter,
+                selection.model,
+                selection.variant,
+            );
             if let Some(prompt) = prompt {
                 argv.push(prompt.to_string());
             }
@@ -589,6 +768,51 @@ impl<'a> Harness<'a> {
             prompt,
             &self.config.environment,
         )
+    }
+
+    pub fn selection_options(&self) -> AgentSelectionOptions {
+        let mut options = self.discover_selection_options().unwrap_or_default();
+        if options.models.is_empty() {
+            options.variants = fallback_variants(&self.config.adapter);
+        }
+        options
+    }
+
+    fn discover_selection_options(&self) -> Option<AgentSelectionOptions> {
+        let mut command = Command::new(self.config.interactive_command.first()?);
+        command.args(self.config.interactive_command.iter().skip(1));
+        command.args(&self.config.arguments);
+        match self.config.adapter.as_str() {
+            "opencode" => {
+                command.args(["models", "--verbose"]);
+            }
+            "codex" => {
+                command.args(["debug", "models", "--bundled"]);
+            }
+            "pi" => {
+                command.arg("--list-models");
+            }
+            _ => return None,
+        }
+        command.envs(&self.config.environment);
+        let output = crate::process::run_output_allow_failure(
+            &mut command,
+            crate::process::ProcessPolicy::Metadata,
+        )
+        .ok()?;
+        if !output.status.success() || output.stdout_truncated {
+            return None;
+        }
+        let options = match self.config.adapter.as_str() {
+            "opencode" => parse_opencode_options(&output.stdout),
+            "codex" => parse_codex_options(&output.stdout),
+            "pi" => AgentSelectionOptions {
+                models: parse_pi_models(&output.stdout),
+                variants: Vec::new(),
+            },
+            _ => AgentSelectionOptions::default(),
+        };
+        (!options.models.is_empty() || !options.variants.is_empty()).then_some(options)
     }
 
     pub fn headless(
@@ -1075,6 +1299,130 @@ mod tests {
             assert_eq!(invocation.argv, expected, "{adapter}");
             assert_eq!(invocation.structured_events, structured, "{adapter}");
         }
+    }
+
+    #[test]
+    fn interactive_agent_selection_is_forwarded_with_multiline_prompt() {
+        for (adapter, expected) in [
+            (
+                "codex",
+                vec![
+                    "codex",
+                    "--model",
+                    "model-a",
+                    "--config",
+                    "model_reasoning_effort=high",
+                    "first line\nsecond line",
+                ],
+            ),
+            (
+                "claude",
+                vec![
+                    "claude",
+                    "--model",
+                    "model-a",
+                    "--effort",
+                    "high",
+                    "first line\nsecond line",
+                ],
+            ),
+            (
+                "pi",
+                vec![
+                    "pi",
+                    "--model",
+                    "model-a",
+                    "--thinking",
+                    "high",
+                    "first line\nsecond line",
+                ],
+            ),
+        ] {
+            let config = builtin(adapter);
+            let invocation = Harness::new(adapter, &config)
+                .interactive_argv_with_model(
+                    Some("first line\nsecond line"),
+                    None,
+                    None,
+                    Path::new("/tmp"),
+                    AgentSelection {
+                        model: Some("model-a"),
+                        variant: Some("high"),
+                    },
+                )
+                .unwrap();
+            assert_eq!(invocation.argv, expected, "{adapter}");
+        }
+    }
+
+    #[test]
+    fn selection_catalog_parsers_read_models_and_variants() {
+        let opencode = parse_opencode_options(
+            r#"provider/model-a
+{
+  "variants": {
+    "low": {"reasoningEffort": "low"},
+    "high": {"reasoningEffort": "high"}
+  }
+}
+provider/model-b
+{"variants":{"max":{"reasoningEffort":"max"}}}
+provider/model-c
+{}
+"#,
+        );
+        assert_eq!(
+            opencode.models,
+            [
+                AgentModelOption {
+                    id: "provider/model-a".into(),
+                    variants: vec!["high".into(), "low".into()],
+                },
+                AgentModelOption {
+                    id: "provider/model-b".into(),
+                    variants: vec!["max".into()],
+                },
+                AgentModelOption {
+                    id: "provider/model-c".into(),
+                    variants: Vec::new(),
+                },
+            ]
+        );
+        assert!(opencode.variants.is_empty());
+
+        let codex = parse_codex_options(
+            r#"{"models":[{"slug":"gpt-a","supported_reasoning_levels":[{"effort":"low"},{"effort":"high"}]},{"slug":"gpt-b","supported_reasoning_levels":[{"effort":"high"}]}]}"#,
+        );
+        assert_eq!(
+            codex.models,
+            [
+                AgentModelOption {
+                    id: "gpt-a".into(),
+                    variants: vec!["high".into(), "low".into()],
+                },
+                AgentModelOption {
+                    id: "gpt-b".into(),
+                    variants: vec!["high".into()],
+                },
+            ]
+        );
+        assert!(codex.variants.is_empty());
+
+        assert_eq!(
+            parse_pi_models(
+                "provider model context max-out thinking images\nopenai gpt-a 128K 32K no no\nanthropic claude-b 128K 16K yes yes\n"
+            ),
+            [
+                AgentModelOption {
+                    id: "anthropic/claude-b".into(),
+                    variants: fallback_variants("pi"),
+                },
+                AgentModelOption {
+                    id: "openai/gpt-a".into(),
+                    variants: Vec::new(),
+                },
+            ]
+        );
     }
 
     #[test]
