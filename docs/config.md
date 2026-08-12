@@ -57,6 +57,11 @@ needs_input = true
 completed = false
 failed = true
 
+[workflow_ai]
+# harness = "pi" # defaults to default_harness
+# model = "provider/fast-model" # defaults to the harness model
+variant = "low"
+
 [worktrees]
 columns = []
 
@@ -73,6 +78,11 @@ credential_env = "FORGEJO_TOKEN" # variable name only, never the token
 The `#:schema` line is an optional TOML comment. Prism ignores it, while Taplo-compatible TOML language servers can use it for completions, descriptions, enum values, and type validation.
 
 Prism treats `main` as the default branch by default. The default branch is not polled or shown as a change-request branch.
+
+`[workflow_ai]` selects the fast headless Agent used by `Space w a` to generate
+one-off Workflow TOML. `harness` defaults to `default_harness`, `model` defaults
+to that harness's model, and `variant` defaults to `low`. The selected harness
+must support headless execution and any explicit model or variant override.
 
 Prism uses squash merges for change requests by default. Set `merge_method` to
 `merge` or `rebase` when the selected provider supports that method. GitLab does
