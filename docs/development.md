@@ -131,7 +131,7 @@ test -x "$PRISM_TEST_WORKTRUNK"
 
 Parser coverage does not require Worktrunk. Redacted fixtures under `tests/fixtures/worktrunk` cover the 0.58.0 schema-1 floor and the schema-1/schema-2 output documented for 0.71.0, including absent and null observations. Unknown schemas must fail closed.
 
-To enforce the same gate as a pre-push hook, opt into the versioned hooks:
+To enforce the same gate before each commit, opt into the versioned pre-commit hook:
 
 ```sh
 git config core.hooksPath .githooks
