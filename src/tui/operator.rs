@@ -133,9 +133,7 @@ impl Tui {
             let triggers = crate::StepTriggerCatalog::builtins();
             let compiled =
                 crate::workflow::ai::compile_generated(&current.name, &current.source, &triggers);
-            if let Err(error) = &compiled {
-                validation_error = Some(error.clone());
-            }
+            validation_error = compiled.as_ref().err().cloned();
             crate::workflow::ai::save_draft(&draft_path, current)?;
             let mut lines = vec![view::DialogLine {
                 text: "Experimental: parallel Steps run concurrently in the same worktree and may edit overlapping files.".into(),

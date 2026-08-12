@@ -66,7 +66,17 @@ pub(crate) fn remove_drafts_for_worktree(
         if path.extension().and_then(|value| value.to_str()) != Some("json") {
             continue;
         }
-        let Some(draft) = load_draft(&path)? else {
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "read one-off Workflow draft {}: {error}",
+                    path.display()
+                ));
+            }
+        };
+        let Ok(draft) = serde_json::from_slice::<OneOffWorkflowDraft>(&bytes) else {
             continue;
         };
         if draft.worktree == worktree {
@@ -184,6 +194,16 @@ pub(crate) fn compile_generated(
     if workflow.steps.iter().any(|step| step.trigger.is_some()) {
         return Err("AI-created one-off Workflows cannot use full-trust Triggers".into());
     }
+    if workflow.steps.iter().any(|step| {
+        step.agent.harness.is_some() || step.agent.model.is_some() || step.agent.variant.is_some()
+    }) {
+        return Err(
+            "AI-created one-off Workflows cannot override harness, model, or variant".into(),
+        );
+    }
+    if workflow.steps.iter().any(|step| !step.followups.is_empty()) {
+        return Err("AI-created one-off Workflows cannot use followups".into());
+    }
     Ok(workflow)
 }
 
@@ -253,5 +273,55 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("cannot use full-trust Triggers"));
+    }
+
+    #[test]
+    fn generated_agent_overrides_and_followups_are_rejected() {
+        for field in ["harness='opencode'", "model='test-model'", "variant='high'"] {
+            let source = format!("[[step]]\nprompt='work'\n{field}\n");
+            let error =
+                compile_generated("ai-test", &source, &TriggerCatalog::builtins()).unwrap_err();
+            assert!(error.contains("cannot override harness, model, or variant"));
+        }
+
+        let error = compile_generated(
+            "ai-test",
+            "[[step]]\nprompt='work'\nfollowups=['continue']\n",
+            &TriggerCatalog::builtins(),
+        )
+        .unwrap_err();
+        assert!(error.contains("cannot use followups"));
+    }
+
+    #[test]
+    fn corrupt_unrelated_draft_does_not_block_worktree_cleanup() {
+        let root = std::env::temp_dir().join(format!(
+            "prism-workflow-draft-cleanup-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let repository = crate::repo::Repository { root: root.clone() };
+        let target_worktree = root.join("target");
+        let target_path = draft_path(&repository, &target_worktree, "target-incarnation");
+        save_draft(
+            &target_path,
+            &OneOffWorkflowDraft {
+                name: "target".into(),
+                description: "target".into(),
+                source: "[[step]]\nprompt='work'\n".into(),
+                worktree: target_worktree.clone(),
+                worktree_incarnation: "target-incarnation".into(),
+                updated_unix_ms: 1,
+            },
+        )
+        .unwrap();
+        let corrupt_path = target_path.with_file_name("corrupt.json");
+        fs::write(&corrupt_path, b"not json").unwrap();
+
+        remove_drafts_for_worktree(&repository, &target_worktree).unwrap();
+
+        assert!(!target_path.exists());
+        assert!(corrupt_path.exists());
+        fs::remove_dir_all(target_path.parent().unwrap()).unwrap();
     }
 }

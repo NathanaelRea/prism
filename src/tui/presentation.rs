@@ -6,7 +6,7 @@ use crate::tui_runtime::TerminalRuntime;
 use crate::view;
 use crate::workspace_state::CiState;
 
-use super::{choice_list, worktree_updated_label, GitAction, LeaderHint, PanelFocus, Tui};
+use super::{GitAction, LeaderHint, PanelFocus, Tui, choice_list, worktree_updated_label};
 
 impl Tui {
     pub(crate) fn draw(&mut self, runtime: &mut TerminalRuntime) -> Result<(), String> {

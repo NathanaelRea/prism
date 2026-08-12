@@ -677,6 +677,7 @@ impl WorkflowScheduler {
 
         let mut failed = false;
         let mut cancelled = false;
+        let mut wave_completed_unix_ms = now_unix_ms;
         let mut remaining = step_indices.len();
         let started = tokio::time::Instant::now();
         let mut renewal =
@@ -720,6 +721,7 @@ impl WorkflowScheduler {
                         ))
                     })?;
                     let completed_unix_ms = phase_time(now_unix_ms, result.elapsed);
+                    wave_completed_unix_ms = wave_completed_unix_ms.max(completed_unix_ms);
                     run.steps[result.step_index].attempts[result.attempt_index]
                         .agent_turn_in_flight = None;
                     match result.error {
@@ -800,12 +802,12 @@ impl WorkflowScheduler {
             return Ok(Some(SchedulerProgress::Failed));
         }
         if cancelled {
-            cancel_run(run, now_unix_ms);
+            cancel_run(run, wave_completed_unix_ms);
             self.store.save_run(run).await?;
             return Ok(Some(SchedulerProgress::Cancelled));
         }
 
-        begin_new_cycle(workflow, run, now_unix_ms);
+        begin_new_cycle(workflow, run, wave_completed_unix_ms);
         self.store.save_run(run).await?;
         Ok(Some(SchedulerProgress::Advanced))
     }
@@ -2296,17 +2298,15 @@ mod tests {
         );
         assert_eq!(max_active_roots.load(AtomicOrdering::Acquire), 2);
         assert_eq!(roots_finished.load(AtomicOrdering::Acquire), 2);
-        assert_eq!(
-            store
-                .load_run("run")
-                .await
-                .unwrap()
-                .unwrap()
-                .step("join")
-                .unwrap()
-                .phase,
-            StepPhase::Pending
-        );
+        let wave_run = store.load_run("run").await.unwrap().unwrap();
+        assert_eq!(wave_run.step("join").unwrap().phase, StepPhase::Pending);
+        let root_finished = ["a", "b"]
+            .into_iter()
+            .filter_map(|key| wave_run.step(key).unwrap().attempts[0].finished_unix_ms)
+            .max()
+            .unwrap();
+        assert!(wave_run.cycle_started_unix_ms >= root_finished);
+        assert!(wave_run.updated_unix_ms >= root_finished);
         assert!(
             tokio::time::timeout(
                 std::time::Duration::from_millis(10),
