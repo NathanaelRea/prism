@@ -567,7 +567,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             output.stdout,
-            format!("{}|present|unset", temp.display()).as_bytes()
+            format!(
+                "{}|present|unset",
+                std::fs::canonicalize(&temp).unwrap().display()
+            )
+            .as_bytes()
         );
         std::fs::remove_dir_all(temp).unwrap();
     }

@@ -12,8 +12,14 @@ use crate::workspace_state::{
     WorkspaceState,
 };
 use crate::{agent_session, config, session, setup, tui, ui_state, workspace};
+use std::future::Future;
+use std::pin::Pin;
 
-pub async fn run() -> Result<(), String> {
+pub fn run() -> Pin<Box<dyn Future<Output = Result<(), String>>>> {
+    Box::pin(run_inner())
+}
+
+async fn run_inner() -> Result<(), String> {
     let args = Args::parse(std::env::args_os().skip(1))?;
     if let CommandKind::Debug(DebugCommand::Record(options)) = &args.command {
         let repo = load_integrity_repo_context(args.repo.as_deref()).await?;
