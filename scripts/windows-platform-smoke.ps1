@@ -68,8 +68,9 @@ try {
     Invoke-Checked cargo "test" "agent_runtime::opencode::tests::real_opencode_server_round_trips_prism_session_api" "--" "--ignored" "--exact" "--nocapture" "--test-threads=1"
 
     Write-Host "==> real no-model Prism, OpenCode, and psmux stack"
-    Invoke-Checked cargo "build" "--locked"
-    $prism = Join-Path $repoRoot "target/debug/prism.exe"
+    $stackTarget = Join-Path $root "prism stack target"
+    Invoke-Checked cargo "build" "--locked" "--target-dir" $stackTarget
+    $prism = Join-Path $stackTarget "debug/prism.exe"
     $repo = Join-Path $root "repo with spaces and 雪"
     $worktree = Join-Path $root "worktree feature 雪"
     New-Item -ItemType Directory -Path $repo | Out-Null
