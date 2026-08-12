@@ -89,6 +89,10 @@ impl ProcessControl {
         self.identity
     }
 
+    pub fn is_finished(&self) -> bool {
+        self.completion.borrow().is_some()
+    }
+
     pub async fn shutdown(&self) -> Result<(), String> {
         if self.completion.borrow().is_some() {
             return completion_result(self.completion.borrow().as_ref().expect("checked"));

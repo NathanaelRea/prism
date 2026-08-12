@@ -403,12 +403,27 @@ async fn healthy_shared_runtime(runtimes: &[OpencodeRuntime]) -> Option<Opencode
     }
     for runtime in servers.into_values() {
         if check_health_async(&runtime.server_url).await
-            && (stored_server_identity_is_valid(runtime) || runtime.server_pid.is_none())
+            && (owned_server_identity_is_valid(runtime).await
+                || stored_server_identity_is_valid(runtime)
+                || runtime.server_pid.is_none())
         {
             return Some(runtime.clone());
         }
     }
     None
+}
+
+async fn owned_server_identity_is_valid(runtime: &OpencodeRuntime) -> bool {
+    let Some(pid) = runtime.server_pid else {
+        return false;
+    };
+    owned_server_processes()
+        .lock()
+        .await
+        .get(&pid)
+        .is_some_and(|owned| {
+            owned.identity == runtime.server_process_identity && !owned.control.is_finished()
+        })
 }
 
 fn stored_server_identity_is_valid(runtime: &OpencodeRuntime) -> bool {
@@ -4156,6 +4171,10 @@ mod tests {
         };
         let first = runtime("feature/first", "/repo/first");
         let second = runtime("feature/second", "/repo/second");
+        assert!(owned_server_identity_is_valid(&first).await);
+        let mut wrong_identity = first.clone();
+        wrong_identity.server_process_identity = Some(u64::MAX);
+        assert!(!owned_server_identity_is_valid(&wrong_identity).await);
         save_runtime(&repo, &first).unwrap();
         save_runtime(&repo, &second).unwrap();
 
