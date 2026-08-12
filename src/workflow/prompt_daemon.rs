@@ -19,6 +19,8 @@ use crate::platform::SupportedOs;
 const PROTOCOL_VERSION: u32 = 4;
 const TRANSITION_TIMEOUT: Duration = Duration::from_secs(3);
 const SOCKET_PATH_BUDGET: usize = 103;
+const AUTHENTICATION_FAILED_RESPONSE: &str = "error authentication-failed";
+const AUTHENTICATION_SECRET_BYTES: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -67,7 +69,9 @@ pub fn probe_health() -> Result<DaemonHealth, String> {
         }
         Err(error) => return Err(format!("connect to Prism worker: {error}")),
     };
-    parse_health(&request_stream(stream, "health")?)
+    parse_health(&request_with_authentication_fallback(
+        &path, stream, "health",
+    )?)
 }
 
 pub fn ensure_running() -> Result<(), String> {
@@ -655,9 +659,45 @@ where
 }
 
 fn request(command: &str) -> Result<String, String> {
-    let stream = UnixStream::connect(validated_socket_path()?)
-        .map_err(|error| format!("connect to Prism worker: {error}"))?;
-    request_stream(stream, command)
+    let path = validated_socket_path()?;
+    let stream =
+        UnixStream::connect(&path).map_err(|error| format!("connect to Prism worker: {error}"))?;
+    request_with_authentication_fallback(&path, stream, command)
+}
+
+fn request_with_authentication_fallback(
+    socket_path: &Path,
+    stream: UnixStream,
+    command: &str,
+) -> Result<String, String> {
+    let response = request_stream(stream, command)?;
+    if response != AUTHENTICATION_FAILED_RESPONSE {
+        return Ok(response);
+    }
+
+    let secret = read_authentication_secret(socket_path)?;
+    let stream = UnixStream::connect(socket_path)
+        .map_err(|error| format!("reconnect to authenticated Prism worker: {error}"))?;
+    request_stream(stream, &format!("auth {secret} {command}"))
+}
+
+fn read_authentication_secret(socket_path: &Path) -> Result<String, String> {
+    let secret_path = socket_path.with_file_name("worker.secret");
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&secret_path)
+        .map_err(|error| format!("read worker authentication secret: {error}"))?;
+    let mut secret = String::new();
+    file.read_to_string(&mut secret)
+        .map_err(|error| format!("read worker authentication secret: {error}"))?;
+    let secret = secret.trim();
+    if secret.len() != AUTHENTICATION_SECRET_BYTES * 2
+        || !secret.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("worker authentication secret is invalid".to_string());
+    }
+    Ok(secret.to_string())
 }
 
 fn request_stream(mut stream: UnixStream, command: &str) -> Result<String, String> {
@@ -857,5 +897,44 @@ mod tests {
     fn socket_path_is_bounded_before_bind() {
         let root = PathBuf::from("x".repeat(SOCKET_PATH_BUDGET));
         assert!(root.join("worker.sock").as_os_str().as_bytes().len() > SOCKET_PATH_BUDGET);
+    }
+
+    #[test]
+    fn authenticated_daemon_response_is_retried_with_runtime_secret() {
+        let root = std::env::temp_dir().join(format!(
+            "prism-worker-auth-fallback-{}-{}",
+            std::process::id(),
+            crate::util::timestamp_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create test runtime");
+        let socket = root.join("worker.sock");
+        let secret = "ab".repeat(AUTHENTICATION_SECRET_BYTES);
+        fs::write(root.join("worker.secret"), &secret).expect("write test worker secret");
+        let listener = UnixListener::bind(&socket).expect("bind test worker socket");
+        let expected_authenticated = format!("auth {secret} health");
+
+        let server = thread::spawn(move || {
+            for (expected, response) in [
+                ("health".to_string(), AUTHENTICATION_FAILED_RESPONSE),
+                (expected_authenticated, "ok authenticated"),
+            ] {
+                let (mut stream, _) = listener.accept().expect("accept test client");
+                let mut request = String::new();
+                BufReader::new(&mut stream)
+                    .read_line(&mut request)
+                    .expect("read test request");
+                assert_eq!(request.trim(), expected);
+                stream
+                    .write_all(format!("{response}\n").as_bytes())
+                    .expect("write test response");
+            }
+        });
+
+        let stream = UnixStream::connect(&socket).expect("connect test client");
+        let response = request_with_authentication_fallback(&socket, stream, "health")
+            .expect("retry authenticated request");
+        assert_eq!(response, "ok authenticated");
+        server.join().expect("join test server");
+        fs::remove_dir_all(root).expect("remove test runtime");
     }
 }

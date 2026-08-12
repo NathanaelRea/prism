@@ -1,31 +1,9 @@
--- Fresh-install repository schema.
-
-CREATE TABLE active_worktree_session (
-  worktree_session_id text primary key references worktree_session(id),
-  repo_root text not null,
-  branch text not null,
-  worktree_path text not null,
-  worktree_incarnation text not null,
-  observed_unix_ms integer not null,
-  unique(repo_root, branch),
-  unique(repo_root, worktree_path)
-) without rowid;
-
-CREATE TABLE agent_state (
-  branch text primary key,
-  state text not null,
-  updated_unix_ms integer not null
+create table metadata (
+  key text primary key,
+  value text not null
 );
 
-CREATE TABLE archived_worktree (
-  branch text primary key,
-  repo_root text not null,
-  worktree_path text not null,
-  archived_unix_ms integer not null,
-  classification text not null default 'work'
-);
-
-CREATE TABLE event (
+create table event (
   id integer primary key autoincrement,
   time_unix_ms integer not null,
   level text not null,
@@ -39,49 +17,81 @@ CREATE TABLE event (
   message text not null,
   data_json text
 );
+create index event_time_idx on event(time_unix_ms);
+create index event_target_idx on event(target);
+create index event_action_idx on event(action);
+create index event_branch_idx on event(branch);
+create index event_operation_idx on event(operation_id);
 
-CREATE TABLE hidden_session (
+create table startup_run (
+  id text primary key,
+  time_started_unix_ms integer not null,
+  time_finished_unix_ms integer,
+  status text not null,
+  repo text,
+  version text not null,
+  error text
+);
+
+create table startup_phase (
+  id integer primary key autoincrement,
+  run_id text not null references startup_run(id) on delete cascade,
+  phase text not null,
+  time_started_unix_ms integer not null,
+  time_finished_unix_ms integer,
+  status text not null,
+  error text
+);
+
+create table task_metadata (
+  branch text primary key,
+  prompt_summary text not null,
+  initial_prompt text not null,
+  worktree text not null,
+  classification text not null default 'work',
+  visibility integer not null default 0,
+  updated_unix_ms integer not null
+);
+
+create table hidden_session (
   branch text primary key,
   hidden_unix_ms integer not null
 );
 
-CREATE TABLE metadata (
-  key text primary key,
-  value text not null
+create table archived_worktree (
+  branch text primary key,
+  repo_root text not null,
+  worktree_path text not null,
+  archived_unix_ms integer not null,
+  classification text not null default 'work'
 );
 
-CREATE TABLE notification_outbox (
-  id integer primary key autoincrement,
-  worktree_path text not null,
-  branch text not null,
-  incarnation text not null,
-  transition_sequence integer not null,
-  kind text not null,
-  title text not null,
-  body text not null,
-  observed_unix_ms integer not null,
-  expires_unix_ms integer not null,
-  delivery_state text not null,
-  attempt_count integer not null default 0,
-  available_unix_ms integer not null,
-  attempted_unix_ms integer,
-  backend_accepted_unix_ms integer,
-  superseded_unix_ms integer,
-  last_failure_category text,
-  unique (worktree_path, branch, incarnation, transition_sequence)
-);
-
-CREATE TABLE notification_session (
-  worktree_path text not null,
-  branch text not null,
-  incarnation text not null,
+create table agent_state (
+  branch text primary key,
   state text not null,
-  transition_sequence integer not null,
-  observed_unix_ms integer not null,
-  primary key (worktree_path, branch, incarnation)
+  updated_unix_ms integer not null
 );
 
-CREATE TABLE opencode_runtime (
+create table worktree_harness (
+  branch text primary key,
+  worktree_path text not null,
+  worktree_incarnation text not null,
+  harness_id text not null,
+  migration_policy text not null default 'ask',
+  updated_unix_ms integer not null
+);
+
+create table pending_worktree_deletion (
+  branch text primary key,
+  worktree_path text not null,
+  worktree_incarnation text not null,
+  branch_oid text,
+  worktree_removed integer not null default 0,
+  branch_deleted integer not null default 0,
+  updated_unix_ms integer not null
+);
+
+create table opencode_runtime (
   repo_root text not null,
   harness_id text not null default 'opencode',
   branch text not null,
@@ -96,18 +106,225 @@ CREATE TABLE opencode_runtime (
   worktree_session_id text,
   primary key (repo_root, harness_id, branch, worktree_path)
 );
+create index opencode_runtime_branch_idx
+  on opencode_runtime(repo_root, harness_id, branch);
 
-CREATE TABLE pending_worktree_deletion (
-  branch text primary key,
+create table plan_run (
+  id text primary key,
+  harness_id text not null default 'opencode',
+  adapter_id text not null default 'opencode',
+  repo_root text not null,
+  scope_path text not null,
+  plan_path text not null,
+  plan_display text not null,
+  step_name text not null,
+  start_step integer not null,
+  total_steps integer not null,
+  mode text not null,
+  status text not null,
+  pause_requested integer not null default 0,
+  selected_step integer not null,
+  created_unix_ms integer not null,
+  updated_unix_ms integer not null,
+  archived_unix_ms integer,
+  worktree_session_id text
+);
+
+create table plan_step_run (
+  run_id text not null references plan_run(id) on delete cascade,
+  step integer not null,
+  prompt text not null,
+  status text not null,
+  opencode_state text,
+  opencode_server_url text,
+  opencode_session_id text,
+  execution_state text,
+  execution_process_id integer,
+  execution_process_start_time_ticks integer,
+  session_endpoint text,
+  session_id text,
+  session_adapter_id text,
+  agent_variant text,
+  process_id integer,
+  started_unix_ms integer,
+  finished_unix_ms integer,
+  exit_code integer,
+  latest_message text,
+  active_tool text,
+  todos_json text not null default '[]',
+  summary text,
+  error text,
+  primary key (run_id, step)
+);
+
+create table plan_output_line (
+  run_id text not null,
+  step integer not null,
+  line_number integer not null,
+  time_unix_ms integer not null,
+  kind text not null,
+  text text not null,
+  block_id text,
+  primary key (run_id, step, line_number),
+  foreign key (run_id, step) references plan_step_run(run_id, step) on delete cascade
+);
+create index plan_run_repo_idx on plan_run(repo_root, updated_unix_ms);
+create index plan_run_scope_idx on plan_run(scope_path, updated_unix_ms);
+create index plan_run_status_idx on plan_run(status, updated_unix_ms);
+create index plan_output_line_step_idx on plan_output_line(run_id, step, line_number);
+
+create table auto_run (
+  id text primary key,
+  harness_id text not null default 'opencode',
+  adapter_id text not null default 'opencode',
+  repo_root text not null,
   worktree_path text not null,
-  worktree_incarnation text not null,
-  branch_oid text,
-  worktree_removed integer not null default 0,
-  branch_deleted integer not null default 0,
+  worktree_incarnation text,
+  branch text not null,
+  mode text not null,
+  implementation_source text not null default 'prompt',
+  plan_path text,
+  plan_run_mode text not null default 'sequential',
+  variant text not null,
+  agent_profile text,
+  prompt_summary text not null,
+  initial_prompt text not null,
+  status text not null,
+  pause_requested integer not null default 0,
+  selected_step_run_id integer,
+  change_request_identity_json text,
+  pr_number integer,
+  pr_url text,
+  current_head_sha text,
+  review_baseline_json text,
+  stabilization_status text,
+  stabilization_blocker text,
+  stabilization_next_work text,
+  pending_push_json text,
+  created_unix_ms integer not null,
+  updated_unix_ms integer not null,
+  archived_unix_ms integer,
+  worktree_session_id text,
+  foreign key (selected_step_run_id) references auto_step_run(id) on delete set null
+);
+
+create table auto_step_run (
+  id integer primary key autoincrement,
+  run_id text not null references auto_run(id) on delete cascade,
+  sequence integer not null,
+  step_key text not null,
+  reason text,
+  status text not null,
+  attempt integer not null,
+  started_unix_ms integer,
+  finished_unix_ms integer,
+  opencode_server_url text,
+  opencode_session_id text,
+  process_id integer,
+  execution_state text,
+  execution_process_id integer,
+  execution_process_start_time_ticks integer,
+  session_endpoint text,
+  session_id text,
+  session_adapter_id text,
+  plan_run_id text,
+  commit_sha text,
+  head_sha text,
+  work_guard_json text,
+  blocker text,
+  summary text,
+  error text,
+  unique(run_id, sequence)
+);
+
+create table auto_output_line (
+  step_run_id integer not null references auto_step_run(id) on delete cascade,
+  line_number integer not null,
+  time_unix_ms integer not null,
+  kind text not null,
+  text text not null,
+  block_id text,
+  primary key (step_run_id, line_number)
+);
+
+create table auto_event (
+  id integer primary key autoincrement,
+  run_id text not null references auto_run(id) on delete cascade,
+  step_run_id integer references auto_step_run(id) on delete set null,
+  time_unix_ms integer not null,
+  kind text not null,
+  data_json text not null
+);
+create index auto_run_repo_idx on auto_run(repo_root, updated_unix_ms);
+create index auto_run_worktree_idx on auto_run(worktree_path, updated_unix_ms);
+create index auto_run_status_idx on auto_run(status, updated_unix_ms);
+create index auto_step_run_run_idx on auto_step_run(run_id, sequence);
+create index auto_step_run_key_idx on auto_step_run(run_id, step_key, attempt);
+create index auto_output_line_step_idx on auto_output_line(step_run_id, line_number);
+create index auto_event_run_idx on auto_event(run_id, time_unix_ms);
+
+-- Retained repository-local integration state from the released v2 schema. New workflow
+-- execution does not write these tables, but adoption must not erase an unfinished cutover.
+create table merge_intent (
+  id integer primary key autoincrement,
+  run_id text not null references auto_run(id) on delete cascade,
+  generation integer not null,
+  state text not null,
+  placement text not null,
+  change_request_identity_json text,
+  lane_key text,
+  target_branch text,
+  pr_number integer,
+  head_sha text,
+  ready_sequence integer,
+  created_unix_ms integer not null,
+  updated_unix_ms integer not null,
+  unique(run_id, generation)
+);
+create unique index merge_intent_active_run_idx
+  on merge_intent(run_id) where state = 'armed';
+create index merge_intent_lane_ready_idx
+  on merge_intent(lane_key, state, ready_sequence);
+
+create table integration_lane (
+  lane_key text primary key,
+  next_ready_sequence integer not null default 1,
+  reserved_intent_id integer references merge_intent(id) on delete set null,
   updated_unix_ms integer not null
 );
 
-CREATE TABLE pr_cache (
+create table workflow_execution (
+  workflow_kind text not null,
+  run_id text not null,
+  dispatch_state text not null,
+  worker_id text,
+  daemon_instance_id text,
+  lease_expires_unix_ms integer,
+  heartbeat_unix_ms integer,
+  fencing_token integer not null default 0,
+  executor_pid integer,
+  executor_process_identity text,
+  requeue_requested integer not null default 0,
+  interruption_generation integer not null default 0,
+  recovery_decided_unix_ms integer,
+  created_unix_ms integer not null,
+  updated_unix_ms integer not null,
+  execution_version integer not null default 1,
+  not_before_unix_ms integer,
+  wake_reason text,
+  workflow_revision integer not null default 0,
+  primary key (workflow_kind, run_id),
+  check (workflow_kind in ('auto', 'plan')),
+  check (dispatch_state in ('queued', 'claimed', 'recovery_pending', 'paused', 'terminal'))
+);
+create index workflow_execution_dispatch_idx
+  on workflow_execution(dispatch_state, not_before_unix_ms, created_unix_ms);
+create index workflow_execution_lease_idx
+  on workflow_execution(dispatch_state, lease_expires_unix_ms);
+create index workflow_execution_daemon_idx
+  on workflow_execution(daemon_instance_id, dispatch_state);
+
+create table pr_cache (
   branch text primary key,
   number integer not null,
   provider text not null,
@@ -144,7 +361,7 @@ CREATE TABLE pr_cache (
   native_state_evidence text not null default '{}'
 );
 
-CREATE TABLE pr_details_cache (
+create table pr_details_cache (
   branch text primary key,
   pr_number integer not null,
   head_sha text not null,
@@ -171,7 +388,7 @@ CREATE TABLE pr_details_cache (
   foreign key (branch) references pr_cache(branch) on delete cascade
 );
 
-CREATE TABLE repo_policy_cache (
+create table repo_policy_cache (
   provider text not null,
   canonical_host text not null,
   project_path text not null,
@@ -188,46 +405,41 @@ CREATE TABLE repo_policy_cache (
   primary key (provider, canonical_host, project_path_key, target_branch)
 );
 
-CREATE TABLE startup_phase (
-  id integer primary key autoincrement,
-  run_id text not null references startup_run(id) on delete cascade,
-  phase text not null,
-  time_started_unix_ms integer not null,
-  time_finished_unix_ms integer,
-  status text not null,
-  error text
-);
-
-CREATE TABLE startup_run (
-  id text primary key,
-  time_started_unix_ms integer not null,
-  time_finished_unix_ms integer,
-  status text not null,
-  repo text,
-  version text not null,
-  error text
-);
-
-CREATE TABLE task_metadata (
-  branch text primary key,
-  prompt_summary text not null,
-  initial_prompt text not null,
-  worktree text not null,
-  classification text not null default 'work',
-  visibility integer not null default 0,
-  updated_unix_ms integer not null
-);
-
-CREATE TABLE worktree_harness (
-  branch text primary key,
+create table notification_session (
   worktree_path text not null,
-  worktree_incarnation text not null,
-  harness_id text not null,
-  migration_policy text not null default 'ask',
-  updated_unix_ms integer not null
+  branch text not null,
+  incarnation text not null,
+  state text not null,
+  transition_sequence integer not null,
+  observed_unix_ms integer not null,
+  primary key (worktree_path, branch, incarnation)
 );
 
-CREATE TABLE worktree_session (
+create table notification_outbox (
+  id integer primary key autoincrement,
+  worktree_path text not null,
+  branch text not null,
+  incarnation text not null,
+  transition_sequence integer not null,
+  kind text not null,
+  title text not null,
+  body text not null,
+  observed_unix_ms integer not null,
+  expires_unix_ms integer not null,
+  delivery_state text not null,
+  attempt_count integer not null default 0,
+  available_unix_ms integer not null,
+  attempted_unix_ms integer,
+  backend_accepted_unix_ms integer,
+  superseded_unix_ms integer,
+  last_failure_category text,
+  unique (worktree_path, branch, incarnation, transition_sequence)
+);
+create index notification_outbox_delivery_idx
+  on notification_outbox(delivery_state, expires_unix_ms, id);
+
+-- Worktree Session identity remains repository-local and survives branch/path reuse.
+create table worktree_session (
   id text primary key,
   repo_root text not null,
   initial_branch text not null,
@@ -235,21 +447,18 @@ CREATE TABLE worktree_session (
   created_unix_ms integer not null
 ) without rowid;
 
-CREATE INDEX active_worktree_session_location_idx
+create table active_worktree_session (
+  worktree_session_id text primary key references worktree_session(id),
+  repo_root text not null,
+  branch text not null,
+  worktree_path text not null,
+  worktree_incarnation text not null,
+  observed_unix_ms integer not null,
+  unique(repo_root, branch),
+  unique(repo_root, worktree_path)
+) without rowid;
+create index active_worktree_session_location_idx
   on active_worktree_session(repo_root, branch, worktree_path);
 
-CREATE INDEX event_action_idx on event(action);
-
-CREATE INDEX event_branch_idx on event(branch);
-
-CREATE INDEX event_operation_idx on event(operation_id);
-
-CREATE INDEX event_target_idx on event(target);
-
-CREATE INDEX event_time_idx on event(time_unix_ms);
-
-CREATE INDEX notification_outbox_delivery_idx
-  on notification_outbox(delivery_state, expires_unix_ms, id);
-
-CREATE INDEX opencode_runtime_branch_idx
-  on opencode_runtime(repo_root, harness_id, branch);
+-- Fence pre-SQLx Prism binaries out after migration ownership transfers to SQLx.
+pragma user_version = 2147483647;
