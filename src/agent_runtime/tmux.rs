@@ -565,7 +565,7 @@ async fn create_detached_agent_session(
     resume_session_id: Option<&str>,
 ) -> Result<(), String> {
     let command = agent_shell_command(repo, config, session, runtime, prompt, resume_session_id)?;
-    run_tmux_status(
+    run_tmux_daemonizing_status(
         Command::new(config.tool("tmux"))
             .env_remove("TMUX")
             .args(["new-session", "-d", "-s"])
@@ -955,6 +955,43 @@ fn tmux_output_result(output: crate::process::ProcessOutput) -> Result<String, S
         Err(format!("tmux exited with {}", output.status))
     } else {
         Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+#[cfg(not(windows))]
+async fn run_tmux_daemonizing_status(command: Command) -> Result<(), String> {
+    run_tmux_status(command).await
+}
+
+#[cfg(windows)]
+async fn run_tmux_daemonizing_status(command: Command) -> Result<(), String> {
+    use processkit::StdioMode;
+
+    // ProcessKit intentionally places descendants in a kill-on-drop Job Object.
+    // psmux's first `new-session` command launches its persistent server as a
+    // descendant, so this one daemonizing invocation must run outside that job.
+    let display = crate::observability::sanitize_command_text(&command.command_line());
+    let mut command = command
+        .stdout(StdioMode::Piped)
+        .stderr(StdioMode::Piped)
+        .to_tokio_command()
+        .map_err(|error| format!("{display}: {error}"))?;
+    command.kill_on_drop(true);
+    let output = tokio::time::timeout(
+        ProcessPolicy::TmuxPoll.settings().deadline,
+        command.output(),
+    )
+    .await
+    .map_err(|_| format!("{display}: deadline exceeded"))?
+    .map_err(|error| format!("{display}: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.is_empty() {
+        Err(format!("tmux exited with {}", output.status))
+    } else {
+        Err(stderr)
     }
 }
 
