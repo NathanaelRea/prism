@@ -4,6 +4,19 @@ use std::path::PathBuf;
 
 #[derive(Debug)]
 pub(crate) enum DatabaseError {
+    UnknownHistoricalSchema {
+        path: PathBuf,
+        user_version: i64,
+    },
+    NonCanonicalRepositorySchema {
+        path: PathBuf,
+    },
+    MissingMigrationBaseline,
+    Backup {
+        path: PathBuf,
+        backup: PathBuf,
+        source: std::io::Error,
+    },
     SetPermissions {
         path: PathBuf,
         source: std::io::Error,
@@ -32,6 +45,29 @@ pub(crate) enum DatabaseError {
 impl fmt::Display for DatabaseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UnknownHistoricalSchema { path, user_version } => write!(
+                formatter,
+                "database {} has an unknown historical schema (user_version={user_version}); the original was not modified",
+                path.display()
+            ),
+            Self::NonCanonicalRepositorySchema { path } => write!(
+                formatter,
+                "adopted repository database {} does not match the canonical migration schema",
+                path.display()
+            ),
+            Self::MissingMigrationBaseline => {
+                formatter.write_str("repository migration history has no baseline")
+            }
+            Self::Backup {
+                path,
+                backup,
+                source,
+            } => write!(
+                formatter,
+                "back up database {} to {}: {source}",
+                path.display(),
+                backup.display()
+            ),
             Self::SetPermissions { path, source } => write!(
                 formatter,
                 "set owner-only permissions on {}: {source}",
@@ -62,12 +98,17 @@ impl Error for DatabaseError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::CreateDirectory { source, .. }
+            | Self::Backup { source, .. }
             | Self::SetPermissions { source, .. }
             | Self::Runtime(source) => Some(source),
             Self::Connect { source, .. } => Some(source),
             Self::Migrate(source) => Some(source),
             Self::Query(source) => Some(source),
-            Self::Integrity { .. } | Self::InvalidValue { .. } => None,
+            Self::UnknownHistoricalSchema { .. }
+            | Self::NonCanonicalRepositorySchema { .. }
+            | Self::MissingMigrationBaseline
+            | Self::Integrity { .. }
+            | Self::InvalidValue { .. } => None,
         }
     }
 }

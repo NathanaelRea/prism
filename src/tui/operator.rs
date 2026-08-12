@@ -1,7 +1,10 @@
 use std::io::Write as _;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
-use crate::tui_runtime::TerminalRuntime;
+use crossterm::event::{KeyCode, KeyEventKind};
+
+use crate::tui_runtime::{RuntimeEvent, TerminalRuntime};
 use crate::view;
 
 use super::Tui;
@@ -13,6 +16,202 @@ struct WorkflowControlRequest {
 }
 
 impl Tui {
+    pub(super) fn create_ai_workflow(
+        &mut self,
+        runtime: &mut TerminalRuntime,
+    ) -> Result<(), String> {
+        let Some(session_index) = self.selected_worktree_index() else {
+            return self
+                .show_message("select a Worktree Session before creating a one-off Workflow");
+        };
+        let session = self
+            .sessions
+            .get(session_index)
+            .ok_or_else(|| "selected Worktree Session disappeared".to_string())?;
+        let managed = self
+            .repos
+            .get(session.repo_index)
+            .ok_or_else(|| "selected repository disappeared".to_string())?;
+        let repository = managed.repo.clone();
+        let config = managed.config.clone();
+        let worktree = session.path.clone();
+        let incarnation = session.incarnation.clone();
+        let draft_path = crate::workflow::ai::draft_path(&repository, &worktree, &incarnation);
+        let previous = crate::workflow::ai::load_draft(&draft_path)?;
+        let initial = previous
+            .as_ref()
+            .map(|draft| draft.description.as_str())
+            .unwrap_or_default();
+        let Some(mut description) = self.prompt_line_dialog(
+            runtime,
+            "AI One-off Workflow",
+            "Describe the serial and parallel work: ",
+            initial,
+        )?
+        else {
+            return Ok(());
+        };
+        if description.trim().is_empty() {
+            return self.show_message("one-off Workflow description cannot be empty");
+        }
+
+        let mut draft = previous.filter(|draft| draft.description == description);
+        let mut validation_error = None::<String>;
+        loop {
+            if draft.is_none() {
+                self.dialog = Some(view::DialogModel::Progress {
+                    title: "AI One-off Workflow".into(),
+                    message: "Generating and validating Workflow TOML…".into(),
+                });
+                self.draw(runtime)?;
+                let cancellation = crate::AgentCancellation::default();
+                let worker_cancellation = cancellation.clone();
+                let worker_repository = repository.clone();
+                let worker_config = config.clone();
+                let worker_worktree = worktree.clone();
+                let worker_description = description.clone();
+                let worker_error = validation_error.clone();
+                let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                std::thread::spawn(move || {
+                    let result =
+                        crate::async_runtime::block_on(crate::workflow::ai::generate_source(
+                            &worker_repository,
+                            &worker_config,
+                            &worker_worktree,
+                            &worker_description,
+                            worker_error.as_deref(),
+                            worker_cancellation,
+                        ))
+                        .map_err(|error| error.to_string())
+                        .and_then(|result| result);
+                    let _ = tx.send(result);
+                });
+                let mut cancelled = false;
+                let source = loop {
+                    match rx.try_recv() {
+                        Ok(result) => break result,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            break Err("AI Workflow generator stopped unexpectedly".into());
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    }
+                    if self.tick_tui_action_jobs().any() {
+                        self.draw(runtime)?;
+                    }
+                    if let Some(RuntimeEvent::Key(event)) =
+                        runtime.poll_event(Duration::from_millis(100))?
+                        && event.kind == KeyEventKind::Press
+                        && event.code == KeyCode::Esc
+                    {
+                        cancelled = true;
+                        cancellation.cancel();
+                        self.dialog = Some(view::DialogModel::Progress {
+                            title: "AI One-off Workflow".into(),
+                            message: "Cancelling generator…".into(),
+                        });
+                        self.draw(runtime)?;
+                    }
+                };
+                self.dialog = None;
+                self.draw(runtime)?;
+                if cancelled {
+                    return Ok(());
+                }
+                let source = source?;
+                let now = crate::workflow_now_unix_ms();
+                draft = Some(crate::workflow::ai::OneOffWorkflowDraft {
+                    name: format!("ai-one-off-{now}"),
+                    description: description.clone(),
+                    source,
+                    worktree: worktree.clone(),
+                    worktree_incarnation: incarnation.clone(),
+                    updated_unix_ms: now,
+                });
+            }
+
+            let current = draft.as_ref().expect("draft was generated");
+            let triggers = crate::StepTriggerCatalog::builtins();
+            let compiled =
+                crate::workflow::ai::compile_generated(&current.name, &current.source, &triggers);
+            validation_error = compiled.as_ref().err().cloned();
+            crate::workflow::ai::save_draft(&draft_path, current)?;
+            let mut lines = vec![view::DialogLine {
+                text: "Experimental: parallel Steps run concurrently in the same worktree and may edit overlapping files.".into(),
+                attention: true,
+            }];
+            if let Some(error) = &validation_error {
+                lines.push(view::DialogLine {
+                    text: format!("Validation failed: {error}"),
+                    attention: true,
+                });
+            }
+            lines.extend(current.source.lines().map(|line| view::DialogLine {
+                text: line.to_string(),
+                attention: false,
+            }));
+            self.notice_dialog(runtime, "Generated Workflow Preview", lines)?;
+            let choices = view::ChoiceList {
+                title: "AI One-off Workflow".into(),
+                choices: vec![
+                    view::KeyChoice::new("r", "run"),
+                    view::KeyChoice::new("e", "edit TOML"),
+                    view::KeyChoice::new("g", "regenerate"),
+                    view::KeyChoice::new("d", "edit description"),
+                    view::KeyChoice::new("c", "cancel (draft is retained)"),
+                ],
+            };
+            match self.prompt_choice_dialog(runtime, choices)?.as_deref() {
+                Some("r") => {
+                    let mut workflow = compiled?;
+                    crate::resolve_workflow_agent_selection(&mut workflow, &config)
+                        .map_err(format_diagnostics)?;
+                    let now = crate::workflow_now_unix_ms();
+                    let run_id = format!(
+                        "run-{:016x}-{now}",
+                        crate::util::stable_hash(std::path::Path::new(&format!(
+                            "{}:{}:{now}",
+                            workflow.digest,
+                            worktree.display()
+                        )))
+                    );
+                    let subject = crate::TriggerSubject {
+                        repository: repository.root.clone(),
+                        worktree: worktree.clone(),
+                        change_request: None,
+                        change_request_head: None,
+                    };
+                    let launched =
+                        crate::worker::launch_prompt_workflow(&workflow, &run_id, &subject)?;
+                    return self.show_message(&format!("launched one-off Workflow {launched}"));
+                }
+                Some("e") => {
+                    let current = draft.as_mut().expect("draft exists");
+                    edit_draft_source(runtime, &draft_path, &mut current.source)?;
+                    current.updated_unix_ms = crate::workflow_now_unix_ms();
+                    validation_error = None;
+                }
+                Some("g") => {
+                    draft = None;
+                }
+                Some("d") => {
+                    let Some(updated) = self.prompt_line_dialog(
+                        runtime,
+                        "AI One-off Workflow",
+                        "Describe the serial and parallel work: ",
+                        &description,
+                    )?
+                    else {
+                        continue;
+                    };
+                    description = updated;
+                    draft = None;
+                    validation_error = None;
+                }
+                _ => return Ok(()),
+            }
+        }
+    }
+
     pub(super) fn control_selected_workflow(
         &mut self,
         runtime: &mut TerminalRuntime,
@@ -192,6 +391,36 @@ impl Tui {
             _ => Ok(()),
         }
     }
+}
+
+fn edit_draft_source(
+    runtime: &mut TerminalRuntime,
+    draft_path: &std::path::Path,
+    source: &mut String,
+) -> Result<(), String> {
+    let editor = crate::terminal::editor_argv_from_env()?
+        .ok_or_else(|| "no editor found; set VISUAL or EDITOR".to_string())?;
+    let source_path = draft_path.with_extension("toml");
+    std::fs::write(&source_path, source.as_bytes())
+        .map_err(|error| format!("write editable Workflow draft: {error}"))?;
+    let result = runtime
+        .suspend_for(|| {
+            Command::new(&editor[0])
+                .args(&editor[1..])
+                .arg(&source_path)
+                .status()
+                .map_err(|error| format!("edit one-off Workflow: {error}"))
+        })
+        .and_then(|status| {
+            if !status.success() {
+                return Err(format!("editor exited with {status}"));
+            }
+            *source = std::fs::read_to_string(&source_path)
+                .map_err(|error| format!("read edited Workflow draft: {error}"))?;
+            Ok(())
+        });
+    let _ = std::fs::remove_file(source_path);
+    result
 }
 
 fn workflow_control_request(

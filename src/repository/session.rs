@@ -950,6 +950,7 @@ fn remove_worktree_owned_state(
     session_store(repo)?
         .remove_owned_state(branch, &worktree_path, &runtimes)
         .map_err(|error| format!("remove worktree session state: {error}"))?;
+    crate::workflow::ai::remove_drafts_for_worktree(repo, path)?;
     transaction.committed();
     Ok(())
 }
