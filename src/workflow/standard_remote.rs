@@ -64,7 +64,7 @@ impl StandardTriggerRemote for ProductionStandardTriggerRemote {
                     .map_err(|error| TriggerError::Protocol(error.to_string()))?;
             let freshness = ObservationFreshness::any(OBSERVATION_MAX_AGE_MS)
                 .not_before(context.cycle_started_unix_ms);
-            let payload = serde_json::to_value(&context.subject)
+            let payload = serde_json::to_value(observation_subject(context))
                 .map_err(|error| TriggerError::Protocol(error.to_string()))?;
             // Subscribe before requesting so a fast coalesced completion cannot race the wake
             // registration.
@@ -154,6 +154,14 @@ impl StandardTriggerRemote for ProductionStandardTriggerRemote {
             )
         })
     }
+}
+
+fn observation_subject(context: &TriggerContext) -> TriggerSubject {
+    let mut subject = context.subject.clone();
+    if context.cycle > 0 {
+        subject.change_request_head = None;
+    }
+    subject
 }
 
 fn lane_for_subject(
@@ -845,6 +853,34 @@ fn permanent(reason: String) -> RemoteOperationFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn context(cycle: u64) -> TriggerContext {
+        TriggerContext {
+            run_id: "run-1".into(),
+            step_key: "review".into(),
+            attempt_id: "attempt-1".into(),
+            cycle,
+            cycle_started_unix_ms: 1,
+            subject: TriggerSubject {
+                repository: "/repo".into(),
+                worktree: "/repo/wt".into(),
+                change_request: Some("github:github.com:example/repo:change_request:PR_42".into()),
+                change_request_head: Some("launch-head".into()),
+            },
+            cancellation_requested: false,
+        }
+    }
+
+    #[test]
+    fn launch_head_is_checked_only_during_the_initial_observation_cycle() {
+        assert_eq!(
+            observation_subject(&context(0))
+                .change_request_head
+                .as_deref(),
+            Some("launch-head")
+        );
+        assert_eq!(observation_subject(&context(1)).change_request_head, None);
+    }
 
     #[test]
     fn production_failure_preserves_provider_retry_after_hint() {

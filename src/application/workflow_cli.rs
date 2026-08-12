@@ -291,9 +291,14 @@ async fn run_workflow_async(repo: Option<&Path>, arguments: &[String]) -> Result
                 &config,
                 json_output,
             )?;
-            let cached_subject = prompt_change_request_subject(&repository, &config, &worktree);
-            let change_request = launch_arguments.change_request.or(cached_subject.0);
-            let change_request_head = launch_arguments.change_request_head.or(cached_subject.1);
+            let (change_request, change_request_head) = match (
+                launch_arguments.change_request,
+                launch_arguments.change_request_head,
+            ) {
+                (Some(identity), Some(head)) => (Some(identity), Some(head)),
+                (None, None) => prompt_change_request_subject(&repository, &config, &worktree),
+                _ => unreachable!("workflow subject arguments are validated as a pair"),
+            };
             let now = now_ms();
             let run_id = format!(
                 "run-{:016x}-{now}",
@@ -734,6 +739,9 @@ fn parse_workflow_run_arguments(arguments: &[String]) -> Result<WorkflowRunArgum
             argument => return Err(format!("unknown workflow run argument: {argument}")),
         }
     }
+    if parsed.change_request.is_some() != parsed.change_request_head.is_some() {
+        return Err("--change-request and --change-request-head must be specified together".into());
+    }
     Ok(parsed)
 }
 
@@ -1006,5 +1014,18 @@ mod tests {
                 .unwrap_err()
                 .contains("unknown")
         );
+        for partial_subject in [
+            [
+                "--change-request",
+                "github:github.com:example/repo:change_request:PR_42",
+            ],
+            ["--change-request-head", "abc123"],
+        ] {
+            assert!(
+                parse_workflow_run_arguments(&partial_subject.map(str::to_string))
+                    .unwrap_err()
+                    .contains("must be specified together")
+            );
+        }
     }
 }
