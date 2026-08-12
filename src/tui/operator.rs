@@ -132,17 +132,28 @@ impl Tui {
         runtime: &mut TerminalRuntime,
     ) -> Result<(), String> {
         let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-        let worktree = self
+        let session = self
             .selected_worktree_index()
-            .and_then(|index| self.sessions.get(index))
+            .and_then(|index| self.sessions.get(index));
+        let worktree = session
             .map(|session| session.path.clone())
             .unwrap_or_else(|| self.repo.root.clone());
+        let change_request = session
+            .and_then(|session| session.pr.summary())
+            .and_then(workflow_change_request_arguments);
         let status = runtime.suspend_for(|| {
-            Command::new(executable)
+            let mut command = Command::new(executable);
+            command
                 .arg("--repo")
                 .arg(&self.repo.root)
                 .args(["workflow", "run", "stabilize", "--worktree"])
-                .arg(worktree)
+                .arg(worktree);
+            if let Some((identity, head)) = change_request {
+                command
+                    .args(["--change-request", &identity])
+                    .args(["--change-request-head", &head]);
+            }
+            command
                 .status()
                 .map_err(|error| format!("launch stabilization Workflow: {error}"))
         })?;
@@ -272,6 +283,25 @@ fn select_prompt_workflow(
     )))
 }
 
+fn workflow_change_request_arguments(
+    summary: &crate::remote::PrSummary,
+) -> Option<(String, String)> {
+    let identity = summary.change_request_identity.as_ref()?;
+    if summary.head_sha.trim().is_empty() {
+        return None;
+    }
+    Some((
+        format!(
+            "{}:{}:{}:change_request:{}",
+            identity.provider().config_label(),
+            identity.canonical_host(),
+            identity.project_path(),
+            identity.native_id()
+        ),
+        summary.head_sha.clone(),
+    ))
+}
+
 fn format_diagnostics(diagnostics: Vec<crate::WorkflowDiagnostic>) -> String {
     diagnostics
         .into_iter()
@@ -300,6 +330,39 @@ mod tests {
             can_cancel: !matches!(status, "done" | "failed" | "aborted"),
             can_retry: status == "failed",
         }
+    }
+
+    #[test]
+    fn stabilization_subject_uses_selected_session_change_request() {
+        let summary = crate::remote::PrSummary {
+            number: 42,
+            change_request_identity: Some(crate::remote::test_change_request_identity()),
+            native_state_evidence: Default::default(),
+            title: String::new(),
+            author: String::new(),
+            body: String::new(),
+            url: String::new(),
+            state: "OPEN".into(),
+            review_decision: String::new(),
+            requested_reviewers: Vec::new(),
+            head_ref: "feature".into(),
+            base_ref: "main".into(),
+            head_sha: "abc123".into(),
+            updated_at: String::new(),
+            check_status: String::new(),
+            merge_state_status: String::new(),
+            queue_state: String::new(),
+            comment_count: 0,
+            merged: false,
+            draft: false,
+        };
+
+        let (identity, head) = workflow_change_request_arguments(&summary).unwrap();
+        assert_eq!(
+            identity,
+            "github:github.com:example/repo:change_request:PR_test"
+        );
+        assert_eq!(head, "abc123");
     }
 
     #[test]

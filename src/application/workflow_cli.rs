@@ -291,8 +291,9 @@ async fn run_workflow_async(repo: Option<&Path>, arguments: &[String]) -> Result
                 &config,
                 json_output,
             )?;
-            let (change_request, change_request_head) =
-                prompt_change_request_subject(&repository, &config, &worktree);
+            let cached_subject = prompt_change_request_subject(&repository, &config, &worktree);
+            let change_request = launch_arguments.change_request.or(cached_subject.0);
+            let change_request_head = launch_arguments.change_request_head.or(cached_subject.1);
             let now = now_ms();
             let run_id = format!(
                 "run-{:016x}-{now}",
@@ -677,6 +678,8 @@ fn edit(path: &Path) -> Result<(), String> {
 struct WorkflowRunArguments {
     worktree: Option<PathBuf>,
     inputs: BTreeMap<String, String>,
+    change_request: Option<String>,
+    change_request_head: Option<String>,
 }
 
 fn parse_workflow_run_arguments(arguments: &[String]) -> Result<WorkflowRunArguments, String> {
@@ -690,6 +693,24 @@ fn parse_workflow_run_arguments(arguments: &[String]) -> Result<WorkflowRunArgum
                     .ok_or_else(|| "--worktree requires a path".to_string())?;
                 if parsed.worktree.replace(PathBuf::from(value)).is_some() {
                     return Err("--worktree may be specified only once".into());
+                }
+                index += 2;
+            }
+            "--change-request" => {
+                let value = arguments
+                    .get(index + 1)
+                    .ok_or_else(|| "--change-request requires an identity".to_string())?;
+                if parsed.change_request.replace(value.clone()).is_some() {
+                    return Err("--change-request may be specified only once".into());
+                }
+                index += 2;
+            }
+            "--change-request-head" => {
+                let value = arguments
+                    .get(index + 1)
+                    .ok_or_else(|| "--change-request-head requires a commit".to_string())?;
+                if parsed.change_request_head.replace(value.clone()).is_some() {
+                    return Err("--change-request-head may be specified only once".into());
                 }
                 index += 2;
             }
@@ -953,6 +974,10 @@ mod tests {
             "plan=plan-workflows.md",
             "--worktree",
             "/repo/wt",
+            "--change-request",
+            "github:github.com:example/repo:change_request:PR_42",
+            "--change-request-head",
+            "abc123",
             "--input",
             "publish=false",
         ]
@@ -961,6 +986,11 @@ mod tests {
         assert_eq!(parsed.worktree, Some(PathBuf::from("/repo/wt")));
         assert_eq!(parsed.inputs["plan"], "plan-workflows.md");
         assert_eq!(parsed.inputs["publish"], "false");
+        assert_eq!(
+            parsed.change_request.as_deref(),
+            Some("github:github.com:example/repo:change_request:PR_42")
+        );
+        assert_eq!(parsed.change_request_head.as_deref(), Some("abc123"));
     }
 
     #[test]

@@ -495,6 +495,13 @@ fn observe_change_request(subject: &TriggerSubject) -> Result<ChangeRequestObser
     {
         return Err("a different Change Request is now associated with the worktree".into());
     }
+    if subject
+        .change_request_head
+        .as_deref()
+        .is_some_and(|expected| expected != summary.head_sha)
+    {
+        return Err("Change Request head changed before workflow observation".into());
+    }
     let provider = match identity.provider() {
         crate::remote::ProviderKind::GitHub => StandardProvider::GitHub,
         crate::remote::ProviderKind::GitLab => StandardProvider::GitLab,
