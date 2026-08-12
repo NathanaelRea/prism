@@ -47,8 +47,8 @@ fi
 [[ -f migrations/prompt-workflow/0001_prompt_workflow_kernel.sql ]] ||
 	fail 'missing prompt Workflow schema'
 
-if rg -n 'prism-standard-extension' install.sh; then
-	fail 'installer still references the removed Standard Extension package'
+if rg -n 'prism-standard-extension' install.sh scripts --glob '!check-workflow-cutover.sh'; then
+	fail 'active scripts still reference the removed Standard Extension package'
 fi
 
 printf 'workflow cutover check passed\n'
