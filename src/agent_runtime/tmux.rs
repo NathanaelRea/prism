@@ -163,7 +163,7 @@ async fn ensure_tmux_agent_session(
             .await?
         {
             let runtime = opencode_runtime_for_session(repo, config, session).await?;
-            create_detached_agent_session(
+            create_configured_agent_session(
                 repo,
                 config,
                 session,
@@ -173,7 +173,6 @@ async fn ensure_tmux_agent_session(
                 None,
             )
             .await?;
-            configure_agent_session(config, runtime_session.name(), runtime.as_ref()).await?;
             ensure_companion_windows(config, session, runtime_session).await?;
             return Ok(wait_for_agent_session_running(
                 config,
@@ -195,7 +194,7 @@ async fn ensure_tmux_agent_session(
         }
     }
     let runtime = opencode_runtime_for_session(repo, config, session).await?;
-    create_detached_agent_session(
+    create_configured_agent_session(
         repo,
         config,
         session,
@@ -205,7 +204,6 @@ async fn ensure_tmux_agent_session(
         None,
     )
     .await?;
-    configure_agent_session(config, runtime_session.name(), runtime.as_ref()).await?;
     ensure_companion_windows(config, session, runtime_session).await?;
     Ok(wait_for_agent_session_running(config, runtime_session, CREATED_SESSION_READY_WAIT).await)
 }
@@ -604,6 +602,37 @@ pub async fn attach_resumable_harness_session(
     configure_agent_session(config, runtime_session.name(), None).await?;
     ensure_companion_windows(config, session, &runtime_session).await?;
     attach(config, &runtime_session, TmuxWindow::Agent).await
+}
+
+async fn create_configured_agent_session(
+    repo: &Repository,
+    config: &Config,
+    session: &Session,
+    runtime_session: &TmuxAgentSession,
+    runtime: Option<&OpencodeRuntime>,
+    prompt: Option<&str>,
+    resume_session_id: Option<&str>,
+) -> Result<(), String> {
+    for _ in 0..2 {
+        create_detached_agent_session(
+            repo,
+            config,
+            session,
+            runtime_session,
+            runtime,
+            prompt,
+            resume_session_id,
+        )
+        .await?;
+        if configure_agent_session(config, runtime_session.name(), runtime).await? {
+            return Ok(());
+        }
+        tokio::time::sleep(SESSION_READY_POLL_INTERVAL).await;
+    }
+    Err(format!(
+        "tmux session '{}' exited before it could be configured",
+        runtime_session.name()
+    ))
 }
 
 async fn configure_agent_session(
@@ -1259,8 +1288,8 @@ mod tests {
 
     use super::{
         TmuxAgentSession, TmuxWindow, attach_or_create_agent, attach_or_create_window,
-        capture_agent_pane, ensure_agent_session, latest_agent_session_generation,
-        migrate_legacy_agent_sessions, pane_command_matches_agent,
+        capture_agent_pane, create_configured_agent_session, ensure_agent_session,
+        latest_agent_session_generation, migrate_legacy_agent_sessions, pane_command_matches_agent,
         pane_start_command_matches_agent, paste_agent_prompt, session_exists,
     };
 
@@ -2321,6 +2350,72 @@ exit 0
         assert!(commands.contains("new-session -d -s"));
         assert!(commands.contains("set-option -t"));
         assert!(!commands.contains("kill-session -t"));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_configured_session_retries_when_initial_agent_exits() {
+        let temp = unique_temp_dir("prism-tmux-create-retry-test");
+        fs::create_dir_all(&temp).unwrap();
+        let log = temp.join("tmux.log");
+        let configure_count = temp.join("configure-count");
+        let tmux = temp.join("tmux");
+        fs::write(
+            &tmux,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$1" in
+  new-session)
+    exit 0
+    ;;
+  set-option)
+    count="$(cat '{}' 2>/dev/null || echo 0)"
+    count="$((count + 1))"
+    echo "$count" > '{}'
+    if [ "$count" -eq 1 ]; then
+      echo "can't find session: vanished" >&2
+      exit 1
+    fi
+    exit 0
+    ;;
+esac
+exit 0
+"#,
+                log.display(),
+                configure_count.display(),
+                configure_count.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux, permissions).unwrap();
+
+        let mut config = test_config();
+        config
+            .tools
+            .insert("tmux".to_string(), tmux.display().to_string());
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let session = test_session(temp.join("worktree"), "feature");
+        let runtime_session = TmuxAgentSession::for_worktree_session(&repo, "feature", 0);
+
+        let result = create_configured_agent_session(
+            &repo,
+            &config,
+            &session,
+            &runtime_session,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(result, Ok(()));
+        let commands = fs::read_to_string(&log).unwrap();
+        assert_eq!(commands.matches("new-session -d -s").count(), 2);
+        assert_eq!(commands.matches("set-option -t").count(), 2);
 
         let _ = fs::remove_dir_all(temp);
     }
