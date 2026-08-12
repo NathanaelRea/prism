@@ -1207,14 +1207,13 @@ fn pane_start_command_matches_agent(config: &Config, pane_start_command: &str) -
         .strip_prefix('"')
         .and_then(|command| command.strip_suffix('"'))
         .unwrap_or(pane_start_command);
-    let Some(executable) = split_command_words(command).into_iter().next() else {
-        return false;
-    };
-    let executable = Path::new(&executable)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(&executable);
-    pane_command_matches_agent(config, executable)
+    split_command_words(command).into_iter().any(|argument| {
+        let executable = Path::new(&argument)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&argument);
+        pane_command_matches_agent(config, executable)
+    })
 }
 
 fn usable_opencode_runtime(
@@ -1569,6 +1568,10 @@ exit 0
         assert!(pane_start_command_matches_agent(
             &config,
             r#""/usr/local/bin/opencode attach http://127.0.0.1:41000""#
+        ));
+        assert!(pane_start_command_matches_agent(
+            &config,
+            r#"& '/usr/local/bin/opencode' 'attach' 'http://127.0.0.1:41000'"#
         ));
         assert!(!pane_start_command_matches_agent(&config, r#""/bin/bash""#));
     }
