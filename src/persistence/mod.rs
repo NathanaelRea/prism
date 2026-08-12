@@ -1,3 +1,5 @@
+mod adoption;
+
 pub(crate) mod database;
 pub(crate) mod error;
 pub(crate) mod observability;

@@ -363,6 +363,30 @@ impl WorkflowScheduler {
         }
         self.store.save_run(&mut run).await?;
 
+        // A concurrent wave can leave several durable active Attempts after a crash. Reconcile
+        // every such effect boundary before considering any pending or retried Step.
+        if let Some((step_index, attempt_index)) =
+            run.steps.iter().enumerate().find_map(|(step_index, step)| {
+                let ready = step.phase != StepPhase::Waiting
+                    || step.wake_at_unix_ms.is_some_and(|wake| wake <= now_unix_ms);
+                ready
+                    .then(|| step.active_attempt_index())
+                    .flatten()
+                    .map(|attempt_index| (step_index, attempt_index))
+            })
+        {
+            return self
+                .resume_attempt(&workflow, &mut run, step_index, attempt_index, now_unix_ms)
+                .await;
+        }
+
+        if let Some(progress) = self
+            .run_unconditional_wave(&workflow, &mut run, now_unix_ms)
+            .await?
+        {
+            return Ok(progress);
+        }
+
         for key in &workflow.topological_order {
             let step_index = workflow
                 .steps
@@ -517,6 +541,285 @@ impl WorkflowScheduler {
             self.store.save_run(&mut run).await?;
             Ok(SchedulerProgress::Waiting)
         }
+    }
+
+    async fn run_unconditional_wave(
+        &self,
+        workflow: &CompiledWorkflow,
+        run: &mut WorkflowRunState,
+        now_unix_ms: i64,
+    ) -> Result<Option<SchedulerProgress>, WorkflowKernelError> {
+        // Recovery remains deliberately single-lifecycle: never start new work beside an
+        // Attempt whose last durable phase needs to be resumed or reconciled.
+        if run
+            .steps
+            .iter()
+            .any(|step| step.active_attempt_index().is_some())
+        {
+            return Ok(None);
+        }
+
+        let mut step_indices = Vec::new();
+        for key in &workflow.topological_order {
+            let step_index = workflow
+                .steps
+                .iter()
+                .position(|step| &step.key == key)
+                .ok_or_else(|| {
+                    WorkflowKernelError::Invalid(format!("unknown compiled step {key}"))
+                })?;
+            let state = &run.steps[step_index];
+            if state.unconditional_completed
+                || state.satisfied_cycle == Some(run.cycle)
+                || !dependencies_satisfied(workflow, run, step_index)
+                || (state.phase == StepPhase::Waiting
+                    && state.wake_at_unix_ms.is_some_and(|wake| wake > now_unix_ms))
+            {
+                continue;
+            }
+            // Trigger decisions and hooks keep their existing serialized path, but an independent
+            // Trigger must not partition unconditional Agents that are eligible for the same wave.
+            if workflow.steps[step_index].trigger.is_none() {
+                step_indices.push(step_index);
+            }
+        }
+
+        let remaining_budget = run.max_agent_runs.saturating_sub(run.agent_runs_consumed) as usize;
+        step_indices.truncate(remaining_budget);
+        if step_indices.len() < 2 {
+            return Ok(None);
+        }
+
+        // Capture every prompt and selected predecessor message before any branch begins. This
+        // makes context for the wave immutable even though Agents intentionally share a worktree.
+        let mut branches = Vec::with_capacity(step_indices.len());
+        for &step_index in &step_indices {
+            let step = &workflow.steps[step_index];
+            let authored = step.prompt.as_deref().ok_or_else(|| {
+                WorkflowKernelError::Invalid(format!("Step {} has no Agent prompt", step.key))
+            })?;
+            let contexts = selected_context(workflow, run, step)?;
+            let mut prompts = Vec::with_capacity(step.followups.len() + 1);
+            prompts.push(prompt_with_context(authored, &contexts));
+            prompts.extend(step.followups.iter().cloned());
+            branches.push(UnconditionalWaveBranch {
+                step_index,
+                attempt_index: 0,
+                step_key: step.key.clone(),
+                prompts,
+                harness: step.agent.harness.clone(),
+                model: step.agent.model.clone(),
+                variant: step.agent.variant.clone(),
+                run_id: run.id.clone(),
+                repository: run.subject.repository.clone(),
+                worktree: run.subject.worktree.clone(),
+            });
+        }
+
+        // Persist the prepared boundary for the complete wave before claiming any Agent phase.
+        for branch in &mut branches {
+            let attempt_index = begin_attempt(run, branch.step_index, now_unix_ms)?;
+            branch.attempt_index = attempt_index;
+            let attempt = &mut run.steps[branch.step_index].attempts[attempt_index];
+            attempt.phase = StepPhase::Prepared;
+            attempt.prepared_state = Some(PreparedState::default());
+            run.steps[branch.step_index].phase = StepPhase::Prepared;
+        }
+        self.store.save_run(run).await?;
+
+        // Budget units and in-flight markers are one durable write ahead of all effects. A crash
+        // after this point therefore requires reconciliation rather than replaying an Agent.
+        for branch in &branches {
+            run.agent_runs_consumed += 1;
+            let attempt = &mut run.steps[branch.step_index].attempts[branch.attempt_index];
+            attempt.phase = StepPhase::RunningAgent;
+            attempt.agent_turn_in_flight = Some(1);
+            run.steps[branch.step_index].phase = StepPhase::RunningAgent;
+            claim_attempt_phase(
+                run,
+                branch.step_index,
+                branch.attempt_index,
+                &self.worker_id,
+                now_unix_ms,
+            );
+            push_attempt_event(
+                run,
+                branch.step_index,
+                branch.attempt_index,
+                now_unix_ms,
+                "agent_started",
+                "fresh Agent Session in concurrent wave",
+            );
+            push_attempt_event(
+                run,
+                branch.step_index,
+                branch.attempt_index,
+                now_unix_ms,
+                "agent_turn_started",
+                &format!("turn 1/{}", branch.prompts.len()),
+            );
+        }
+        self.store.save_run(run).await?;
+
+        // Hold one worktree claim for the wave. Branches inside this claim intentionally overlap,
+        // while a different Workflow Run cannot mutate the same worktree at the same time.
+        let _worktree_claim = self
+            .worktree_lock(&run.subject.worktree)
+            .await
+            .lock_owned()
+            .await;
+        let cancellation = AgentCancellation::default();
+        self.run_cancellations
+            .lock()
+            .await
+            .insert(run.id.clone(), cancellation.clone());
+        let (turn_tx, mut turn_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut tasks = tokio::task::JoinSet::new();
+        for branch in branches {
+            let agents = self.agents.clone();
+            let cancellation = cancellation.clone();
+            let turn_tx = turn_tx.clone();
+            tasks.spawn(async move {
+                execute_unconditional_branch(agents, branch, cancellation, turn_tx).await
+            });
+        }
+        drop(turn_tx);
+
+        let mut failed = false;
+        let mut cancelled = false;
+        let mut wave_completed_unix_ms = now_unix_ms;
+        let mut remaining = step_indices.len();
+        let started = tokio::time::Instant::now();
+        let mut renewal =
+            tokio::time::interval(std::time::Duration::from_millis(PHASE_LEASE_RENEW_MS));
+        renewal.tick().await;
+        while remaining > 0 {
+            tokio::select! {
+                Some(turn) = turn_rx.recv() => {
+                    let completed_unix_ms = phase_time(now_unix_ms, turn.elapsed);
+                    let attempt = &mut run.steps[turn.step_index].attempts[turn.attempt_index];
+                    attempt.agent_turns.push(turn.outcome);
+                    attempt.agent_turn_in_flight = (turn.turn_number < turn.total_turns)
+                        .then_some(turn.turn_number + 1);
+                    push_attempt_event(
+                        run,
+                        turn.step_index,
+                        turn.attempt_index,
+                        completed_unix_ms,
+                        "agent_turn_succeeded",
+                        &format!("turn {}/{}", turn.turn_number, turn.total_turns),
+                    );
+                    if turn.turn_number < turn.total_turns {
+                        push_attempt_event(
+                            run,
+                            turn.step_index,
+                            turn.attempt_index,
+                            completed_unix_ms,
+                            "agent_turn_started",
+                            &format!("turn {}/{}", turn.turn_number + 1, turn.total_turns),
+                        );
+                    }
+                    self.store.save_run(run).await?;
+                    let _ = turn.persisted.send(());
+                }
+                joined = tasks.join_next() => {
+                    let Some(joined) = joined else { break };
+                    remaining = remaining.saturating_sub(1);
+                    let result = joined.map_err(|error| {
+                        WorkflowKernelError::Invalid(format!(
+                            "concurrent Agent task failed: {error}"
+                        ))
+                    })?;
+                    let completed_unix_ms = phase_time(now_unix_ms, result.elapsed);
+                    wave_completed_unix_ms = wave_completed_unix_ms.max(completed_unix_ms);
+                    run.steps[result.step_index].attempts[result.attempt_index]
+                        .agent_turn_in_flight = None;
+                    match result.error {
+                        None => {
+                            let outcome = run.steps[result.step_index].attempts[result.attempt_index]
+                                .agent_turns
+                                .last()
+                                .cloned()
+                                .ok_or_else(|| {
+                                    WorkflowKernelError::Invalid(
+                                        "concurrent Agent produced no completed turns".into(),
+                                    )
+                                })?;
+                            run.steps[result.step_index].attempts[result.attempt_index].agent_outcome =
+                                Some(outcome);
+                            run.steps[result.step_index].attempts[result.attempt_index].phase =
+                                StepPhase::AgentSucceeded;
+                            finish_attempt(
+                                run,
+                                result.step_index,
+                                result.attempt_index,
+                                completed_unix_ms,
+                            );
+                            run.steps[result.step_index].unconditional_completed = true;
+                            run.steps[result.step_index].phase = StepPhase::Completed;
+                            run.steps[result.step_index].summary = Some("Agent completed".into());
+                        }
+                        Some(AgentExecutionError::Cancelled) => {
+                            cancelled = true;
+                            cancel_attempt(
+                                run,
+                                result.step_index,
+                                result.attempt_index,
+                                completed_unix_ms,
+                                "concurrent Agent cancelled",
+                            );
+                        }
+                        Some(error) => {
+                            failed = true;
+                            cancellation.cancel();
+                            fail_attempt(
+                                run,
+                                result.step_index,
+                                result.attempt_index,
+                                completed_unix_ms,
+                                error.to_string(),
+                            );
+                        }
+                    }
+                    self.store.save_run(run).await?;
+                }
+                _ = renewal.tick() => {
+                    let renewed_unix_ms = phase_time(now_unix_ms, started.elapsed());
+                    for &step_index in &step_indices {
+                        let Some(attempt_index) = run.steps[step_index].active_attempt_index() else {
+                            continue;
+                        };
+                        let fencing_token = run.steps[step_index].attempts[attempt_index].fencing_token;
+                        renew_attempt_phase(
+                            run,
+                            step_index,
+                            attempt_index,
+                            &self.worker_id,
+                            fencing_token,
+                            renewed_unix_ms,
+                        )?;
+                    }
+                    run.updated_unix_ms = renewed_unix_ms;
+                    self.store.save_run(run).await?;
+                }
+            }
+        }
+        self.run_cancellations.lock().await.remove(&run.id);
+
+        if failed {
+            run.status = WorkflowRunStatus::Failed;
+            self.store.save_run(run).await?;
+            return Ok(Some(SchedulerProgress::Failed));
+        }
+        if cancelled {
+            cancel_run(run, wave_completed_unix_ms);
+            self.store.save_run(run).await?;
+            return Ok(Some(SchedulerProgress::Cancelled));
+        }
+
+        begin_new_cycle(workflow, run, wave_completed_unix_ms);
+        self.store.save_run(run).await?;
+        Ok(Some(SchedulerProgress::Advanced))
     }
 
     async fn prepare_attempt(
@@ -1207,6 +1510,122 @@ impl WorkflowScheduler {
     }
 }
 
+struct UnconditionalWaveBranch {
+    step_index: usize,
+    attempt_index: usize,
+    step_key: String,
+    prompts: Vec<String>,
+    harness: Option<String>,
+    model: Option<String>,
+    variant: Option<String>,
+    run_id: String,
+    repository: PathBuf,
+    worktree: PathBuf,
+}
+
+struct UnconditionalWaveTurn {
+    step_index: usize,
+    attempt_index: usize,
+    turn_number: u32,
+    total_turns: u32,
+    outcome: AgentOutcome,
+    elapsed: std::time::Duration,
+    persisted: tokio::sync::oneshot::Sender<()>,
+}
+
+struct UnconditionalWaveResult {
+    step_index: usize,
+    attempt_index: usize,
+    elapsed: std::time::Duration,
+    error: Option<AgentExecutionError>,
+}
+
+async fn execute_unconditional_branch(
+    agents: Arc<dyn AgentExecutor>,
+    branch: UnconditionalWaveBranch,
+    cancellation: AgentCancellation,
+    turn_tx: tokio::sync::mpsc::UnboundedSender<UnconditionalWaveTurn>,
+) -> UnconditionalWaveResult {
+    let started = tokio::time::Instant::now();
+    let mut last_outcome: Option<AgentOutcome> = None;
+    let mut error = None;
+    for (turn_index, prompt) in branch.prompts.iter().enumerate() {
+        if cancellation.is_cancelled() {
+            error = Some(AgentExecutionError::Cancelled);
+            break;
+        }
+        let resume_session_id = last_outcome
+            .as_ref()
+            .map(|outcome| outcome.session_id.clone());
+        let execution = agents
+            .execute(AgentRequest {
+                run_id: branch.run_id.clone(),
+                step_key: branch.step_key.clone(),
+                attempt_id: format!(
+                    "{}:{}:{}",
+                    branch.run_id,
+                    branch.step_key,
+                    branch.attempt_index + 1
+                ),
+                repository: branch.repository.clone(),
+                worktree: branch.worktree.clone(),
+                harness: branch.harness.clone(),
+                model: branch.model.clone(),
+                variant: branch.variant.clone(),
+                prompt: prompt.clone(),
+                resume_session_id: resume_session_id.clone(),
+                require_resumable_session: branch.prompts.len() > 1 && turn_index == 0,
+                cancellation: cancellation.clone(),
+            })
+            .await;
+        match execution {
+            Ok(outcome) => {
+                if let Some(expected) = resume_session_id.as_deref()
+                    && outcome.session_id != expected
+                {
+                    error = Some(AgentExecutionError::Protocol(format!(
+                        "Agent follow-up resumed session {expected}, but reported {}",
+                        outcome.session_id
+                    )));
+                    break;
+                }
+                last_outcome = Some(outcome.clone());
+                let (persisted, persisted_rx) = tokio::sync::oneshot::channel();
+                let turn_number = u32::try_from(turn_index + 1).unwrap_or(u32::MAX);
+                let total_turns = u32::try_from(branch.prompts.len()).unwrap_or(u32::MAX);
+                if turn_tx
+                    .send(UnconditionalWaveTurn {
+                        step_index: branch.step_index,
+                        attempt_index: branch.attempt_index,
+                        turn_number,
+                        total_turns,
+                        outcome,
+                        elapsed: started.elapsed(),
+                        persisted,
+                    })
+                    .is_err()
+                    || persisted_rx.await.is_err()
+                {
+                    error = Some(AgentExecutionError::Protocol(
+                        "concurrent Agent result could not be persisted".into(),
+                    ));
+                    break;
+                }
+            }
+            Err(branch_error) => {
+                error = Some(branch_error);
+                break;
+            }
+        }
+    }
+    UnconditionalWaveResult {
+        step_index: branch.step_index,
+        attempt_index: branch.attempt_index,
+        elapsed: started.elapsed(),
+        error,
+    }
+}
+
 fn resolve_trigger(
     registry: &TriggerRegistry,
     revision: &crate::workflow::source::TriggerRevision,
@@ -1330,6 +1749,17 @@ fn fail_attempt(
     run.steps[step].summary = Some(reason.clone());
     run.status = WorkflowRunStatus::Failed;
     push_attempt_event(run, step, attempt, now, "attempt_failed", &reason);
+}
+
+fn cancel_attempt(run: &mut WorkflowRunState, step: usize, attempt: usize, now: i64, reason: &str) {
+    release_attempt_phase(run, step, attempt);
+    run.steps[step].attempts[attempt].status = AttemptStatus::Cancelled;
+    run.steps[step].attempts[attempt].phase = StepPhase::Cancelled;
+    run.steps[step].attempts[attempt].error = Some(reason.into());
+    run.steps[step].attempts[attempt].finished_unix_ms = Some(now);
+    run.steps[step].phase = StepPhase::Cancelled;
+    run.steps[step].summary = Some(reason.into());
+    push_attempt_event(run, step, attempt, now, "attempt_cancelled", reason);
 }
 
 fn fail_step(run: &mut WorkflowRunState, step: usize, now: i64, reason: &str) {
@@ -1657,7 +2087,8 @@ mod tests {
     use crate::workflow::source::{TriggerCatalog, compile_workflow};
     use crate::workflow::step_trigger::{AgentOutcomeStatus, ScriptedTrigger};
     use std::path::Path;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+    use tokio::sync::{Barrier, Notify};
 
     #[derive(Default)]
     struct TriggerStartGateStore {
@@ -1842,6 +2273,111 @@ mod tests {
             scheduler.tick("run", 3).await.unwrap(),
             SchedulerProgress::Succeeded
         );
+    }
+
+    #[tokio::test]
+    async fn parallel_roots_overlap_and_join_waits_for_both() {
+        struct OverlapAgent {
+            barrier: Arc<Barrier>,
+            roots_finished: Arc<AtomicUsize>,
+            active_roots: Arc<AtomicUsize>,
+            max_active_roots: Arc<AtomicUsize>,
+            join_started: Arc<Notify>,
+        }
+
+        impl AgentExecutor for OverlapAgent {
+            fn execute<'a>(
+                &'a self,
+                request: AgentRequest,
+            ) -> super::super::agent_phase::AgentFuture<'a> {
+                Box::pin(async move {
+                    if request.step_key == "join" {
+                        assert_eq!(
+                            self.roots_finished.load(AtomicOrdering::Acquire),
+                            2,
+                            "join must not start until both roots have settled"
+                        );
+                        self.join_started.notify_one();
+                        return Ok(outcome("join-session", "joined"));
+                    }
+
+                    let active = self.active_roots.fetch_add(1, AtomicOrdering::AcqRel) + 1;
+                    self.max_active_roots
+                        .fetch_max(active, AtomicOrdering::AcqRel);
+                    self.barrier.wait().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    self.active_roots.fetch_sub(1, AtomicOrdering::AcqRel);
+                    self.roots_finished.fetch_add(1, AtomicOrdering::AcqRel);
+                    Ok(outcome(
+                        &format!("{}-session", request.step_key),
+                        &format!("{} done", request.step_key),
+                    ))
+                })
+            }
+        }
+
+        let workflow = workflow(
+            "[[step]]\nid='a'\ndepends_on=[]\nprompt='root a'\n[[step]]\nid='b'\ndepends_on=[]\nprompt='root b'\n[[step]]\nid='join'\ndepends_on=['a','b']\ncontext=['a','b']\nprompt='join'\n",
+        );
+        let roots_finished = Arc::new(AtomicUsize::new(0));
+        let max_active_roots = Arc::new(AtomicUsize::new(0));
+        let join_started = Arc::new(Notify::new());
+        let agents = Arc::new(OverlapAgent {
+            barrier: Arc::new(Barrier::new(2)),
+            roots_finished: roots_finished.clone(),
+            active_roots: Arc::new(AtomicUsize::new(0)),
+            max_active_roots: max_active_roots.clone(),
+            join_started: join_started.clone(),
+        });
+        let store = Arc::new(MemoryWorkflowRunStore::default());
+        let scheduler = WorkflowScheduler::new(store.clone(), TriggerRegistry::default(), agents);
+        scheduler
+            .start(StartPromptWorkflow {
+                run_id: "run",
+                workflow: &workflow,
+                subject: subject(),
+                now_unix_ms: 1,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            scheduler.tick("run", 2).await.unwrap(),
+            SchedulerProgress::Advanced
+        );
+        assert_eq!(max_active_roots.load(AtomicOrdering::Acquire), 2);
+        assert_eq!(roots_finished.load(AtomicOrdering::Acquire), 2);
+        let wave_run = store.load_run("run").await.unwrap().unwrap();
+        assert_eq!(wave_run.step("join").unwrap().phase, StepPhase::Pending);
+        let root_finished = ["a", "b"]
+            .into_iter()
+            .filter_map(|key| wave_run.step(key).unwrap().attempts[0].finished_unix_ms)
+            .max()
+            .unwrap();
+        assert!(wave_run.cycle_started_unix_ms >= root_finished);
+        assert!(wave_run.updated_unix_ms >= root_finished);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                join_started.notified()
+            )
+            .await
+            .is_err(),
+            "join started during the root wave"
+        );
+
+        assert_eq!(
+            scheduler.tick("run", 3).await.unwrap(),
+            SchedulerProgress::Advanced
+        );
+        join_started.notified().await;
+        assert_eq!(
+            scheduler.tick("run", 4).await.unwrap(),
+            SchedulerProgress::Succeeded
+        );
+        let run = store.load_run("run").await.unwrap().unwrap();
+        assert_eq!(run.agent_runs_consumed, 3);
+        assert_eq!(run.step("join").unwrap().final_text(), Some("joined"));
     }
 
     #[tokio::test]

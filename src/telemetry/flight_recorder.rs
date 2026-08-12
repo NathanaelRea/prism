@@ -529,6 +529,10 @@ enum Control {
         endpoints: Vec<RecorderEndpoint>,
     },
     StopAll,
+    #[cfg(all(test, unix))]
+    Drain {
+        reply: mpsc::SyncSender<()>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -619,6 +623,16 @@ pub(crate) fn register_repositories<'a>(repos: impl IntoIterator<Item = &'a Repo
 
 pub(crate) fn stop_all_servers() {
     let _ = recorder().control_tx.try_send(Control::StopAll);
+}
+
+#[cfg(all(test, unix))]
+fn drain_events_for_test() -> bool {
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    recorder()
+        .control_tx
+        .send(Control::Drain { reply: reply_tx })
+        .is_ok()
+        && reply_rx.recv_timeout(Duration::from_secs(1)).is_ok()
 }
 
 fn server_endpoints<'a>(repos: impl IntoIterator<Item = &'a Repository>) -> Vec<ServerEndpoint> {
@@ -1040,6 +1054,16 @@ impl RecorderState {
                 self.servers = retained;
             }
             Control::StopAll => self.remove_all_servers(),
+            #[cfg(all(test, unix))]
+            Control::Drain { reply } => {
+                for _ in 0..EVENT_CHANNEL_CAPACITY {
+                    let Ok(event) = self.event_rx.try_recv() else {
+                        break;
+                    };
+                    self.push(event);
+                }
+                let _ = reply.send(());
+            }
         }
     }
 
@@ -1872,6 +1896,7 @@ mod tests {
                 .contains(".tmp-")
         }));
 
+        assert!(drain_events_for_test());
         in_flight.finish(ExternalCallOutcome::Success, Vec::new());
         let secret = "flight-secret-argv-env-output-stderr";
         let command = crate::process::Command::new("sh")

@@ -11,6 +11,7 @@ enum KeyInputState {
     Normal,
     Leader,
     LeaderG,
+    LeaderWorkflow,
 }
 
 impl KeyInput {
@@ -23,6 +24,7 @@ impl KeyInput {
             KeyInputState::Normal => self.map_normal(event),
             KeyInputState::Leader => self.map_leader(event),
             KeyInputState::LeaderG => self.map_leader_git(event),
+            KeyInputState::LeaderWorkflow => self.map_leader_workflow(event),
         })
     }
 
@@ -90,9 +92,9 @@ impl KeyInput {
                 self.state = KeyInputState::Normal;
                 Key::OpenTmuxSession
             }
-            KeyCode::Char('W') if plain_char(event) => {
-                self.state = KeyInputState::Normal;
-                Key::WorkflowLauncher
+            KeyCode::Char('w') if plain_char(event) => {
+                self.state = KeyInputState::LeaderWorkflow;
+                Key::LeaderWorkflow
             }
             KeyCode::Char('c') if plain_char(event) => {
                 self.state = KeyInputState::Normal;
@@ -114,6 +116,15 @@ impl KeyInput {
                 self.state = KeyInputState::Normal;
                 Key::Other
             }
+        }
+    }
+
+    fn map_leader_workflow(&mut self, event: KeyEvent) -> Key {
+        self.state = KeyInputState::Normal;
+        match event.code {
+            KeyCode::Char('a') if plain_char(event) => Key::WorkflowAi,
+            KeyCode::Char('w') if plain_char(event) => Key::WorkflowLauncher,
+            _ => Key::Other,
         }
     }
 
@@ -172,8 +183,10 @@ pub enum Key {
     NextView,
     Leader,
     LeaderGit,
+    LeaderWorkflow,
     OpenTmuxSession,
     WorkflowLauncher,
+    WorkflowAi,
     WorkflowPauseResume,
     WorkflowRetry,
     Configuration,
@@ -313,7 +326,17 @@ mod tests {
         );
         assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
         assert_eq!(
-            map(&mut input, shift_key(KeyCode::Char('W'))),
+            map(&mut input, key(KeyCode::Char('w'))),
+            Key::LeaderWorkflow
+        );
+        assert_eq!(map(&mut input, key(KeyCode::Char('a'))), Key::WorkflowAi);
+        assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char('w'))),
+            Key::LeaderWorkflow
+        );
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char('w'))),
             Key::WorkflowLauncher
         );
         assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);

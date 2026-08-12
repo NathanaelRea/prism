@@ -146,11 +146,15 @@ credential source.
 A Workflow is a prompt-first TOML file whose filename stem is its default
 identity. It declares optional Agent defaults and an acyclic graph of Agent
 Steps. A plain `[[step]]` list is linear; explicit `id` and `depends_on` values
-create roots, branches, and joins.
+create roots, branches, and joins. Prism may also retain an AI-generated one-off
+Workflow draft in user state for one exact Worktree Session incarnation; running
+it still creates the ordinary immutable Workflow Run snapshot.
 
 Workflow source has no required schema version, qualified package ID, launch
 mode, capability list, typed port, Step class, implementation ID, or
-`skippable` declaration. It may declare typed file, string, boolean, number, and
+`skippable` declaration. Simultaneously eligible unconditional Steps may run
+concurrently in a shared worktree; this experimental mode intentionally permits
+overlapping edits, while dependency joins preserve graph ordering. It may declare typed file, string, boolean, number, and
 enum inputs with optional defaults. Canonical values are substituted into Agent
 turns; files use normalized worktree-relative paths and are never read into a
 prompt implicitly. First setup copies

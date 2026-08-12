@@ -27,7 +27,85 @@ pub(crate) async fn list_worktrees(
         ProcessPolicy::Metadata,
     )
     .await?;
-    Ok(parse_worktree_inventory(&output))
+    let mut inventory = parse_worktree_inventory(&output);
+    for entry in &mut inventory {
+        if entry.branch == "(detached)"
+            && let Some(branch) = rebase_branch(&entry.path, config).await
+        {
+            entry.branch = branch;
+        }
+    }
+    Ok(inventory)
+}
+
+async fn rebase_branch(path: &Path, config: &Config) -> Option<String> {
+    for head_name in ["rebase-merge/head-name", "rebase-apply/head-name"] {
+        let Ok(output) = run_capture(
+            Command::new(config.tool("git")).arg("-C").arg(path).args([
+                "rev-parse",
+                "--git-path",
+                head_name,
+            ]),
+            ProcessPolicy::Metadata,
+        )
+        .await
+        else {
+            continue;
+        };
+        let Some(git_path) = single_git_line(&output) else {
+            continue;
+        };
+        let git_path = PathBuf::from(git_path);
+        let git_path = if git_path.is_absolute() {
+            git_path
+        } else {
+            path.join(git_path)
+        };
+        let Ok(first_read) = std::fs::read_to_string(&git_path) else {
+            continue;
+        };
+        let Some(full_ref) = single_git_line(&first_read) else {
+            continue;
+        };
+        let Some(branch) = full_ref.strip_prefix("refs/heads/") else {
+            continue;
+        };
+        if branch.is_empty()
+            || branch.starts_with('-')
+            || !git_succeeds(path, config, &["check-ref-format", full_ref]).await
+            || !git_succeeds(path, config, &["show-ref", "--verify", "--quiet", full_ref]).await
+            || git_exit_code(path, config, &["symbolic-ref", "--quiet", "HEAD"]).await != Some(1)
+            || std::fs::read_to_string(git_path).ok().as_deref() != Some(first_read.as_str())
+        {
+            continue;
+        }
+        return Some(branch.to_string());
+    }
+    None
+}
+
+fn single_git_line(output: &str) -> Option<&str> {
+    let output = output.strip_suffix('\n').unwrap_or(output);
+    let output = output.strip_suffix('\r').unwrap_or(output);
+    (!output.is_empty() && !output.contains(['\n', '\r'])).then_some(output)
+}
+
+async fn git_succeeds(path: &Path, config: &Config, args: &[&str]) -> bool {
+    git_exit_code(path, config, args).await == Some(0)
+}
+
+async fn git_exit_code(path: &Path, config: &Config, args: &[&str]) -> Option<i32> {
+    run_output_allow_failure(
+        Command::new(config.tool("git"))
+            .arg("-C")
+            .arg(path)
+            .args(args),
+        ProcessPolicy::Metadata,
+    )
+    .await
+    .ok()?
+    .status
+    .code()
 }
 
 fn parse_worktree_inventory(output: &str) -> Vec<WorktreeInventoryEntry> {
@@ -239,7 +317,7 @@ pub(crate) async fn delete_branch_if_same_incarnation(
         Command::new(config.tool("git"))
             .arg("-C")
             .arg(&repo.root)
-            .args(["branch", "-D", branch]),
+            .args(["branch", "-D", "--", branch]),
         ProcessPolicy::LocalMutation,
     )
     .await
@@ -335,7 +413,80 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     #[cfg(unix)]
+    use std::process::Command as StdCommand;
+    #[cfg(unix)]
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn list_worktrees_recovers_branch_during_conflicted_rebase() {
+        let temp = unique_temp_dir("prism-rebase-worktree-branch-test");
+        let repo_root = temp.join("repo");
+        let worktree = temp.join("feature-worktree");
+        fs::create_dir_all(&repo_root).unwrap();
+        run_git(&repo_root, &["init", "-b", "main"]);
+        run_git(&repo_root, &["config", "user.email", "test@example.com"]);
+        run_git(&repo_root, &["config", "user.name", "Prism Test"]);
+        fs::write(repo_root.join("shared.txt"), "base\n").unwrap();
+        run_git(&repo_root, &["add", "shared.txt"]);
+        run_git(&repo_root, &["commit", "-m", "base"]);
+        run_git(&repo_root, &["branch", "feature"]);
+        fs::write(repo_root.join("shared.txt"), "main\n").unwrap();
+        run_git(&repo_root, &["commit", "-am", "main"]);
+        run_git(
+            &repo_root,
+            &["worktree", "add", worktree.to_str().unwrap(), "feature"],
+        );
+        fs::write(worktree.join("shared.txt"), "feature\n").unwrap();
+        run_git(&worktree, &["commit", "-am", "feature"]);
+
+        let rebase = StdCommand::new("git")
+            .arg("-C")
+            .arg(&worktree)
+            .args(["rebase", "main"])
+            .status()
+            .unwrap();
+        assert!(!rebase.success(), "fixture rebase must pause on a conflict");
+
+        let repo = Repository::with_config_dir_for_test(repo_root, temp.join("config"));
+        let mut config = test_config();
+        config.tools.insert("git".to_string(), "git".to_string());
+        let inventory = super::list_worktrees(&repo, &config).await.unwrap();
+        let feature_worktree_path = inventory
+            .iter()
+            .find(|entry| entry.branch == "feature")
+            .and_then(|entry| fs::canonicalize(&entry.path).ok());
+        let expected_worktree_path = fs::canonicalize(&worktree);
+        assert!(expected_worktree_path.is_ok());
+        assert_eq!(feature_worktree_path, expected_worktree_path.ok());
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rebase_branch_rejects_invalid_or_stale_head_name() {
+        let temp = unique_temp_dir("prism-invalid-rebase-branch-test");
+        let head_name = temp.join("head-name");
+        fs::create_dir_all(&temp).unwrap();
+        let git = temp.join("git");
+        write_executable(
+            &git,
+            &format!(
+                "#!/bin/sh\ncase \"$*\" in\n  *\"rev-parse --git-path rebase-merge/head-name\"*) printf '{}\\n' ;;\n  *\"symbolic-ref --quiet HEAD\"*) exit 1 ;;\n  *) exit 0 ;;\nesac\n",
+                head_name.display()
+            ),
+        );
+        fs::write(&head_name, "refs/heads/--unsafe\n").unwrap();
+        let mut config = test_config();
+        config
+            .tools
+            .insert("git".to_string(), git.display().to_string());
+
+        assert_eq!(super::rebase_branch(&temp, &config).await, None);
+
+        let _ = fs::remove_dir_all(temp);
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     #[cfg(unix)]
@@ -814,7 +965,7 @@ exit 0
         assert!(tmux_commands.contains(&format!("kill-session -t {}", runtime.name())));
         assert!(!tmux_commands.contains(&format!("kill-session -t {}", other_runtime.name())));
         let git_commands = fs::read_to_string(&git_log).unwrap();
-        assert!(git_commands.contains("branch -D feature/delete"));
+        assert!(git_commands.contains("branch -D -- feature/delete"));
         let wt_commands = fs::read_to_string(&wt_log).unwrap();
         assert!(
             wt_commands.contains("remove --foreground --force --no-delete-branch --format=json --")
@@ -895,7 +1046,7 @@ case "$*" in
   *"worktree prune"*)
     exit 0
     ;;
-  *"branch -D feature/delete"*)
+  *"branch -D -- feature/delete"*)
     exit 0
     ;;
 esac
@@ -971,7 +1122,7 @@ exit 0
 
         let git_commands = fs::read_to_string(&git_log).unwrap();
         assert!(git_commands.contains("worktree list --porcelain"));
-        assert!(git_commands.contains("branch -D feature/delete"));
+        assert!(git_commands.contains("branch -D -- feature/delete"));
         assert!(
             fs::read_to_string(&wt_log)
                 .unwrap()
@@ -1195,7 +1346,7 @@ case "$*" in
     ;;
   *"rev-parse --verify refs/heads/{branch}"*) printf 'branch-oid\n' ;;
   *"show-ref --verify --quiet refs/heads/{branch}"*) test ! -e '{branch_deleted}' ;;
-  *"branch -D {branch}"*) touch '{branch_deleted}' ;;
+  *"branch -D -- {branch}"*) touch '{branch_deleted}' ;;
 esac
 exit 0
 "#,
@@ -1346,7 +1497,7 @@ exit 0
         assert_eq!(count_rows(&repo, "pending_worktree_deletion", branch), 0);
         let git_commands = fs::read_to_string(git_log).unwrap();
         assert!(git_commands.contains("show-ref --verify --quiet"));
-        assert!(!git_commands.contains(&format!("branch -D {branch}")));
+        assert!(!git_commands.contains(&format!("branch -D -- {branch}")));
         let _ = fs::remove_dir_all(temp);
     }
 
@@ -1365,7 +1516,7 @@ exit 0
         write_executable(
             &git,
             &format!(
-                "#!/bin/sh\ncase \"$*\" in\n  *\"rev-parse --verify refs/heads/feature/keep\"*) echo branch-oid; exit 0 ;;\n  *\"branch -D feature/keep\"*) test ! -e '{}' || exit 1 ;;\n  *\"worktree list --porcelain\"*) exit 0 ;;\nesac\nexit 0\n",
+                "#!/bin/sh\ncase \"$*\" in\n  *\"rev-parse --verify refs/heads/feature/keep\"*) echo branch-oid; exit 0 ;;\n  *\"branch -D -- feature/keep\"*) test ! -e '{}' || exit 1 ;;\n  *\"worktree list --porcelain\"*) exit 0 ;;\nesac\nexit 0\n",
                 fail_branch_delete.display()
             ),
         );
@@ -1494,6 +1645,17 @@ exit 0
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("{prefix}-{id}"))
+    }
+
+    #[cfg(unix)]
+    fn run_git(path: &std::path::Path, args: &[&str]) {
+        let status = StdCommand::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git command failed: git {args:?}");
     }
 
     #[cfg(unix)]

@@ -1,4 +1,5 @@
 pub mod agent_phase;
+pub(crate) mod ai;
 pub mod kernel;
 pub(crate) mod prompt_daemon;
 pub mod prompt_worker;

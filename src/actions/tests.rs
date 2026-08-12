@@ -658,7 +658,7 @@ case "$*" in
     fi
     exit 0
     ;;
-  *"branch -D feature/delete"*)
+  *"branch -D -- feature/delete"*)
     exit 0
     ;;
 esac
@@ -743,7 +743,7 @@ exit 0
     assert!(
         fs::read_to_string(&git_log)
             .unwrap()
-            .contains("branch -D feature/delete")
+            .contains("branch -D -- feature/delete")
     );
 
     let _ = fs::remove_dir_all(temp);
@@ -907,7 +907,7 @@ async fn phase_1_branch_delete_failure_reconciles_without_vanished_worktree_path
 case "$*" in
   *"rev-parse --verify refs/heads/feature/delete"*) echo branch-oid; exit 0 ;;
   *"worktree remove --force"*) exit 0 ;;
-  *"branch -D feature/delete"*) exit 1 ;;
+  *"branch -D -- feature/delete"*) exit 1 ;;
   *"worktree list --porcelain"*)
     if [ -d '{}' ]; then
       printf 'worktree %s\nHEAD branch-oid\nbranch refs/heads/feature/delete\n\n' '{}'

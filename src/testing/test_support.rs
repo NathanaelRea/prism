@@ -5,7 +5,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::config::{Config, EscapeKey, IconStyle, LayoutConfig, MergeMethod, NotificationConfig};
+use crate::config::{
+    Config, EscapeKey, IconStyle, LayoutConfig, MergeMethod, NotificationConfig, WorkflowAiConfig,
+};
 
 #[cfg(windows)]
 #[allow(dead_code)]
@@ -54,6 +56,7 @@ pub(crate) fn test_config() -> Config {
         icon_style_configured: false,
         layout: LayoutConfig::default(),
         notifications: NotificationConfig::default(),
+        workflow_ai: WorkflowAiConfig::default(),
         worktree_columns: Vec::new(),
         tools,
         remote_hosts: BTreeMap::new(),

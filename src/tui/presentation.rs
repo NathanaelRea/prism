@@ -575,7 +575,7 @@ impl Tui {
                 "Shortcuts",
                 &[
                     ("g", "git actions"),
-                    ("W", "workflow management"),
+                    ("w", "workflow actions"),
                     ("c", "configuration"),
                     ("0", "focus main"),
                 ],
@@ -584,7 +584,7 @@ impl Tui {
                 title: "Shortcuts".to_string(),
                 choices: vec![
                     view::KeyChoice::new("g", "git actions"),
-                    view::KeyChoice::new("W", "workflow management"),
+                    view::KeyChoice::new("w", "workflow actions"),
                     view::KeyChoice::new("c", "configuration"),
                     self.remote_pr_list_choice(),
                     view::KeyChoice::new("W", "worktree columns"),
@@ -596,12 +596,16 @@ impl Tui {
                 "Shortcuts",
                 &[
                     ("g", "git actions"),
-                    ("W", "workflow management"),
+                    ("w", "workflow actions"),
                     ("c", "configuration"),
                     ("0", "focus main"),
                     ("enter", "terminal"),
                     ("space", "agent if valid"),
                 ],
+            )),
+            (Some(LeaderHint::Workflow), _) => Some(choice_list(
+                "Workflow Actions",
+                &[("a", "AI one-off"), ("w", "workflow picker")],
             )),
             (Some(LeaderHint::Git), PanelFocus::Status) => Some(view::ChoiceList {
                 title: "Git Actions".to_string(),

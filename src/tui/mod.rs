@@ -201,6 +201,7 @@ const TUI_TICK_TIME_BUDGET: Duration = Duration::from_millis(8);
 pub(crate) enum LeaderHint {
     Root,
     Git,
+    Workflow,
 }
 
 #[derive(Default)]
@@ -722,6 +723,9 @@ impl Tui {
                 Key::LeaderGit => {
                     self.leader_hint = Some(LeaderHint::Git);
                 }
+                Key::LeaderWorkflow => {
+                    self.leader_hint = Some(LeaderHint::Workflow);
+                }
                 Key::OpenTmuxSession => {
                     self.clear_leader_hint();
                     pending_g = false;
@@ -751,6 +755,13 @@ impl Tui {
                     pending_g = false;
                     if let Err(error) = self.launch_workflow(runtime).await {
                         self.show_error("workflow launcher failed", &error)?;
+                    }
+                }
+                Key::WorkflowAi => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if let Err(error) = self.create_ai_workflow(runtime).await {
+                        self.show_error("AI Workflow creation failed", &error)?;
                     }
                 }
                 Key::WorkflowPauseResume => {

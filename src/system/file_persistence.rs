@@ -675,12 +675,12 @@ fn create_staging(target: &Path, parent: &Path) -> Result<(File, PathBuf), Persi
 }
 
 #[cfg(unix)]
-fn commit_staging(staging: &Path, target: &Path) -> io::Result<()> {
+pub(crate) fn commit_staging(staging: &Path, target: &Path) -> io::Result<()> {
     fs::rename(staging, target)
 }
 
 #[cfg(windows)]
-fn commit_staging(staging: &Path, target: &Path) -> io::Result<()> {
+pub(crate) fn commit_staging(staging: &Path, target: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Storage::FileSystem::{
         MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACE_FILE_FLAGS, ReplaceFileW,
