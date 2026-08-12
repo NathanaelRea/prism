@@ -901,12 +901,9 @@ mod tests {
 
     #[test]
     fn authenticated_daemon_response_is_retried_with_runtime_secret() {
-        let root = std::env::temp_dir().join(format!(
-            "prism-worker-auth-fallback-{}-{}",
-            std::process::id(),
-            crate::util::timestamp_nanos()
-        ));
-        fs::create_dir_all(&root).expect("create test runtime");
+        let runtime = crate::compact_runtime::CompactTempDir::new("auth-fallback");
+        let root = runtime.runtime_path();
+        fs::create_dir_all(root).expect("create test runtime");
         let socket = root.join("worker.sock");
         let secret = "ab".repeat(AUTHENTICATION_SECRET_BYTES);
         fs::write(root.join("worker.secret"), &secret).expect("write test worker secret");
@@ -935,6 +932,5 @@ mod tests {
             .expect("retry authenticated request");
         assert_eq!(response, "ok authenticated");
         server.join().expect("join test server");
-        fs::remove_dir_all(root).expect("remove test runtime");
     }
 }
