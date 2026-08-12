@@ -148,6 +148,29 @@
         }
       }
     },
+    "workflow_ai": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Fast headless Agent selection used by Space w a to generate one-off Workflows.",
+      "properties": {
+        "harness": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Harness ID; defaults to default_harness."
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Optional harness-specific fast model override."
+        },
+        "variant": {
+          "type": "string",
+          "minLength": 1,
+          "default": "low",
+          "description": "Harness-specific generation effort/variant."
+        }
+      }
+    },
     "notifications": {
       "type": "object",
       "additionalProperties": false,

@@ -51,6 +51,11 @@ needs_input = true
 completed = false
 failed = true
 
+[workflow_ai]
+# harness = "pi" # defaults to default_harness
+# model = "provider/fast-model" # defaults to the harness model
+variant = "low"
+
 [worktrees]
 columns = []
 
@@ -92,6 +97,23 @@ pub fn repo_config_template(include_worktree_columns: bool) -> String {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LayoutConfig {
     pub sidebar_width: Option<u16>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkflowAiConfig {
+    pub harness: Option<String>,
+    pub model: Option<String>,
+    pub variant: Option<String>,
+}
+
+impl Default for WorkflowAiConfig {
+    fn default() -> Self {
+        Self {
+            harness: None,
+            model: None,
+            variant: Some("low".into()),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -211,6 +233,7 @@ pub struct Config {
     pub icon_style_configured: bool,
     pub layout: LayoutConfig,
     pub notifications: NotificationConfig,
+    pub workflow_ai: WorkflowAiConfig,
     pub worktree_columns: Vec<String>,
     pub tools: BTreeMap<String, String>,
     pub(crate) remote_hosts: BTreeMap<String, RemoteHostConfig>,
@@ -237,6 +260,7 @@ struct RawConfig {
     ui: Option<RawUiConfig>,
     layout: Option<RawLayoutConfig>,
     notifications: Option<RawNotificationConfig>,
+    workflow_ai: Option<RawWorkflowAiConfig>,
     worktrees: Option<RawWorktrees>,
     tools: Option<BTreeMap<String, String>>,
     remote_hosts: Option<BTreeMap<String, RawRemoteHostConfig>>,
@@ -279,6 +303,14 @@ struct RawNotificationConfig {
     needs_input: Option<bool>,
     completed: Option<bool>,
     failed: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawWorkflowAiConfig {
+    harness: Option<String>,
+    model: Option<String>,
+    variant: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -530,6 +562,13 @@ impl Config {
                 config.default_harness, config.default_harness
             ));
         }
+        if let Some(harness) = config.workflow_ai.harness.as_deref()
+            && !config.harnesses.contains_key(harness)
+        {
+            config.config_errors.push(format!(
+                "workflow_ai.harness '{harness}' is not configured in [harnesses.{harness}]"
+            ));
+        }
         config
     }
 
@@ -574,6 +613,7 @@ impl Config {
             icon_style_configured: false,
             layout: LayoutConfig::default(),
             notifications: NotificationConfig::default(),
+            workflow_ai: WorkflowAiConfig::default(),
             worktree_columns: Vec::new(),
             tools,
             remote_hosts: BTreeMap::new(),
@@ -699,6 +739,17 @@ impl Config {
             }
             if let Some(enabled) = notifications.failed {
                 self.notifications.failed = enabled;
+            }
+        }
+        if let Some(workflow_ai) = raw.workflow_ai {
+            if let Some(value) = workflow_ai.harness {
+                self.workflow_ai.harness = Some(value);
+            }
+            if let Some(value) = workflow_ai.model {
+                self.workflow_ai.model = Some(value);
+            }
+            if let Some(value) = workflow_ai.variant {
+                self.workflow_ai.variant = Some(value);
             }
         }
         if let Some(worktrees) = raw.worktrees

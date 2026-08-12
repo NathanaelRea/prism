@@ -73,7 +73,10 @@
   satisfied in the current cycle or every unconditional dependency completed
   earlier in the run.
 - **Behavior**: Independent branches can continue while another branch waits.
-  Agent execution and mutating hooks sharing one worktree are serialized.
+  Simultaneously eligible unconditional Agent Steps run concurrently, including
+  against one shared worktree; joins wait for every dependency. Trigger hooks
+  remain serialized around their worktree mutations. Shared-worktree Agent
+  concurrency is experimental and may produce overlapping edits.
 - **Invariant**: After a successful Agent/post-Step lifecycle, transient Trigger
   observations are invalidated and a new cycle starts at the roots.
 - **Invariant**: A wake also starts a new cycle at the roots, allowing an earlier
@@ -137,6 +140,11 @@
   required/default status, inline string/number editing, boolean toggles, enum
   dropdowns, and `fzf` file selection. The form validates every value before
   launch and retains entered values when reporting an error.
+- **Behavior**: `Space w a` opens a focused AI one-off Workflow creator for the
+  selected Worktree Session. A configurable fast headless Agent generates TOML,
+  Prism compiles it through the ordinary Workflow validator, and a preview offers
+  Run, Edit, Regenerate, or Cancel. Drafts live in per-repository Prism state,
+  are bound to the exact Worktree Session incarnation, and are removed with it.
 - **Invariant**: Repository-owned executable resources are not used before
   repository trust. Active runs retain content-addressed source and executable
   bytes.
