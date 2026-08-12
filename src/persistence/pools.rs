@@ -148,40 +148,84 @@ mod tests {
             .unwrap()
     }
 
+    fn released_migration_history(applied: usize) -> String {
+        let rows = [
+            "insert into _sqlx_migrations (version, description, success, checksum, execution_time) values (1, 'initial', 1, X'AFA7799DCF872B465A2F56538B06E5AF6023B8B55256C1BC3A4136A046047F6B73AAD5EE40554F922C62D19CF40EEC4C', 0);",
+            "insert into _sqlx_migrations (version, description, success, checksum, execution_time) values (2, 'drop legacy workflows', 1, X'E0A2ACB7A8032D00C9869FEAA578021DBCF1CF865568BFFA97FB82FCDB84237EC19B63895D6C589E5585D6839ECFEBC1', 0);",
+        ];
+        format!(
+            "create table _sqlx_migrations (version bigint primary key, description text not null, installed_on timestamp not null default current_timestamp, success boolean not null, checksum blob not null, execution_time bigint not null);{}",
+            rows[..applied].join("")
+        )
+    }
+
+    async fn assert_released_sqlx_upgrade(applied: usize) {
+        let path = database_path(&format!("sqlx-upgrade-v{applied}"));
+        let backup = path.with_extension("db.pre-migration-rebaseline-backup");
+        let mut connection = open_connection(&path).await;
+        sqlx::raw_sql(include_str!("fixtures/released_repository_0001.sql"))
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        if applied == 2 {
+            sqlx::raw_sql(include_str!("fixtures/released_repository_0002.sql"))
+                .execute(&mut connection)
+                .await
+                .unwrap();
+        }
+        sqlx::raw_sql(&released_migration_history(applied))
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        sqlx::query("insert into metadata (key, value) values ('preserved', 'yes')")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        connection.close().await.unwrap();
+
+        initialize_repository_database(&path).await.unwrap();
+
+        let mut connection = open_connection(&path).await;
+        let history: Vec<(i64, String)> = sqlx::query_as(
+            "select version, hex(checksum) from _sqlx_migrations where success order by version",
+        )
+        .fetch_all(&mut connection)
+        .await
+        .unwrap();
+        assert_eq!(
+            history,
+            [
+                (1, "C72EACE717551A3E3EAA63642B38BDFC9EBCD840B940686BECE9C81BC7AC3C2B24518C4F4AA7239654345D4FEA4B7D2F".into()),
+                (2, "5EDB6152EA6D11D90A7CE3A1E2239674C6F6DAE299F631EE30F894137694BD6D532A8B5F8CFBBE57FF8981C35B2C6C3C".into()),
+            ]
+        );
+        let preserved: String =
+            sqlx::query_scalar("select value from metadata where key = 'preserved'")
+                .fetch_one(&mut connection)
+                .await
+                .unwrap();
+        assert_eq!(preserved, "yes");
+        connection.close().await.unwrap();
+        assert!(backup.exists());
+
+        let before = std::fs::metadata(&backup).unwrap().modified().unwrap();
+        initialize_repository_database(&path).await.unwrap();
+        assert_eq!(
+            std::fs::metadata(&backup).unwrap().modified().unwrap(),
+            before
+        );
+
+        let _ = std::fs::remove_file(backup);
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
-    fn upgrades_the_released_sqlx_repository_schema() {
-        let path = database_path("sqlx-upgrade");
+    fn upgrades_released_sqlx_repository_schemas() {
         crate::async_runtime::block_on(async {
-            let mut connection = open_connection(&path).await;
-            sqlx::raw_sql(include_str!(
-                "../../migrations/repository/0001_initial.sql"
-            ))
-            .execute(&mut connection)
-            .await
-            .unwrap();
-            sqlx::raw_sql(
-                "create table _sqlx_migrations (version bigint primary key, description text not null, installed_on timestamp not null default current_timestamp, success boolean not null, checksum blob not null, execution_time bigint not null);\
-                 insert into _sqlx_migrations (version, description, success, checksum, execution_time) values (1, 'initial', 1, X'C72EACE717551A3E3EAA63642B38BDFC9EBCD840B940686BECE9C81BC7AC3C2B24518C4F4AA7239654345D4FEA4B7D2F', 0);",
-            )
-            .execute(&mut connection)
-            .await
-            .unwrap();
-            connection.close().await.unwrap();
-
-            initialize_repository_database(&path).await.unwrap();
-
-            let mut connection = open_connection(&path).await;
-            let versions: Vec<i64> = sqlx::query_scalar(
-                "select version from _sqlx_migrations where success order by version",
-            )
-            .fetch_all(&mut connection)
-            .await
-            .unwrap();
-            assert_eq!(versions, [1, 2]);
-            connection.close().await.unwrap();
+            assert_released_sqlx_upgrade(1).await;
+            assert_released_sqlx_upgrade(2).await;
         })
         .unwrap();
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
