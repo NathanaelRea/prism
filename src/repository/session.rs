@@ -2282,6 +2282,53 @@ exit 0
     }
 
     #[test]
+    fn rebase_detachment_refresh_preserves_branch_session() {
+        let temp = unique_temp_dir("prism-rebase-session-refresh-test");
+        let worktree = temp.join("worktree");
+        fs::create_dir_all(&worktree).unwrap();
+        let head_name = temp.join("head-name");
+        fs::write(&head_name, "refs/heads/feature\n").unwrap();
+        let git = temp.join("git");
+        write_executable(
+            &git,
+            &format!(
+                "#!/bin/sh\ncase \"$*\" in\n  *\"worktree list --porcelain\"*) printf 'worktree {}\\nHEAD abc\\ndetached\\n\\n' ;;\n  *\"rev-parse --git-path rebase-merge/head-name\"*) printf '{}\\n' ;;\n  *\"symbolic-ref --quiet HEAD\"*) exit 1 ;;\n  *\"status --short --branch\"*) printf '## HEAD (no branch)\\n' ;;\nesac\n",
+                worktree.display(),
+                head_name.display()
+            ),
+        );
+        let mut config = test_config();
+        config
+            .tools
+            .insert("git".to_string(), git.display().to_string());
+        let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
+        let repository = WorktreeRepositoryKey::new(repo.root.clone());
+        let mut previous = test_session("feature", &worktree.display().to_string());
+        previous.agent_state = AgentState::Running;
+        let mut sessions = vec![previous];
+        let repositories = [WorktreeSessionRepository {
+            repo_index: 0,
+            repo: &repo,
+            config: &config,
+            label: "repo",
+            key: None,
+            identity: &repository,
+        }];
+
+        refresh_worktree_sessions(
+            &repositories,
+            &BTreeMap::from([(0, repository.clone())]),
+            &mut sessions,
+        )
+        .unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].branch, "feature");
+        assert_eq!(sessions[0].agent_state, AgentState::Running);
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn detached_session_discovery_refresh_preserves_matching_session() {
         let temp = unique_temp_dir("prism-detached-session-refresh-test");
         let worktree = temp.join("worktree");
