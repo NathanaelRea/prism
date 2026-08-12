@@ -162,7 +162,7 @@ impl Error for ProcessExecutionError {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub async fn execute(
     command: Command,
     policy: ProcessPolicy,
@@ -381,7 +381,7 @@ async fn execute_configured(
     Ok(output)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub async fn run_output(command: Command, policy: ProcessPolicy) -> Result<ProcessOutput, String> {
     let descriptor = infer_descriptor(&command);
     run_output_named(command, policy, descriptor).await

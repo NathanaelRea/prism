@@ -751,14 +751,22 @@ mod tests {
         .await
         .unwrap();
         let recorded = super::super::record_process(process.pid()).unwrap();
+        let mut completion = process.control.completion.clone();
         drop(process);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        while super::super::observe_process(recorded).unwrap()
-            == super::super::ProcessObservation::RunningSameProcess
-        {
-            assert!(tokio::time::Instant::now() < deadline);
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while completion.borrow().is_none() {
+                completion
+                    .changed()
+                    .await
+                    .expect("owned process completion sender remains live");
+            }
+        })
+        .await
+        .expect("dropped process is canceled and reaped");
+        assert_ne!(
+            super::super::observe_process(recorded).unwrap(),
+            super::super::ProcessObservation::RunningSameProcess
+        );
         let marker = executable.display().to_string();
         let terminals = crate::observability::take_captured_events()
             .into_iter()

@@ -33,7 +33,7 @@ pub enum ProcessPolicy {
     WorkflowStep,
     TmuxPoll,
     TmuxCapture,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     Test,
 }
 
@@ -67,7 +67,7 @@ impl ProcessPolicy {
             }
             Self::TmuxPoll => PolicySettings::new(Duration::from_secs(15), 1024 * 1024),
             Self::TmuxCapture => PolicySettings::new(Duration::from_secs(4), 4 * 1024 * 1024),
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             Self::Test => PolicySettings {
                 deadline: Duration::from_millis(250),
                 termination_grace: Duration::from_millis(100),
@@ -84,7 +84,7 @@ impl ProcessPolicy {
             Self::WorkflowStep => "workflow_step",
             Self::TmuxPoll => "tmux_poll",
             Self::TmuxCapture => "tmux_capture",
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             Self::Test => "test",
         }
     }

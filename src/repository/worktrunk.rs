@@ -1946,12 +1946,6 @@ mod tests {
         failure.kind
     }
 
-    #[cfg(windows)]
-    fn success_status() -> std::process::ExitStatus {
-        use std::os::windows::process::ExitStatusExt;
-        std::process::ExitStatus::from_raw(0)
-    }
-
     #[cfg(unix)]
     fn write_executable(path: &Path, contents: &str) {
         fs::write(path, contents).unwrap();

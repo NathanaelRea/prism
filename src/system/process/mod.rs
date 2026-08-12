@@ -12,7 +12,7 @@ use std::env;
 use std::future::Future;
 use std::path::Path;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub use execution::run_output;
 pub use execution::{
     ProcessCompletion, ProcessInput, ProcessOutput, execute_prefix_bounded, is_cancellation_error,
