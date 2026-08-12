@@ -191,7 +191,7 @@ impl Tui {
             0,
             Some(TUI_ACTION_JOB_TIMEOUT),
             "prism-tui-maintenance".to_string(),
-            move |_| {
+            move |_| async move {
                 for repo in &repos {
                     if let Err(error) = maintain_workflow_storage(repo) {
                         let _ = crate::observability::append_runtime_message(
@@ -205,7 +205,7 @@ impl Tui {
         );
     }
 
-    pub(crate) fn spawn_tui_job<F>(
+    pub(crate) fn spawn_tui_job<F, Fut>(
         &mut self,
         kind: TuiJobKind,
         key: TuiJobKey,
@@ -215,11 +215,8 @@ impl Tui {
         job: F,
     ) -> JobId
     where
-        F: FnOnce(
-                JobContext<TuiJobKind, TuiJobKey, TuiJobPayload>,
-            ) -> Result<Option<TuiJobPayload>, String>
-            + Send
-            + 'static,
+        F: FnOnce(JobContext<TuiJobKind, TuiJobKey, TuiJobPayload>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<Option<TuiJobPayload>, String>> + Send + 'static,
     {
         if matches!(kind, TuiJobKind::DeleteSession | TuiJobKind::RemoteAction) {
             let label = kind.label();
@@ -979,7 +976,7 @@ impl Tui {
         }
     }
 
-    pub(super) fn cleanup_tui_jobs(&mut self, reason: ShutdownReason) -> Result<(), String> {
+    pub(super) async fn cleanup_tui_jobs(&mut self, reason: ShutdownReason) -> Result<(), String> {
         let mut errors = Vec::new();
         let started = Instant::now();
         let active_jobs = self.jobs.active_metadata().len();
@@ -988,7 +985,7 @@ impl Tui {
         self.jobs.stop_accepting();
         let protected = self.remote_actions_requiring_reconciliation.clone();
         self.jobs.cancel_all_except(&protected);
-        if let Err(error) = self.shutdown_owned_opencode_servers() {
+        if let Err(error) = self.shutdown_owned_opencode_servers().await {
             errors.push(error);
         }
 

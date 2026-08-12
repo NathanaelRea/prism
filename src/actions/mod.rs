@@ -1,6 +1,6 @@
+use crate::process::Command;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 use crate::agent::AgentState;

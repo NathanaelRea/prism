@@ -45,17 +45,20 @@ pub(crate) enum BranchMoveRefusal {
     DirtyCheckout,
 }
 
-pub(crate) fn maybe_prompt_startup_setup(repo: &Repository, config: &Config) -> Result<(), String> {
+pub(crate) async fn maybe_prompt_startup_setup(
+    repo: &Repository,
+    config: &Config,
+) -> Result<(), String> {
     if !stdin_is_tty() {
         return Ok(());
     }
 
-    let setup = inspect_startup_setup(repo, config)?;
+    let setup = inspect_startup_setup(repo, config).await?;
     if !setup.needs_prompt {
         return Ok(());
     }
 
-    prompt_setup_loop(repo, config, setup)
+    prompt_setup_loop(repo, config, setup).await
 }
 
 pub(crate) fn maybe_prompt_icon_style(config: &Config) -> Result<Option<IconStyle>, String> {
@@ -171,13 +174,13 @@ fn prompt_harness_setup(
     Ok(selected.clone())
 }
 
-pub(crate) fn inspect_startup_setup(
+pub(crate) async fn inspect_startup_setup(
     repo: &Repository,
     config: &Config,
 ) -> Result<StartupSetup, String> {
-    Ok(classify_startup(&inspect_repository_checkout(
-        repo, config,
-    )?))
+    Ok(classify_startup(
+        &inspect_repository_checkout(repo, config).await?,
+    ))
 }
 
 pub(crate) fn classify_startup(checkout: &RepositoryCheckout) -> StartupSetup {
@@ -219,7 +222,7 @@ fn classify_branch_move(
     BranchMoveDecision::Ready
 }
 
-fn prompt_setup_loop(
+async fn prompt_setup_loop(
     repo: &Repository,
     config: &Config,
     setup: StartupSetup,
@@ -259,23 +262,23 @@ fn prompt_setup_loop(
             "" | "o" => return Ok(()),
             "w" if setup.can_move_branch => {
                 // Re-check immediately before moving; the prompt decision may be stale.
-                if worktree_dirty(repo, config)? {
+                if worktree_dirty(repo, config).await? {
                     println!("Cannot move branch while this checkout is dirty.");
                     println!("Commit or stash changes, then reopen Prism.");
                     continue;
                 }
-                move_current_branch_to_worktree_from_setup(repo, config, &setup)?;
+                move_current_branch_to_worktree_from_setup(repo, config, &setup).await?;
                 return Ok(());
             }
             "w" if setup.branch_move
                 == BranchMoveDecision::Refused(BranchMoveRefusal::DirtyCheckout) =>
             {
-                if worktree_dirty(repo, config)? {
+                if worktree_dirty(repo, config).await? {
                     println!("Cannot move branch while this checkout is dirty.");
                     println!("Commit or stash changes, then reopen Prism.");
                     continue;
                 }
-                move_current_branch_to_worktree_from_setup(repo, config, &setup)?;
+                move_current_branch_to_worktree_from_setup(repo, config, &setup).await?;
                 return Ok(());
             }
             _ => {
@@ -285,7 +288,7 @@ fn prompt_setup_loop(
     }
 }
 
-fn move_current_branch_to_worktree_from_setup(
+async fn move_current_branch_to_worktree_from_setup(
     repo: &Repository,
     config: &Config,
     setup: &StartupSetup,
@@ -309,7 +312,7 @@ fn move_current_branch_to_worktree_from_setup(
         return Ok(());
     }
 
-    move_current_branch_to_worktree(repo, config, branch, base)
+    move_current_branch_to_worktree(repo, config, branch, base).await
 }
 
 fn read_line() -> Result<String, String> {

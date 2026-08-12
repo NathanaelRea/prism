@@ -7,14 +7,14 @@ const TMUX_ATTACH_RESIZE_SETTLE: Duration = Duration::from_millis(100);
 
 impl Tui {
     #[cfg(all(test, unix))]
-    pub(crate) fn attach_selected_tmux_session(&mut self) -> Result<(), String> {
+    pub(crate) async fn attach_selected_tmux_session(&mut self) -> Result<(), String> {
         let Some(index) = self.selected_worktree_index() else {
             return Ok(());
         };
-        self.attach_tmux_session_for_index(index)
+        self.attach_tmux_session_for_index(index).await
     }
 
-    pub(crate) fn prepare_tmux_session_for_attach(
+    pub(crate) async fn prepare_tmux_session_for_attach(
         &mut self,
         session_index: usize,
         terminal_size: (u16, u16),
@@ -39,7 +39,7 @@ impl Tui {
         )
         .name()
         .to_string();
-        self.finish_tmux_warmup_for_key(&use_.warmup_key);
+        self.finish_tmux_warmup_for_key(&use_.warmup_key).await;
         let (width, height) = terminal_size;
         let result = crate::tmux::resize_agent_pane(
             &repo,
@@ -48,9 +48,10 @@ impl Tui {
             use_.generation,
             width.max(1),
             height.max(1),
-        );
+        )
+        .await;
         if result.is_ok() {
-            std::thread::sleep(TMUX_ATTACH_RESIZE_SETTLE);
+            tokio::time::sleep(TMUX_ATTACH_RESIZE_SETTLE).await;
         }
         crate::flight_recorder::record(
             "attach",
@@ -66,7 +67,7 @@ impl Tui {
         result
     }
 
-    pub(crate) fn attach_tmux_session_for_index(
+    pub(crate) async fn attach_tmux_session_for_index(
         &mut self,
         session_index: usize,
     ) -> Result<(), String> {
@@ -89,10 +90,10 @@ impl Tui {
         )
         .name()
         .to_string();
-        self.finish_tmux_warmup_for_key(&use_.warmup_key);
+        self.finish_tmux_warmup_for_key(&use_.warmup_key).await;
         let attach_started = Instant::now();
         let attach_result =
-            crate::agent_session::attach_session(&repo, &config, &session, use_.generation);
+            crate::agent_session::attach_session(&repo, &config, &session, use_.generation).await;
         crate::flight_recorder::record(
             "attach",
             "interactive",
@@ -106,7 +107,8 @@ impl Tui {
         );
         let running = attach_result?;
         let detach_started = Instant::now();
-        self.resize_tmux_portal_after_detach(&repo, &config, &session, &use_);
+        self.resize_tmux_portal_after_detach(&repo, &config, &session, &use_)
+            .await;
         crate::flight_recorder::record(
             "attach",
             "detach_resize",
@@ -130,7 +132,8 @@ impl Tui {
                 branch: &session.branch,
                 running,
             },
-        );
+        )
+        .await;
         self.accept_external_agent_state_change(session_index, previous_agent_state, true);
         if let Some(warmup) = outcome.delayed_warmup {
             self.start_tmux_agent_warmup_for_key(warmup.key, warmup.delay);
@@ -148,14 +151,18 @@ impl Tui {
         Ok(())
     }
 
-    pub(crate) fn attach_selected_tmux_window(&mut self, window: TmuxWindow) -> Result<(), String> {
+    pub(crate) async fn attach_selected_tmux_window(
+        &mut self,
+        window: TmuxWindow,
+    ) -> Result<(), String> {
         let Some(context) = self.selected_worktree_context() else {
             return Ok(());
         };
         self.attach_tmux_window_for_session_index(context.session_index, window, false)
+            .await
     }
 
-    pub(super) fn attach_tmux_window_for_session_index(
+    pub(super) async fn attach_tmux_window_for_session_index(
         &mut self,
         session_index: usize,
         window: TmuxWindow,
@@ -178,7 +185,8 @@ impl Tui {
                 &self.repos,
                 &mut self.tmux_generations,
                 use_.slot.clone(),
-            );
+            )
+            .await;
             use_.warmup_key = crate::agent_session::AgentSessionWarmupKey::new(
                 use_.slot.clone(),
                 use_.generation,
@@ -191,10 +199,11 @@ impl Tui {
         )
         .name()
         .to_string();
-        self.finish_tmux_warmup_for_key(&use_.warmup_key);
+        self.finish_tmux_warmup_for_key(&use_.warmup_key).await;
         let attach_started = Instant::now();
         let attach_result =
-            crate::agent_session::attach_window(&repo, &config, &session, use_.generation, window);
+            crate::agent_session::attach_window(&repo, &config, &session, use_.generation, window)
+                .await;
         crate::flight_recorder::record(
             "attach",
             "interactive",
@@ -208,7 +217,8 @@ impl Tui {
         );
         let running = attach_result?;
         let detach_started = Instant::now();
-        self.resize_tmux_portal_after_detach(&repo, &config, &session, &use_);
+        self.resize_tmux_portal_after_detach(&repo, &config, &session, &use_)
+            .await;
         crate::flight_recorder::record(
             "attach",
             "detach_resize",
@@ -243,7 +253,7 @@ impl Tui {
         Ok(())
     }
 
-    fn resize_tmux_portal_after_detach(
+    async fn resize_tmux_portal_after_detach(
         &mut self,
         repo: &Repository,
         config: &Config,
@@ -264,6 +274,7 @@ impl Tui {
             width,
             height,
         )
+        .await
         .is_ok()
         {
             self.tmux_portal_resized = Some((use_.warmup_key.clone(), (width, height)));
@@ -319,8 +330,8 @@ impl Tui {
             key.generation,
             Some(TUI_ACTION_JOB_TIMEOUT),
             format!("prism-tmux-warmup-{}", job.key.slot.worktree.branch),
-            move |context| {
-                if !job.delay.is_zero() && context.wait(job.delay) {
+            move |context| async move {
+                if !job.delay.is_zero() && context.wait(job.delay).await {
                     return Ok(None);
                 }
                 let result = crate::agent_session::ensure_session(
@@ -328,7 +339,8 @@ impl Tui {
                     &job.config,
                     &job.session,
                     job.key.generation,
-                );
+                )
+                .await;
                 let (running, error) = match result {
                     Ok(running) => (Some(running), None),
                     Err(error) => (None, Some(error)),
@@ -353,7 +365,7 @@ impl Tui {
         changed
     }
 
-    pub(crate) fn finish_tmux_warmup_for_key(&mut self, key: &AgentSessionWarmupKey) -> bool {
+    pub(crate) async fn finish_tmux_warmup_for_key(&mut self, key: &AgentSessionWarmupKey) -> bool {
         let mut changed = self.poll_tmux_agent_warmup();
         while self.tmux_warmups_in_flight.contains(key) {
             self.route_tui_job_messages();
@@ -361,7 +373,7 @@ impl Tui {
                 changed |= self.apply_tmux_warmup_result(result);
             }
             if self.tmux_warmups_in_flight.contains(key) {
-                std::thread::sleep(Duration::from_millis(5));
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
         }
         changed
@@ -399,7 +411,7 @@ impl Tui {
         changed
     }
 
-    pub(super) fn paste_prompt_into_tmux_agent(
+    pub(super) async fn paste_prompt_into_tmux_agent(
         &mut self,
         index: usize,
         prompt: &str,
@@ -424,7 +436,8 @@ impl Tui {
                 &self.repos,
                 &mut self.tmux_generations,
                 use_.slot.clone(),
-            );
+            )
+            .await;
             use_.warmup_key = crate::agent_session::AgentSessionWarmupKey::new(
                 use_.slot.clone(),
                 use_.generation,
@@ -438,9 +451,10 @@ impl Tui {
             return Ok(());
         }
 
-        self.finish_tmux_warmup_for_key(&use_.warmup_key);
+        self.finish_tmux_warmup_for_key(&use_.warmup_key).await;
         let running =
-            crate::agent_session::submit_prompt(&repo, &config, &session, use_.generation, prompt)?;
+            crate::agent_session::submit_prompt(&repo, &config, &session, use_.generation, prompt)
+                .await?;
         let previous_agent_state = self.sessions[index].agent_state;
         if crate::agent_session::apply_running_result(
             &self.repos,

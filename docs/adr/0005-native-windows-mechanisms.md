@@ -20,11 +20,9 @@ Windows backends will remain in their capability-owning modules. Prism will not 
 
 ### Process supervision and identity
 
-Use `process-wrap` 9.1.0's Tokio `JobObject` backend. Spawn the root suspended, assign it to the Job Object before it runs, and combine it with `CREATE_NEW_PROCESS_GROUP` and kill-on-drop. Graceful cancellation may deliver `CTRL_BREAK_EVENT` to a compatible console process group for a bounded interval. Escalation terminates the Job Object and waits for its completion; it is the deterministic no-orphan guarantee.
+Use ProcessKit 3.3.1 as Prism's general process supervisor on every supported operating system. ProcessKit owns spawn-time containment, asynchronous stdin and output draining, cancellation and timeout escalation, leader reaping, and kill-on-drop. On Windows its `process-control` backend assigns children to a Job Object before they can escape containment. Prism does not maintain a parallel raw-child or Job Object supervisor. The prompt worker is the deliberate exception to kill-on-drop: `Command::spawn_detached` starts it with null stdio and, on Unix, an independent session, returns its PID immediately for telemetry, and lets ProcessKit reap it on Unix.
 
-Use direct `windows` APIs for observations: `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE)`, `GetProcessTimes`, and a nonblocking handle wait. Persist the process creation time with the PID and reject a live PID whose creation time differs. The spike also places a child-owned Job Object inside Prism's outer job and proves outer cancellation removes the nested descendants.
-
-`command-group` is not selected because `process-wrap` exposes the stronger lifecycle needed here: assignment-before-resume, whole-job wait, explicit forced termination, and kill-on-drop. Console control delivery remains conditional; it never replaces forced Job Object cleanup.
+Two native exceptions remain narrow and do not replace the general supervisor. First, attached-terminal execution on Unix retains the code required to create a foreground process group, transfer controlling-terminal ownership with `tcsetpgrp`, restore ownership, and reap the attached leader; Windows attached execution remains ProcessKit-managed with Prism's console Ctrl-C ownership guard. Second, restart recovery retains direct process identity observation and, where the operating system exposes it through documented interfaces, argv observation. On Windows this uses `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE)`, `GetProcessTimes`, image-path validation, and a nonblocking handle wait; the full argv is unavailable through that contract. Unix uses its native process metadata, including argv. Prism persists the observed start identity with the PID and rejects reuse or unverifiable identity. Windows recovery cleanup therefore fails closed when full command intent would be required; it does not scrape undocumented PEB structures or claim full argv verification. Persisted cleanup never adopts an external PID into a new ProcessKit group because adoption could alter containment before identity intent is established.
 
 ### Worker IPC and ownership
 
@@ -92,7 +90,8 @@ cargo clippy --locked --manifest-path spikes/windows/Cargo.toml --target x86_64-
 - Later phases have concrete Windows mechanisms and executable contracts rather than placeholder `cfg(windows)` branches.
 - Linux and macOS production behavior and dependencies are unchanged in phase 0.
 - Windows support is gated by native root-package tests, the pinned psmux/OpenCode/Worktrunk smoke, archive installation verification, and the focused manual interactive checklist in `docs/windows-interactive-smoke.md`.
-- Job Objects provide deterministic forced cleanup; graceful console events are best effort and bounded.
+- ProcessKit is the single general process supervisor; its Windows Job Objects provide deterministic forced cleanup, while graceful console events are best effort and bounded.
+- Native process code is limited to Unix attached-terminal ownership and reuse-safe persisted-identity recovery.
 - Worker IPC and recorder telemetry intentionally use different transports because their delivery contracts differ.
 - psmux's terminal-owned sizing is a known contract difference that subsequent adapter and TUI work must preserve explicitly.
 - File replacement and lock ownership must use separate permanent paths.

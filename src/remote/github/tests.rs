@@ -21,8 +21,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[test]
-fn direct_and_index_summary_paths_produce_equivalent_cache_facts() {
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_and_index_summary_paths_produce_equivalent_cache_facts() {
     let temp = unique_temp_dir("prism-pr-equivalent-summary-paths");
     fs::create_dir_all(&temp).unwrap();
     let direct_repo =
@@ -69,7 +69,8 @@ fn direct_and_index_summary_paths_produce_equivalent_cache_facts() {
         0,
         vec![new_summary.clone()],
         poll_started_at,
-    );
+    )
+    .await;
 
     assert_eq!(direct.summary(), Some(&new_summary));
     assert_eq!(sessions[0].pr.summary(), direct.summary());
@@ -83,8 +84,8 @@ fn direct_and_index_summary_paths_produce_equivalent_cache_facts() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn canonical_change_request_or_head_changes_invalidate_cached_details() {
+#[tokio::test(flavor = "multi_thread")]
+async fn canonical_change_request_or_head_changes_invalidate_cached_details() {
     let base_summary = PrSummary {
         change_request_identity: Some(test_identity(
             crate::remote::ProviderKind::GitHub,
@@ -151,8 +152,8 @@ fn canonical_change_request_or_head_changes_invalidate_cached_details() {
     assert!(cache.details().is_none());
 }
 
-#[test]
-fn create_pr_uses_fill_with_explicit_empty_body_and_default_base_when_configured() {
+#[tokio::test(flavor = "multi_thread")]
+async fn create_pr_uses_fill_with_explicit_empty_body_and_default_base_when_configured() {
     assert_eq!(
         create_pr_args(Some("main"), "", None, None),
         vec!["pr", "create", "--fill", "--body", "", "--base", "main"]
@@ -184,8 +185,8 @@ fn create_pr_uses_fill_with_explicit_empty_body_and_default_base_when_configured
     );
 }
 
-#[test]
-fn merge_pr_args_use_configured_method() {
+#[tokio::test(flavor = "multi_thread")]
+async fn merge_pr_args_use_configured_method() {
     assert_eq!(
         merge_pr_args("42", MergeMethod::Squash, "abc123", None),
         vec![
@@ -222,8 +223,8 @@ fn merge_pr_args_use_configured_method() {
 }
 
 #[cfg(unix)]
-#[test]
-fn merge_pull_request_does_not_delegate_branch_deletion_to_gh() {
+#[tokio::test(flavor = "multi_thread")]
+async fn merge_pull_request_does_not_delegate_branch_deletion_to_gh() {
     let temp = unique_temp_dir("prism-merge-no-delete-branch-test");
     let worktree = temp.join("worktree");
     fs::create_dir_all(&worktree).unwrap();
@@ -245,7 +246,9 @@ exit 0
         .tools
         .insert("gh".to_string(), gh.display().to_string());
 
-    merge_pull_request(&config, &worktree, 42, "abc123", None).unwrap();
+    merge_pull_request(&config, &worktree, 42, "abc123", None)
+        .await
+        .unwrap();
 
     let commands = fs::read_to_string(&log).unwrap();
     let actual_pwd = commands
@@ -262,8 +265,8 @@ exit 0
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn pr_json_parser_reads_summary_details_and_missing_fields() {
+#[tokio::test(flavor = "multi_thread")]
+async fn pr_json_parser_reads_summary_details_and_missing_fields() {
     let raw = r#"{
             "number": 42,
             "title": "Fix review",
@@ -305,8 +308,8 @@ fn pr_json_parser_reads_summary_details_and_missing_fields() {
     assert_eq!(details.reviews[0].submitted_at, "2026-01-01T00:01:00Z");
 }
 
-#[test]
-fn paginated_rest_reviews_accept_numeric_github_ids() {
+#[tokio::test(flavor = "multi_thread")]
+async fn paginated_rest_reviews_accept_numeric_github_ids() {
     let pages = serde_json::from_str::<Vec<Vec<GhPrReview>>>(
         r#"[[{"id":4833758968,"user":{"login":"maintainer"},"state":"APPROVED"}]]"#,
     )
@@ -318,8 +321,8 @@ fn paginated_rest_reviews_accept_numeric_github_ids() {
     assert_eq!(reviews[0].state, "APPROVED");
 }
 
-#[test]
-fn paginated_rest_comments_accept_numeric_github_ids() {
+#[tokio::test(flavor = "multi_thread")]
+async fn paginated_rest_comments_accept_numeric_github_ids() {
     let pages = serde_json::from_str::<Vec<Vec<GhPrComment>>>(
         r#"[[{"id":2195515127,"user":{"login":"reviewer"},"body":"Looks good"}]]"#,
     )
@@ -331,8 +334,8 @@ fn paginated_rest_comments_accept_numeric_github_ids() {
     assert_eq!(comments[0].body, "Looks good");
 }
 
-#[test]
-fn empty_check_rollup_is_authoritative_no_ci_but_missing_rollup_is_unknown() {
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_check_rollup_is_authoritative_no_ci_but_missing_rollup_is_unknown() {
     for rollup in ["[]", "null", r#"{"contexts":{"nodes":[]}}"#] {
         let raw = format!(
             r#"{{
@@ -353,8 +356,8 @@ fn empty_check_rollup_is_authoritative_no_ci_but_missing_rollup_is_unknown() {
     assert_eq!(summary.check_state(), PrCheckState::Unknown);
 }
 
-#[test]
-fn malformed_or_truncated_check_rollup_is_unknown_evidence() {
+#[tokio::test(flavor = "multi_thread")]
+async fn malformed_or_truncated_check_rollup_is_unknown_evidence() {
     for raw in [
         r#"{"number":42,"state":"OPEN","statusCheckRollup":{}}"#,
         r#"{"number":42,"state":"OPEN","statusCheckRollup":{"contexts":{}}}"#,
@@ -370,8 +373,8 @@ fn malformed_or_truncated_check_rollup_is_unknown_evidence() {
     assert!(serde_json::from_value::<GithubPullRequest>(capped).is_err());
 }
 
-#[test]
-fn check_state_normalizes_display_labels_for_workflow_decisions() {
+#[tokio::test(flavor = "multi_thread")]
+async fn check_state_normalizes_display_labels_for_workflow_decisions() {
     assert_eq!(PrCheckState::from_label("running"), PrCheckState::Pending);
     assert_eq!(PrCheckState::from_label("pending"), PrCheckState::Pending);
     assert_eq!(PrCheckState::from_label("passed"), PrCheckState::Success);
@@ -381,8 +384,8 @@ fn check_state_normalizes_display_labels_for_workflow_decisions() {
     assert_eq!(PrCheckState::from_label(""), PrCheckState::Unknown);
 }
 
-#[test]
-fn rest_check_failures_are_detected_case_insensitively() {
+#[tokio::test(flavor = "multi_thread")]
+async fn rest_check_failures_are_detected_case_insensitively() {
     let contexts = vec![
         GithubStatusContext {
             name: Some("check-run".to_string()),
@@ -402,8 +405,8 @@ fn rest_check_failures_are_detected_case_insensitively() {
     );
 }
 
-#[test]
-fn resolve_review_thread_args_target_exact_thread_id() {
+#[tokio::test(flavor = "multi_thread")]
+async fn resolve_review_thread_args_target_exact_thread_id() {
     let host = crate::remote::HostIdentity::new("github.example.com", None).unwrap();
     let config = crate::test_support::test_config();
     let args = resolve_review_thread_args(&config, &host, "PRRT_thread_1");
@@ -421,8 +424,8 @@ fn resolve_review_thread_args_target_exact_thread_id() {
     );
 }
 
-#[test]
-fn configured_api_override_uses_full_rest_and_graphql_endpoints_with_canonical_host() {
+#[tokio::test(flavor = "multi_thread")]
+async fn configured_api_override_uses_full_rest_and_graphql_endpoints_with_canonical_host() {
     let host = crate::remote::HostIdentity::new("github.example.com", None).unwrap();
     let mut config = crate::test_support::test_config();
     config.remote_hosts.insert(
@@ -452,8 +455,8 @@ fn configured_api_override_uses_full_rest_and_graphql_endpoints_with_canonical_h
 }
 
 #[cfg(unix)]
-#[test]
-fn ghes_summary_graphql_uses_the_canonical_hostname() {
+#[tokio::test(flavor = "multi_thread")]
+async fn ghes_summary_graphql_uses_the_canonical_hostname() {
     let temp = unique_temp_dir("prism-ghes-summary-host");
     fs::create_dir_all(&temp).unwrap();
     let gh = temp.join("gh");
@@ -478,6 +481,7 @@ fn ghes_summary_graphql_uses_the_canonical_hostname() {
 
     assert!(
         fetch_pr_summary_index_for_repository(&temp, &config, &repository)
+            .await
             .unwrap()
             .is_empty()
     );
@@ -491,8 +495,8 @@ fn ghes_summary_graphql_uses_the_canonical_hostname() {
 }
 
 #[cfg(unix)]
-#[test]
-fn exact_summary_observation_queries_only_the_requested_number() {
+#[tokio::test(flavor = "multi_thread")]
+async fn exact_summary_observation_queries_only_the_requested_number() {
     let temp = unique_temp_dir("prism-github-exact-summary");
     fs::create_dir_all(&temp).unwrap();
     let gh = temp.join("gh");
@@ -519,6 +523,7 @@ printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_42","number":4
     .unwrap();
 
     let summary = fetch_pr_summary_for_repository_number(&temp, &config, &repository, 42)
+        .await
         .unwrap()
         .unwrap();
 
@@ -532,8 +537,8 @@ printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_42","number":4
 }
 
 #[cfg(unix)]
-#[test]
-fn ghes_review_thread_mutation_uses_the_canonical_hostname() {
+#[tokio::test(flavor = "multi_thread")]
+async fn ghes_review_thread_mutation_uses_the_canonical_hostname() {
     let temp = unique_temp_dir("prism-ghes-thread-host");
     fs::create_dir_all(&temp).unwrap();
     let gh = temp.join("gh");
@@ -551,7 +556,9 @@ fn ghes_review_thread_mutation_uses_the_canonical_hostname() {
         .insert("gh".to_string(), gh.display().to_string());
     let host = crate::remote::HostIdentity::new("github.example.com", None).unwrap();
 
-    resolve_review_thread(&temp, &config, &host, "PRRT_1").unwrap();
+    resolve_review_thread(&temp, &config, &host, "PRRT_1")
+        .await
+        .unwrap();
 
     assert!(
         fs::read_to_string(log)
@@ -562,8 +569,8 @@ fn ghes_review_thread_mutation_uses_the_canonical_hostname() {
 }
 
 #[cfg(unix)]
-#[test]
-fn phase_1_failed_forced_summary_keeps_stale_display_but_authoritative_access_errors() {
+#[tokio::test(flavor = "multi_thread")]
+async fn phase_1_failed_forced_summary_keeps_stale_display_but_authoritative_access_errors() {
     let temp = unique_temp_dir("prism-phase-1-failed-summary-refresh");
     fs::create_dir_all(&temp).unwrap();
     let gh = temp.join("gh");
@@ -589,7 +596,11 @@ fn phase_1_failed_forced_summary_keeps_stale_display_but_authoritative_access_er
     let mut cache = PrCache::observed(stale_summary.clone(), Some(stale_details));
     cache.record_summary_observation(Some(stale_summary.clone()), "before failure".to_string());
 
-    assert!(refresh_pr_cache(&repo, "feature", &mut cache, &temp, &config, true).is_err());
+    assert!(
+        refresh_pr_cache(&repo, "feature", &mut cache, &temp, &config, true)
+            .await
+            .is_err()
+    );
 
     assert_eq!(cache.summary(), Some(&stale_summary));
     assert_eq!(cache.details().unwrap().files, vec!["src/stale.rs"]);
@@ -601,8 +612,8 @@ fn phase_1_failed_forced_summary_keeps_stale_display_but_authoritative_access_er
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn phase_1_details_for_head_a_are_rejected_after_same_pr_advances_to_head_b() {
+#[tokio::test(flavor = "multi_thread")]
+async fn phase_1_details_for_head_a_are_rejected_after_same_pr_advances_to_head_b() {
     let temp = unique_temp_dir("prism-phase-1-stale-head-details");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -632,8 +643,8 @@ fn phase_1_details_for_head_a_are_rejected_after_same_pr_advances_to_head_b() {
 }
 
 #[cfg(unix)]
-#[test]
-fn phase_1_malformed_github_summary_output_is_failure_not_authoritative_absence() {
+#[tokio::test(flavor = "multi_thread")]
+async fn phase_1_malformed_github_summary_output_is_failure_not_authoritative_absence() {
     let temp = unique_temp_dir("prism-phase-1-malformed-summary");
     fs::create_dir_all(&temp).unwrap();
     let gh = temp.join("gh");
@@ -646,15 +657,47 @@ fn phase_1_malformed_github_summary_output_is_failure_not_authoritative_absence(
     let result = fetch_pr_summary(&temp, "feature", &config);
 
     assert!(
-        result.is_err(),
+        result.await.is_err(),
         "malformed output must not mean no pull request"
     );
 
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn pr_cache_round_trips_details() {
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn fetch_pr_summary_rejects_stdout_truncation_before_json_parsing() {
+    let temp = unique_temp_dir("prism-truncated-gh-summary");
+    fs::create_dir_all(&temp).unwrap();
+    let gh = temp.join("gh");
+    write_executable(
+        &gh,
+        "#!/bin/sh\nprintf '{\"title\":\"'\nhead -c 5000000 /dev/zero | tr '\\0' x\nprintf '\"}'\n",
+    );
+    let git = temp.join("git");
+    write_executable(
+        &git,
+        "#!/bin/sh\ncase \"$*\" in *\"remote get-url origin\"*) echo https://github.com/example/repo.git ;; esac\n",
+    );
+    let mut config = test_config();
+    config
+        .tools
+        .insert("gh".to_string(), gh.display().to_string());
+    config
+        .tools
+        .insert("git".to_string(), git.display().to_string());
+
+    let error = fetch_pr_summary(&temp, "feature", &config)
+        .await
+        .unwrap_err();
+
+    assert!(error.contains("truncated"), "{error}");
+    assert!(!error.contains("parse gh pr view output"), "{error}");
+    let _ = fs::remove_dir_all(temp);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pr_cache_round_trips_details() {
     let temp = unique_temp_dir("prism-pr-details-cache-test");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -767,8 +810,8 @@ fn pr_cache_round_trips_details() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn restart_accepts_only_details_associated_with_persisted_pr_and_head() {
+#[tokio::test(flavor = "multi_thread")]
+async fn restart_accepts_only_details_associated_with_persisted_pr_and_head() {
     let temp = unique_temp_dir("prism-pr-details-association-test");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -818,8 +861,8 @@ fn restart_accepts_only_details_associated_with_persisted_pr_and_head() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn successful_details_write_does_not_clear_previous_persistence_failure() {
+#[tokio::test(flavor = "multi_thread")]
+async fn successful_details_write_does_not_clear_previous_persistence_failure() {
     let temp = unique_temp_dir("prism-pr-persistence-error-test");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -842,8 +885,8 @@ fn successful_details_write_does_not_clear_previous_persistence_failure() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn obsolete_details_generation_is_rejected_for_same_pr_and_head() {
+#[tokio::test(flavor = "multi_thread")]
+async fn obsolete_details_generation_is_rejected_for_same_pr_and_head() {
     let temp = unique_temp_dir("prism-obsolete-details-generation-test");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -860,8 +903,8 @@ fn obsolete_details_generation_is_rejected_for_same_pr_and_head() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn pr_summary_refresh_preserves_details_when_signature_matches() {
+#[tokio::test(flavor = "multi_thread")]
+async fn pr_summary_refresh_preserves_details_when_signature_matches() {
     let summary = test_summary("feature", "abc123", 2);
     let details = PrDetails {
         review_comments: vec![PrReviewComment {
@@ -885,8 +928,8 @@ fn pr_summary_refresh_preserves_details_when_signature_matches() {
     assert_eq!(cache.last_refreshed(), Some("now"));
 }
 
-#[test]
-fn pr_summary_refresh_drops_details_when_signature_changes() {
+#[tokio::test(flavor = "multi_thread")]
+async fn pr_summary_refresh_drops_details_when_signature_changes() {
     let old_summary = test_summary("feature", "abc123", 2);
     let new_summary = test_summary("feature", "def456", 2);
     let mut cache = PrCache::observed(old_summary, Some(PrDetails::default()));
@@ -897,8 +940,8 @@ fn pr_summary_refresh_drops_details_when_signature_changes() {
     assert!(cache.details().is_none());
 }
 
-#[test]
-fn summary_refresh_preserves_details_when_pr_and_head_are_unchanged() {
+#[tokio::test(flavor = "multi_thread")]
+async fn summary_refresh_preserves_details_when_pr_and_head_are_unchanged() {
     let old_summary = test_summary("feature", "abc123", 2);
     let mut new_summary = old_summary.clone();
     new_summary.review_decision = "APPROVED".to_string();
@@ -960,8 +1003,8 @@ fn successful_details_observation_for(summary: &PrSummary) -> PrDetailsObservati
     }
 }
 
-#[test]
-fn partial_comment_failure_preserves_previous_comments() {
+#[tokio::test(flavor = "multi_thread")]
+async fn partial_comment_failure_preserves_previous_comments() {
     let (temp, repo, mut cache, summary) = persisted_cache_with_observed_details();
     let mut observation = successful_details_observation_for(&summary);
     observation.comments = Err("comments unavailable".to_string());
@@ -995,8 +1038,8 @@ fn partial_comment_failure_preserves_previous_comments() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn partial_review_thread_failure_preserves_previous_threads() {
+#[tokio::test(flavor = "multi_thread")]
+async fn partial_review_thread_failure_preserves_previous_threads() {
     let (temp, repo, mut cache, summary) = persisted_cache_with_observed_details();
     let mut observation = successful_details_observation_for(&summary);
     observation.review_comments = Err("threads unavailable".to_string());
@@ -1028,8 +1071,8 @@ fn partial_review_thread_failure_preserves_previous_threads() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn partial_check_failure_preserves_previous_checks() {
+#[tokio::test(flavor = "multi_thread")]
+async fn partial_check_failure_preserves_previous_checks() {
     let (temp, repo, mut cache, summary) = persisted_cache_with_observed_details();
     let mut observation = successful_details_observation_for(&summary);
     observation.failing_checks = Err("checks unavailable".to_string());
@@ -1061,8 +1104,8 @@ fn partial_check_failure_preserves_previous_checks() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn unavailable_ci_logs_preserve_previous_logs_without_poisoning_other_details() {
+#[tokio::test(flavor = "multi_thread")]
+async fn unavailable_ci_logs_preserve_previous_logs_without_poisoning_other_details() {
     let (temp, repo, mut cache, summary) = persisted_cache_with_observed_details();
     let mut observation = successful_details_observation_for(&summary);
     observation.ci_failures = Err("logs unavailable".to_string());
@@ -1105,8 +1148,8 @@ fn persisted_cache_with_observed_details() -> (PathBuf, Repository, PrCache, PrS
     (temp, repo, cache, summary)
 }
 
-#[test]
-fn pr_summary_refresh_clears_cache_when_branch_has_no_pr() {
+#[tokio::test(flavor = "multi_thread")]
+async fn pr_summary_refresh_clears_cache_when_branch_has_no_pr() {
     let summary = test_summary("feature", "abc123", 2);
     let mut cache = PrCache::observed(summary, Some(PrDetails::default()));
     cache.record_summary_failure("previous error".to_string());
@@ -1119,8 +1162,8 @@ fn pr_summary_refresh_clears_cache_when_branch_has_no_pr() {
     assert_eq!(cache.last_refreshed(), Some("now"));
 }
 
-#[test]
-fn pr_cache_eligibility_excludes_default_detached_missing_remote_and_merged_prs() {
+#[tokio::test(flavor = "multi_thread")]
+async fn pr_cache_eligibility_excludes_default_detached_missing_remote_and_merged_prs() {
     let merged_summary = PrSummary {
         merged: true,
         ..test_summary("feature", "abc123", 0)
@@ -1155,8 +1198,8 @@ fn pr_cache_eligibility_excludes_default_detached_missing_remote_and_merged_prs(
     assert!(!pr_cache_pollable_for_session(&merged, &test_config()));
 }
 
-#[test]
-fn missing_pr_details_obey_poll_interval_after_an_attempt_starts() {
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_pr_details_obey_poll_interval_after_an_attempt_starts() {
     let mut cache = PrCache::observed(test_summary("feature", "abc123", 0), None);
 
     assert!(pr_details_due(&cache));
@@ -1165,8 +1208,8 @@ fn missing_pr_details_obey_poll_interval_after_an_attempt_starts() {
     assert!(!pr_details_due(&cache));
 }
 
-#[test]
-fn pr_cache_comment_count_prefers_loaded_details_over_summary() {
+#[tokio::test(flavor = "multi_thread")]
+async fn pr_cache_comment_count_prefers_loaded_details_over_summary() {
     let cache = PrCache::observed(
         test_summary("feature", "abc123", 12),
         Some(PrDetails {
@@ -1203,8 +1246,8 @@ fn pr_cache_comment_count_prefers_loaded_details_over_summary() {
     assert!(pr_cache_has_comments(&cache));
 }
 
-#[test]
-fn preserved_stale_cache_remains_displayable_but_has_distinct_render_signature() {
+#[tokio::test(flavor = "multi_thread")]
+async fn preserved_stale_cache_remains_displayable_but_has_distinct_render_signature() {
     let fresh = cache_with_observed_details();
     let mut stale = fresh.clone();
     stale.mark_preserved_stale();
@@ -1219,8 +1262,8 @@ fn preserved_stale_cache_remains_displayable_but_has_distinct_render_signature()
 }
 
 #[cfg(unix)]
-#[test]
-fn pr_summary_index_refresh_updates_sessions_and_pr_cache_storage() {
+#[tokio::test(flavor = "multi_thread")]
+async fn pr_summary_index_refresh_updates_sessions_and_pr_cache_storage() {
     let temp = unique_temp_dir("prism-pr-summary-index-test");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -1275,7 +1318,8 @@ fn pr_summary_index_refresh_updates_sessions_and_pr_cache_storage() {
         0,
         vec![feature_summary.clone()],
         poll_started_at,
-    );
+    )
+    .await;
 
     assert!(sessions[0].pr.summary().is_none());
     assert!(sessions[2].pr.summary().is_none());
@@ -1291,8 +1335,8 @@ fn pr_summary_index_refresh_updates_sessions_and_pr_cache_storage() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn stale_pr_summary_index_refresh_does_not_clear_newer_direct_refresh() {
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_pr_summary_index_refresh_does_not_clear_newer_direct_refresh() {
     let temp = unique_temp_dir("prism-stale-pr-summary-index-test");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -1316,7 +1360,8 @@ fn stale_pr_summary_index_refresh_does_not_clear_newer_direct_refresh() {
         0,
         Vec::new(),
         poll_started_at,
-    );
+    )
+    .await;
 
     assert_eq!(sessions[0].pr.summary(), Some(&summary));
     assert_eq!(load_pr_cache(&repo, "feature").summary(), Some(&summary));
@@ -1326,8 +1371,8 @@ fn stale_pr_summary_index_refresh_does_not_clear_newer_direct_refresh() {
 }
 
 #[cfg(unix)]
-#[test]
-fn merged_pr_from_previous_branch_generation_is_not_reused() {
+#[tokio::test(flavor = "multi_thread")]
+async fn merged_pr_from_previous_branch_generation_is_not_reused() {
     let temp = unique_temp_dir("prism-reused-branch-pr-test");
     fs::create_dir_all(&temp).unwrap();
     let git = temp.join("git");
@@ -1353,7 +1398,7 @@ fn merged_pr_from_previous_branch_generation_is_not_reused() {
     let old_cache = PrCache::observed(old_summary.clone(), None);
     save_pr_cache(&repo, "feature", &old_cache).unwrap();
 
-    let loaded = load_pr_cache_for_branch(&repo, &config, "feature", &sessions[0].path);
+    let loaded = load_pr_cache_for_branch(&repo, &config, "feature", &sessions[0].path).await;
 
     assert_eq!(loaded.summary(), Some(&old_summary));
     assert!(loaded.trusted_summary().is_err());
@@ -1371,7 +1416,8 @@ fn merged_pr_from_previous_branch_generation_is_not_reused() {
         0,
         vec![old_summary],
         poll_started_at,
-    );
+    )
+    .await;
 
     assert!(sessions[0].pr.summary().is_none());
     assert!(load_pr_cache(&repo, "feature").summary().is_none());
@@ -1381,8 +1427,8 @@ fn merged_pr_from_previous_branch_generation_is_not_reused() {
 }
 
 #[cfg(unix)]
-#[test]
-fn open_pr_from_previous_branch_generation_is_not_reused_even_when_old_head_is_ancestor() {
+#[tokio::test(flavor = "multi_thread")]
+async fn open_pr_from_previous_branch_generation_is_not_reused_even_when_old_head_is_ancestor() {
     let temp = unique_temp_dir("prism-reused-open-branch-pr-test");
     fs::create_dir_all(&temp).unwrap();
     let git = temp.join("git");
@@ -1405,7 +1451,7 @@ fn open_pr_from_previous_branch_generation_is_not_reused_even_when_old_head_is_a
     old_cache.record_summary_observation(Some(old_summary.clone()), "old".to_string());
     save_pr_cache(&repo, "feature", &old_cache).unwrap();
 
-    let loaded = load_pr_cache_for_branch(&repo, &config, "feature", &temp);
+    let loaded = load_pr_cache_for_branch(&repo, &config, "feature", &temp).await;
 
     assert_eq!(loaded.summary(), Some(&old_summary));
     assert!(loaded.trusted_summary().is_err());
@@ -1425,7 +1471,8 @@ fn open_pr_from_previous_branch_generation_is_not_reused_even_when_old_head_is_a
         0,
         vec![old_summary],
         poll_started_at,
-    );
+    )
+    .await;
     assert!(sessions[0].pr.summary().is_none());
 
     let _ = fs::remove_dir_all(repo.prism_dir());
@@ -1433,8 +1480,8 @@ fn open_pr_from_previous_branch_generation_is_not_reused_even_when_old_head_is_a
 }
 
 #[cfg(unix)]
-#[test]
-fn canonical_cached_pr_requires_fresh_reassociation_after_restart() {
+#[tokio::test(flavor = "multi_thread")]
+async fn canonical_cached_pr_requires_fresh_reassociation_after_restart() {
     let temp = unique_temp_dir("prism-synthetic-canonical-pr-test");
     fs::create_dir_all(&temp).unwrap();
     let git = temp.join("git");
@@ -1464,7 +1511,7 @@ fn canonical_cached_pr_requires_fresh_reassociation_after_restart() {
     let cache = PrCache::observed(summary.clone(), Some(details));
     persist_pr_cache_snapshot(&repo, "pr-42", &cache).unwrap();
 
-    let loaded = load_pr_cache_for_branch(&repo, &config, "pr-42", &temp);
+    let loaded = load_pr_cache_for_branch(&repo, &config, "pr-42", &temp).await;
 
     assert_eq!(loaded.summary(), Some(&summary));
     assert_eq!(
@@ -1474,7 +1521,7 @@ fn canonical_cached_pr_requires_fresh_reassociation_after_restart() {
     let mut session = test_session("pr-42", loaded);
     session.path = temp.clone();
     assert_eq!(
-        resolve_pr_summary_for_session(&session, &config, &[summary]),
+        resolve_pr_summary_for_session(&session, &config, &[summary]).await,
         None
     );
 
@@ -1483,8 +1530,8 @@ fn canonical_cached_pr_requires_fresh_reassociation_after_restart() {
 }
 
 #[cfg(unix)]
-#[test]
-fn guarded_repair_head_uses_exact_lookup_after_restart() {
+#[tokio::test(flavor = "multi_thread")]
+async fn guarded_repair_head_uses_exact_lookup_after_restart() {
     let temp = unique_temp_dir("prism-guarded-repair-restart-test");
     fs::create_dir_all(&temp).unwrap();
     let git = temp.join("git");
@@ -1527,6 +1574,7 @@ printf '%s\n' '{"data":{"repository":{"pullRequest":{"id":"PR_test","number":42,
         &config,
         false,
     )
+    .await
     .unwrap();
 
     assert!(loaded.summary().is_some_and(|summary| summary.merged));
@@ -1539,8 +1587,8 @@ printf '%s\n' '{"data":{"repository":{"pullRequest":{"id":"PR_test","number":42,
 }
 
 #[cfg(unix)]
-#[test]
-fn unavailable_remote_discovery_preserves_persisted_cache_as_stale() {
+#[tokio::test(flavor = "multi_thread")]
+async fn unavailable_remote_discovery_preserves_persisted_cache_as_stale() {
     let temp = unique_temp_dir("prism-unavailable-remote-cache-test");
     fs::create_dir_all(&temp).unwrap();
     let git = temp.join("git");
@@ -1565,7 +1613,7 @@ fn unavailable_remote_discovery_preserves_persisted_cache_as_stale() {
     )
     .unwrap();
 
-    let loaded = load_pr_cache_for_branch(&repo, &config, "feature", &temp);
+    let loaded = load_pr_cache_for_branch(&repo, &config, "feature", &temp).await;
 
     assert_eq!(loaded.summary(), Some(&summary));
     assert_eq!(
@@ -1584,8 +1632,8 @@ fn unavailable_remote_discovery_preserves_persisted_cache_as_stale() {
 }
 
 #[cfg(unix)]
-#[test]
-fn known_open_pr_is_preserved_while_local_repair_is_unpushed() {
+#[tokio::test(flavor = "multi_thread")]
+async fn known_open_pr_is_preserved_while_local_repair_is_unpushed() {
     let temp = unique_temp_dir("prism-known-open-pr-local-divergence-test");
     fs::create_dir_all(&temp).unwrap();
     let git = temp.join("git");
@@ -1624,15 +1672,16 @@ fn known_open_pr_is_preserved_while_local_repair_is_unpushed() {
         0,
         vec![summary.clone()],
         poll_started_at,
-    );
+    )
+    .await;
 
     assert_eq!(sessions[0].pr.summary(), Some(&summary));
     let _ = fs::remove_dir_all(repo.prism_dir());
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn parses_graphql_pr_summary_index() {
+#[tokio::test(flavor = "multi_thread")]
+async fn parses_graphql_pr_summary_index() {
     let raw = r#"{
           "data": {
             "repository": {
@@ -1702,8 +1751,8 @@ fn parses_graphql_pr_summary_index() {
     assert_eq!(summaries[0].merge_state_status, "DIRTY");
 }
 
-#[test]
-fn github_preserves_merge_state_status_separately_from_mergeability() {
+#[tokio::test(flavor = "multi_thread")]
+async fn github_preserves_merge_state_status_separately_from_mergeability() {
     let raw = r#"{
         "data": {
             "repository": {
@@ -1786,8 +1835,8 @@ fn github_preserves_merge_state_status_separately_from_mergeability() {
     );
 }
 
-#[test]
-fn graphql_queue_state_distinguishes_native_entry_absence_and_unobserved() {
+#[tokio::test(flavor = "multi_thread")]
+async fn graphql_queue_state_distinguishes_native_entry_absence_and_unobserved() {
     let queued = try_parse_pr_summary_index(
             r#"{"data":{"repository":{"pullRequests":{"nodes":[{"number":42,"mergeQueueEntry":{"state":"AWAITING_CHECKS"}}],"pageInfo":{"hasNextPage":false}}}}}"#,
         )
@@ -1806,8 +1855,8 @@ fn graphql_queue_state_distinguishes_native_entry_absence_and_unobserved() {
     );
 }
 
-#[test]
-fn github_adapter_rejects_identity_less_summary() {
+#[tokio::test(flavor = "multi_thread")]
+async fn github_adapter_rejects_identity_less_summary() {
     let repository = adapter_change_request().id.repository().clone();
     let mut summary = test_summary("feature", "head", 0);
     summary.change_request_identity = None;
@@ -1822,8 +1871,8 @@ fn github_adapter_rejects_identity_less_summary() {
     assert!(error.to_string().contains("missing canonical identity"));
 }
 
-#[test]
-fn graphql_summary_index_preserves_unknown_lifecycle_without_dropping_other_items() {
+#[tokio::test(flavor = "multi_thread")]
+async fn graphql_summary_index_preserves_unknown_lifecycle_without_dropping_other_items() {
     let raw = r#"{
           "data": {"repository": {"pullRequests": {
             "pageInfo": {"hasNextPage": false},
@@ -1841,15 +1890,15 @@ fn graphql_summary_index_preserves_unknown_lifecycle_without_dropping_other_item
     assert_eq!(summaries[1].state, "SUPERSEDED_BY_TRAIN");
 }
 
-#[test]
-fn incomplete_graphql_summary_index_is_an_observation_failure() {
+#[tokio::test(flavor = "multi_thread")]
+async fn incomplete_graphql_summary_index_is_an_observation_failure() {
     let raw = r#"{"data":{"repository":{}}}"#;
 
     assert!(try_parse_pr_summary_index(raw).is_err());
 }
 
-#[test]
-fn incomplete_graphql_summary_pagination_is_a_reported_failure() {
+#[tokio::test(flavor = "multi_thread")]
+async fn incomplete_graphql_summary_pagination_is_a_reported_failure() {
     let raw = include_str!("../../../tests/fixtures/remote/github/summary-truncated.json");
     let error = try_parse_pr_summary_index(raw).unwrap_err();
     let summary = test_summary("feature", "abc123", 0);
@@ -1874,8 +1923,8 @@ fn incomplete_graphql_summary_pagination_is_a_reported_failure() {
     assert!(cache.trusted_summary().is_err());
 }
 
-#[test]
-fn paginated_graphql_summary_index_combines_every_page() {
+#[tokio::test(flavor = "multi_thread")]
+async fn paginated_graphql_summary_index_combines_every_page() {
     let raw = r#"[
           {"data":{"repository":{"pullRequests":{
             "pageInfo":{"hasNextPage":true,"endCursor":"page-1"},
@@ -1901,8 +1950,8 @@ fn paginated_graphql_summary_index_combines_every_page() {
     );
 }
 
-#[test]
-fn exact_graphql_summary_distinguishes_absence_from_query_errors() {
+#[tokio::test(flavor = "multi_thread")]
+async fn exact_graphql_summary_distinguishes_absence_from_query_errors() {
     let repository = crate::remote::RemoteRepositoryId::new(
         crate::remote::ProviderKind::GitHub,
         crate::remote::HostIdentity::parse("github.com").unwrap(),
@@ -1926,8 +1975,8 @@ fn exact_graphql_summary_distinguishes_absence_from_query_errors() {
     );
 }
 
-#[test]
-fn incomplete_or_truncated_graphql_check_rollup_is_rejected() {
+#[tokio::test(flavor = "multi_thread")]
+async fn incomplete_or_truncated_graphql_check_rollup_is_rejected() {
     let response = |page_info: &str| {
         format!(
             r#"{{"data":{{"repository":{{"pullRequests":{{
@@ -1951,8 +2000,8 @@ fn incomplete_or_truncated_graphql_check_rollup_is_rejected() {
     );
 }
 
-#[test]
-fn parses_classic_branch_protection_without_discarding_checks_shape() {
+#[tokio::test(flavor = "multi_thread")]
+async fn parses_classic_branch_protection_without_discarding_checks_shape() {
     let facts = parse_classic_branch_protection(
             r#"{
                 "url":"https://api.github.com/repos/owner/repo/branches/main/protection",
@@ -1976,8 +2025,8 @@ fn parses_classic_branch_protection_without_discarding_checks_shape() {
 }
 
 #[cfg(unix)]
-#[test]
-fn fetches_and_combines_exact_branch_classic_and_evaluated_ruleset_policy() {
+#[tokio::test(flavor = "multi_thread")]
+async fn fetches_and_combines_exact_branch_classic_and_evaluated_ruleset_policy() {
     let temp = unique_temp_dir("prism-github-exact-policy");
     fs::create_dir_all(&temp).unwrap();
     let gh = temp.join("gh");
@@ -2014,7 +2063,9 @@ esac
     )
     .unwrap();
 
-    let policy = fetch_repo_policy(&temp, &config, &repository, "release/next").unwrap();
+    let policy = fetch_repo_policy(&temp, &config, &repository, "release/next")
+        .await
+        .unwrap();
 
     assert_eq!(policy.target_branch.as_deref(), Some("release/next"));
     assert_eq!(policy.required_approvals, 2);
@@ -2030,8 +2081,8 @@ esac
 }
 
 #[cfg(unix)]
-#[test]
-fn authoritative_unprotected_and_empty_rulesets_produce_known_empty_policy() {
+#[tokio::test(flavor = "multi_thread")]
+async fn authoritative_unprotected_and_empty_rulesets_produce_known_empty_policy() {
     let temp = unique_temp_dir("prism-github-empty-policy");
     fs::create_dir_all(&temp).unwrap();
     let gh = temp.join("gh");
@@ -2061,7 +2112,9 @@ esac
     )
     .unwrap();
 
-    let policy = fetch_repo_policy(&temp, &config, &repository, "main").unwrap();
+    let policy = fetch_repo_policy(&temp, &config, &repository, "main")
+        .await
+        .unwrap();
 
     assert_eq!(policy.required_approvals, 0);
     assert!(policy.required_checks.is_empty());
@@ -2071,8 +2124,8 @@ esac
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn evaluated_rules_require_paginated_envelope_and_complete_parameters() {
+#[tokio::test(flavor = "multi_thread")]
+async fn evaluated_rules_require_paginated_envelope_and_complete_parameters() {
     assert!(parse_evaluated_branch_rules("[]").is_err());
     assert!(parse_evaluated_branch_rules(r#"[{"type":"merge_queue"}]"#).is_err());
     assert!(parse_evaluated_branch_rules(r#"[[{"type":"merge_queue"}]]"#).is_err());
@@ -2090,8 +2143,8 @@ fn evaluated_rules_require_paginated_envelope_and_complete_parameters() {
     );
 }
 
-#[test]
-fn evaluated_rules_ignore_known_non_merge_constraints() {
+#[tokio::test(flavor = "multi_thread")]
+async fn evaluated_rules_ignore_known_non_merge_constraints() {
     let facts = parse_evaluated_branch_rules(
         r#"[[
                 {"type":"required_linear_history"},
@@ -2107,8 +2160,8 @@ fn evaluated_rules_ignore_known_non_merge_constraints() {
     assert!(!facts.merge_queue_required);
 }
 
-#[test]
-fn safety_relevant_and_unknown_rules_produce_unknown_policy_evidence() {
+#[tokio::test(flavor = "multi_thread")]
+async fn safety_relevant_and_unknown_rules_produce_unknown_policy_evidence() {
     for rule_type in [
         "workflows",
         "required_deployments",
@@ -2124,8 +2177,8 @@ fn safety_relevant_and_unknown_rules_produce_unknown_policy_evidence() {
     }
 }
 
-#[test]
-fn only_explicit_unprotected_404_is_authoritative_classic_absence() {
+#[tokio::test(flavor = "multi_thread")]
+async fn only_explicit_unprotected_404_is_authoritative_classic_absence() {
     assert!(is_unprotected_branch_response(
         "gh: Branch not protected (HTTP 404)"
     ));
@@ -2138,8 +2191,8 @@ fn only_explicit_unprotected_404_is_authoritative_classic_absence() {
 }
 
 #[cfg(unix)]
-#[test]
-fn failed_policy_refresh_preserves_identity_matched_stale_facts() {
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_policy_refresh_preserves_identity_matched_stale_facts() {
     let temp = unique_temp_dir("prism-github-stale-policy-refresh");
     fs::create_dir_all(&temp).unwrap();
     let gh = temp.join("gh");
@@ -2175,7 +2228,9 @@ fn failed_policy_refresh_preserves_identity_matched_stale_facts() {
     };
     save_repo_policy_cache(&repo, &stale).unwrap();
 
-    let refreshed = refresh_repo_policy_cache(&repo, &temp, &config).unwrap();
+    let refreshed = refresh_repo_policy_cache(&repo, &temp, &config)
+        .await
+        .unwrap();
 
     assert_eq!(refreshed.required_approvals, stale.required_approvals);
     assert_eq!(refreshed.required_checks, stale.required_checks);
@@ -2210,8 +2265,8 @@ fn failed_policy_refresh_preserves_identity_matched_stale_facts() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn repo_policy_cache_round_trips_success_and_error() {
+#[tokio::test(flavor = "multi_thread")]
+async fn repo_policy_cache_round_trips_success_and_error() {
     let temp = unique_temp_dir("prism-repo-policy-cache-test");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -2264,8 +2319,8 @@ fn repo_policy_cache_round_trips_success_and_error() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn repo_policy_cache_keeps_distinct_target_branches_under_one_identity() {
+#[tokio::test(flavor = "multi_thread")]
+async fn repo_policy_cache_keeps_distinct_target_branches_under_one_identity() {
     let temp = unique_temp_dir("prism-repo-policy-identity-test");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -2308,8 +2363,8 @@ fn repo_policy_cache_keeps_distinct_target_branches_under_one_identity() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn github_policy_identity_queries_and_upserts_use_normalized_path_keys() {
+#[tokio::test(flavor = "multi_thread")]
+async fn github_policy_identity_queries_and_upserts_use_normalized_path_keys() {
     let temp = unique_temp_dir("prism-github-policy-case-key-test");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -2341,8 +2396,8 @@ fn github_policy_identity_queries_and_upserts_use_normalized_path_keys() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn parses_requested_reviewers_from_gh_pr_view() {
+#[tokio::test(flavor = "multi_thread")]
+async fn parses_requested_reviewers_from_gh_pr_view() {
     let raw = r#"{
           "reviewRequests": [
             {"requestedReviewer": {"login": "alice"}},
@@ -2354,8 +2409,8 @@ fn parses_requested_reviewers_from_gh_pr_view() {
     assert_eq!(parse_requested_reviewers(raw), vec!["alice", "backend"]);
 }
 
-#[test]
-fn parses_github_remote_urls() {
+#[tokio::test(flavor = "multi_thread")]
+async fn parses_github_remote_urls() {
     assert_eq!(
         parse_github_remote("git@github.com:owner/repo.git"),
         Some(("owner".to_string(), "repo".to_string()))
@@ -2367,8 +2422,8 @@ fn parses_github_remote_urls() {
     assert_eq!(parse_github_remote("https://example.com/owner/repo"), None);
 }
 
-#[test]
-fn parses_inline_review_comments() {
+#[tokio::test(flavor = "multi_thread")]
+async fn parses_inline_review_comments() {
     let raw = r#"[
             {
                 "path": "src/main.rs",
@@ -2389,8 +2444,8 @@ fn parses_inline_review_comments() {
     assert!(!comments[0].resolved);
 }
 
-#[test]
-fn parses_review_thread_resolution_status() {
+#[tokio::test(flavor = "multi_thread")]
+async fn parses_review_thread_resolution_status() {
     let raw = r#"{
           "data": {
             "repository": {
@@ -2459,8 +2514,8 @@ fn parses_review_thread_resolution_status() {
     assert!(!comments[1].resolved);
 }
 
-#[test]
-fn rejects_truncated_review_threads() {
+#[tokio::test(flavor = "multi_thread")]
+async fn rejects_truncated_review_threads() {
     let raw = r#"{
           "data": {
             "repository": {
@@ -2487,8 +2542,8 @@ fn rejects_truncated_review_threads() {
     );
 }
 
-#[test]
-fn combines_paginated_review_threads() {
+#[tokio::test(flavor = "multi_thread")]
+async fn combines_paginated_review_threads() {
     let raw = r#"[
           {
             "data": {"repository": {"pullRequest": {"reviewThreads": {
@@ -2521,8 +2576,8 @@ fn combines_paginated_review_threads() {
     assert_eq!(comments[1].thread_id, "PRRT_2");
 }
 
-#[test]
-fn rejects_truncated_comments_inside_a_review_thread() {
+#[tokio::test(flavor = "multi_thread")]
+async fn rejects_truncated_comments_inside_a_review_thread() {
     let raw = r#"[{
           "data": {"repository": {"pullRequest": {"reviewThreads": {
             "totalCount": 1,
@@ -2545,8 +2600,8 @@ fn rejects_truncated_comments_inside_a_review_thread() {
 }
 
 #[cfg(unix)]
-#[test]
-fn canonical_target_number_details_use_complete_paginated_endpoints() {
+#[tokio::test(flavor = "multi_thread")]
+async fn canonical_target_number_details_use_complete_paginated_endpoints() {
     let temp = unique_temp_dir("prism-github-paginated-details");
     fs::create_dir_all(&temp).unwrap();
     let gh = temp.join("gh");
@@ -2603,6 +2658,7 @@ esac
         "synthetic-local-branch",
         "head-sha",
     )
+    .await
     .unwrap();
 
     assert_eq!(details.comments.unwrap().len(), 2);
@@ -2619,8 +2675,8 @@ esac
 }
 
 #[cfg(unix)]
-#[test]
-fn fetch_pr_summary_uses_merged_at_instead_of_removed_merged_field() {
+#[tokio::test(flavor = "multi_thread")]
+async fn fetch_pr_summary_uses_merged_at_instead_of_removed_merged_field() {
     let temp = unique_temp_dir("prism-gh-summary-test");
     let bin = temp.join("bin");
     let repo = temp.join("repo");
@@ -2677,6 +2733,7 @@ JSON
         .insert("git".to_string(), git.display().to_string());
 
     let summary = fetch_pr_summary(&repo, "feature", &config)
+        .await
         .unwrap()
         .unwrap()
         .0;
@@ -2696,8 +2753,8 @@ JSON
 }
 
 #[cfg(unix)]
-#[test]
-fn fetch_pr_summary_preserves_unknown_native_lifecycle() {
+#[tokio::test(flavor = "multi_thread")]
+async fn fetch_pr_summary_preserves_unknown_native_lifecycle() {
     let temp = unique_temp_dir("prism-gh-unknown-summary-test");
     let bin = temp.join("bin");
     let repo = temp.join("repo");
@@ -2736,6 +2793,7 @@ JSON
         .insert("git".to_string(), git.display().to_string());
 
     let summary = fetch_pr_summary(&repo, "feature", &config)
+        .await
         .unwrap()
         .unwrap()
         .0;
@@ -2750,8 +2808,8 @@ JSON
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn github_summary_retains_known_lossy_and_future_native_states() {
+#[tokio::test(flavor = "multi_thread")]
+async fn github_summary_retains_known_lossy_and_future_native_states() {
     let node: GithubPullRequest = serde_json::from_str(
         r#"{
                 "number":42,
@@ -2779,8 +2837,8 @@ fn github_summary_retains_known_lossy_and_future_native_states() {
     assert_eq!(summary.native_state_evidence.queue, ["AWAITING_CHECKS"]);
 }
 
-#[test]
-fn closed_unmerged_request_does_not_match_a_worktree() {
+#[tokio::test(flavor = "multi_thread")]
+async fn closed_unmerged_request_does_not_match_a_worktree() {
     let mut summary = test_summary("feature", "head123", 0);
     summary.state = "CLOSED".to_string();
 
@@ -2793,8 +2851,8 @@ fn closed_unmerged_request_does_not_match_a_worktree() {
     ));
 }
 
-#[test]
-fn initial_association_requires_origin_push_source_and_exact_local_head() {
+#[tokio::test(flavor = "multi_thread")]
+async fn initial_association_requires_origin_push_source_and_exact_local_head() {
     let origin_push = crate::remote::RemoteRepositoryId::new(
         crate::remote::ProviderKind::GitHub,
         crate::remote::HostIdentity::new("github.example.com", None).unwrap(),
@@ -2855,8 +2913,8 @@ fn initial_association_requires_origin_push_source_and_exact_local_head() {
 }
 
 #[cfg(unix)]
-#[test]
-fn summary_index_association_uses_the_branch_push_remote() {
+#[tokio::test(flavor = "multi_thread")]
+async fn summary_index_association_uses_the_branch_push_remote() {
     let temp = unique_temp_dir("prism-branch-push-summary-association");
     fs::create_dir_all(&temp).unwrap();
     let git = temp.join("git");
@@ -2902,15 +2960,15 @@ esac
     session.path = temp.clone();
 
     assert_eq!(
-        resolve_pr_summary_for_session(&session, &config, std::slice::from_ref(&summary)),
+        resolve_pr_summary_for_session(&session, &config, std::slice::from_ref(&summary)).await,
         Some(summary)
     );
 
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn explicit_cached_target_pr_preserves_maintainer_fork_association() {
+#[tokio::test(flavor = "multi_thread")]
+async fn explicit_cached_target_pr_preserves_maintainer_fork_association() {
     let host = crate::remote::HostIdentity::new("github.com", None).unwrap();
     let source = crate::remote::RemoteRepositoryId::new(
         crate::remote::ProviderKind::GitHub,
@@ -2954,8 +3012,8 @@ fn explicit_cached_target_pr_preserves_maintainer_fork_association() {
     ));
 }
 
-#[test]
-fn unknown_lifecycle_poll_preserves_matching_canonical_session_association() {
+#[tokio::test(flavor = "multi_thread")]
+async fn unknown_lifecycle_poll_preserves_matching_canonical_session_association() {
     let identity = test_identity(
         crate::remote::ProviderKind::GitHub,
         "github.com",
@@ -2972,7 +3030,8 @@ fn unknown_lifecycle_poll_preserves_matching_canonical_session_association() {
     );
 
     let resolved =
-        resolve_pr_summary_for_session(&session, &test_config(), std::slice::from_ref(&observed));
+        resolve_pr_summary_for_session(&session, &test_config(), std::slice::from_ref(&observed))
+            .await;
     let poll_started_at = Instant::now();
     session.pr.begin_summary_poll(poll_started_at);
     assert!(apply_pr_summary_poll_result(
@@ -3010,8 +3069,8 @@ fn unique_temp_dir(prefix: &str) -> PathBuf {
 }
 
 #[cfg(unix)]
-#[test]
-fn adapter_submit_review_posts_authorized_commit_to_configured_api() {
+#[tokio::test(flavor = "multi_thread")]
+async fn adapter_submit_review_posts_authorized_commit_to_configured_api() {
     let directory = unique_temp_dir("prism-github-adapter-submit-review");
     fs::create_dir_all(&directory).unwrap();
     let log = directory.join("review-command");
@@ -3063,6 +3122,7 @@ esac
             kind: ReviewSubmissionKind::RequestChanges,
             body: "  needs changes  ".to_string(),
         })
+        .await
         .unwrap();
 
     let command = fs::read_to_string(&log).unwrap();
@@ -3103,8 +3163,8 @@ esac
 }
 
 #[cfg(unix)]
-#[test]
-fn adapter_submit_review_rejects_a_stale_head_before_mutation() {
+#[tokio::test(flavor = "multi_thread")]
+async fn adapter_submit_review_rejects_a_stale_head_before_mutation() {
     let directory = unique_temp_dir("prism-github-adapter-submit-review-stale");
     fs::create_dir_all(&directory).unwrap();
     let mutation = directory.join("mutation");
@@ -3143,6 +3203,7 @@ esac
             kind: ReviewSubmissionKind::Approve,
             body: String::new(),
         })
+        .await
         .unwrap_err();
 
     assert_eq!(error.operation(), RemoteOperation::SubmitReview);
@@ -3154,8 +3215,8 @@ esac
 }
 
 #[cfg(unix)]
-#[test]
-fn adapter_submit_review_rejects_a_mismatched_created_review_commit() {
+#[tokio::test(flavor = "multi_thread")]
+async fn adapter_submit_review_rejects_a_mismatched_created_review_commit() {
     let directory = unique_temp_dir("prism-github-adapter-submit-review-mismatch");
     fs::create_dir_all(&directory).unwrap();
     let gh = directory.join("configured-gh");
@@ -3192,6 +3253,7 @@ esac
             kind: ReviewSubmissionKind::Approve,
             body: String::new(),
         })
+        .await
         .unwrap_err();
 
     assert_eq!(error.operation(), RemoteOperation::SubmitReview);
@@ -3202,8 +3264,8 @@ esac
 }
 
 #[cfg(unix)]
-#[test]
-fn adapter_submit_review_rejects_a_malformed_success_response() {
+#[tokio::test(flavor = "multi_thread")]
+async fn adapter_submit_review_rejects_a_malformed_success_response() {
     let directory = unique_temp_dir("prism-github-adapter-submit-review-malformed");
     fs::create_dir_all(&directory).unwrap();
     let gh = directory.join("configured-gh");
@@ -3240,6 +3302,7 @@ esac
             kind: ReviewSubmissionKind::Comment,
             body: "comment".to_string(),
         })
+        .await
         .unwrap_err();
 
     assert_eq!(error.operation(), RemoteOperation::SubmitReview);
@@ -3250,8 +3313,8 @@ esac
 }
 
 #[cfg(unix)]
-#[test]
-fn adapter_details_reject_association_changes_after_detail_calls() {
+#[tokio::test(flavor = "multi_thread")]
+async fn adapter_details_reject_association_changes_after_detail_calls() {
     let directory = unique_temp_dir("prism-github-adapter-details-drift");
     fs::create_dir_all(&directory).unwrap();
     let mut config = test_config();
@@ -3264,7 +3327,10 @@ fn adapter_details_reject_association_changes_after_detail_calls() {
     )
     .unwrap();
 
-    let error = adapter.change_request_details(&change_request).unwrap_err();
+    let error = adapter
+        .change_request_details(&change_request)
+        .await
+        .unwrap_err();
 
     assert_eq!(error.operation(), RemoteOperation::ObserveChangeRequest);
     assert_eq!(error.class(), RemoteErrorClass::StaleHead);
@@ -3274,8 +3340,8 @@ fn adapter_details_reject_association_changes_after_detail_calls() {
 }
 
 #[cfg(unix)]
-#[test]
-fn adapter_resolve_rejects_thread_from_another_change_request_before_mutation() {
+#[tokio::test(flavor = "multi_thread")]
+async fn adapter_resolve_rejects_thread_from_another_change_request_before_mutation() {
     let directory = unique_temp_dir("prism-github-adapter-thread-association");
     fs::create_dir_all(&directory).unwrap();
     let mut config = test_config();
@@ -3290,6 +3356,7 @@ fn adapter_resolve_rejects_thread_from_another_change_request_before_mutation() 
 
     let error = adapter
         .resolve_review_thread(&resolve_request(&change_request))
+        .await
         .unwrap_err();
 
     assert_eq!(error.operation(), RemoteOperation::ResolveReviewThread);
@@ -3300,8 +3367,8 @@ fn adapter_resolve_rejects_thread_from_another_change_request_before_mutation() 
 }
 
 #[cfg(unix)]
-#[test]
-fn adapter_resolve_rechecks_head_immediately_before_mutation() {
+#[tokio::test(flavor = "multi_thread")]
+async fn adapter_resolve_rechecks_head_immediately_before_mutation() {
     let directory = unique_temp_dir("prism-github-adapter-thread-pre-mutation-drift");
     fs::create_dir_all(&directory).unwrap();
     let mut config = test_config();
@@ -3316,6 +3383,7 @@ fn adapter_resolve_rechecks_head_immediately_before_mutation() {
 
     let error = adapter
         .resolve_review_thread(&resolve_request(&change_request))
+        .await
         .unwrap_err();
 
     assert_eq!(error.operation(), RemoteOperation::ResolveReviewThread);
@@ -3327,8 +3395,8 @@ fn adapter_resolve_rechecks_head_immediately_before_mutation() {
 }
 
 #[cfg(unix)]
-#[test]
-fn adapter_resolve_rejects_head_change_after_mutation() {
+#[tokio::test(flavor = "multi_thread")]
+async fn adapter_resolve_rejects_head_change_after_mutation() {
     let directory = unique_temp_dir("prism-github-adapter-thread-post-mutation-drift");
     fs::create_dir_all(&directory).unwrap();
     let mut config = test_config();
@@ -3343,6 +3411,7 @@ fn adapter_resolve_rejects_head_change_after_mutation() {
 
     let error = adapter
         .resolve_review_thread(&resolve_request(&change_request))
+        .await
         .unwrap_err();
 
     assert_eq!(error.operation(), RemoteOperation::ResolveReviewThread);

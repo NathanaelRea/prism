@@ -55,7 +55,7 @@ impl StandardTriggerRemote for ProductionStandardTriggerRemote {
         context: &'a TriggerContext,
     ) -> StandardRemoteFuture<'a, StandardObservationResult> {
         Box::pin(async move {
-            let lane = lane_for_subject(&context.subject)?;
+            let lane = lane_for_subject(&context.subject).await?;
             let change_request = context.subject.change_request.clone().ok_or_else(|| {
                 TriggerError::Protocol("standard Trigger requires a Change Request".into())
             })?;
@@ -114,7 +114,7 @@ impl StandardTriggerRemote for ProductionStandardTriggerRemote {
                     "no captured review threads needed resolution".into(),
                 ));
             }
-            let lane = lane_for_subject(&context.subject)?;
+            let lane = lane_for_subject(&context.subject).await?;
             let change_request = context.subject.change_request.clone().ok_or_else(|| {
                 TriggerError::Protocol("review resolution requires a Change Request".into())
             })?;
@@ -156,13 +156,15 @@ impl StandardTriggerRemote for ProductionStandardTriggerRemote {
     }
 }
 
-fn lane_for_subject(
+async fn lane_for_subject(
     subject: &TriggerSubject,
 ) -> Result<crate::remote::request_coordinator::RemoteLaneKey, TriggerError> {
-    lane_for_remote_paths(&subject.repository, &subject.worktree).map_err(TriggerError::Protocol)
+    lane_for_remote_paths(&subject.repository, &subject.worktree)
+        .await
+        .map_err(TriggerError::Protocol)
 }
 
-pub(crate) fn lane_for_remote_paths(
+pub(crate) async fn lane_for_remote_paths(
     repository: &std::path::Path,
     worktree: &std::path::Path,
 ) -> Result<crate::remote::request_coordinator::RemoteLaneKey, String> {
@@ -179,6 +181,7 @@ pub(crate) fn lane_for_remote_paths(
         "origin",
         crate::remote::RemoteUrlKind::Fetch,
     )
+    .await
     .map_err(|error| error.to_string())?;
     crate::remote::request_coordinator::RemoteLaneKey::new(
         discovered.repository.id.host().to_string(),
@@ -215,20 +218,11 @@ impl RemoteOperationExecutor for PrismProviderExecutor {
     ) -> Pin<
         Box<dyn Future<Output = Result<RemoteOperationOutput, RemoteOperationFailure>> + Send + 'a>,
     > {
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || execute_blocking(operation))
-                .await
-                .map_err(|error| RemoteOperationFailure {
-                    reason: format!("provider operation task failed: {error}"),
-                    retryable: true,
-                    retry_after_unix_ms: None,
-                    rate_limit_reset_unix_ms: None,
-                })?
-        })
+        Box::pin(async move { execute_async(operation).await })
     }
 }
 
-fn execute_blocking(
+async fn execute_async(
     operation: CoordinatedRemoteOperation,
 ) -> Result<RemoteOperationOutput, RemoteOperationFailure> {
     match operation {
@@ -237,7 +231,9 @@ fn execute_blocking(
         {
             let subject: TriggerSubject = serde_json::from_value(request.payload)
                 .map_err(|error| permanent(format!("invalid observation subject: {error}")))?;
-            let observation = observe_change_request(&subject).map_err(classify_failure)?;
+            let observation = observe_change_request(&subject)
+                .await
+                .map_err(classify_failure)?;
             let value = serde_json::to_value(&observation)
                 .map_err(|error| permanent(format!("serialize provider observation: {error}")))?;
             let response_bytes = serde_json::to_vec(&value)
@@ -262,6 +258,7 @@ fn execute_blocking(
             let config = crate::config::Config::load(&repository);
             let summaries =
                 crate::remote::dispatcher::list_change_requests(&payload.worktree, &config)
+                    .await
                     .map_err(classify_failure)?;
             output(summaries, "list")
         }
@@ -279,6 +276,7 @@ fn execute_blocking(
                 &payload.worktree,
                 &config,
             )
+            .await
             .map_err(classify_failure)?;
             output(true, "policy")
         }
@@ -299,6 +297,7 @@ fn execute_blocking(
                 &payload.branch,
                 &config,
             )
+            .await
             .map_err(classify_failure)?;
             output(head, "remote-branch-head")
         }
@@ -320,6 +319,7 @@ fn execute_blocking(
                 &config,
                 payload.force_details,
             )
+            .await
             .map_err(classify_failure)?;
             let revision = cache
                 .summary()
@@ -337,7 +337,7 @@ fn execute_blocking(
                 serde_json::from_value(request.payload).map_err(|error| {
                     permanent(format!("invalid review resolution request: {error}"))
                 })?;
-            resolve_threads(payload).map_err(classify_failure)?;
+            resolve_threads(payload).await.map_err(classify_failure)?;
             output(serde_json::json!({"resolved": true}), "mutation")
         }
         CoordinatedRemoteOperation::Mutate(request)
@@ -356,6 +356,7 @@ fn execute_blocking(
                     &payload.summary,
                     thread_id,
                 )
+                .await
                 .map_err(classify_failure)?;
             }
             output(payload.thread_ids.len(), "mutation")
@@ -372,6 +373,7 @@ fn execute_blocking(
                 &config,
                 &payload.branch,
             )
+            .await
             .map_err(classify_failure)?;
             if !crate::remote::dispatcher::same_push_target(&payload.expected, &current) {
                 return Err(permanent(
@@ -384,6 +386,7 @@ fn execute_blocking(
                 &payload.branch,
                 current.set_upstream,
             )
+            .await
             .map_err(classify_failure)?;
             let mut cache = crate::remote::load_pr_cache(&repository, &payload.branch);
             crate::remote::dispatcher::refresh_change_request_cache(
@@ -394,6 +397,7 @@ fn execute_blocking(
                 &config,
                 true,
             )
+            .await
             .map_err(classify_failure)?;
             output(
                 crate::remote::WorkerPrCacheSnapshot::capture(&cache),
@@ -415,6 +419,7 @@ fn execute_blocking(
                 &payload.summary,
                 &payload.branch,
             )
+            .await
             .map_err(classify_failure)?;
             output(true, "mutation")
         }
@@ -432,6 +437,7 @@ fn execute_blocking(
                 payload.kind,
                 payload.body,
             )
+            .await
             .map_err(classify_failure)?;
             output(serde_json::json!({"submitted": true}), "mutation")
         }
@@ -446,7 +452,9 @@ fn execute_blocking(
     }
 }
 
-fn observe_change_request(subject: &TriggerSubject) -> Result<ChangeRequestObservation, String> {
+async fn observe_change_request(
+    subject: &TriggerSubject,
+) -> Result<ChangeRequestObservation, String> {
     let repository = crate::repo::Repository {
         root: subject.repository.clone(),
     };
@@ -454,7 +462,8 @@ fn observe_change_request(subject: &TriggerSubject) -> Result<ChangeRequestObser
     if !config.config_errors.is_empty() {
         return Err(config.config_errors.join("; "));
     }
-    let branch = crate::git::current_branch_name(&subject.worktree, &config)?
+    let branch = crate::git::current_branch_name(&subject.worktree, &config)
+        .await?
         .ok_or_else(|| "standard Workflow Triggers do not support detached HEAD".to_string())?;
     let mut cache = crate::remote::load_pr_cache(&repository, &branch);
     crate::remote::dispatcher::refresh_change_request_cache(
@@ -464,7 +473,8 @@ fn observe_change_request(subject: &TriggerSubject) -> Result<ChangeRequestObser
         &subject.worktree,
         &config,
         true,
-    )?;
+    )
+    .await?;
     let summary = cache.summary().cloned().ok_or_else(|| {
         "no open Change Request is associated with the selected worktree".to_string()
     })?;
@@ -476,7 +486,8 @@ fn observe_change_request(subject: &TriggerSubject) -> Result<ChangeRequestObser
         &repository,
         &subject.worktree,
         &config,
-    )?;
+    )
+    .await?;
     let identity = summary
         .change_request_identity
         .as_ref()
@@ -507,7 +518,8 @@ fn observe_change_request(subject: &TriggerSubject) -> Result<ChangeRequestObser
         &subject.worktree,
         &config,
         &target_repository,
-    )?;
+    )
+    .await?;
     let merge_relation = match summary
         .merge_state_status
         .trim()
@@ -649,12 +661,13 @@ fn output(
     })
 }
 
-fn resolve_threads(payload: ResolveThreadsPayload) -> Result<(), String> {
+async fn resolve_threads(payload: ResolveThreadsPayload) -> Result<(), String> {
     let repository = crate::repo::Repository {
         root: payload.subject.repository.clone(),
     };
     let config = crate::config::Config::load(&repository);
-    let branch = crate::git::current_branch_name(&payload.subject.worktree, &config)?
+    let branch = crate::git::current_branch_name(&payload.subject.worktree, &config)
+        .await?
         .ok_or_else(|| "cannot resolve review threads from detached HEAD".to_string())?;
     let mut cache = crate::remote::load_pr_cache(&repository, &branch);
     crate::remote::dispatcher::refresh_change_request_cache(
@@ -664,7 +677,8 @@ fn resolve_threads(payload: ResolveThreadsPayload) -> Result<(), String> {
         &payload.subject.worktree,
         &config,
         true,
-    )?;
+    )
+    .await?;
     let summary = cache
         .summary()
         .ok_or_else(|| "Change Request summary is unavailable for review resolution".to_string())?;
@@ -700,7 +714,8 @@ fn resolve_threads(payload: ResolveThreadsPayload) -> Result<(), String> {
                 &config,
                 summary,
                 thread_id,
-            )?;
+            )
+            .await?;
         }
     }
     Ok(())
@@ -810,7 +825,9 @@ fn classify_failure(reason: String) -> RemoteOperationFailure {
         && !normalized.contains("no open change request")
         && !normalized.contains("different change request")
         && !normalized.contains("detached head")
-        && !normalized.contains("configuration");
+        && !normalized.contains("configuration")
+        && !normalized.contains("canceled")
+        && !normalized.contains("cancelled");
     RemoteOperationFailure {
         reason,
         retryable,
@@ -851,5 +868,15 @@ mod tests {
                 .retry_after_unix_ms
                 .is_some_and(|wake| wake >= before + 2_500)
         );
+    }
+
+    #[test]
+    fn provider_cancellation_is_not_retryable() {
+        let failure =
+            classify_failure("GitHub observe failed: cancelled; retry=not_retryable".into());
+
+        assert!(!failure.retryable);
+        assert!(failure.reason.contains("cancelled"));
+        assert!(failure.retry_after_unix_ms.is_none());
     }
 }

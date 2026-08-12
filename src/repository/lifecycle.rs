@@ -1,5 +1,5 @@
+use crate::process::Command;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::config::Config;
 use crate::process::{
@@ -15,7 +15,7 @@ pub(crate) struct WorktreeInventoryEntry {
     pub branch: String,
 }
 
-pub(crate) fn list_worktrees(
+pub(crate) async fn list_worktrees(
     repo: &Repository,
     config: &Config,
 ) -> Result<Vec<WorktreeInventoryEntry>, String> {
@@ -25,7 +25,8 @@ pub(crate) fn list_worktrees(
             .arg(&repo.root)
             .args(["worktree", "list", "--porcelain"]),
         ProcessPolicy::Metadata,
-    )?;
+    )
+    .await?;
     Ok(parse_worktree_inventory(&output))
 }
 
@@ -59,7 +60,7 @@ fn parse_worktree_inventory(output: &str) -> Vec<WorktreeInventoryEntry> {
     entries
 }
 
-pub(crate) fn create_worktree(
+pub(crate) async fn create_worktree(
     repo: &Repository,
     config: &Config,
     branch: &str,
@@ -71,9 +72,10 @@ pub(crate) fn create_worktree(
         create: true,
         base: config.default_base.as_deref(),
     })
+    .await
 }
 
-pub(crate) fn checkout_worktree(
+pub(crate) async fn checkout_worktree(
     repo: &Repository,
     config: &Config,
     branch: &str,
@@ -85,9 +87,10 @@ pub(crate) fn checkout_worktree(
         create: false,
         base: None,
     })
+    .await
 }
 
-pub(crate) fn verify_switch_outcome(
+pub(crate) async fn verify_switch_outcome(
     repo: &Repository,
     config: &Config,
     requested_branch: &str,
@@ -99,10 +102,14 @@ pub(crate) fn verify_switch_outcome(
             outcome.branch
         ));
     }
-    if list_worktrees(repo, config)?.into_iter().any(|entry| {
-        crate::worktrunk::paths_equivalent(&entry.path, &outcome.path)
-            && entry.branch == outcome.branch
-    }) {
+    if list_worktrees(repo, config)
+        .await?
+        .into_iter()
+        .any(|entry| {
+            crate::worktrunk::paths_equivalent(&entry.path, &outcome.path)
+                && entry.branch == outcome.branch
+        })
+    {
         Ok(())
     } else {
         Err(format!(
@@ -113,21 +120,23 @@ pub(crate) fn verify_switch_outcome(
     }
 }
 
-pub(crate) fn check_worktrunk_approval_status(
+pub(crate) async fn check_worktrunk_approval_status(
     repo: &Repository,
     config: &Config,
 ) -> Result<WorktrunkApprovalStatus, String> {
-    crate::worktrunk::approval_status(repo, config).map_err(|error| error.to_string())
+    crate::worktrunk::approval_status(repo, config)
+        .await
+        .map_err(|error| error.to_string())
 }
 
-pub(crate) fn run_worktrunk_approval_prompt(
+pub(crate) async fn run_worktrunk_approval_prompt(
     repo: &Repository,
     config: &Config,
 ) -> Result<(), String> {
-    crate::worktrunk::run_approval_prompt(repo, config)
+    crate::worktrunk::run_approval_prompt(repo, config).await
 }
 
-pub(crate) fn branch_has_worktree(
+pub(crate) async fn branch_has_worktree(
     repo: &Repository,
     config: &Config,
     branch: &str,
@@ -138,14 +147,15 @@ pub(crate) fn branch_has_worktree(
             .arg(&repo.root)
             .args(["worktree", "list", "--porcelain"]),
         ProcessPolicy::Metadata,
-    )?;
+    )
+    .await?;
     Ok(output.lines().any(|line| {
         line.strip_prefix("branch refs/heads/")
             .is_some_and(|current| current == branch)
     }))
 }
 
-pub(crate) fn move_current_branch_to_worktree(
+pub(crate) async fn move_current_branch_to_worktree(
     repo: &Repository,
     config: &Config,
     branch: &str,
@@ -154,7 +164,8 @@ pub(crate) fn move_current_branch_to_worktree(
     run_status(
         Command::new(config.tool("git")).args(switch_checkout_args(&repo.root, base)),
         ProcessPolicy::LocalMutation,
-    )?;
+    )
+    .await?;
     let outcome = crate::worktrunk::switch_worktree(crate::worktrunk::SwitchRequest {
         repo,
         config,
@@ -162,8 +173,9 @@ pub(crate) fn move_current_branch_to_worktree(
         create: false,
         base: None,
     })
+    .await
     .map_err(|failure| failure.to_string())?;
-    verify_switch_outcome(repo, config, branch, &outcome)?;
+    verify_switch_outcome(repo, config, branch, &outcome).await?;
     let _ = crate::observability::append_runtime_message(
         repo,
         &format!("moved {branch} into Worktrunk worktree and switched checkout to {base}"),
@@ -171,7 +183,7 @@ pub(crate) fn move_current_branch_to_worktree(
     Ok(())
 }
 
-pub(crate) fn push_branch(
+pub(crate) async fn push_branch(
     config: &Config,
     path: &Path,
     branch: &str,
@@ -189,7 +201,8 @@ pub(crate) fn push_branch(
             .args(args),
         ProcessPolicy::NetworkQuery,
         ProcessDescriptor::new("git.push"),
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
@@ -202,7 +215,7 @@ fn switch_checkout_args(repo_root: &Path, branch: &str) -> Vec<String> {
     ]
 }
 
-pub(crate) fn delete_branch_if_same_incarnation(
+pub(crate) async fn delete_branch_if_same_incarnation(
     repo: &Repository,
     config: &Config,
     branch: &str,
@@ -211,12 +224,12 @@ pub(crate) fn delete_branch_if_same_incarnation(
     if branch == "(detached)" {
         return Ok(());
     }
-    if branch_has_worktree(repo, config, branch)? {
+    if branch_has_worktree(repo, config, branch).await? {
         return Err(format!(
             "branch {branch} is attached to a new worktree and was retained"
         ));
     }
-    let current_oid = branch_oid(repo, config, branch)?;
+    let current_oid = branch_oid(repo, config, branch).await?;
     if expected_oid.is_some() && Some(current_oid.as_str()) != expected_oid {
         return Err(format!(
             "branch {branch} changed while deletion was in progress and was retained"
@@ -229,9 +242,10 @@ pub(crate) fn delete_branch_if_same_incarnation(
             .args(["branch", "-D", branch]),
         ProcessPolicy::LocalMutation,
     )
+    .await
 }
 
-pub(crate) fn branch_oid(
+pub(crate) async fn branch_oid(
     repo: &Repository,
     config: &Config,
     branch: &str,
@@ -242,7 +256,8 @@ pub(crate) fn branch_oid(
             .arg(&repo.root)
             .args(["rev-parse", "--verify", &format!("refs/heads/{branch}")]),
         ProcessPolicy::Metadata,
-    )?;
+    )
+    .await?;
     let oid = oid.trim();
     if oid.is_empty() {
         Err(format!("branch {branch} identity was empty; retained it"))
@@ -251,7 +266,7 @@ pub(crate) fn branch_oid(
     }
 }
 
-pub(crate) fn branch_exists(
+pub(crate) async fn branch_exists(
     repo: &Repository,
     config: &Config,
     branch: &str,
@@ -267,7 +282,8 @@ pub(crate) fn branch_exists(
                 &format!("refs/heads/{branch}"),
             ]),
         ProcessPolicy::Metadata,
-    )?;
+    )
+    .await?;
     match output.status.code() {
         Some(0) => Ok(true),
         Some(1) => Ok(false),
@@ -277,15 +293,15 @@ pub(crate) fn branch_exists(
     }
 }
 
-pub(crate) fn remove_worktree(
+pub(crate) async fn remove_worktree(
     repo: &Repository,
     config: &Config,
     path: &Path,
 ) -> Result<crate::worktrunk::RemoveOutcome, crate::worktrunk::WorktrunkFailure> {
-    crate::worktrunk::remove_worktree(crate::worktrunk::RemoveRequest { repo, config, path })
+    crate::worktrunk::remove_worktree(crate::worktrunk::RemoveRequest { repo, config, path }).await
 }
 
-pub(crate) fn prune_worktrees(repo: &Repository, config: &Config) -> Result<(), String> {
+pub(crate) async fn prune_worktrees(repo: &Repository, config: &Config) -> Result<(), String> {
     run_status(
         Command::new(config.tool("git"))
             .arg("-C")
@@ -293,6 +309,7 @@ pub(crate) fn prune_worktrees(repo: &Repository, config: &Config) -> Result<(), 
             .args(["worktree", "prune"]),
         ProcessPolicy::LocalMutation,
     )
+    .await
 }
 
 #[cfg(test)]
@@ -320,9 +337,9 @@ mod tests {
     #[cfg(unix)]
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[test]
+    #[tokio::test(flavor = "multi_thread")]
     #[cfg(unix)]
-    fn create_worktree_session_clears_stale_hidden_marker() {
+    async fn create_worktree_session_clears_stale_hidden_marker() {
         let temp = unique_temp_dir("prism-create-clears-hidden-test");
         fs::create_dir_all(&temp).unwrap();
         let wt = temp.join("wt");
@@ -362,7 +379,9 @@ mod tests {
         })
         .unwrap();
 
-        crate::session::create_worktree_session(&repo, &config, "feature").unwrap();
+        crate::session::create_worktree_session(&repo, &config, "feature")
+            .await
+            .unwrap();
 
         let hidden = count_rows(&repo, "hidden_session", "feature");
         assert_eq!(hidden, 0);
@@ -371,8 +390,9 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn create_worktree_session_preserves_metadata_when_switch_result_is_not_in_git_inventory() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_worktree_session_preserves_metadata_when_switch_result_is_not_in_git_inventory()
+    {
         let temp = unique_temp_dir("prism-create-verification-failure-test");
         fs::create_dir_all(&temp).unwrap();
         let wt = temp.join("wt");
@@ -405,7 +425,9 @@ mod tests {
         })
         .unwrap();
 
-        let outcome = crate::session::create_worktree_session(&repo, &config, "feature").unwrap();
+        let outcome = crate::session::create_worktree_session(&repo, &config, "feature")
+            .await
+            .unwrap();
 
         assert!(matches!(
             outcome,
@@ -416,8 +438,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn create_worktree_session_restores_existing_hidden_worktree_without_creating() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_worktree_session_restores_existing_hidden_worktree_without_creating() {
         let temp = unique_temp_dir("prism-create-restores-hidden-test");
         fs::create_dir_all(&temp).unwrap();
         let git = temp.join("git");
@@ -446,7 +468,9 @@ mod tests {
         })
         .unwrap();
 
-        crate::session::create_worktree_session(&repo, &config, "feature").unwrap();
+        crate::session::create_worktree_session(&repo, &config, "feature")
+            .await
+            .unwrap();
 
         assert_eq!(count_rows(&repo, "hidden_session", "feature"), 0);
 
@@ -454,8 +478,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn phase_1_restore_by_create_clears_hidden_and_archived_state() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn phase_1_restore_by_create_clears_hidden_and_archived_state() {
         let temp = unique_temp_dir("prism-create-restores-archived-test");
         fs::create_dir_all(&temp).unwrap();
         let git = temp.join("git");
@@ -504,7 +528,9 @@ mod tests {
         })
         .unwrap();
 
-        crate::session::create_worktree_session(&repo, &config, "feature").unwrap();
+        crate::session::create_worktree_session(&repo, &config, "feature")
+            .await
+            .unwrap();
 
         assert_eq!(count_rows(&repo, "hidden_session", "feature"), 0);
         assert_eq!(count_rows(&repo, "archived_worktree", "feature"), 0);
@@ -513,8 +539,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn check_worktrunk_approval_status_reports_pending() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn check_worktrunk_approval_status_reports_pending() {
         let temp = unique_temp_dir("prism-wt-approval-status-test");
         fs::create_dir_all(&temp).unwrap();
         let wt = temp.join("wt");
@@ -529,7 +555,9 @@ mod tests {
             .insert("wt".to_string(), wt.display().to_string());
         let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
 
-        let status = check_worktrunk_approval_status(&repo, &config).unwrap();
+        let status = check_worktrunk_approval_status(&repo, &config)
+            .await
+            .unwrap();
 
         assert_eq!(status, WorktrunkApprovalStatus::Pending);
 
@@ -537,8 +565,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn create_worktree_session_adds_worktrunk_approval_hint() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_worktree_session_adds_worktrunk_approval_hint() {
         let temp = unique_temp_dir("prism-create-wt-approval-hint-test");
         fs::create_dir_all(&temp).unwrap();
         let wt = temp.join("wt");
@@ -554,6 +582,7 @@ mod tests {
         let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
 
         let error = crate::session::create_worktree_session(&repo, &config, "feature")
+            .await
             .unwrap_err()
             .to_string();
 
@@ -565,8 +594,8 @@ mod tests {
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn move_current_branch_args_switches_checkout_first() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn move_current_branch_args_switches_checkout_first() {
         let repo = PathBuf::from("/repo/prism");
 
         assert_eq!(
@@ -576,8 +605,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn move_current_branch_uses_typed_worktrunk_switch() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn move_current_branch_uses_typed_worktrunk_switch() {
         let temp = unique_temp_dir("prism-move-current-branch-test");
         fs::create_dir_all(&temp).unwrap();
         let git_log = temp.join("git.log");
@@ -607,7 +636,9 @@ mod tests {
             .insert("wt".to_string(), wt.display().to_string());
         let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
 
-        super::move_current_branch_to_worktree(&repo, &config, "feat/test", "main").unwrap();
+        super::move_current_branch_to_worktree(&repo, &config, "feat/test", "main")
+            .await
+            .unwrap();
 
         assert!(
             fs::read_to_string(git_log)
@@ -620,8 +651,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn complete_delete_removes_all_owned_session_state() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn complete_delete_removes_all_owned_session_state() {
         let temp = unique_temp_dir("prism-delete-kills-tmux-test");
         fs::create_dir_all(&temp).unwrap();
         let tmux_log = temp.join("tmux.log");
@@ -775,6 +806,7 @@ exit 0
         fs::create_dir_all(agent_log.parent().unwrap()).unwrap();
         fs::write(&agent_log, "owned Agent Session log\n").unwrap();
         crate::session::delete_worktree_session_if_current(&repo, &config, &path, branch, None)
+            .await
             .unwrap();
 
         let tmux_commands = fs::read_to_string(&tmux_log).unwrap();
@@ -808,8 +840,8 @@ exit 0
     }
 
     #[cfg(unix)]
-    #[test]
-    fn delete_worktree_session_cleans_only_the_removed_session_runtime() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delete_worktree_session_cleans_only_the_removed_session_runtime() {
         let temp = unique_temp_dir("prism-delete-deregistered-failure-test");
         fs::create_dir_all(&temp).unwrap();
         let tmux_log = temp.join("tmux.log");
@@ -934,6 +966,7 @@ exit 0
         fs::write(&log, "agent log\n").unwrap();
 
         crate::session::delete_worktree_session_if_current(&repo, &config, &path, branch, None)
+            .await
             .unwrap();
 
         let git_commands = fs::read_to_string(&git_log).unwrap();
@@ -958,8 +991,8 @@ exit 0
     }
 
     #[cfg(unix)]
-    #[test]
-    fn failed_worktrunk_removal_preserves_prism_state_branch_and_artifacts() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_worktrunk_removal_preserves_prism_state_branch_and_artifacts() {
         let temp = unique_temp_dir("prism-phase-1-preserve-failed-delete-test");
         fs::create_dir_all(&temp).unwrap();
         let tmux = temp.join("tmux");
@@ -1119,6 +1152,7 @@ exit 0
 
         let error =
             crate::session::delete_worktree_session_if_current(&repo, &config, &path, branch, None)
+                .await
                 .unwrap_err();
 
         assert!(error.contains("pre-remove hook failed"));
@@ -1140,8 +1174,8 @@ exit 0
     }
 
     #[cfg(unix)]
-    #[test]
-    fn failed_worktrunk_removal_after_path_removal_is_resumable_without_repeating_remove() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_worktrunk_removal_after_path_removal_is_resumable_without_repeating_remove() {
         let temp = unique_temp_dir("prism-wt-failed-after-remove-retry-test");
         fs::create_dir_all(&temp).unwrap();
         let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
@@ -1205,6 +1239,7 @@ exit 0
 
         let first =
             crate::session::delete_worktree_session_if_current(&repo, &config, &path, branch, None)
+                .await
                 .unwrap();
 
         assert!(matches!(
@@ -1221,6 +1256,7 @@ exit 0
 
         let retried =
             crate::session::delete_worktree_session_if_current(&repo, &config, &path, branch, None)
+                .await
                 .unwrap();
 
         assert_eq!(retried, crate::session::DeleteWorktreeOutcome::Deleted);
@@ -1231,8 +1267,8 @@ exit 0
     }
 
     #[cfg(unix)]
-    #[test]
-    fn pending_removed_worktree_with_absent_branch_resumes_owned_state_cleanup() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pending_removed_worktree_with_absent_branch_resumes_owned_state_cleanup() {
         let temp = unique_temp_dir("prism-pending-removed-absent-branch-test");
         fs::create_dir_all(&temp).unwrap();
         let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
@@ -1285,10 +1321,13 @@ exit 0
         })
         .unwrap();
 
-        crate::session::reconcile_worktree_state(&repo, &config).unwrap();
+        crate::session::reconcile_worktree_state(&repo, &config)
+            .await
+            .unwrap();
         assert_eq!(count_rows(&repo, "task_metadata", branch), 1);
         assert_eq!(
             crate::session::discover_sessions(&repo, &config)
+                .await
                 .unwrap()
                 .iter()
                 .map(|session| session.status_label.as_str())
@@ -1298,6 +1337,7 @@ exit 0
 
         let outcome =
             crate::session::delete_worktree_session_if_current(&repo, &config, &path, branch, None)
+                .await
                 .unwrap();
 
         assert_eq!(outcome, crate::session::DeleteWorktreeOutcome::Deleted);
@@ -1311,8 +1351,8 @@ exit 0
     }
 
     #[cfg(unix)]
-    #[test]
-    fn branch_delete_failure_reports_removed_worktree_and_retained_branch() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn branch_delete_failure_reports_removed_worktree_and_retained_branch() {
         let temp = unique_temp_dir("prism-delete-branch-retained-test");
         fs::create_dir_all(&temp).unwrap();
         let tmux = temp.join("tmux");
@@ -1362,6 +1402,7 @@ exit 0
             "feature/keep",
             None,
         )
+        .await
         .unwrap();
 
         assert!(matches!(
@@ -1379,6 +1420,7 @@ exit 0
             "feature/keep",
             None,
         )
+        .await
         .unwrap();
 
         assert_eq!(retried, crate::session::DeleteWorktreeOutcome::Deleted);
@@ -1388,8 +1430,8 @@ exit 0
     }
 
     #[cfg(unix)]
-    #[test]
-    fn branch_identity_failure_stops_before_worktree_removal() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn branch_identity_failure_stops_before_worktree_removal() {
         let temp = unique_temp_dir("prism-delete-branch-identity-failure-test");
         fs::create_dir_all(&temp).unwrap();
         let git_log = temp.join("git.log");
@@ -1427,6 +1469,7 @@ exit 0
             "feature/keep",
             None,
         )
+        .await
         .unwrap_err();
 
         assert!(error.contains("rev-parse"));

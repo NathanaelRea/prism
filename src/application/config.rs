@@ -1265,7 +1265,7 @@ pub fn print_config(repo: &Repository, config: &Config) {
     }
 }
 
-pub fn doctor(repo: &Repository, config: &mut Config) -> Result<(), String> {
+pub async fn doctor(repo: &Repository, config: &mut Config) -> Result<(), String> {
     println!("Prism doctor");
     println!("repo: {}", repo.root.display());
     println!("user config: {}", config.user_path.display());
@@ -1306,14 +1306,14 @@ pub fn doctor(repo: &Repository, config: &mut Config) -> Result<(), String> {
             description.submit,
             description.cancel_session
         );
-        print_tool_status("harness", program, true);
+        print_tool_status("harness", program, true).await;
         if let Some(headless_program) = configured
             .headless_command
             .as_ref()
             .and_then(|command| command.first())
             && headless_program != program
         {
-            print_tool_status("harness headless", headless_program, true);
+            print_tool_status("harness headless", headless_program, true).await;
         }
         for (capability, supported, reason) in [
             (
@@ -1357,22 +1357,22 @@ pub fn doctor(repo: &Repository, config: &mut Config) -> Result<(), String> {
     }
     println!();
 
-    print_tool_status("git", &config.tool("git"), true);
-    print_tool_status("gh", &config.tool("gh"), false);
-    print_tool_status("glab", &config.tool("glab"), false);
-    print_tool_status("tmux", &config.tool("tmux"), true);
-    print_worktrunk_status(repo, config);
-    print_tool_status("fzf", &config.tool("fzf"), false);
+    print_tool_status("git", &config.tool("git"), true).await;
+    print_tool_status("gh", &config.tool("gh"), false).await;
+    print_tool_status("glab", &config.tool("glab"), false).await;
+    print_tool_status("tmux", &config.tool("tmux"), true).await;
+    print_worktrunk_status(repo, config).await;
+    print_tool_status("fzf", &config.tool("fzf"), false).await;
     println!();
 
     println!();
-    print_remote_doctor(repo, config);
+    print_remote_doctor(repo, config).await;
 
     println!();
     print_workflow_doctor(repo);
 
     println!();
-    match discover_sessions(repo, config) {
+    match discover_sessions(repo, config).await {
         Ok(sessions) => {
             println!("worktrees: {}", sessions.len());
             for session in sessions {
@@ -1482,7 +1482,7 @@ fn resolve_executable_candidate(candidate: PathBuf) -> Option<PathBuf> {
     None
 }
 
-pub fn ensure_required_tools(
+pub async fn ensure_required_tools(
     repo: &Repository,
     config: &Config,
 ) -> Result<crate::worktrunk::WorktrunkVersion, String> {
@@ -1499,7 +1499,9 @@ pub fn ensure_required_tools(
         config,
         "origin",
         crate::remote::RemoteUrlKind::Fetch,
-    ) {
+    )
+    .await
+    {
         match remote.repository.id.provider() {
             ProviderKind::GitHub => required.push(("gh", config.tool("gh"))),
             ProviderKind::GitLab => required.push(("glab", config.tool("glab"))),
@@ -1519,10 +1521,10 @@ pub fn ensure_required_tools(
             config.repo_config_path.display()
         ));
     }
-    crate::worktrunk::ensure_supported_version(config)
+    crate::worktrunk::ensure_supported_version(config).await
 }
 
-fn print_worktrunk_status(repo: &Repository, config: &Config) {
+async fn print_worktrunk_status(repo: &Repository, config: &Config) {
     let command = config.tool(&config.worktree_command);
     if !command_exists(&command) {
         println!(
@@ -1531,7 +1533,7 @@ fn print_worktrunk_status(repo: &Repository, config: &Config) {
         );
         return;
     }
-    match crate::worktrunk::detect_version(config) {
+    match crate::worktrunk::detect_version(config).await {
         Ok(version) => {
             let status = if version.supported() {
                 "ok"
@@ -1546,7 +1548,7 @@ fn print_worktrunk_status(repo: &Repository, config: &Config) {
                 crate::worktrunk::TESTED_CURRENT_VERSION,
             );
             if version.supported() {
-                match crate::worktrunk::observe_repository(repo, config) {
+                match crate::worktrunk::observe_repository(repo, config).await {
                     Ok(snapshot) => println!(
                         "worktrunk observation: fresh schema={} worktrees={}",
                         match snapshot.schema {
@@ -1569,20 +1571,21 @@ fn print_worktrunk_status(repo: &Repository, config: &Config) {
     }
 }
 
-fn print_remote_doctor(repo: &Repository, config: &Config) {
-    for line in remote_doctor_lines(repo, config) {
+async fn print_remote_doctor(repo: &Repository, config: &Config) {
+    for line in remote_doctor_lines(repo, config).await {
         println!("{line}");
     }
 }
 
-fn remote_doctor_lines(repo: &Repository, config: &Config) -> Vec<String> {
+async fn remote_doctor_lines(repo: &Repository, config: &Config) -> Vec<String> {
     let mut lines = Vec::new();
     let remote = crate::remote::discover_git_remote(
         &repo.root,
         config,
         "origin",
         crate::remote::RemoteUrlKind::Fetch,
-    );
+    )
+    .await;
     let Ok(remote) = remote else {
         lines.push(format!("remote: unavailable: {}", remote.unwrap_err()));
         return lines;
@@ -1599,7 +1602,7 @@ fn remote_doctor_lines(repo: &Repository, config: &Config) -> Vec<String> {
             crate::remote::WebScheme::Https => "https",
         }
     ));
-    let diagnostics = crate::remote::dispatcher::runtime_diagnostics(&repo.root, config);
+    let diagnostics = crate::remote::dispatcher::runtime_diagnostics(&repo.root, config).await;
     let capabilities = diagnostics
         .as_ref()
         .map(|diagnostics| diagnostics.capabilities.clone())
@@ -1624,6 +1627,7 @@ fn remote_doctor_lines(repo: &Repository, config: &Config) -> Vec<String> {
     lines.push(format!(
         "remote authentication: {}",
         crate::remote::dispatcher::authentication_status(&repo.root, config)
+            .await
             .unwrap_or_else(|error| error)
     ));
     lines.push(format!(
@@ -1639,14 +1643,16 @@ fn remote_doctor_lines(repo: &Repository, config: &Config) -> Vec<String> {
     lines
 }
 
-fn print_tool_status(label: &str, command: &str, required: bool) {
+async fn print_tool_status(label: &str, command: &str, required: bool) {
     let prefix = if command_exists(command) {
         "ok"
     } else {
         "missing"
     };
     let required = if required { "required" } else { "optional" };
-    let version = command_version(command).unwrap_or_else(|| "-".to_string());
+    let version = command_version(command)
+        .await
+        .unwrap_or_else(|| "-".to_string());
     println!("{prefix:7} {label:12} {command:18} {required:8} {version}");
 }
 
@@ -1797,8 +1803,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn doctor_reports_configured_transport_and_runtime_forgejo_capabilities() {
+    #[tokio::test]
+    async fn doctor_reports_configured_transport_and_runtime_forgejo_capabilities() {
         let directory = std::env::temp_dir().join(format!(
             "prism-doctor-forgejo-{}-{}",
             std::process::id(),
@@ -1824,7 +1830,7 @@ mod tests {
             },
         );
 
-        let report = remote_doctor_lines(&repo, &config).join("\n");
+        let report = remote_doctor_lines(&repo, &config).await.join("\n");
         worker.join().unwrap();
 
         assert!(report.contains("remote transport: http"));
@@ -1836,8 +1842,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn doctor_reports_unknown_runtime_capabilities_with_safe_failure_reason() {
+    #[tokio::test]
+    async fn doctor_reports_unknown_runtime_capabilities_with_safe_failure_reason() {
         let directory = std::env::temp_dir().join(format!(
             "prism-doctor-forgejo-unavailable-{}-{}",
             std::process::id(),
@@ -1862,7 +1868,7 @@ mod tests {
             },
         );
 
-        let report = remote_doctor_lines(&repo, &config).join("\n");
+        let report = remote_doctor_lines(&repo, &config).await.join("\n");
 
         assert!(report.contains("remote transport: https"));
         assert!(report.contains("create=unknown"));
@@ -1873,8 +1879,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn doctor_reports_gitlab_rebase_merge_as_unavailable() {
+    #[tokio::test]
+    async fn doctor_reports_gitlab_rebase_merge_as_unavailable() {
         let directory = std::env::temp_dir().join(format!(
             "prism-doctor-gitlab-rebase-{}-{}",
             std::process::id(),
@@ -1890,7 +1896,7 @@ mod tests {
             .tools
             .insert("git".to_string(), git.display().to_string());
 
-        let report = remote_doctor_lines(&repo, &config).join("\n");
+        let report = remote_doctor_lines(&repo, &config).await.join("\n");
 
         assert!(report.contains("merge=unsupported"));
         assert!(

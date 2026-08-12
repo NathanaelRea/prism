@@ -1,5 +1,4 @@
 pub mod agent_phase;
-mod child_process;
 pub mod kernel;
 pub(crate) mod prompt_daemon;
 pub mod prompt_worker;

@@ -17,8 +17,8 @@ use super::support::{
     unique_temp_dir,
 };
 
-#[test]
-fn empty_list_retains_persisted_create_marker_until_matching_summary_is_observed() {
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_list_retains_persisted_create_marker_until_matching_summary_is_observed() {
     let temp = unique_temp_dir("prism-tui-mutation-reconciliation-test");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -93,8 +93,8 @@ fn empty_list_retains_persisted_create_marker_until_matching_summary_is_observed
     fs::remove_dir_all(temp).unwrap();
 }
 
-#[test]
-fn reconciliation_clears_only_markers_with_matched_authoritative_evidence() {
+#[tokio::test(flavor = "multi_thread")]
+async fn reconciliation_clears_only_markers_with_matched_authoritative_evidence() {
     let temp = unique_temp_dir("prism-tui-matched-mutation-evidence-test");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -198,8 +198,8 @@ fn reconciliation_clears_only_markers_with_matched_authoritative_evidence() {
     fs::remove_dir_all(temp).unwrap();
 }
 
-#[test]
-fn cleanup_applies_a_mutation_payload_routed_before_shutdown_started() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cleanup_applies_a_mutation_payload_routed_before_shutdown_started() {
     let temp = unique_temp_dir("prism-tui-routed-mutation-shutdown-test");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -229,7 +229,7 @@ fn cleanup_applies_a_mutation_payload_routed_before_shutdown_started() {
         0,
         None,
         "already-routed-mutation".to_string(),
-        move |context| {
+        move |context| async move {
             Ok(Some(TuiJobPayload::RemoteAction(Box::new(
                 RemoteActionDelivery {
                     id: context.id(),
@@ -254,6 +254,7 @@ fn cleanup_applies_a_mutation_payload_routed_before_shutdown_started() {
     tui.route_tui_job_messages();
 
     tui.cleanup_tui_jobs(super::super::ShutdownReason::Sigterm)
+        .await
         .unwrap();
 
     assert!(tui.remote_actions_requiring_reconciliation.is_empty());
@@ -269,8 +270,8 @@ fn cleanup_applies_a_mutation_payload_routed_before_shutdown_started() {
     fs::remove_dir_all(temp).unwrap();
 }
 
-#[test]
-fn mutation_remote_action_jobs_cannot_be_abandoned_or_timed_out() {
+#[tokio::test(flavor = "multi_thread")]
+async fn mutation_remote_action_jobs_cannot_be_abandoned_or_timed_out() {
     let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
     let interrupt = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
 
@@ -301,8 +302,8 @@ fn mutation_remote_action_jobs_cannot_be_abandoned_or_timed_out() {
     );
 }
 
-#[test]
-fn push_remote_action_cannot_be_abandoned_and_reconciles_after_generation_change() {
+#[tokio::test(flavor = "multi_thread")]
+async fn push_remote_action_cannot_be_abandoned_and_reconciles_after_generation_change() {
     let abandon_cancelable = false;
     let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
     let interrupt = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
@@ -321,7 +322,7 @@ fn push_remote_action_cannot_be_abandoned_and_reconciles_after_generation_change
         tui.session_inventory_generation,
         remote_action_timeout(abandon_cancelable),
         "push-reconciliation-test".to_string(),
-        |context| {
+        |context| async move {
             Ok(Some(TuiJobPayload::RemoteAction(Box::new(
                 RemoteActionDelivery {
                     id: context.id(),
@@ -350,8 +351,8 @@ fn push_remote_action_cannot_be_abandoned_and_reconciles_after_generation_change
     tui.remote_actions_requiring_reconciliation.remove(&id);
 }
 
-#[test]
-fn queued_remote_timing_updates_the_visible_progress_dialog() {
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_remote_timing_updates_the_visible_progress_dialog() {
     let temp = unique_temp_dir("prism-tui-remote-wait-progress-test");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -375,8 +376,8 @@ fn queued_remote_timing_updates_the_visible_progress_dialog() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn applying_remote_action_results_performs_no_provider_or_database_io() {
+#[tokio::test(flavor = "multi_thread")]
+async fn applying_remote_action_results_performs_no_provider_or_database_io() {
     let temp = unique_temp_dir("prism-tui-remote-action-result-test");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));

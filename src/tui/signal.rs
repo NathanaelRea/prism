@@ -26,6 +26,7 @@ impl ShutdownSignal {
 }
 
 pub(crate) struct ShutdownNotification {
+    #[allow(dead_code)]
     canceled: Arc<AtomicBool>,
     signal: Arc<AtomicU8>,
     #[cfg(unix)]
@@ -84,6 +85,7 @@ impl ShutdownNotification {
         })
     }
 
+    #[allow(dead_code)]
     pub(crate) fn cancellation(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.canceled)
     }

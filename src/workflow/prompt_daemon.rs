@@ -7,7 +7,6 @@ use std::os::fd::AsRawFd as _;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -88,16 +87,12 @@ pub fn ensure_running() -> Result<(), String> {
         let _ = request("shutdown");
         wait_stopped(TRANSITION_TIMEOUT)?;
     }
-    let executable = std::env::current_exe()
-        .map_err(|error| format!("resolve Prism worker executable: {error}"))?;
-    crate::process::spawn_detached_named(
-        Command::new(executable)
-            .args(["worker", "serve"])
-            .env("PRISM_WORKER_GENERATION", &generation),
-        crate::process::DetachedProcessPolicy::WorkerDaemon,
-        crate::process::ProcessDescriptor::new("prism.worker.serve"),
-    )
-    .map_err(|error| format!("start Prism worker daemon: {error}"))?;
+    let executable =
+        worker_executable().map_err(|error| format!("resolve Prism worker executable: {error}"))?;
+    let command = crate::process::Command::new(executable)
+        .args(["worker", "serve"])
+        .env("PRISM_WORKER_GENERATION", &generation);
+    let _pid = spawn_detached_worker(command)?;
     let deadline = Instant::now() + TRANSITION_TIMEOUT;
     let mut last = "worker did not become ready".to_string();
     while Instant::now() < deadline {
@@ -115,6 +110,67 @@ pub fn ensure_running() -> Result<(), String> {
         thread::sleep(Duration::from_millis(25));
     }
     Err(last)
+}
+
+fn worker_executable() -> io::Result<PathBuf> {
+    let current = std::env::current_exe()?;
+    #[cfg(test)]
+    if current.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new("deps"))
+        && let Some(profile_directory) = current.parent().and_then(Path::parent)
+    {
+        let executable = profile_directory.join(format!("prism{}", std::env::consts::EXE_SUFFIX));
+        if executable.is_file() {
+            return Ok(executable);
+        }
+    }
+    Ok(current)
+}
+
+fn spawn_detached_worker(command: crate::process::Command) -> Result<u32, String> {
+    use crate::flight_recorder::{
+        ExternalCallCategory, ExternalCallOutcome, ExternalCallTrace, text, unsigned,
+    };
+
+    let mut trace = ExternalCallTrace::begin(
+        ExternalCallCategory::Process,
+        "prism.worker.serve",
+        vec![text("policy", "detached")],
+    );
+    match command.spawn_detached() {
+        Ok(child) => {
+            let pid = child.pid();
+            trace.finish(
+                ExternalCallOutcome::Success,
+                vec![
+                    text("completion", "detached"),
+                    text("termination_stage", "none"),
+                    unsigned("child_pid", pid),
+                    unsigned("stdout_bytes", 0_u64),
+                    unsigned("stderr_bytes", 0_u64),
+                    crate::flight_recorder::boolean("stdout_truncated", false),
+                    crate::flight_recorder::boolean("stderr_truncated", false),
+                ],
+            );
+            // ProcessKit's detached handle intentionally has no ownership or
+            // control semantics; it is dropped here without stopping the worker.
+            Ok(pid)
+        }
+        Err(error) => {
+            trace.finish(
+                ExternalCallOutcome::SpawnFailed,
+                vec![
+                    text("completion", "spawn_failed"),
+                    text("termination_stage", "none"),
+                    text("error_kind", error.kind().name()),
+                    unsigned("stdout_bytes", 0_u64),
+                    unsigned("stderr_bytes", 0_u64),
+                    crate::flight_recorder::boolean("stdout_truncated", false),
+                    crate::flight_recorder::boolean("stderr_truncated", false),
+                ],
+            );
+            Err(format!("start Prism worker daemon: {error}"))
+        }
+    }
 }
 
 pub fn health_response() -> Result<String, String> {
@@ -144,25 +200,20 @@ fn wait_stopped(timeout: Duration) -> Result<(), String> {
     Err("timed out waiting for Prism worker daemon to stop".into())
 }
 
-pub fn serve() -> Result<(), String> {
+pub async fn serve() -> Result<(), String> {
     let generation = std::env::var("PRISM_WORKER_GENERATION")
         .ok()
         .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
         .map_or_else(binary_generation, Ok)?;
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .map_err(|error| format!("create Prism worker runtime: {error}"))?;
-    let service = runtime
-        .block_on(crate::PromptWorkflowService::open(
-            &crate::PromptWorkflowService::database_path(),
-            &crate::PromptWorkflowService::state_root(),
-        ))
-        .map_err(|error| format!("open prompt Workflow service: {error}"))?;
+    let service = crate::PromptWorkflowService::open(
+        &crate::PromptWorkflowService::database_path(),
+        &crate::PromptWorkflowService::state_root(),
+    )
+    .await
+    .map_err(|error| format!("open prompt Workflow service: {error}"))?;
     let (shutdown, mut shutdown_receiver) = tokio::sync::watch::channel(false);
     let background = service.clone();
-    let scheduler = runtime.spawn(async move {
+    let scheduler = tokio::spawn(async move {
         loop {
             if *shutdown_receiver.borrow() {
                 break;
@@ -181,16 +232,15 @@ pub fn serve() -> Result<(), String> {
             }
         }
     });
-    let result = serve_socket(&runtime, &service, &generation);
+    let result = serve_socket(&service, &generation).await;
     let _ = shutdown.send(true);
-    runtime
-        .block_on(scheduler)
+    scheduler
+        .await
         .map_err(|error| format!("join prompt Workflow scheduler: {error}"))?;
     result
 }
 
-fn serve_socket(
-    runtime: &tokio::runtime::Runtime,
+async fn serve_socket(
     service: &crate::PromptWorkflowService,
     generation: &str,
 ) -> Result<(), String> {
@@ -225,16 +275,9 @@ fn serve_socket(
     let mut draining = false;
     loop {
         match worker_ipc::accept(&listener) {
-            Ok(mut stream) => {
-                draining |= respond(
-                    runtime,
-                    service,
-                    &mut stream,
-                    &secret,
-                    &instance,
-                    generation,
-                    draining,
-                );
+            Ok(stream) => {
+                draining |=
+                    respond(service, stream, &secret, &instance, generation, draining).await;
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(error) => return Err(format!("accept Prism worker connection: {error}")),
@@ -242,7 +285,7 @@ fn serve_socket(
         if draining {
             break;
         }
-        thread::sleep(Duration::from_millis(25));
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
     drop(listener);
     endpoint
@@ -250,30 +293,52 @@ fn serve_socket(
         .map_err(|error| format!("remove Prism worker endpoint: {error}"))
 }
 
-fn respond(
-    runtime: &tokio::runtime::Runtime,
+async fn respond(
     service: &crate::PromptWorkflowService,
-    stream: &mut WorkerStream,
+    stream: WorkerStream,
     secret: &str,
     instance: &str,
     generation: &str,
     draining: bool,
 ) -> bool {
-    let Ok(request) = read_request_line(stream) else {
-        let _ = write_with_deadline(stream, b"error invalid-request\n", RESPONSE_WRITE_TIMEOUT);
+    // Local-socket streams expose synchronous I/O. Keep the one accepted
+    // connection's bounded read/write deadlines off Tokio worker threads; the
+    // sequential accept loop bounds this to one blocking task at a time.
+    let read = tokio::task::spawn_blocking(move || {
+        let mut stream = stream;
+        let request = read_request_line(&mut stream);
+        (stream, request)
+    })
+    .await;
+    let Ok((mut stream, request)) = read else {
+        return false;
+    };
+    let Ok(request) = request else {
+        let _ = tokio::task::spawn_blocking(move || {
+            write_with_deadline(
+                &mut stream,
+                b"error invalid-request\n",
+                RESPONSE_WRITE_TIMEOUT,
+            )
+        })
+        .await;
         return false;
     };
     let request = request.trim();
     let Some(request) = authenticate_command(secret, request) else {
-        let _ = write_with_deadline(
-            stream,
-            b"error authentication-failed\n",
-            RESPONSE_WRITE_TIMEOUT,
-        );
+        let _ = tokio::task::spawn_blocking(move || {
+            write_with_deadline(
+                &mut stream,
+                b"error authentication-failed\n",
+                RESPONSE_WRITE_TIMEOUT,
+            )
+        })
+        .await;
         return false;
     };
-    let active = runtime
-        .block_on(service.list(None, 10_000))
+    let active = service
+        .list(None, 10_000)
+        .await
         .map(|runs| {
             runs.into_iter()
                 .filter(|run| !run.status.terminal())
@@ -283,11 +348,15 @@ fn respond(
     let response = match request {
         "health" | "wake" => health_line(instance, generation, draining, active),
         "shutdown" => health_line(instance, generation, true, active),
-        request if request.starts_with('{') => prompt_response(runtime, service, request),
+        request if request.starts_with('{') => prompt_response(service, request).await,
         _ => "error unknown-command\n".into(),
     };
-    let _ = write_with_deadline(stream, response.as_bytes(), RESPONSE_WRITE_TIMEOUT);
-    request == "shutdown"
+    let shutdown = request == "shutdown";
+    let _ = tokio::task::spawn_blocking(move || {
+        write_with_deadline(&mut stream, response.as_bytes(), RESPONSE_WRITE_TIMEOUT)
+    })
+    .await;
+    shutdown
 }
 
 fn read_request_line(stream: &mut WorkerStream) -> io::Result<String> {
@@ -445,102 +514,96 @@ enum SocketControl {
     Retry,
 }
 
-fn prompt_response(
-    runtime: &tokio::runtime::Runtime,
-    service: &crate::PromptWorkflowService,
-    request: &str,
-) -> String {
+async fn prompt_response(service: &crate::PromptWorkflowService, request: &str) -> String {
     let request = match serde_json::from_str::<SocketRequest>(request) {
         Ok(request) => request,
         Err(error) => return json_error(format!("invalid Worker request: {error}")),
     };
-    let result = runtime.block_on(async {
-        match request {
-            SocketRequest::Launch {
-                workflow,
-                run_id,
-                subject,
-                now_unix_ms,
-            } => service
-                .launch(*workflow, &run_id, subject, now_unix_ms)
-                .await
-                .map(|run| serde_json::json!({"ok": true, "run_id": run.id}))
-                .map_err(|error| error.to_string()),
-            SocketRequest::List { repository, limit } => service
-                .list(repository.as_deref().map(Path::new), limit)
-                .await
-                .map(|runs| serde_json::json!({"ok": true, "runs": runs}))
-                .map_err(|error| error.to_string()),
-            SocketRequest::Inspect { run_id } => service
-                .inspect(&run_id)
-                .await
-                .map(|run| serde_json::json!({"ok": true, "run": run}))
-                .map_err(|error| error.to_string()),
-            SocketRequest::Command {
-                run_id,
-                command,
-                now_unix_ms,
-            } => {
-                let result = match command {
-                    SocketControl::Pause => service.pause(&run_id, now_unix_ms).await,
-                    SocketControl::Resume => service.resume(&run_id, now_unix_ms).await,
-                    SocketControl::Cancel => service.cancel(&run_id, now_unix_ms).await,
-                    SocketControl::Retry => service.retry(&run_id, now_unix_ms).await,
-                };
-                result
-                    .map(|()| serde_json::json!({"ok": true}))
-                    .map_err(|error| error.to_string())
-            }
-            SocketRequest::RemoteObserve {
-                repository,
-                worktree,
-                operation,
-                subject,
-                payload,
-            } => service
-                .remote_observe(&repository, &worktree, operation, subject, payload)
-                .await
-                .and_then(|result| match result {
-                    crate::remote::request_coordinator::RemoteObservationResult::Fresh(value) => {
-                        Ok(serde_json::json!({"ok": true, "state": "fresh", "value": value.value}))
-                    }
-                    crate::remote::request_coordinator::RemoteObservationResult::Pending(wait) => {
-                        Ok(serde_json::json!({"ok": true, "state": "pending", "wait": wait}))
-                    }
-                    crate::remote::request_coordinator::RemoteObservationResult::Failed(reason) => {
-                        Err(reason)
-                    }
-                }),
-            SocketRequest::RemoteMutate {
-                repository,
-                worktree,
+    let result = match request {
+        SocketRequest::Launch {
+            workflow,
+            run_id,
+            subject,
+            now_unix_ms,
+        } => service
+            .launch(*workflow, &run_id, subject, now_unix_ms)
+            .await
+            .map(|run| serde_json::json!({"ok": true, "run_id": run.id}))
+            .map_err(|error| error.to_string()),
+        SocketRequest::List { repository, limit } => service
+            .list(repository.as_deref().map(Path::new), limit)
+            .await
+            .map(|runs| serde_json::json!({"ok": true, "runs": runs}))
+            .map_err(|error| error.to_string()),
+        SocketRequest::Inspect { run_id } => service
+            .inspect(&run_id)
+            .await
+            .map(|run| serde_json::json!({"ok": true, "run": run}))
+            .map_err(|error| error.to_string()),
+        SocketRequest::Command {
+            run_id,
+            command,
+            now_unix_ms,
+        } => {
+            let result = match command {
+                SocketControl::Pause => service.pause(&run_id, now_unix_ms).await,
+                SocketControl::Resume => service.resume(&run_id, now_unix_ms).await,
+                SocketControl::Cancel => service.cancel(&run_id, now_unix_ms).await,
+                SocketControl::Retry => service.retry(&run_id, now_unix_ms).await,
+            };
+            result
+                .map(|()| serde_json::json!({"ok": true}))
+                .map_err(|error| error.to_string())
+        }
+        SocketRequest::RemoteObserve {
+            repository,
+            worktree,
+            operation,
+            subject,
+            payload,
+        } => service
+            .remote_observe(&repository, &worktree, operation, subject, payload)
+            .await
+            .and_then(|result| match result {
+                crate::remote::request_coordinator::RemoteObservationResult::Fresh(value) => {
+                    Ok(serde_json::json!({"ok": true, "state": "fresh", "value": value.value}))
+                }
+                crate::remote::request_coordinator::RemoteObservationResult::Pending(wait) => {
+                    Ok(serde_json::json!({"ok": true, "state": "pending", "wait": wait}))
+                }
+                crate::remote::request_coordinator::RemoteObservationResult::Failed(reason) => {
+                    Err(reason)
+                }
+            }),
+        SocketRequest::RemoteMutate {
+            repository,
+            worktree,
+            request_id,
+            operation,
+            subject,
+            payload,
+        } => service
+            .remote_mutate(
+                &repository,
+                &worktree,
                 request_id,
                 operation,
                 subject,
                 payload,
-            } => service
-                .remote_mutate(
-                    &repository,
-                    &worktree,
-                    request_id,
-                    operation,
-                    subject,
-                    payload,
-                )
-                .await
-                .and_then(|result| match result {
-                    crate::remote::request_coordinator::RemoteMutationResult::Applied(value) => {
-                        Ok(serde_json::json!({"ok": true, "state": "applied", "value": value}))
-                    }
-                    crate::remote::request_coordinator::RemoteMutationResult::Pending(wait) => {
-                        Ok(serde_json::json!({"ok": true, "state": "pending", "wait": wait}))
-                    }
-                    crate::remote::request_coordinator::RemoteMutationResult::Failed(reason) => {
-                        Err(reason)
-                    }
-                }),
-        }
-    });
+            )
+            .await
+            .and_then(|result| match result {
+                crate::remote::request_coordinator::RemoteMutationResult::Applied(value) => {
+                    Ok(serde_json::json!({"ok": true, "state": "applied", "value": value}))
+                }
+                crate::remote::request_coordinator::RemoteMutationResult::Pending(wait) => {
+                    Ok(serde_json::json!({"ok": true, "state": "pending", "wait": wait}))
+                }
+                crate::remote::request_coordinator::RemoteMutationResult::Failed(reason) => {
+                    Err(reason)
+                }
+            }),
+    };
     match result {
         Ok(value) => format!("{value}\n"),
         Err(error) => json_error(error.to_string()),
@@ -1061,9 +1124,89 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn synchronous_daemon_io_does_not_starve_the_tokio_runtime() {
+        use std::io::Write as _;
+
+        let (server, mut client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let reader = tokio::task::spawn_blocking(move || {
+            let mut server = server;
+            read_request_line(&mut server)
+        });
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            tokio::time::sleep(Duration::from_millis(20)),
+        )
+        .await
+        .expect("Tokio timer was starved by synchronous daemon I/O");
+        client.write_all(b"health\n").unwrap();
+        assert_eq!(reader.await.unwrap().unwrap(), "health\n");
+    }
+
+    #[cfg(unix)]
     #[test]
     fn socket_path_is_bounded_before_bind() {
         let root = PathBuf::from("x".repeat(worker_ipc::UNIX_SOCKET_PATH_BUDGET));
         assert!(WorkerEndpoint::for_runtime(&root).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn detached_worker_survives_handle_drop_and_can_be_recovered_by_identity() {
+        let directory = crate::compact_runtime::CompactTempDir::new("detached-worker");
+        let marker = directory.path().join("ready");
+        let pid = spawn_detached_worker(
+            crate::process::Command::new("sh")
+                .args(["-c", "printf ready > \"$1\"; exec sleep 30", "worker"])
+                .arg(&marker),
+        )
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while !marker.exists() {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let recorded = crate::process::record_process(pid).unwrap();
+        assert_eq!(
+            crate::process::observe_process(recorded).unwrap(),
+            crate::process::ProcessObservation::RunningSameProcess
+        );
+        assert_eq!(
+            crate::process::terminate_recorded_process(recorded, Duration::from_millis(250))
+                .await
+                .unwrap(),
+            crate::process::TerminationOutcome::Terminated
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn detached_worker_exit_is_reaped_by_processkit() {
+        let pid = spawn_detached_worker(crate::process::Command::new("sh").args(["-c", "exit 0"]))
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if matches!(
+                crate::process::observe_process(crate::process::RecordedProcess::from_stored(
+                    pid,
+                    Some(u64::MAX)
+                ))
+                .unwrap(),
+                crate::process::ProcessObservation::Missing
+            ) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "detached child {pid} was not reaped"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let wait = unsafe { libc::waitpid(pid.cast_signed(), std::ptr::null_mut(), libc::WNOHANG) };
+        assert_eq!(wait, -1, "detached child must not remain waitable by Prism");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
     }
 }

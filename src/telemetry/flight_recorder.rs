@@ -44,6 +44,10 @@ thread_local! {
     static EXTERNAL_CALLS_FORBIDDEN: Cell<bool> = const { Cell::new(false) };
 }
 
+tokio::task_local! {
+    static ASYNC_JOB_CONTEXT: JobDiagnosticContext;
+}
+
 #[cfg(test)]
 pub(crate) fn deny_external_calls_on_current_thread<T>(operation: impl FnOnce() -> T) -> T {
     struct Reset(bool);
@@ -65,6 +69,7 @@ struct JobDiagnosticContext {
     job_type: &'static str,
 }
 
+#[cfg(test)]
 pub(crate) fn with_job_context<T>(
     job_id: u64,
     job_type: &'static str,
@@ -84,8 +89,24 @@ pub(crate) fn with_job_context<T>(
     operation()
 }
 
+pub(crate) async fn with_async_job_context<F>(
+    job_id: u64,
+    job_type: &'static str,
+    operation: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    ASYNC_JOB_CONTEXT
+        .scope(JobDiagnosticContext { job_id, job_type }, operation)
+        .await
+}
+
 fn current_job_context() -> Option<JobDiagnosticContext> {
-    CURRENT_JOB_CONTEXT.with(|current| *current.borrow())
+    ASYNC_JOB_CONTEXT
+        .try_with(|context| *context)
+        .ok()
+        .or_else(|| CURRENT_JOB_CONTEXT.with(|current| *current.borrow()))
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -145,6 +166,7 @@ pub(crate) enum ExternalCallOutcome {
     TimedOut,
     Canceled,
     SpawnFailed,
+    Dropped,
     Closed,
 }
 
@@ -156,6 +178,7 @@ impl ExternalCallOutcome {
             Self::TimedOut => "timed_out",
             Self::Canceled => "canceled",
             Self::SpawnFailed => "spawn_failed",
+            Self::Dropped => "dropped",
             Self::Closed => "closed",
         }
     }
@@ -1783,8 +1806,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn trigger_writes_an_atomic_jsonl_capture_without_sqlite() {
+    #[tokio::test]
+    async fn trigger_writes_an_atomic_jsonl_capture_without_sqlite() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = crate::compact_runtime::CompactTempDir::new("flight-recorder");
@@ -1851,8 +1874,7 @@ mod tests {
 
         in_flight.finish(ExternalCallOutcome::Success, Vec::new());
         let secret = "flight-secret-argv-env-output-stderr";
-        let mut command = std::process::Command::new("sh");
-        command
+        let command = crate::process::Command::new("sh")
             .args([
                 "-c",
                 "printf '%s' \"$FLIGHT_SECRET\"; printf '%s' \"$1\" >&2",
@@ -1860,44 +1882,47 @@ mod tests {
                 secret,
             ])
             .env("FLIGHT_SECRET", secret);
-        with_job_context(77, "test_job", || {
+        with_async_job_context(
+            77,
+            "test_job",
             crate::process::run_output_named(
-                &mut command,
+                command,
                 crate::process::ProcessPolicy::Test,
                 crate::process::ProcessDescriptor::new("test.external.private"),
-            )
-        })
+            ),
+        )
+        .await
         .unwrap();
-        let mut missing = std::process::Command::new("/prism-test/missing-executable");
         assert!(
             crate::process::run_output_named(
-                &mut missing,
+                crate::process::Command::new("/prism-test/missing-executable"),
                 crate::process::ProcessPolicy::Test,
                 crate::process::ProcessDescriptor::new("test.external.spawn_failed"),
             )
+            .await
             .is_err()
         );
-        let mut timed_out = std::process::Command::new("sh");
-        timed_out.args(["-c", "exec sleep 2"]);
         assert!(
             crate::process::run_output_named(
-                &mut timed_out,
+                crate::process::Command::new("sh").args(["-c", "exec sleep 2"]),
                 crate::process::ProcessPolicy::Test,
                 crate::process::ProcessDescriptor::new("test.external.timed_out"),
             )
+            .await
             .is_err()
         );
-        let mut canceled = std::process::Command::new("sh");
-        canceled.args(["-c", "exec sleep 2"]);
-        let canceled_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let canceled = crate::process::CancellationToken::new();
+        canceled.cancel();
         assert!(
-            crate::process::with_cancellation(canceled_flag, || {
+            crate::process::with_cancellation(
+                canceled,
                 crate::process::run_output_named(
-                    &mut canceled,
+                    crate::process::Command::new("sh").args(["-c", "exec sleep 2"]),
                     crate::process::ProcessPolicy::Test,
                     crate::process::ProcessDescriptor::new("test.external.canceled"),
-                )
-            })
+                ),
+            )
+            .await
             .is_err()
         );
         let completed_path = trigger(
@@ -1935,6 +1960,10 @@ mod tests {
             line.contains("test.external.private")
                 && line.contains("\"job_id\",\"value\":77")
                 && line.contains("\"job_type\",\"value\":\"test_job\"")
+                && line.contains(&format!("\"stdout_bytes\",\"value\":{}", secret.len()))
+                && line.contains(&format!("\"stderr_bytes\",\"value\":{}", secret.len()))
+                && line.contains("\"stdout_truncated\",\"value\":false")
+                && line.contains("\"stderr_truncated\",\"value\":false")
         }));
         assert!(!completed.contains(secret));
         drop(server);

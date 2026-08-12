@@ -1,9 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
-use std::thread::{self, JoinHandle};
+use std::sync::{Arc, Mutex, mpsc};
+#[cfg(all(test, unix))]
+use std::thread;
 use std::time::{Duration, Instant};
+use tokio::task::JoinHandle;
 
 pub(crate) type JobId = u64;
 
@@ -22,6 +24,7 @@ pub(crate) struct JobMetadata<K, Q> {
 pub(crate) enum JobOutcome {
     Completed,
     Failed(String),
+    #[allow(dead_code)]
     SpawnFailed(std::io::Error),
     Panicked(String),
     Canceled,
@@ -171,9 +174,7 @@ pub(crate) fn latest_channel<K: Ord, T>(
 }
 
 struct CancellationState {
-    canceled: Arc<AtomicBool>,
-    mutex: Mutex<()>,
-    wake: Condvar,
+    token: crate::process::CancellationToken,
 }
 
 type CoalescedSlots<K, Q, P> = BTreeMap<(JobId, CoalescedFacet), StreamPayload<K, Q, P>>;
@@ -219,7 +220,7 @@ impl<K: Clone, Q: Clone, P> JobContext<K, Q, P> {
     }
 
     pub(crate) fn is_canceled(&self) -> bool {
-        self.cancellation.canceled.load(Ordering::Acquire)
+        self.cancellation.token.is_cancelled()
             || self
                 .metadata
                 .deadline
@@ -325,7 +326,7 @@ impl<K: Clone, Q: Clone, P> JobContext<K, Q, P> {
         crate::flight_recorder::record("queue", operation, None, fields);
     }
 
-    pub(crate) fn wait(&self, duration: Duration) -> bool {
+    pub(crate) async fn wait(&self, duration: Duration) -> bool {
         if self.is_canceled() {
             return true;
         }
@@ -338,16 +339,10 @@ impl<K: Clone, Q: Clone, P> JobContext<K, Q, P> {
                     .min(duration)
             })
             .unwrap_or(duration);
-        let guard = self
-            .cancellation
-            .mutex
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let _ = self
-            .cancellation
-            .wake
-            .wait_timeout_while(guard, wait, |_| !self.is_canceled());
-        self.is_canceled()
+        tokio::select! {
+            () = self.cancellation.token.cancelled() => true,
+            () = tokio::time::sleep(wait) => self.is_canceled(),
+        }
     }
 }
 
@@ -367,17 +362,17 @@ pub(crate) struct JobDiagnostic {
     pub kind: &'static str,
 }
 
-enum JobState<P> {
-    Running(JoinHandle<JobCompletion<P>>),
+enum JobState {
+    Running(JoinHandle<()>),
     Finished(JobOutcome),
 }
 
-struct JobEntry<K, Q, P> {
+struct JobEntry<K, Q> {
     metadata: JobMetadata<K, Q>,
     cancellation: Arc<CancellationState>,
     dirty: Arc<AtomicBool>,
     coalesce_payload: bool,
-    state: JobState<P>,
+    state: JobState,
 }
 
 type LatestKey<K, Q> = (K, Q, u64, JobId);
@@ -386,10 +381,12 @@ type LatestValue<K, Q, P> = (JobMetadata<K, Q>, P);
 pub(crate) struct JobRegistry<K, Q, P> {
     next_id: JobId,
     accepting: bool,
-    jobs: BTreeMap<JobId, JobEntry<K, Q, P>>,
+    jobs: BTreeMap<JobId, JobEntry<K, Q>>,
     latest: BTreeMap<LatestKey<K, Q>, LatestValue<K, Q, P>>,
     delivery: Arc<EventDelivery<K, Q, P>>,
     event_rx: mpsc::Receiver<StreamPayload<K, Q, P>>,
+    completion_tx: mpsc::Sender<(JobId, JobCompletion<P>)>,
+    completion_rx: mpsc::Receiver<(JobId, JobCompletion<P>)>,
     pending_event: Option<StreamPayload<K, Q, P>>,
     pending_dirty: BTreeMap<JobId, JobMetadata<K, Q>>,
     overflow_reported: u64,
@@ -409,6 +406,7 @@ impl<K, Q, P> Default for JobRegistry<K, Q, P> {
 impl<K, Q, P> JobRegistry<K, Q, P> {
     pub(crate) fn with_event_capacity(capacity: usize) -> Self {
         let (tx, event_rx) = mpsc::sync_channel(capacity);
+        let (completion_tx, completion_rx) = mpsc::channel();
         Self {
             next_id: 1,
             accepting: true,
@@ -425,6 +423,8 @@ impl<K, Q, P> JobRegistry<K, Q, P> {
                 dirty: AtomicBool::new(false),
             }),
             event_rx,
+            completion_tx,
+            completion_rx,
             pending_event: None,
             pending_dirty: BTreeMap::new(),
             overflow_reported: 0,
@@ -442,7 +442,7 @@ where
     P: Send + 'static,
 {
     #[cfg(test)]
-    pub(crate) fn spawn<F>(
+    pub(crate) fn spawn<F, Fut>(
         &mut self,
         kind: K,
         key: Q,
@@ -452,7 +452,8 @@ where
         job: F,
     ) -> JobId
     where
-        F: FnOnce(JobContext<K, Q, P>) -> Result<Option<P>, String> + Send + 'static,
+        F: FnOnce(JobContext<K, Q, P>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<Option<P>, String>> + Send + 'static,
     {
         self.spawn_with_delivery(
             kind,
@@ -469,7 +470,7 @@ where
     }
 
     #[cfg(test)]
-    pub(crate) fn spawn_reliable<F>(
+    pub(crate) fn spawn_reliable<F, Fut>(
         &mut self,
         kind: K,
         key: Q,
@@ -479,7 +480,8 @@ where
         job: F,
     ) -> JobId
     where
-        F: FnOnce(JobContext<K, Q, P>) -> Result<Option<P>, String> + Send + 'static,
+        F: FnOnce(JobContext<K, Q, P>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<Option<P>, String>> + Send + 'static,
     {
         self.spawn_with_delivery(
             kind,
@@ -495,7 +497,7 @@ where
         )
     }
 
-    pub(crate) fn spawn_diagnostic<F>(
+    pub(crate) fn spawn_diagnostic<F, Fut>(
         &mut self,
         kind: K,
         key: Q,
@@ -505,7 +507,8 @@ where
         job: F,
     ) -> JobId
     where
-        F: FnOnce(JobContext<K, Q, P>) -> Result<Option<P>, String> + Send + 'static,
+        F: FnOnce(JobContext<K, Q, P>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<Option<P>, String>> + Send + 'static,
     {
         self.spawn_with_delivery(
             kind,
@@ -521,7 +524,7 @@ where
         )
     }
 
-    pub(crate) fn spawn_reliable_diagnostic<F>(
+    pub(crate) fn spawn_reliable_diagnostic<F, Fut>(
         &mut self,
         kind: K,
         key: Q,
@@ -531,7 +534,8 @@ where
         job: F,
     ) -> JobId
     where
-        F: FnOnce(JobContext<K, Q, P>) -> Result<Option<P>, String> + Send + 'static,
+        F: FnOnce(JobContext<K, Q, P>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<Option<P>, String>> + Send + 'static,
     {
         self.spawn_with_delivery(
             kind,
@@ -547,17 +551,18 @@ where
         )
     }
 
-    fn spawn_with_delivery<F>(
+    fn spawn_with_delivery<F, Fut>(
         &mut self,
         kind: K,
         key: Q,
         generation: u64,
-        name: String,
+        _name: String,
         delivery: JobDelivery,
         job: F,
     ) -> JobId
     where
-        F: FnOnce(JobContext<K, Q, P>) -> Result<Option<P>, String> + Send + 'static,
+        F: FnOnce(JobContext<K, Q, P>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<Option<P>, String>> + Send + 'static,
     {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
@@ -572,9 +577,7 @@ where
             diagnostic_kind: delivery.diagnostic_kind,
         };
         let cancellation = Arc::new(CancellationState {
-            canceled: Arc::new(AtomicBool::new(false)),
-            mutex: Mutex::new(()),
-            wake: Condvar::new(),
+            token: crate::process::CancellationToken::new(),
         });
         let dirty = Arc::new(AtomicBool::new(false));
         if !self.accepting {
@@ -607,25 +610,30 @@ where
             delivery: self.delivery.clone(),
         };
         let terminal_metadata = metadata.clone();
-        let thread = thread::Builder::new().name(name).spawn(move || {
-            let result = catch_unwind(AssertUnwindSafe(|| {
-                let run = || {
-                    crate::process::with_cancellation(context.cancellation.canceled.clone(), || {
-                        job(context.clone())
-                    })
-                };
-                if let Some(job_type) = context.metadata.diagnostic_kind {
-                    crate::flight_recorder::with_job_context(context.metadata.id, job_type, run)
-                } else {
-                    run()
-                }
-            }));
-            match result {
-                Err(payload) => JobCompletion {
-                    outcome: JobOutcome::Panicked(panic_message(payload)),
+        let completion_tx = self.completion_tx.clone();
+        let token = cancellation.token.clone();
+        let diagnostic_kind = metadata.diagnostic_kind;
+        let work = tokio::spawn(async move {
+            let future = job(context.clone());
+            let operation = crate::process::with_cancellation(token, future);
+            let result = if let Some(job_type) = diagnostic_kind {
+                crate::flight_recorder::with_async_job_context(id, job_type, operation).await
+            } else {
+                operation.await
+            };
+            (context, result)
+        });
+        let handle = tokio::spawn(async move {
+            let completion = match work.await {
+                Err(error) if error.is_panic() => JobCompletion {
+                    outcome: JobOutcome::Panicked(panic_message(error.into_panic())),
                     payload: None,
                 },
-                Ok(_)
+                Err(error) => JobCompletion {
+                    outcome: JobOutcome::Failed(format!("job task failed: {error}")),
+                    payload: None,
+                },
+                Ok((_, _))
                     if terminal_metadata
                         .deadline
                         .is_some_and(|deadline| Instant::now() >= deadline) =>
@@ -635,41 +643,31 @@ where
                         payload: None,
                     }
                 }
-                Ok(_) if context.is_canceled() => JobCompletion {
+                Ok((context, _)) if context.is_canceled() => JobCompletion {
                     outcome: JobOutcome::Canceled,
                     payload: None,
                 },
-                Ok(Ok(payload)) => JobCompletion {
+                Ok((_, Ok(payload))) => JobCompletion {
                     outcome: JobOutcome::Completed,
                     payload,
                 },
-                Ok(Err(error)) => JobCompletion {
+                Ok((_, Err(error))) => JobCompletion {
                     outcome: JobOutcome::Failed(error),
                     payload: None,
                 },
-            }
+            };
+            let _ = completion_tx.send((id, completion));
         });
-        match thread {
-            Ok(handle) => {
-                self.jobs.insert(
-                    id,
-                    JobEntry {
-                        metadata,
-                        cancellation,
-                        dirty,
-                        coalesce_payload: delivery.coalesce_payload,
-                        state: JobState::Running(handle),
-                    },
-                );
-            }
-            Err(error) => self.insert_finished(
+        self.jobs.insert(
+            id,
+            JobEntry {
                 metadata,
                 cancellation,
                 dirty,
-                delivery.coalesce_payload,
-                JobOutcome::SpawnFailed(error),
-            ),
-        }
+                coalesce_payload: delivery.coalesce_payload,
+                state: JobState::Running(handle),
+            },
+        );
         id
     }
 
@@ -680,26 +678,16 @@ where
 
     fn collect_finished_limit(&mut self, limit: usize) {
         self.cancel_expired();
-        let finished = self
-            .jobs
-            .iter()
-            .filter_map(|(id, entry)| match &entry.state {
-                JobState::Running(handle) if handle.is_finished() => Some(*id),
-                JobState::Running(_) | JobState::Finished(_) => None,
-            })
+        let finished = std::iter::from_fn(|| self.completion_rx.try_recv().ok())
             .take(limit)
             .collect::<Vec<_>>();
-        for id in finished {
+        for (id, completion) in finished {
             let Some(entry) = self.jobs.remove(&id) else {
                 continue;
             };
-            let JobState::Running(handle) = entry.state else {
-                unreachable!();
+            let JobState::Running(_handle) = entry.state else {
+                continue;
             };
-            let completion = handle.join().unwrap_or_else(|payload| JobCompletion {
-                outcome: JobOutcome::Panicked(panic_message(payload)),
-                payload: None,
-            });
             if let Some(payload) = completion.payload {
                 let key = (
                     entry.metadata.kind.clone(),
@@ -753,7 +741,7 @@ where
                 }
                 self.latest.insert(key, (entry.metadata.clone(), payload));
             }
-            entry.cancellation.canceled.store(true, Ordering::Release);
+            entry.cancellation.token.cancel();
             self.clear_coalesced(id);
             self.jobs.insert(
                 id,
@@ -928,8 +916,7 @@ where
             if protected.contains(&entry.metadata.id) {
                 continue;
             }
-            entry.cancellation.canceled.store(true, Ordering::Release);
-            entry.cancellation.wake.notify_all();
+            entry.cancellation.token.cancel();
         }
         let mut coalesced = self
             .delivery
@@ -947,8 +934,7 @@ where
 
     pub(crate) fn cancel(&self, id: JobId) {
         if let Some(entry) = self.jobs.get(&id) {
-            entry.cancellation.canceled.store(true, Ordering::Release);
-            entry.cancellation.wake.notify_all();
+            entry.cancellation.token.cancel();
         }
         self.clear_coalesced(id);
     }
@@ -1005,8 +991,7 @@ where
                 .deadline
                 .is_some_and(|deadline| now >= deadline)
             {
-                entry.cancellation.canceled.store(true, Ordering::Release);
-                entry.cancellation.wake.notify_all();
+                entry.cancellation.token.cancel();
             }
         }
     }
@@ -1029,8 +1014,7 @@ impl<K, Q, P> Drop for JobRegistry<K, Q, P> {
     fn drop(&mut self) {
         self.accepting = false;
         for entry in self.jobs.values() {
-            entry.cancellation.canceled.store(true, Ordering::Release);
-            entry.cancellation.wake.notify_all();
+            entry.cancellation.token.cancel();
         }
     }
 }
@@ -1048,13 +1032,13 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
-    use std::process::Command;
+    use crate::process::Command;
     use std::time::Duration;
 
     use super::{CoalescedFacet, JobMessage, JobOutcome, JobRegistry};
 
-    #[test]
-    fn panic_emits_one_terminal_outcome_and_a_later_job_can_start() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn panic_emits_one_terminal_outcome_and_a_later_job_can_start() {
         let mut jobs = JobRegistry::<&'static str, String, ()>::default();
         jobs.spawn(
             "poll",
@@ -1062,7 +1046,7 @@ mod tests {
             1,
             Some(Duration::from_secs(1)),
             "panic-job".to_string(),
-            |_| panic!("before result"),
+            |_| async { panic!("before result") },
         );
         let terminal = wait_for_terminal(&mut jobs);
         assert!(matches!(terminal, JobOutcome::Panicked(message) if message == "before result"));
@@ -1074,7 +1058,7 @@ mod tests {
             1,
             Some(Duration::from_secs(1)),
             "replacement-job".to_string(),
-            |_| Ok(None),
+            |_| async { Ok(None) },
         );
         assert!(matches!(
             wait_for_terminal(&mut jobs),
@@ -1082,8 +1066,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn spawn_failure_emits_one_terminal_outcome_and_a_later_job_can_start() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_failure_emits_one_terminal_outcome_and_a_later_job_can_start() {
         let mut jobs = JobRegistry::<&'static str, String, ()>::default();
         jobs.fail_next_spawn();
         jobs.spawn(
@@ -1092,7 +1076,7 @@ mod tests {
             1,
             None,
             "failed-job".to_string(),
-            |_| Ok(None),
+            |_| async { Ok(None) },
         );
         let terminal = wait_for_terminal(&mut jobs);
         assert!(
@@ -1105,7 +1089,7 @@ mod tests {
             2,
             None,
             "replacement-job".to_string(),
-            |_| Ok(None),
+            |_| async { Ok(None) },
         );
         assert!(matches!(
             wait_for_terminal(&mut jobs),
@@ -1113,8 +1097,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn bounded_stream_counts_exact_overflow_without_blocking() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bounded_stream_counts_exact_overflow_without_blocking() {
         let capacity = 4;
         let burst = 1_000;
         let mut jobs =
@@ -1125,7 +1109,7 @@ mod tests {
             1,
             None,
             "burst".to_string(),
-            move |context| {
+            move |context| async move {
                 for value in 0..burst {
                     context.send(value)?;
                 }
@@ -1146,8 +1130,8 @@ mod tests {
         assert_eq!(jobs.queue_stats().event_depth, 0);
     }
 
-    #[test]
-    fn coalesced_overflow_has_two_slots_per_active_stream_and_clears_on_cancel() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn coalesced_overflow_has_two_slots_per_active_stream_and_clears_on_cancel() {
         let capacity = 1;
         let snapshots_per_facet = 100;
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
@@ -1159,14 +1143,14 @@ mod tests {
             1,
             None,
             "coalesced-burst".to_string(),
-            move |context| {
+            move |context| async move {
                 context.send(usize::MAX)?;
                 for value in 0..snapshots_per_facet {
                     context.send_coalesced(CoalescedFacet::Status, value)?;
                     context.send_coalesced(CoalescedFacet::Message, snapshots_per_facet + value)?;
                 }
                 ready_tx.send(()).unwrap();
-                while !context.wait(Duration::from_secs(60)) {}
+                while !context.wait(Duration::from_secs(60)).await {}
                 Ok(None)
             },
         );
@@ -1188,8 +1172,8 @@ mod tests {
         assert!(matches!(wait_for_terminal(&mut jobs), JobOutcome::Canceled));
     }
 
-    #[test]
-    fn coalesced_snapshot_keeps_its_position_before_a_later_ordered_event() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn coalesced_snapshot_keeps_its_position_before_a_later_ordered_event() {
         let (overflowed_tx, overflowed_rx) = std::sync::mpsc::sync_channel(0);
         let (continue_tx, continue_rx) = std::sync::mpsc::sync_channel(0);
         let (ordered_tx, ordered_rx) = std::sync::mpsc::sync_channel(0);
@@ -1200,14 +1184,14 @@ mod tests {
             1,
             None,
             "ordered-coalesced".to_string(),
-            move |context| {
+            move |context| async move {
                 context.send_coalesced(CoalescedFacet::Status, 1)?;
                 context.send_coalesced(CoalescedFacet::Status, 2)?;
                 overflowed_tx.send(()).unwrap();
                 continue_rx.recv().unwrap();
                 context.send(3)?;
                 ordered_tx.send(()).unwrap();
-                while !context.wait(Duration::from_secs(60)) {}
+                while !context.wait(Duration::from_secs(60)).await {}
                 Ok(None)
             },
         );
@@ -1232,8 +1216,8 @@ mod tests {
         assert!(matches!(wait_for_terminal(&mut jobs), JobOutcome::Canceled));
     }
 
-    #[test]
-    fn latest_results_coalesce_by_kind_key_and_generation() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn latest_results_coalesce_by_kind_key_and_generation() {
         let mut jobs = JobRegistry::<&'static str, &'static str, usize>::default();
         for value in 0..100 {
             jobs.spawn(
@@ -1242,7 +1226,7 @@ mod tests {
                 7,
                 None,
                 format!("poll-{value}"),
-                move |_| Ok(Some(value)),
+                move |_| async move { Ok(Some(value)) },
             );
         }
         wait_until_all_finished(&mut jobs);
@@ -1254,8 +1238,8 @@ mod tests {
         assert!(matches!(payload, JobMessage::Payload { payload: 99, .. }));
     }
 
-    #[test]
-    fn reliable_payloads_keep_one_slot_per_terminal_outcome() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reliable_payloads_keep_one_slot_per_terminal_outcome() {
         let mut jobs = JobRegistry::<&'static str, &'static str, usize>::default();
         for value in 0..2 {
             jobs.spawn_reliable(
@@ -1264,7 +1248,7 @@ mod tests {
                 1,
                 None,
                 format!("control-{value}"),
-                move |_| Ok(Some(value)),
+                move |_| async move { Ok(Some(value)) },
             );
         }
         wait_until_all_finished(&mut jobs);
@@ -1282,11 +1266,13 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn terminal_budget_never_discards_outcomes() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_budget_never_discards_outcomes() {
         let mut jobs = JobRegistry::<&'static str, usize, ()>::default();
         for key in 0..20 {
-            jobs.spawn("poll", key, 1, None, format!("poll-{key}"), |_| Ok(None));
+            jobs.spawn("poll", key, 1, None, format!("poll-{key}"), |_| async {
+                Ok(None)
+            });
         }
         wait_until_all_finished(&mut jobs);
 
@@ -1296,8 +1282,8 @@ mod tests {
         assert!(!jobs.has_jobs());
     }
 
-    #[test]
-    fn dropping_registry_interrupts_a_listener_wait() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropping_registry_interrupts_a_listener_wait() {
         let (stopped_tx, stopped_rx) = std::sync::mpsc::sync_channel(0);
         let mut jobs = JobRegistry::<&'static str, String, ()>::default();
         jobs.spawn(
@@ -1306,8 +1292,8 @@ mod tests {
             0,
             None,
             "listener-job".to_string(),
-            move |context| {
-                while !context.wait(Duration::from_secs(60)) {}
+            move |context| async move {
+                while !context.wait(Duration::from_secs(60)).await {}
                 stopped_tx.send(()).unwrap();
                 Ok(None)
             },
@@ -1318,9 +1304,9 @@ mod tests {
         stopped_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     }
 
-    #[test]
+    #[tokio::test(flavor = "multi_thread")]
     #[cfg(unix)]
-    fn canceled_job_terminates_and_joins_a_supervised_domain_command() {
+    async fn canceled_job_terminates_and_joins_a_supervised_domain_command() {
         let marker = std::env::temp_dir().join(format!(
             "prism-canceled-job-{}-{}",
             std::process::id(),
@@ -1337,7 +1323,7 @@ mod tests {
             0,
             Some(Duration::from_secs(30)),
             "supervised-command".to_string(),
-            move |_| {
+            move |_| async move {
                 crate::process::run_status(
                     Command::new("sh")
                         .arg("-c")
@@ -1345,7 +1331,8 @@ mod tests {
                         .arg("job-command")
                         .arg(&job_marker),
                     crate::process::ProcessPolicy::WorkflowStep,
-                )?;
+                )
+                .await?;
                 Ok(None)
             },
         );
@@ -1365,8 +1352,8 @@ mod tests {
         std::fs::remove_file(marker).unwrap();
     }
 
-    #[test]
-    fn selective_shutdown_cancels_ordinary_jobs_but_keeps_protected_jobs_running() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn selective_shutdown_cancels_ordinary_jobs_but_keeps_protected_jobs_running() {
         let (ordinary_stopped_tx, ordinary_stopped_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let mut jobs = JobRegistry::<&'static str, &'static str, &'static str>::default();
@@ -1376,8 +1363,8 @@ mod tests {
             0,
             None,
             "ordinary-job".to_string(),
-            move |context| {
-                while !context.wait(Duration::from_secs(60)) {}
+            move |context| async move {
+                while !context.wait(Duration::from_secs(60)).await {}
                 ordinary_stopped_tx.send(()).unwrap();
                 Ok(None)
             },
@@ -1388,7 +1375,7 @@ mod tests {
             0,
             None,
             "protected-job".to_string(),
-            move |context| {
+            move |context| async move {
                 release_rx.recv().unwrap();
                 assert!(!context.is_canceled());
                 Ok(Some("accepted"))

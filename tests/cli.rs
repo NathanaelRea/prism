@@ -308,14 +308,15 @@ fn list_preserves_tracked_order_and_reports_missing_repositories() {
     init_repo(&first);
     init_repo(&second);
     fs::create_dir_all(&outside).unwrap();
-    fs::create_dir_all(config_home.join("prism")).unwrap();
+    let prism_config = config_home.join(if cfg!(windows) { "Prism" } else { "prism" });
+    fs::create_dir_all(&prism_config).unwrap();
     fs::write(
-        config_home.join("prism/repos.toml"),
+        prism_config.join("repos.toml"),
         format!(
             "[[repos]]\npath = \"{}\"\nkey = \"2\"\n[[repos]]\npath = \"{}\"\n[[repos]]\npath = \"{}\"\nkey = \"1\"\n",
-            second.display(),
-            missing.display(),
-            first.display()
+            toml_escape(&second.display().to_string()),
+            toml_escape(&missing.display().to_string()),
+            toml_escape(&first.display().to_string())
         ),
     )
     .unwrap();
@@ -449,7 +450,10 @@ fn config_prints_effective_repo_config() {
 
     assert!(output.status.success(), "{}", stderr(&output));
     let stdout = stdout(&output);
-    assert!(stdout.contains(&format!("repo_root = {}", canonical_display(&repo))));
+    assert_eq!(
+        canonical_display(Path::new(output_value(&stdout, "repo_root"))),
+        canonical_display(&repo)
+    );
     assert!(stdout.contains("default_harness = opencode"));
     assert!(stdout.contains("default_base = main"));
 }
@@ -483,11 +487,13 @@ fn config_discovery_commands_print_templates_schema_and_paths() {
     let paths = run(["config", "paths"], &repo, &config_home);
     assert!(paths.status.success(), "{}", stderr(&paths));
     let paths_stdout = stdout(&paths);
-    #[cfg(unix)]
-    let expected_user_config = config_home.join("prism/config.toml");
-    #[cfg(windows)]
-    let expected_user_config = config_home.join("Prism/config.toml");
-    assert!(paths_stdout.contains(&format!("user_config = {}", expected_user_config.display())));
+    let expected_user_config = config_home
+        .join(if cfg!(windows) { "Prism" } else { "prism" })
+        .join("config.toml");
+    assert_eq!(
+        Path::new(output_value(&paths_stdout, "user_config")),
+        expected_user_config
+    );
     assert!(paths_stdout.contains("repo_config = "));
     assert!(paths_stdout.contains("schema_url = https://raw.githubusercontent.com/"));
 }
@@ -539,11 +545,15 @@ fn db_path_prints_repo_database_path() {
 
     assert!(output.status.success(), "{}", stderr(&output));
     let path = stdout(&output);
-    assert!(
-        path.trim()
-            .starts_with(&config_home.join("prism/repos").display().to_string())
+    let path = Path::new(path.trim());
+    let expected_repos = config_home
+        .join(if cfg!(windows) { "Prism" } else { "prism" })
+        .join("repos");
+    assert_eq!(
+        path.parent().and_then(Path::parent),
+        Some(expected_repos.as_path())
     );
-    assert!(path.trim().ends_with("/prism.db"));
+    assert_eq!(path.file_name(), Some(OsStr::new("prism.db")));
 }
 
 #[test]
@@ -1008,7 +1018,6 @@ fn run_agent_ensure(repo: &Path, config_home: &Path) -> Output {
         .expect("run prism agent ensure")
 }
 
-#[cfg(unix)]
 fn output_value<'a>(output: &'a str, key: &str) -> &'a str {
     output
         .lines()
@@ -1059,7 +1068,6 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
-#[cfg(unix)]
 fn toml_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }

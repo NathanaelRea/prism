@@ -573,18 +573,15 @@ impl Tui {
         })
     }
 
-    pub(crate) fn run_remote_action<F>(
+    pub(crate) fn run_remote_action<F, Fut>(
         &mut self,
         runtime: &mut TerminalRuntime,
         request: RemoteActionRequest<'_>,
         action: F,
     ) -> Result<RemoteActionValue, String>
     where
-        F: FnOnce(
-                JobContext<TuiJobKind, TuiJobKey, TuiJobPayload>,
-            ) -> Result<RemoteActionValue, String>
-            + Send
-            + 'static,
+        F: FnOnce(JobContext<TuiJobKind, TuiJobKey, TuiJobPayload>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<RemoteActionValue, String>> + Send + 'static,
     {
         if request
             .mutation
@@ -616,12 +613,11 @@ impl Tui {
             request.generation,
             timeout,
             request.name.to_string(),
-            move |context| {
+            move |context| async move {
+                let id = context.id();
+                let result = action(context).await;
                 Ok(Some(TuiJobPayload::RemoteAction(Box::new(
-                    RemoteActionDelivery {
-                        id: context.id(),
-                        result: action(context),
-                    },
+                    RemoteActionDelivery { id, result },
                 ))))
             },
         );

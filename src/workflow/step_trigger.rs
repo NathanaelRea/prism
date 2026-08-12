@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::process::Command;
+
+use crate::process::{Command, ProcessCompletion, ProcessInput};
 
 pub const TRIGGER_PROTOCOL_VERSION: u32 = 1;
 
@@ -243,7 +243,6 @@ impl ExternalTrigger {
         &self,
         request: TriggerPhaseRequest,
     ) -> Result<TriggerPhaseResponse, TriggerError> {
-        let deadline = tokio::time::Instant::now() + self.limits.timeout;
         let metadata = std::fs::metadata(&self.executable).map_err(TriggerError::Io)?;
         #[cfg(unix)]
         let executable = metadata.is_file() && metadata.permissions().mode() & 0o111 != 0;
@@ -255,88 +254,41 @@ impl ExternalTrigger {
                 self.executable.display()
             )));
         }
-        let mut command = Command::new(&self.executable);
-        super::child_process::configure(&mut command);
-        command
-            .kill_on_drop(true)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let mut child = super::child_process::spawn(&mut command).map_err(TriggerError::Io)?;
-        let mut process_guard = super::child_process::DropGuard::new(&child);
-        let body = serde_json::to_vec(&request)
+        let mut body = serde_json::to_vec(&request)
             .map_err(|error| TriggerError::Protocol(error.to_string()))?;
-        let stdin = super::child_process::stdin(&mut child)
-            .take()
-            .ok_or_else(|| {
-                TriggerError::Protocol("external trigger stdin was not captured".into())
-            })?;
-        let stdout = super::child_process::stdout(&mut child)
-            .take()
-            .ok_or_else(|| {
-                TriggerError::Protocol("external trigger stdout was not captured".into())
-            })?;
-        let stderr = super::child_process::stderr(&mut child)
-            .take()
-            .ok_or_else(|| {
-                TriggerError::Protocol("external trigger stderr was not captured".into())
-            })?;
-        let stdout_limit = self.limits.stdout_bytes;
-        let stderr_limit = self.limits.stderr_bytes;
-        let stdout_task = tokio::spawn(read_bounded(stdout, stdout_limit));
-        let stderr_task = tokio::spawn(read_bounded(stderr, stderr_limit));
-        let status = match tokio::time::timeout_at(
-            deadline,
-            write_trigger_request_and_wait(&mut child, stdin, &body),
+        body.push(b'\n');
+        let output = crate::process::execute_prefix_bounded(
+            Command::new(&self.executable),
+            crate::process::ProcessPolicy::WorkflowStep,
+            self.limits.timeout,
+            self.limits.stdout_bytes,
+            self.limits.stderr_bytes,
+            ProcessInput::Bytes(&body),
+            None,
+            crate::process::ProcessDescriptor::new("workflow.trigger.external"),
         )
         .await
-        {
-            Ok(status) => status?,
-            Err(_) => {
-                super::child_process::terminate(&mut child).await;
-                process_guard.disarm();
-                let _ = stdout_task.await;
-                let stderr = stderr_task
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
-                    .map(|output| String::from_utf8_lossy(&output.bytes).into_owned())
-                    .unwrap_or_default();
-                return Err(TriggerError::Timeout {
-                    executable: self.executable.clone(),
-                    diagnostic: stderr,
-                });
-            }
-        };
-        let (stdout, stderr) = match tokio::time::timeout_at(deadline, async {
-            let stdout = stdout_task.await.map_err(|error| {
-                TriggerError::Protocol(format!("join trigger stdout: {error}"))
-            })??;
-            let stderr = stderr_task.await.map_err(|error| {
-                TriggerError::Protocol(format!("join trigger stderr: {error}"))
-            })??;
-            Ok::<_, TriggerError>((stdout, stderr))
-        })
-        .await
-        {
-            Ok(output) => output?,
-            Err(_) => {
-                return Err(TriggerError::Timeout {
-                    executable: self.executable.clone(),
-                    diagnostic: "Trigger output streams did not close".into(),
-                });
-            }
-        };
-        process_guard.disarm();
-        let diagnostic = String::from_utf8_lossy(&stderr.bytes).into_owned();
-        if !status.success() {
-            return Err(TriggerError::Process {
+        .map_err(|error| {
+            TriggerError::Protocol(format!(
+                "execute external trigger {}: {error}",
+                self.executable.display()
+            ))
+        })?;
+        let diagnostic = String::from_utf8_lossy(&output.stderr).into_owned();
+        if output.completion == ProcessCompletion::DeadlineExceeded {
+            return Err(TriggerError::Timeout {
                 executable: self.executable.clone(),
-                status: status.to_string(),
                 diagnostic,
             });
         }
-        if stdout.truncated {
+        if !output.status.success() {
+            return Err(TriggerError::Process {
+                executable: self.executable.clone(),
+                status: output.status.to_string(),
+                diagnostic,
+            });
+        }
+        if output.stdout_truncated {
             return Err(TriggerError::Protocol(format!(
                 "trigger {} exceeded its {} byte stdout limit",
                 self.executable.display(),
@@ -344,7 +296,7 @@ impl ExternalTrigger {
             )));
         }
         let response: TriggerPhaseResponse =
-            serde_json::from_slice(&stdout.bytes).map_err(|error| {
+            serde_json::from_slice(&output.stdout).map_err(|error| {
                 TriggerError::Protocol(format!(
                     "invalid response from trigger {}: {error}; stderr: {}",
                     self.executable.display(),
@@ -507,45 +459,6 @@ fn unexpected_response(phase: &str, response: &TriggerPhaseResponse) -> TriggerE
             TriggerPhaseResponse::Completed { .. } => "completed",
         }
     ))
-}
-
-struct BoundedOutput {
-    bytes: Vec<u8>,
-    truncated: bool,
-}
-
-async fn write_trigger_request_and_wait(
-    child: &mut super::child_process::Child,
-    mut stdin: tokio::process::ChildStdin,
-    body: &[u8],
-) -> Result<std::process::ExitStatus, TriggerError> {
-    stdin.write_all(body).await.map_err(TriggerError::Io)?;
-    stdin.write_all(b"\n").await.map_err(TriggerError::Io)?;
-    drop(stdin);
-    super::child_process::wait(child)
-        .await
-        .map_err(TriggerError::Io)
-}
-
-async fn read_bounded(
-    mut reader: impl AsyncRead + Unpin,
-    limit: usize,
-) -> Result<BoundedOutput, TriggerError> {
-    let mut output = Vec::with_capacity(limit.min(8192));
-    let mut buffer = [0_u8; 8192];
-    let mut truncated = false;
-    loop {
-        let count = reader.read(&mut buffer).await.map_err(TriggerError::Io)?;
-        if count == 0 {
-            return Ok(BoundedOutput {
-                bytes: output,
-                truncated,
-            });
-        }
-        let remaining = limit.saturating_sub(output.len());
-        output.extend_from_slice(&buffer[..count.min(remaining)]);
-        truncated |= count > remaining;
-    }
 }
 
 #[derive(Clone, Debug)]

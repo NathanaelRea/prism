@@ -1,5 +1,4 @@
-use std::io::Write as _;
-use std::process::{Command, Stdio};
+use crate::process::{Command, ProcessPolicy, Stdin};
 
 use crate::tui_runtime::TerminalRuntime;
 use crate::view;
@@ -13,7 +12,7 @@ struct WorkflowControlRequest {
 }
 
 impl Tui {
-    pub(super) fn control_selected_workflow(
+    pub(super) async fn control_selected_workflow(
         &mut self,
         runtime: &mut TerminalRuntime,
         requested: &str,
@@ -39,17 +38,14 @@ impl Tui {
             return Ok(true);
         }
         let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-        let status = runtime.suspend_for(|| {
-            Command::new(executable)
-                .arg("--repo")
-                .arg(&self.repo.root)
-                .args(["workflow", &request.command, &request.run_id])
-                .status()
-                .map_err(|error| format!("run Workflow control: {error}"))
-        })?;
-        if !status.success() {
-            return Err(format!("Workflow control exited with {status}"));
-        }
+        let command = Command::new(executable)
+            .arg("--repo")
+            .arg(&self.repo.root)
+            .args(["workflow", &request.command, &request.run_id]);
+        runtime
+            .suspend_for_async(crate::process::run_status_inherited(command))
+            .await
+            .map_err(|error| format!("run Workflow control: {error}"))?;
         self.show_message(&format!(
             "{} requested for {}",
             request.command, request.run_id
@@ -58,7 +54,10 @@ impl Tui {
     }
 
     /// Open one flat, hot-discovered Workflow picker. Enter runs and Ctrl-E edits.
-    pub(super) fn launch_workflow(&mut self, runtime: &mut TerminalRuntime) -> Result<(), String> {
+    pub(super) async fn launch_workflow(
+        &mut self,
+        runtime: &mut TerminalRuntime,
+    ) -> Result<(), String> {
         let global = crate::util::prism_config_dir();
         let local = self.repo.root.join(".prism");
         let repository_trusted =
@@ -82,7 +81,9 @@ impl Tui {
             return self.show_message("no Workflow is available for the selected worktree");
         }
         let fzf = self.config.tool("fzf");
-        let selected = runtime.suspend_for(|| select_prompt_workflow(&fzf, &candidates))?;
+        let selected = runtime
+            .suspend_for_async(select_prompt_workflow(&fzf, &candidates))
+            .await?;
         let Some((action, name)) = selected else {
             return Ok(());
         };
@@ -96,8 +97,9 @@ impl Tui {
             let workflow = catalog
                 .get(&name)
                 .ok_or_else(|| format!("selected Workflow '{name}' disappeared"))?;
-            let Some(values) =
-                self.prompt_workflow_input_form(runtime, workflow, &worktree, &fzf)?
+            let Some(values) = self
+                .prompt_workflow_input_form(runtime, workflow, &worktree, &fzf)
+                .await?
             else {
                 return Ok(());
             };
@@ -105,29 +107,24 @@ impl Tui {
         } else {
             Default::default()
         };
-        let status = runtime.suspend_for(|| {
-            let mut command = Command::new(executable);
-            command
-                .arg("--repo")
-                .arg(&self.repo.root)
-                .args(["workflow", &action, &name]);
-            if action == "run" {
-                command.arg("--worktree").arg(&worktree);
-                for (input_name, value) in &input_values {
-                    command.arg("--input").arg(format!("{input_name}={value}"));
-                }
+        let mut command = Command::new(executable)
+            .arg("--repo")
+            .arg(&self.repo.root)
+            .args(["workflow", &action, &name]);
+        if action == "run" {
+            command = command.arg("--worktree").arg(&worktree);
+            for (input_name, value) in &input_values {
+                command = command.arg("--input").arg(format!("{input_name}={value}"));
             }
-            command
-                .status()
-                .map_err(|error| format!("{action} Workflow: {error}"))
-        })?;
-        if !status.success() {
-            return Err(format!("Workflow {action} exited with {status}"));
         }
+        runtime
+            .suspend_for_async(crate::process::run_status_inherited(command))
+            .await
+            .map_err(|error| format!("{action} Workflow: {error}"))?;
         self.show_message(&format!("{action} {name}"))
     }
 
-    pub(super) fn launch_stabilization_workflow(
+    pub(super) async fn launch_stabilization_workflow(
         &mut self,
         runtime: &mut TerminalRuntime,
     ) -> Result<(), String> {
@@ -137,23 +134,19 @@ impl Tui {
             .and_then(|index| self.sessions.get(index))
             .map(|session| session.path.clone())
             .unwrap_or_else(|| self.repo.root.clone());
-        let status = runtime.suspend_for(|| {
-            Command::new(executable)
-                .arg("--repo")
-                .arg(&self.repo.root)
-                .args(["workflow", "run", "stabilize", "--worktree"])
-                .arg(worktree)
-                .status()
-                .map_err(|error| format!("launch stabilization Workflow: {error}"))
-        })?;
-        if status.success() {
-            self.show_message("launched stabilize")
-        } else {
-            Err(format!("workflow command exited with {status}"))
-        }
+        let command = Command::new(executable)
+            .arg("--repo")
+            .arg(&self.repo.root)
+            .args(["workflow", "run", "stabilize", "--worktree"])
+            .arg(worktree);
+        runtime
+            .suspend_for_async(crate::process::run_status_inherited(command))
+            .await
+            .map_err(|error| format!("launch stabilization Workflow: {error}"))?;
+        self.show_message("launched stabilize")
     }
 
-    pub(super) fn show_configuration_tree(
+    pub(super) async fn show_configuration_tree(
         &mut self,
         runtime: &mut TerminalRuntime,
     ) -> Result<(), String> {
@@ -172,12 +165,12 @@ impl Tui {
             .collect(),
         };
         match self.prompt_choice_dialog(runtime, choices)?.as_deref() {
-            Some("g") => self.edit_user_config(runtime),
-            Some("r") => self.edit_config(runtime),
-            Some("t") => self.edit_repositories(runtime),
-            Some("w") => self.edit_worktrunk_user_config(runtime),
+            Some("g") => self.edit_user_config(runtime).await,
+            Some("r") => self.edit_config(runtime).await,
+            Some("t") => self.edit_repositories(runtime).await,
+            Some("w") => self.edit_worktrunk_user_config(runtime).await,
             Some("c") => self.edit_worktree_columns(runtime),
-            Some("h") => self.select_default_harness(runtime),
+            Some("h") => self.select_default_harness(runtime).await,
             _ => Ok(()),
         }
     }
@@ -214,38 +207,35 @@ fn workflow_control_request(
     })
 }
 
-fn select_prompt_workflow(
+async fn select_prompt_workflow(
     fzf: &str,
     candidates: &[crate::DiscoveredWorkflow],
 ) -> Result<Option<(String, String)>, String> {
-    let mut child = Command::new(fzf)
-        .args([
-            "--delimiter=\t",
-            "--prompt=Workflow> ",
-            "--with-nth=1..",
-            "--header=Enter: run · Ctrl-E: edit",
-            "--expect=enter,ctrl-e",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("start fzf '{fzf}': {error}"))?;
-    {
-        let input = child.stdin.as_mut().expect("fzf stdin is piped");
-        for candidate in candidates {
-            writeln!(
-                input,
-                "{}\t{:?}\t{}",
+    let input = candidates
+        .iter()
+        .map(|candidate| {
+            format!(
+                "{}\t{:?}\t{}\n",
                 candidate.name,
                 candidate.scope,
                 candidate.path.display()
             )
-            .map_err(|error| format!("write Workflow choices: {error}"))?;
-        }
-    }
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("wait for fzf: {error}"))?;
+        })
+        .collect::<String>();
+    let output = crate::process::run_output_allow_failure(
+        Command::new(fzf)
+            .args([
+                "--delimiter=\t",
+                "--prompt=Workflow> ",
+                "--with-nth=1..",
+                "--header=Enter: run · Ctrl-E: edit",
+                "--expect=enter,ctrl-e",
+            ])
+            .stdin(Stdin::from_bytes(input.into_bytes())),
+        ProcessPolicy::LocalMutation,
+    )
+    .await
+    .map_err(|error| format!("run fzf '{fzf}': {error}"))?;
     if output
         .status
         .code()

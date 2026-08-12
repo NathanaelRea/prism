@@ -28,10 +28,37 @@ const MAX_ACTION_PAGES: u32 = 100;
 const MAX_LIST_SUMMARY_ENRICHMENTS: usize = 8;
 const LOG_TAIL_BYTES: usize = 16 * 1024;
 
+#[derive(Clone)]
 pub(crate) struct ForgejoAdapter {
     profile: HostProfile,
     client: HttpClient,
     cancelled: Arc<AtomicBool>,
+    _cancellation_waiter: Arc<CancellationWaiter>,
+}
+
+struct CancellationWaiter {
+    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl CancellationWaiter {
+    fn new(task: Option<tokio::task::JoinHandle<()>>) -> Self {
+        Self {
+            task: Mutex::new(task),
+        }
+    }
+}
+
+impl Drop for CancellationWaiter {
+    fn drop(&mut self) {
+        if let Some(task) = self
+            .task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            task.abort();
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,13 +102,20 @@ impl ForgejoAdapter {
                 "Forgejo adapter requires a configured Forgejo host profile",
             ));
         }
-        let cancelled = crate::process::current_cancellation()
-            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancellation_waiter = crate::process::current_cancellation().map(|token| {
+            let cancelled = Arc::clone(&cancelled);
+            tokio::spawn(async move {
+                token.cancelled().await;
+                cancelled.store(true, Ordering::Relaxed);
+            })
+        });
         let client = HttpClient::new(&profile, timeout, response_limit, Arc::clone(&cancelled))?;
         Ok(Self {
             profile,
             client,
             cancelled,
+            _cancellation_waiter: Arc::new(CancellationWaiter::new(cancellation_waiter)),
         })
     }
 
@@ -1722,8 +1756,8 @@ mod tests {
         response
     }
 
-    #[test]
-    fn discovers_codeberg_shaped_version_and_settings() {
+    #[tokio::test]
+    async fn discovers_codeberg_shaped_version_and_settings() {
         let server = TestServer::start(vec![
             response(
                 "200 OK",
@@ -1745,8 +1779,8 @@ mod tests {
         assert!(requests[1].starts_with("GET /api/v1/settings/api HTTP/1.1"));
     }
 
-    #[test]
-    fn caches_discovery_across_adapters_and_uses_the_discovered_page_limit() {
+    #[tokio::test]
+    async fn caches_discovery_across_adapters_and_uses_the_discovered_page_limit() {
         let server = TestServer::start(vec![
             response("200 OK", &[], r#"{"version":"11.0.0"}"#),
             response("200 OK", &[], r#"{"max_response_items":7}"#),
@@ -1774,8 +1808,8 @@ mod tests {
         assert!(requests[3].contains("limit=7"));
     }
 
-    #[test]
-    fn supported_forgejo_major_version_fixtures_remain_forward_compatible() {
+    #[tokio::test]
+    async fn supported_forgejo_major_version_fixtures_remain_forward_compatible() {
         for (fixture, expected_major) in [
             (
                 include_str!("../../tests/fixtures/remote/forgejo/version-9.json"),
@@ -1797,8 +1831,8 @@ mod tests {
         assert_eq!(forgejo_major("9"), None);
     }
 
-    #[test]
-    fn maps_fork_source_target_and_exact_head_from_fixture() {
+    #[tokio::test]
+    async fn maps_fork_source_target_and_exact_head_from_fixture() {
         let fixture = include_str!("../../tests/fixtures/remote/forgejo/pull-fork.json");
         let server = TestServer::start(vec![
             response(
@@ -1834,8 +1868,8 @@ mod tests {
         assert_eq!(change.source_repository.host(), &profile.host);
     }
 
-    #[test]
-    fn list_enriches_only_a_bounded_number_of_open_requests() {
+    #[tokio::test]
+    async fn list_enriches_only_a_bounded_number_of_open_requests() {
         let pulls = (0..=MAX_LIST_SUMMARY_ENRICHMENTS)
             .map(|index| {
                 let number = index + 1;
@@ -1897,8 +1931,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sends_configured_token_only_as_a_redacted_header() {
+    #[tokio::test]
+    async fn sends_configured_token_only_as_a_redacted_header() {
         const ENVIRONMENT: &str = "PRISM_FORGEJO_TEST_TOKEN_HEADER";
         const SECRET: &str = "super-secret-token";
         // Each test uses a unique variable; changing process environment is otherwise isolated.
@@ -1918,8 +1952,8 @@ mod tests {
         assert!(!format!("{error:?}").contains(SECRET));
     }
 
-    #[test]
-    fn rejects_oversized_and_invalid_json_responses() {
+    #[tokio::test]
+    async fn rejects_oversized_and_invalid_json_responses() {
         let oversized = "x".repeat(65);
         let server = TestServer::start(vec![response("200 OK", &[], &oversized)]);
         let adapter = ForgejoAdapter::with_transport_options(
@@ -1962,8 +1996,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn follows_same_origin_pagination_and_rejects_cross_origin_links() {
+    #[tokio::test]
+    async fn follows_same_origin_pagination_and_rejects_cross_origin_links() {
         let server = TestServer::start(vec![
             response("200 OK", &[], r#"{"version":"11.0.0"}"#),
             response("200 OK", &[], r#"{"max_response_items":50}"#),
@@ -1998,8 +2032,8 @@ mod tests {
         assert_eq!(server.requests().len(), 5);
     }
 
-    #[test]
-    fn rejects_same_origin_links_outside_the_api_and_incomplete_totals() {
+    #[tokio::test]
+    async fn rejects_same_origin_links_outside_the_api_and_incomplete_totals() {
         let server = TestServer::start(vec![
             response("200 OK", &[], r#"{"version":"11.0.0"}"#),
             response("200 OK", &[], r#"{"max_response_items":50}"#),
@@ -2042,8 +2076,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn status_page_two_failure_is_an_observation_failure() {
+    #[tokio::test]
+    async fn status_page_two_failure_is_an_observation_failure() {
         let server = TestServer::start(vec![
             response("200 OK", &[], r#"{"version":"11.0.0"}"#),
             response("200 OK", &[], r#"{"max_response_items":50}"#),
@@ -2073,8 +2107,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn classifies_retry_after_and_statuses() {
+    #[tokio::test]
+    async fn classifies_retry_after_and_statuses() {
         let server = TestServer::start(vec![
             response("429 Too Many Requests", &[("Retry-After", "17")], ""),
             response("503 Service Unavailable", &[], ""),
@@ -2094,8 +2128,8 @@ mod tests {
         assert_eq!(missing.class(), RemoteErrorClass::NotFound);
     }
 
-    #[test]
-    fn create_fails_closed_when_discovery_fails_without_posting() {
+    #[tokio::test]
+    async fn create_fails_closed_when_discovery_fails_without_posting() {
         let server = TestServer::start(vec![response("503 Service Unavailable", &[], "")]);
         let profile = server.profile(None);
         let repository =
@@ -2120,8 +2154,8 @@ mod tests {
         assert!(requests.iter().all(|request| !request.starts_with("POST ")));
     }
 
-    #[test]
-    fn unverified_versions_block_create_before_posting() {
+    #[tokio::test]
+    async fn unverified_versions_block_create_before_posting() {
         for (version, expected_class) in [
             ("not-a-version", RemoteErrorClass::InvalidResponse),
             ("8.0.0", RemoteErrorClass::Unsupported),
@@ -2155,8 +2189,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn actions_pagination_uses_total_count_instead_of_requested_page_size() {
+    #[tokio::test]
+    async fn actions_pagination_uses_total_count_instead_of_requested_page_size() {
         let server = TestServer::start(vec![
             response("200 OK", &[], r#"{"version":"11.0.0"}"#),
             response("200 OK", &[], r#"{"max_response_items":50}"#),
@@ -2185,8 +2219,8 @@ mod tests {
         assert!(requests[3].contains("page=2"));
     }
 
-    #[test]
-    fn retains_status_and_action_states_in_check_evidence() {
+    #[tokio::test]
+    async fn retains_status_and_action_states_in_check_evidence() {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
             "../../tests/fixtures/remote/forgejo/statuses-and-actions.json"
         ))
@@ -2218,8 +2252,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn combined_checks_preserve_values_as_stale_when_either_source_fails() {
+    #[tokio::test]
+    async fn combined_checks_preserve_values_as_stale_when_either_source_fails() {
         let status = CheckContext {
             name: "external".to_string(),
             state: CheckState::Passed,
@@ -2260,8 +2294,8 @@ mod tests {
         assert_eq!(error.unwrap().class(), RemoteErrorClass::Provider);
     }
 
-    #[test]
-    fn stale_passing_checks_do_not_become_a_passing_summary() {
+    #[tokio::test]
+    async fn stale_passing_checks_do_not_become_a_passing_summary() {
         let observation = Observation::Stale {
             value: vec![CheckContext {
                 name: "external".to_string(),
@@ -2283,8 +2317,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unsupported_actions_do_not_poison_external_status_readiness() {
+    #[tokio::test]
+    async fn unsupported_actions_do_not_poison_external_status_readiness() {
         let status = CheckContext {
             name: "woodpecker/pr".to_string(),
             state: CheckState::Passed,
@@ -2306,8 +2340,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn stale_or_unverifiable_approvals_do_not_become_summary_approval() {
+    #[tokio::test]
+    async fn stale_or_unverifiable_approvals_do_not_become_summary_approval() {
         let mut reviews: Vec<ReviewResponse> = serde_json::from_str(include_str!(
             "../../tests/fixtures/remote/forgejo/reviews-stale.json"
         ))
@@ -2337,8 +2371,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn folds_fresh_reviews_and_exact_head_checks_into_summary_facts() {
+    #[tokio::test]
+    async fn folds_fresh_reviews_and_exact_head_checks_into_summary_facts() {
         let pull = r#"{"id":99,"number":7,"title":"Change","state":"open","merged":false,"mergeable":true,"requested_reviewers":[],"head":{"ref":"topic","sha":"abc123","repo":{"full_name":"acme/widget"}},"base":{"ref":"main","sha":"def456","repo":{"full_name":"acme/widget"}}}"#;
         let server = TestServer::start(vec![
             response("200 OK", &[], pull),
@@ -2388,8 +2422,8 @@ mod tests {
         assert_eq!(summary.native_state_evidence.check, ["success"]);
     }
 
-    #[test]
-    fn details_reject_a_source_transition_after_all_fact_groups_are_loaded() {
+    #[tokio::test]
+    async fn details_reject_a_source_transition_after_all_fact_groups_are_loaded() {
         let initial = r#"{"id":99,"number":7,"title":"Change","state":"open","merged":false,"mergeable":true,"head":{"ref":"topic","sha":"abc123","repo":{"full_name":"acme/widget"}},"base":{"ref":"main","sha":"def456","repo":{"full_name":"acme/widget","has_actions":false}}}"#;
         let changed = initial.replace(
             r#""full_name":"acme/widget"}},"base"#,
@@ -2439,8 +2473,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unavailable_action_logs_do_not_erase_failed_job_evidence() {
+    #[tokio::test]
+    async fn unavailable_action_logs_do_not_erase_failed_job_evidence() {
         let server = TestServer::start(vec![
             response("200 OK", &[], r#"{"version":"11.0.0"}"#),
             response("200 OK", &[], r#"{"max_response_items":50}"#),
@@ -2465,8 +2499,8 @@ mod tests {
         assert!(failures[0].log_tail.is_empty());
     }
 
-    #[test]
-    fn disabled_actions_do_not_hide_external_statuses_or_trigger_log_requests() {
+    #[tokio::test]
+    async fn disabled_actions_do_not_hide_external_statuses_or_trigger_log_requests() {
         let server = TestServer::start(vec![
             response(
                 "200 OK",
@@ -2524,8 +2558,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn disabled_actions_and_fresh_empty_statuses_are_authoritative_no_ci() {
+    #[tokio::test]
+    async fn disabled_actions_and_fresh_empty_statuses_are_authoritative_no_ci() {
         let server = TestServer::start(vec![
             response(
                 "200 OK",
@@ -2562,8 +2596,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn missing_branch_protection_safety_fields_remain_unknown() {
+    #[tokio::test]
+    async fn missing_branch_protection_safety_fields_remain_unknown() {
         let server = TestServer::start(vec![response(
             "200 OK",
             &[],
@@ -2599,8 +2633,8 @@ mod tests {
         assert_eq!(protection.block_on_outdated_branch, Some(true));
     }
 
-    #[test]
-    fn supported_discovery_permits_create_flow() {
+    #[tokio::test]
+    async fn supported_discovery_permits_create_flow() {
         let pull = r#"{"id":99,"number":7,"title":"Change","state":"open","merged":false,"mergeable":true,"head":{"ref":"topic","sha":"abc123","repo":{"full_name":"acme/widget"}},"base":{"ref":"main","sha":"def456","repo":{"full_name":"acme/widget"}}}"#;
         let server = TestServer::start(vec![
             response(
@@ -2638,8 +2672,8 @@ mod tests {
         assert!(requests[3].starts_with("POST /api/v1/repos/acme/widget/pulls HTTP/1.1"));
     }
 
-    #[test]
-    fn guarded_merge_rejects_old_version_without_posting() {
+    #[tokio::test]
+    async fn guarded_merge_rejects_old_version_without_posting() {
         let server = TestServer::start(vec![
             response("200 OK", &[], r#"{"version":"8.0.0"}"#),
             response("200 OK", &[], "{}"),
@@ -2670,8 +2704,8 @@ mod tests {
         assert!(requests.iter().all(|request| !request.starts_with("POST ")));
     }
 
-    #[test]
-    fn supported_discovery_permits_guarded_merge_flow() {
+    #[tokio::test]
+    async fn supported_discovery_permits_guarded_merge_flow() {
         let pull = r#"{"id":99,"number":7,"title":"Change","state":"open","merged":false,"mergeable":true,"head":{"ref":"topic","sha":"abc123","repo":{"full_name":"acme/widget"}},"base":{"ref":"main","sha":"def456","repo":{"full_name":"acme/widget"}}}"#;
         let merged = r#"{"id":99,"number":7,"title":"Change","state":"closed","merged":true,"mergeable":true,"head":{"ref":"topic","sha":"abc123","repo":{"full_name":"acme/widget"}},"base":{"ref":"main","sha":"def456","repo":{"full_name":"acme/widget"}}}"#;
         let server = TestServer::start(vec![
@@ -2715,8 +2749,8 @@ mod tests {
         assert!(requests[4].starts_with("GET /api/v1/repos/acme/widget/pulls/7 HTTP/1.1"));
     }
 
-    #[test]
-    fn closed_unmerged_post_response_without_queue_evidence_is_uncertain() {
+    #[tokio::test]
+    async fn closed_unmerged_post_response_without_queue_evidence_is_uncertain() {
         let pull = r#"{"id":99,"number":7,"title":"Change","state":"open","merged":false,"mergeable":true,"head":{"ref":"topic","sha":"abc123","repo":{"full_name":"acme/widget"}},"base":{"ref":"main","sha":"def456","repo":{"full_name":"acme/widget"}}}"#;
         let closed = pull.replace(r#""state":"open""#, r#""state":"closed""#);
         let server = TestServer::start(vec![
@@ -2755,8 +2789,8 @@ mod tests {
         assert_eq!(result.summary.lifecycle, LifecycleState::Closed);
     }
 
-    #[test]
-    fn merge_conflict_is_stale_only_when_reobservation_finds_a_changed_head() {
+    #[tokio::test]
+    async fn merge_conflict_is_stale_only_when_reobservation_finds_a_changed_head() {
         let pull = r#"{"id":99,"number":7,"title":"Change","state":"open","merged":false,"mergeable":true,"head":{"ref":"topic","sha":"abc123","repo":{"full_name":"acme/widget"}},"base":{"ref":"main","sha":"def456","repo":{"full_name":"acme/widget"}}}"#;
         let changed = pull.replace("abc123", "new-head");
         for (current, expected_class) in [
@@ -2794,8 +2828,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn unsupported_merge_method_response_is_not_misclassified_as_stale() {
+    #[tokio::test]
+    async fn unsupported_merge_method_response_is_not_misclassified_as_stale() {
         let pull = r#"{"id":99,"number":7,"title":"Change","state":"open","merged":false,"mergeable":true,"head":{"ref":"topic","sha":"abc123","repo":{"full_name":"acme/widget"}},"base":{"ref":"main","sha":"def456","repo":{"full_name":"acme/widget"}}}"#;
         let server = TestServer::start(vec![
             response("200 OK", &[], r#"{"version":"11.0.0"}"#),
@@ -2826,8 +2860,27 @@ mod tests {
         assert_eq!(error.class(), RemoteErrorClass::Unsupported);
     }
 
-    #[test]
-    fn cancellation_is_best_effort_between_requests() {
+    #[tokio::test]
+    async fn cancellation_waiter_lifetime_is_shared_and_ends_with_last_adapter_clone() {
+        let server = TestServer::start(Vec::new());
+        let token = crate::process::CancellationToken::new();
+        let waiter = crate::process::with_cancellation(token, async {
+            let adapter = ForgejoAdapter::new(server.profile(None)).unwrap();
+            let waiter = Arc::downgrade(&adapter._cancellation_waiter);
+            let clone = adapter.clone();
+            drop(adapter);
+            assert!(waiter.upgrade().is_some());
+            drop(clone);
+            waiter
+        })
+        .await;
+
+        tokio::task::yield_now().await;
+        assert!(waiter.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn cancellation_is_best_effort_between_requests() {
         let server = TestServer::start(Vec::new());
         let adapter = ForgejoAdapter::new(server.profile(None)).unwrap();
         adapter.cancel();
@@ -2835,8 +2888,8 @@ mod tests {
         assert_eq!(error.class(), RemoteErrorClass::Cancelled);
     }
 
-    #[test]
-    fn cancellation_is_observed_while_reading_a_response_body() {
+    #[tokio::test]
+    async fn cancellation_is_observed_while_reading_a_response_body() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap().to_string();
         let (sent, received) = mpsc::channel();
@@ -2866,8 +2919,8 @@ mod tests {
         assert_eq!(error.class(), RemoteErrorClass::Cancelled);
     }
 
-    #[test]
-    fn stalled_transport_is_bounded_by_the_request_timeout() {
+    #[tokio::test]
+    async fn stalled_transport_is_bounded_by_the_request_timeout() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap().to_string();
         let server_thread = thread::spawn(move || {
@@ -2893,8 +2946,8 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
-    #[test]
-    fn unsupported_operations_are_explicit() {
+    #[tokio::test]
+    async fn unsupported_operations_are_explicit() {
         let server = TestServer::start(Vec::new());
         let adapter = ForgejoAdapter::new(server.profile(None)).unwrap();
         let static_capabilities = Capabilities::for_provider(ProviderKind::Forgejo);
@@ -2932,9 +2985,9 @@ mod tests {
         assert_eq!(static_capabilities.merge_queue, SupportLevel::Unsupported);
     }
 
-    #[test]
+    #[tokio::test]
     #[ignore = "requires scripts/remote-compatibility.sh forgejo"]
-    fn pinned_local_forgejo_adapter_compatibility() {
+    async fn pinned_local_forgejo_adapter_compatibility() {
         assert!(
             matches!(std::env::var("PRISM_REMOTE_COMPATIBILITY"), Ok(value) if value == "1"),
             "unsupported fixture: run this test only through scripts/remote-compatibility.sh forgejo"

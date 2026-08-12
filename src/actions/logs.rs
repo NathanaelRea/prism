@@ -36,13 +36,12 @@ impl Tui {
                 0,
                 Some(TUI_ACTION_JOB_TIMEOUT),
                 format!("prism-worktrunk-logs-{repo_index}"),
-                move |_| {
-                    let observation =
-                        crate::worktrunk::observe_hook_logs(&repo, &config).map(|entries| {
-                            crate::tui::WtHookLogObservation {
-                                entries,
-                                observed_at: std::time::Instant::now(),
-                            }
+                move |_| async move {
+                    let observation = crate::worktrunk::observe_hook_logs(&repo, &config)
+                        .await
+                        .map(|entries| crate::tui::WtHookLogObservation {
+                            entries,
+                            observed_at: std::time::Instant::now(),
                         });
                     Ok(Some(TuiJobPayload::WorktrunkHookLogs(
                         crate::tui::WtHookLogPollResult {

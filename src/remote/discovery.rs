@@ -1,14 +1,12 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
-use std::path::Path;
-use std::process::Command;
-
 use super::{
     HostIdentity, IdentityError, ProviderKind, RemoteBase, RemoteRepository, RemoteRepositoryId,
     WebScheme,
 };
 use crate::config::Config;
-use crate::process::{ProcessPolicy, run_capture};
+use crate::process::{Command, ProcessPolicy, run_capture};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::path::Path;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GitTransport {
@@ -74,19 +72,22 @@ pub(crate) enum RemoteUrlKind {
     Push,
 }
 
-pub(crate) fn discover_git_remote(
+pub(crate) async fn discover_git_remote(
     path: &Path,
     config: &Config,
     remote_name: &str,
     kind: RemoteUrlKind,
 ) -> Result<DiscoveredRemote, DiscoveryError> {
-    let mut command = Command::new(config.tool("git"));
-    command.arg("-C").arg(path).args(["remote", "get-url"]);
-    command.arg(remote_name);
+    let mut command = Command::new(config.tool("git"))
+        .arg("-C")
+        .arg(path)
+        .args(["remote", "get-url"])
+        .arg(remote_name);
     if kind == RemoteUrlKind::Push {
-        command.arg("--push");
+        command = command.arg("--push");
     }
-    let remote = run_capture(&mut command, ProcessPolicy::Metadata)
+    let remote = run_capture(command, ProcessPolicy::Metadata)
+        .await
         .map_err(|error| DiscoveryError::Git(format!("read {remote_name} remote URL: {error}")))?;
     config
         .remote_discovery()

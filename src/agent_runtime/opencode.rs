@@ -5,8 +5,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::agent::AgentState;
@@ -24,10 +23,14 @@ const SSE_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVER_START_POLL: Duration = Duration::from_millis(100);
 
-static OWNED_SERVER_PROCESSES: OnceLock<Mutex<BTreeMap<u32, OwnedServerProcess>>> = OnceLock::new();
+static OWNED_SERVER_PROCESSES: OnceLock<tokio::sync::Mutex<BTreeMap<u32, OwnedServerProcess>>> =
+    OnceLock::new();
 
+#[derive(Clone)]
 struct OwnedServerProcess {
-    child: crate::process::SupervisedChild,
+    pid: u32,
+    identity: Option<u64>,
+    control: crate::process::ProcessControl,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -174,7 +177,7 @@ impl OpencodeStatus {
     }
 }
 
-pub fn ensure_opencode_server(
+pub async fn ensure_opencode_server(
     repo: &Repository,
     config: &Config,
     branch: &str,
@@ -188,9 +191,10 @@ pub fn ensure_opencode_server(
         worktree,
         &config.tool("opencode"),
     )
+    .await
 }
 
-pub fn ensure_opencode_server_with_program(
+pub async fn ensure_opencode_server_with_program(
     repo: &Repository,
     config: &Config,
     harness_id: &str,
@@ -199,10 +203,10 @@ pub fn ensure_opencode_server_with_program(
     program: &str,
 ) -> Result<OpencodeRuntime, String> {
     let _server_lock = lock_repository_server(repo)?;
-    ensure_opencode_server_locked(repo, config, harness_id, branch, worktree, program)
+    ensure_opencode_server_locked(repo, config, harness_id, branch, worktree, program).await
 }
 
-fn ensure_opencode_server_locked(
+async fn ensure_opencode_server_locked(
     repo: &Repository,
     config: &Config,
     harness_id: &str,
@@ -212,7 +216,7 @@ fn ensure_opencode_server_locked(
 ) -> Result<OpencodeRuntime, String> {
     let existing = load_runtime(repo, harness_id, branch, worktree)?;
     let runtimes = load_runtimes_for_harness(repo, harness_id)?;
-    if let Some(shared) = healthy_shared_runtime(&runtimes) {
+    if let Some(shared) = healthy_shared_runtime(&runtimes).await {
         let runtime = runtime_for_worktree(repo, harness_id, branch, worktree, &shared, &existing);
         save_shared_server_runtime(repo, &runtime)?;
         return Ok(runtime);
@@ -233,42 +237,67 @@ fn ensure_opencode_server_locked(
         port_status,
     )?;
     let server_url = server_url(port);
-    let mut started_server = None;
-    let server_pid = if check_health(&server_url) {
-        existing.as_ref().and_then(|runtime| runtime.server_pid)
-    } else {
-        let mut command = Command::new(program);
-        command
-            .arg("serve")
-            .args(["--hostname", "127.0.0.1"])
-            .args(["--port", &port.to_string()])
-            .current_dir(&repo.root)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let mut child = crate::process::SupervisedChild::spawn_named(
-            &mut command,
-            None,
-            None,
+    if check_health_async(&server_url).await {
+        let runtime = OpencodeRuntime {
+            repo_root: repo.root.display().to_string(),
+            harness_id: harness_id.to_string(),
+            branch: branch.to_string(),
+            worktree_path: worktree.display().to_string(),
+            server_port: port,
+            server_url,
+            server_pid: existing.as_ref().and_then(|runtime| runtime.server_pid),
+            server_process_identity: existing
+                .as_ref()
+                .and_then(|runtime| runtime.server_process_identity),
+            opencode_session_id: existing.and_then(|runtime| runtime.opencode_session_id),
+            generation: 0,
+            updated_unix_ms: unix_ms(),
+        };
+        save_shared_server_runtime(repo, &runtime)?;
+        return Ok(runtime);
+    }
+
+    let command = crate::process::Command::new(program)
+        .arg("serve")
+        .args(["--hostname", "127.0.0.1"])
+        .args(["--port", &port.to_string()])
+        .current_dir(&repo.root);
+
+    #[cfg(unix)]
+    let (server_pid, server_process_identity, owned_control) = {
+        let child = command
+            .spawn_detached()
+            .map_err(|error| format!("start opencode server: {error}"))?;
+        let recorded = crate::process::record_process(child.pid())
+            .map_err(|error| format!("record opencode server {} identity: {error}", child.pid()))?;
+        let identity = recorded
+            .identity
+            .map(crate::process::ProcessIdentity::stored_value)
+            .ok_or_else(|| {
+                format!(
+                    "record opencode server {} identity: reusable identity is unavailable",
+                    child.pid()
+                )
+            })?;
+        (child.pid(), Some(identity), None)
+    };
+    #[cfg(windows)]
+    let (server_pid, server_process_identity, owned_control) = {
+        let control = crate::process::spawn_owned(
+            command,
             crate::process::ProcessDescriptor::new("opencode.server.serve"),
         )
+        .await
         .map_err(|error| format!("start opencode server: {error}"))?;
-        if let Err(error) = wait_for_health(&server_url) {
-            let _ = child.terminate();
-            return Err(error);
-        }
-        let pid = child.id();
-        started_server = Some(child);
-        Some(pid)
+        let pid = control.pid();
+        let identity = control.identity().ok_or_else(|| {
+            format!("record opencode server {pid} identity: reusable identity is unavailable")
+        })?;
+        (pid, Some(identity), Some(control))
     };
 
-    let server_process_identity = if started_server.is_some() {
-        server_pid.and_then(stored_process_identity)
-    } else {
-        existing
-            .as_ref()
-            .and_then(|runtime| runtime.server_process_identity)
-    };
+    // Persist the exact spawn-time identity before readiness polling so a crash or
+    // restart during startup can still recover this specific server fail-closed.
     let runtime = OpencodeRuntime {
         repo_root: repo.root.display().to_string(),
         harness_id: harness_id.to_string(),
@@ -276,22 +305,68 @@ fn ensure_opencode_server_locked(
         worktree_path: worktree.display().to_string(),
         server_port: port,
         server_url,
-        server_pid,
+        server_pid: Some(server_pid),
         server_process_identity,
-        opencode_session_id: existing.and_then(|runtime| runtime.opencode_session_id),
+        opencode_session_id: existing
+            .as_ref()
+            .and_then(|runtime| runtime.opencode_session_id.clone()),
         generation: 0,
         updated_unix_ms: unix_ms(),
     };
-    if let Err(error) = save_shared_server_runtime(repo, &runtime) {
-        if let Some(mut child) = started_server {
-            let _ = child.terminate();
+    // Write the spawning worktree first, then update every shared reference only
+    // after readiness. This keeps crash recovery immediate without publishing an
+    // unready endpoint to the other worktrees.
+    if let Err(error) = save_runtime(repo, &runtime) {
+        stop_started_server(server_pid, server_process_identity, owned_control).await;
+        return Err(error);
+    }
+    if let Some(control) = owned_control.clone() {
+        record_owned_server_process(control).await;
+    }
+    if let Err(error) = wait_for_health(&runtime.server_url).await {
+        match shutdown_stored_server(&runtime).await {
+            Ok(()) => rollback_starting_runtime(repo, &runtime, existing.as_ref()),
+            Err(shutdown) => return Err(format!("{error}; startup cleanup failed: {shutdown}")),
         }
         return Err(error);
     }
-    if let Some(child) = started_server {
-        record_owned_server_process(child);
+    if let Err(error) = save_shared_server_runtime(repo, &runtime) {
+        match shutdown_stored_server(&runtime).await {
+            Ok(()) => rollback_starting_runtime(repo, &runtime, existing.as_ref()),
+            Err(shutdown) => return Err(format!("{error}; startup cleanup failed: {shutdown}")),
+        }
+        return Err(error);
     }
     Ok(runtime)
+}
+
+fn rollback_starting_runtime(
+    repo: &Repository,
+    starting: &OpencodeRuntime,
+    previous: Option<&OpencodeRuntime>,
+) {
+    if let Some(previous) = previous {
+        let _ = save_runtime(repo, previous);
+    } else {
+        let _ =
+            crate::persistence::session::delete_runtime(&observability::db_path(repo), starting);
+    }
+}
+
+async fn stop_started_server(
+    pid: u32,
+    identity: Option<u64>,
+    control: Option<crate::process::ProcessControl>,
+) {
+    if let Some(control) = control {
+        let _ = control.shutdown().await;
+    } else {
+        let _ = crate::process::terminate_recorded_process(
+            crate::process::RecordedProcess::from_stored(pid, identity),
+            Duration::from_secs(1),
+        )
+        .await;
+    }
 }
 
 pub(crate) fn lock_repository_server(repo: &Repository) -> Result<File, String> {
@@ -319,20 +394,21 @@ pub(crate) fn lock_repository_server(repo: &Repository) -> Result<File, String> 
     Ok(lock)
 }
 
-fn healthy_shared_runtime(runtimes: &[OpencodeRuntime]) -> Option<OpencodeRuntime> {
+async fn healthy_shared_runtime(runtimes: &[OpencodeRuntime]) -> Option<OpencodeRuntime> {
     let mut servers = BTreeMap::new();
     for runtime in runtimes {
         servers
             .entry((runtime.server_port, runtime.server_url.as_str()))
             .or_insert(runtime);
     }
-    servers
-        .into_values()
-        .find(|runtime| {
-            check_health(&runtime.server_url)
-                && (stored_server_identity_is_valid(runtime) || runtime.server_pid.is_none())
-        })
-        .cloned()
+    for runtime in servers.into_values() {
+        if check_health_async(&runtime.server_url).await
+            && (stored_server_identity_is_valid(runtime) || runtime.server_pid.is_none())
+        {
+            return Some(runtime.clone());
+        }
+    }
+    None
 }
 
 fn stored_server_identity_is_valid(runtime: &OpencodeRuntime) -> bool {
@@ -425,7 +501,7 @@ fn server_reference_count(repo: &Repository, runtime: &OpencodeRuntime) -> Resul
     .map_err(|error| format!("count OpenCode server references: {error}"))
 }
 
-pub fn ensure_opencode_session(
+pub async fn ensure_opencode_session(
     repo: &Repository,
     config: &Config,
     branch: &str,
@@ -439,9 +515,10 @@ pub fn ensure_opencode_session(
         worktree,
         &config.tool("opencode"),
     )
+    .await
 }
 
-pub fn ensure_opencode_session_with_program(
+pub async fn ensure_opencode_session_with_program(
     repo: &Repository,
     config: &Config,
     harness_id: &str,
@@ -451,7 +528,7 @@ pub fn ensure_opencode_session_with_program(
 ) -> Result<OpencodeRuntime, String> {
     let _server_lock = lock_repository_server(repo)?;
     let mut runtime =
-        ensure_opencode_server_locked(repo, config, harness_id, branch, worktree, program)?;
+        ensure_opencode_server_locked(repo, config, harness_id, branch, worktree, program).await?;
     let session = resolve_session(&runtime, worktree)?;
     save_runtime_session(repo, &mut runtime, session.id)?;
     Ok(runtime)
@@ -659,42 +736,54 @@ pub fn abort_session(server_url: &str, session_id: &str) -> Result<(), String> {
     }
 }
 
-pub fn shutdown_owned_server(runtime: &OpencodeRuntime) -> Result<(), String> {
+pub async fn shutdown_owned_server(runtime: &OpencodeRuntime) -> Result<(), String> {
     let Some(pid) = runtime.server_pid else {
         return Ok(());
     };
-    let Some(mut owned) = take_owned_server_process(pid) else {
+    let Some(owned) = take_owned_server_process(pid).await else {
+        #[cfg(unix)]
+        return shutdown_external_server_with(runtime, crate::process::process_arguments).await;
+        #[cfg(windows)]
         return Ok(());
     };
-    if owned
-        .child
-        .try_wait()
-        .map_err(|error| format!("inspect owned opencode server {pid} before shutdown: {error}"))?
-        .is_some()
-    {
-        return Ok(());
+    if owned.pid != pid || owned.identity != runtime.server_process_identity {
+        return Err(format!(
+            "refusing to stop owned opencode server {pid}: registry identity disagrees with persisted identity"
+        ));
     }
     owned
-        .child
-        .terminate()
-        .map(|_| ())
+        .control
+        .shutdown()
+        .await
         .map_err(|error| format!("stop opencode server {pid}: {error}"))
 }
 
-pub(crate) fn shutdown_stored_server(runtime: &OpencodeRuntime) -> Result<(), String> {
-    shutdown_stored_server_with(runtime, crate::process::process_arguments)
+pub(crate) async fn shutdown_stored_server(runtime: &OpencodeRuntime) -> Result<(), String> {
+    shutdown_stored_server_with(runtime, crate::process::process_arguments).await
 }
 
-fn shutdown_stored_server_with(
+async fn shutdown_stored_server_with(
     runtime: &OpencodeRuntime,
     inspect_arguments: impl FnOnce(
         u32,
     )
         -> Result<Option<Vec<String>>, crate::process::ProcessLifecycleError>,
 ) -> Result<(), String> {
-    if runtime.server_pid.is_some_and(owned_server_process) {
-        return shutdown_owned_server(runtime);
+    if let Some(pid) = runtime.server_pid
+        && owned_server_process(pid).await
+    {
+        return shutdown_owned_server(runtime).await;
     }
+    shutdown_external_server_with(runtime, inspect_arguments).await
+}
+
+async fn shutdown_external_server_with(
+    runtime: &OpencodeRuntime,
+    inspect_arguments: impl FnOnce(
+        u32,
+    )
+        -> Result<Option<Vec<String>>, crate::process::ProcessLifecycleError>,
+) -> Result<(), String> {
     let Some(pid) = runtime.server_pid else {
         return Ok(());
     };
@@ -706,6 +795,7 @@ fn shutdown_stored_server_with(
     let recorded =
         crate::process::RecordedProcess::from_stored(pid, runtime.server_process_identity);
     match crate::process::terminate_recorded_process(recorded, Duration::from_secs(1))
+        .await
         .map_err(|error| format!("stop opencode server {pid}: {error}"))?
     {
         crate::process::TerminationOutcome::Terminated
@@ -749,31 +839,26 @@ fn stored_server_args_match(args: &[&str], port: u16) -> bool {
             .any(|window| window[0] == "--port" && window[1] == port)
 }
 
-fn owned_server_processes() -> &'static Mutex<BTreeMap<u32, OwnedServerProcess>> {
-    OWNED_SERVER_PROCESSES.get_or_init(|| Mutex::new(BTreeMap::new()))
+fn owned_server_processes() -> &'static tokio::sync::Mutex<BTreeMap<u32, OwnedServerProcess>> {
+    OWNED_SERVER_PROCESSES.get_or_init(|| tokio::sync::Mutex::new(BTreeMap::new()))
 }
 
-fn record_owned_server_process(child: crate::process::SupervisedChild) {
-    let pid = child.id();
-    let process = OwnedServerProcess { child };
-    owned_server_processes()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .insert(pid, process);
+async fn record_owned_server_process(control: crate::process::ProcessControl) {
+    let pid = control.pid();
+    let process = OwnedServerProcess {
+        pid,
+        identity: control.identity(),
+        control,
+    };
+    owned_server_processes().lock().await.insert(pid, process);
 }
 
-fn owned_server_process(pid: u32) -> bool {
-    owned_server_processes()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .contains_key(&pid)
+async fn owned_server_process(pid: u32) -> bool {
+    owned_server_processes().lock().await.contains_key(&pid)
 }
 
-fn take_owned_server_process(pid: u32) -> Option<OwnedServerProcess> {
-    owned_server_processes()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .remove(&pid)
+async fn take_owned_server_process(pid: u32) -> Option<OwnedServerProcess> {
+    owned_server_processes().lock().await.remove(&pid)
 }
 
 fn stored_process_identity(pid: u32) -> Option<u64> {
@@ -937,6 +1022,21 @@ pub(crate) fn listen_classified_events_until(
     on_event: impl FnMut(OpencodeEvent, Option<OpencodeSnapshotFacet>) -> Result<(), String>,
 ) -> Result<(), String> {
     listen_classified_events_until_in_directory(server_url, Some(directory), should_stop, on_event)
+}
+
+pub(crate) async fn listen_classified_events_until_async(
+    server_url: String,
+    directory: std::path::PathBuf,
+    should_stop: impl FnMut() -> bool + Send + 'static,
+    on_event: impl FnMut(OpencodeEvent, Option<OpencodeSnapshotFacet>) -> Result<(), String>
+    + Send
+    + 'static,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        listen_classified_events_until(&server_url, &directory, should_stop, on_event)
+    })
+    .await
+    .map_err(|error| format!("OpenCode event listener task failed: {error}"))?
 }
 
 fn listen_classified_events_until_in_directory(
@@ -1777,7 +1877,7 @@ pub(crate) fn reconcile_session_refresh(
     *current = previous;
 }
 
-pub(crate) fn shutdown_worktree_session_runtimes(
+pub(crate) async fn shutdown_worktree_session_runtimes(
     repo: &Repository,
     branch: &str,
     worktree: &Path,
@@ -1797,7 +1897,7 @@ pub(crate) fn shutdown_worktree_session_runtimes(
             }
         };
         if references <= 1
-            && let Err(error) = shutdown_stored_server(&runtime)
+            && let Err(error) = shutdown_stored_server(&runtime).await
         {
             errors.push(error);
             continue;
@@ -1816,7 +1916,7 @@ pub(crate) fn shutdown_worktree_session_runtimes(
     }
 }
 
-pub(crate) fn shutdown_worktree_session_runtime_processes_with_lock_held(
+pub(crate) async fn shutdown_worktree_session_runtime_processes_with_lock_held(
     repo: &Repository,
     runtimes: &[OpencodeRuntime],
 ) -> Result<(), String> {
@@ -1832,7 +1932,7 @@ pub(crate) fn shutdown_worktree_session_runtime_processes_with_lock_held(
             .count() as i64;
         match server_reference_count(repo, runtime) {
             Ok(references) if references <= removed_references => {
-                if let Err(error) = shutdown_stored_server(runtime) {
+                if let Err(error) = shutdown_stored_server(runtime).await {
                     errors.push(error);
                 }
             }
@@ -1907,13 +2007,41 @@ pub fn port_status(port: u16) -> PortStatus {
     }
 }
 
-fn wait_for_health(server_url: &str) -> Result<(), String> {
-    let started = std::time::Instant::now();
+async fn check_health_async(server_url: &str) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let Ok((host, port)) = parse_localhost_url(server_url) else {
+        return false;
+    };
+    let request = async {
+        let mut stream = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
+        stream
+            .write_all(
+                format!(
+                    "GET /global/health HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await?;
+        let mut response = [0_u8; 64];
+        let count = stream.read(&mut response).await?;
+        Ok::<bool, std::io::Error>(
+            response[..count].starts_with(b"HTTP/1.1 200")
+                || response[..count].starts_with(b"HTTP/1.0 200"),
+        )
+    };
+    tokio::time::timeout(HEALTH_TIMEOUT, request)
+        .await
+        .is_ok_and(|result| result.unwrap_or(false))
+}
+
+async fn wait_for_health(server_url: &str) -> Result<(), String> {
+    let started = tokio::time::Instant::now();
     while started.elapsed() < SERVER_START_TIMEOUT {
-        if check_health(server_url) {
+        if check_health_async(server_url).await {
             return Ok(());
         }
-        std::thread::sleep(SERVER_START_POLL);
+        tokio::time::sleep(SERVER_START_POLL).await;
     }
     Err(format!(
         "opencode server did not become healthy at {server_url}"
@@ -2768,6 +2896,59 @@ mod tests {
         server.join().unwrap();
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn multiple_async_event_listeners_do_not_starve_current_thread_runtime() {
+        fn idle_server() -> (String, std::thread::JoinHandle<()>) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 512];
+                let _ = stream.read(&mut request).unwrap();
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+                    .unwrap();
+                stream.flush().unwrap();
+                std::thread::sleep(Duration::from_millis(500));
+            });
+            (url, server)
+        }
+
+        let (first_url, first_server) = idle_server();
+        let (second_url, second_server) = idle_server();
+        let canceled = Arc::new(AtomicBool::new(false));
+        let first_canceled = canceled.clone();
+        let second_canceled = canceled.clone();
+        let started = Instant::now();
+        let first = tokio::spawn(listen_classified_events_until_async(
+            first_url,
+            PathBuf::from("/tmp/first"),
+            move || first_canceled.load(Ordering::Acquire),
+            |_, _| Ok(()),
+        ));
+        let second = tokio::spawn(listen_classified_events_until_async(
+            second_url,
+            PathBuf::from("/tmp/second"),
+            move || second_canceled.load(Ordering::Acquire),
+            |_, _| Ok(()),
+        ));
+
+        tokio::task::yield_now().await;
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "synchronous SSE listeners starved the current-thread runtime"
+        );
+        canceled.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            first.await.unwrap().unwrap();
+            second.await.unwrap().unwrap();
+        })
+        .await
+        .unwrap();
+        first_server.join().unwrap();
+        second_server.join().unwrap();
+    }
+
     #[test]
     fn event_listener_reports_an_idle_stream_timeout() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2864,8 +3045,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn stored_server_shutdown_reports_argument_inspection_failure() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stored_server_shutdown_reports_argument_inspection_failure() {
         let runtime = OpencodeRuntime {
             repo_root: "/repo".to_string(),
             harness_id: "opencode".to_string(),
@@ -2886,6 +3067,7 @@ mod tests {
                 source: std::io::Error::other("injected argument inspection failure"),
             })
         })
+        .await
         .unwrap_err();
 
         assert!(error.contains("inspect stored opencode server 42 before shutdown"));
@@ -2993,8 +3175,8 @@ mod tests {
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn worktrees_in_one_repository_reuse_one_healthy_server() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn worktrees_in_one_repository_reuse_one_healthy_server() {
         let temp = unique_temp_dir("prism-opencode-shared-server-test");
         fs::create_dir_all(&temp).unwrap();
         let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -3025,6 +3207,7 @@ mod tests {
             &second_worktree,
             "/definitely/missing/opencode",
         )
+        .await
         .unwrap();
 
         assert_eq!(second.server_url, first.server_url);
@@ -3035,8 +3218,8 @@ mod tests {
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn legacy_worktree_servers_converge_to_one_canonical_server() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn legacy_worktree_servers_converge_to_one_canonical_server() {
         let temp = unique_temp_dir("prism-opencode-legacy-server-test");
         fs::create_dir_all(&temp).unwrap();
         let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -3081,6 +3264,7 @@ mod tests {
             Path::new(&noncanonical.worktree_path),
             "/definitely/missing/opencode",
         )
+        .await
         .unwrap();
 
         assert_eq!(selected.server_url, canonical_url);
@@ -3257,10 +3441,10 @@ mod tests {
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
+    #[tokio::test(flavor = "multi_thread")]
     #[cfg(target_os = "linux")]
-    fn legacy_runtime_without_start_time_cannot_stop_a_matching_live_process() {
-        let mut child = Command::new("sh")
+    async fn legacy_runtime_without_start_time_cannot_stop_a_matching_live_process() {
+        let mut child = std::process::Command::new("sh")
             .arg("-c")
             .arg("while :; do sleep 1; done")
             .arg("legacy-opencode-fixture")
@@ -3291,6 +3475,7 @@ mod tests {
                 "41222".to_string(),
             ]))
         });
+        let result = result.await;
         let child_was_running = child.try_wait().unwrap().is_none();
         child.kill().unwrap();
         child.wait().unwrap();
@@ -3804,9 +3989,9 @@ mod tests {
         assert_eq!(parse_response(chunked_with_trailer).unwrap().body, "[]");
     }
 
-    #[test]
+    #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires PRISM_TEST_OPENCODE pointing to a real OpenCode binary"]
-    fn real_opencode_server_round_trips_prism_session_api() {
+    async fn real_opencode_server_round_trips_prism_session_api() {
         let opencode = std::env::var("PRISM_TEST_OPENCODE")
             .expect("set PRISM_TEST_OPENCODE to the real OpenCode binary");
         let temp = unique_temp_dir("prism-real-opencode-test");
@@ -3872,13 +4057,15 @@ mod tests {
             .tools
             .insert("opencode".to_string(), wrapper.display().to_string());
 
-        let runtime = ensure_opencode_server(&repo, &config, "feature/smoke", &worktree).unwrap();
-        let result = (|| -> Result<(), String> {
+        let runtime = ensure_opencode_server(&repo, &config, "feature/smoke", &worktree)
+            .await
+            .unwrap();
+        let result = async {
             if !check_health(&runtime.server_url) {
                 return Err("OpenCode server did not remain healthy".to_string());
             }
             let second_runtime =
-                ensure_opencode_server(&repo, &config, "feature/second", &second_worktree)?;
+                ensure_opencode_server(&repo, &config, "feature/second", &second_worktree).await?;
             if second_runtime.server_url != runtime.server_url
                 || second_runtime.server_pid != runtime.server_pid
             {
@@ -3899,7 +4086,8 @@ mod tests {
                     created.id
                 ));
             }
-            let resolved = ensure_opencode_session(&repo, &config, "feature/smoke", &worktree)?;
+            let resolved =
+                ensure_opencode_session(&repo, &config, "feature/smoke", &worktree).await?;
             if resolved.opencode_session_id.as_deref() != Some(created.id.as_str()) {
                 return Err(format!(
                     "Prism did not select created OpenCode session {} for {}",
@@ -3924,34 +4112,35 @@ mod tests {
                     persisted = true;
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
             if !persisted {
                 return Err("submitted OpenCode prompt was not persisted".to_string());
             }
-            Ok(())
-        })();
-        let shutdown = shutdown_owned_server(&runtime);
+            Ok::<(), String>(())
+        }
+        .await;
+        let shutdown = shutdown_owned_server(&runtime).await;
         let _ = fs::remove_dir_all(temp);
 
         result.unwrap();
         shutdown.unwrap();
     }
 
-    #[test]
+    #[tokio::test(flavor = "multi_thread")]
     #[cfg(unix)]
-    fn worktree_cleanup_keeps_a_server_referenced_by_another_worktree() {
+    async fn worktree_cleanup_keeps_a_server_referenced_by_another_worktree() {
         let temp = unique_temp_dir("prism-shared-opencode-cleanup");
         fs::create_dir_all(&temp).unwrap();
         let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
-        let mut command = Command::new("sh");
-        command
-            .args(["-c", "while :; do sleep 1; done"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let child = crate::process::SupervisedChild::spawn(&mut command, None, None).unwrap();
-        let process_id = child.id();
-        record_owned_server_process(child);
+        let control = crate::process::spawn_owned(
+            crate::process::Command::new("sh").args(["-c", "while :; do sleep 1; done"]),
+            crate::process::ProcessDescriptor::new("test.opencode.shared"),
+        )
+        .await
+        .unwrap();
+        let process_id = control.pid();
+        record_owned_server_process(control.clone()).await;
         let runtime = |branch: &str, worktree: &str| OpencodeRuntime {
             repo_root: repo.root.display().to_string(),
             harness_id: "opencode".to_string(),
@@ -3974,8 +4163,9 @@ mod tests {
             &repo,
             std::slice::from_ref(&first),
         )
+        .await
         .unwrap();
-        assert!(owned_server_process(process_id));
+        assert!(owned_server_process(process_id).await);
 
         crate::persistence::session::delete_runtime(&observability::db_path(&repo), &first)
             .unwrap();
@@ -3983,14 +4173,15 @@ mod tests {
             &repo,
             std::slice::from_ref(&second),
         )
+        .await
         .unwrap();
-        assert!(!owned_server_process(process_id));
+        assert!(!owned_server_process(process_id).await);
         fs::remove_dir_all(temp).unwrap();
     }
 
-    #[test]
+    #[tokio::test(flavor = "multi_thread")]
     #[cfg(unix)]
-    fn owned_server_shutdown_kills_term_ignoring_descendant_and_reaps_leader() {
+    async fn owned_server_shutdown_kills_term_ignoring_descendant_and_reaps_leader() {
         let temp = unique_temp_dir("prism-owned-opencode-process");
         fs::create_dir_all(&temp).unwrap();
         let descendant_path = temp.join("descendant.pid");
@@ -4004,18 +4195,19 @@ mod tests {
             printf '%s\n' "$descendant" > "$1"
             wait "$descendant"
         "#;
-        let mut command = Command::new("sh");
-        command
-            .arg("-c")
-            .arg(script)
-            .arg("owned-opencode-fixture")
-            .arg(&descendant_path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let child = crate::process::SupervisedChild::spawn(&mut command, None, None).unwrap();
-        let process_id = child.id();
+        let control = crate::process::spawn_owned(
+            crate::process::Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .arg("owned-opencode-fixture")
+                .arg(&descendant_path),
+            crate::process::ProcessDescriptor::new("test.opencode.owned"),
+        )
+        .await
+        .unwrap();
+        let process_id = control.pid();
         let recorded_process = crate::process::record_process(process_id).unwrap();
-        record_owned_server_process(child);
+        record_owned_server_process(control).await;
         let runtime = OpencodeRuntime {
             repo_root: "/repo".to_string(),
             harness_id: "opencode".to_string(),
@@ -4044,10 +4236,10 @@ mod tests {
         let recorded_descendant = crate::process::record_process(descendant_id).unwrap();
 
         let started = std::time::Instant::now();
-        shutdown_owned_server(&runtime).unwrap();
+        shutdown_owned_server(&runtime).await.unwrap();
 
         assert!(started.elapsed() < Duration::from_secs(3));
-        assert!(!owned_server_process(process_id));
+        assert!(!owned_server_process(process_id).await);
         for process in [recorded_process, recorded_descendant] {
             let gone_deadline = std::time::Instant::now() + Duration::from_secs(2);
             loop {
@@ -4068,8 +4260,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn stored_server_shutdown_uses_verified_bounded_process_group_recovery() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stored_server_shutdown_uses_verified_bounded_process_group_recovery() {
         let temp = unique_temp_dir("prism-stored-opencode-process");
         fs::create_dir_all(&temp).unwrap();
         let descendant_path = temp.join("descendant.pid");
@@ -4083,17 +4275,15 @@ mod tests {
             printf '%s\n' "$descendant" > "$1"
             wait "$descendant"
         "#;
-        let mut command = Command::new("sh");
-        command
+        let detached = crate::process::Command::new("sh")
             .arg("-c")
             .arg(script)
             .arg("stored-opencode-fixture")
             .arg(&descendant_path)
             .args(["serve", "--hostname", "127.0.0.1", "--port", "41000"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let mut child = crate::process::SupervisedChild::spawn(&mut command, None, None).unwrap();
-        let process_id = child.id();
+            .spawn_detached()
+            .unwrap();
+        let process_id = detached.pid();
         let recorded_process = crate::process::record_process(process_id).unwrap();
         let runtime = OpencodeRuntime {
             repo_root: "/repo".to_string(),
@@ -4121,22 +4311,22 @@ mod tests {
             .parse::<u32>()
             .unwrap();
         let recorded_descendant = crate::process::record_process(descendant_id).unwrap();
-        let reaper = std::thread::spawn(move || child.wait().unwrap());
-
         let started = std::time::Instant::now();
-        shutdown_stored_server(&runtime).unwrap();
+        shutdown_stored_server(&runtime).await.unwrap();
 
         assert!(started.elapsed() < Duration::from_secs(3));
-        reaper.join().unwrap();
-        let gone_deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while crate::process::observe_process(recorded_descendant).unwrap()
-            != crate::process::ProcessObservation::Missing
-        {
-            assert!(
-                std::time::Instant::now() < gone_deadline,
-                "stored server descendant {descendant_id} survived shutdown"
-            );
-            std::thread::sleep(Duration::from_millis(10));
+        for process in [recorded_process, recorded_descendant] {
+            let gone_deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while crate::process::observe_process(process).unwrap()
+                != crate::process::ProcessObservation::Missing
+            {
+                assert!(
+                    std::time::Instant::now() < gone_deadline,
+                    "stored server process {} survived shutdown",
+                    process.pid
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
         fs::remove_dir_all(temp).unwrap();
     }
@@ -4174,7 +4364,9 @@ mod tests {
                 };
                 stream.set_nonblocking(false).unwrap();
                 let mut request = [0_u8; 1024];
-                let count = stream.read(&mut request).unwrap();
+                let Ok(count) = stream.read(&mut request) else {
+                    continue;
+                };
                 let request = String::from_utf8_lossy(&request[..count]);
                 let body = if request.starts_with("GET /global/health ") {
                     r#"{"healthy":true}"#.to_string()
@@ -4184,12 +4376,11 @@ mod tests {
                         worktree.display()
                     )
                 };
-                write!(
+                let _ = write!(
                     stream,
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
-                )
-                .unwrap();
+                );
             }
         });
         (url, stop, server)

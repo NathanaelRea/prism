@@ -571,58 +571,55 @@ impl StandardGitOperations for ProcessStandardGitOperations {
             let git = config.tool("git").to_string();
             let remote = target_remote.to_string();
             let branch = target_branch.to_string();
-            tokio::task::spawn_blocking(move || {
-                crate::process::run_status_named(
-                    std::process::Command::new(&git)
-                        .arg("-C")
-                        .arg(&worktree)
-                        .args(["fetch", "--", &remote, &branch]),
-                    crate::process::ProcessPolicy::NetworkQuery,
-                    crate::process::ProcessDescriptor::new("workflow.trigger.git.fetch"),
-                )
-                .map_err(TriggerError::Fixture)?;
-                let merge_target = format!("refs/remotes/{remote}/{branch}");
-                let output = crate::process::run_output_allow_failure_named(
-                    std::process::Command::new(&git)
-                        .arg("-C")
-                        .arg(&worktree)
-                        .args(["merge", "--no-edit", "--no-ff", &merge_target]),
-                    crate::process::ProcessPolicy::LocalMutation,
-                    crate::process::ProcessDescriptor::new("workflow.trigger.git.merge"),
-                )
-                .map_err(TriggerError::Fixture)?;
-                if output.status.success() {
-                    return Ok(MergePreparation {
-                        target_remote: remote,
-                        target_branch: branch,
-                        has_conflicts: false,
-                    });
-                }
-                let unmerged = crate::process::run_capture_named(
-                    std::process::Command::new(&git)
-                        .arg("-C")
-                        .arg(&worktree)
-                        .args(["diff", "--name-only", "--diff-filter=U"]),
-                    crate::process::ProcessPolicy::Metadata,
-                    crate::process::ProcessDescriptor::new("workflow.trigger.git.conflicts"),
-                )
-                .map_err(TriggerError::Fixture)?;
-                if unmerged.trim().is_empty() {
-                    return Err(TriggerError::Fixture(format!(
-                        "git merge failed without conflict markers: {}",
-                        output.stderr.trim()
-                    )));
-                }
-                Ok(MergePreparation {
+            crate::process::run_status_named(
+                crate::process::Command::new(&git)
+                    .arg("-C")
+                    .arg(&worktree)
+                    .args(["fetch", "--", &remote, &branch]),
+                crate::process::ProcessPolicy::NetworkQuery,
+                crate::process::ProcessDescriptor::new("workflow.trigger.git.fetch"),
+            )
+            .await
+            .map_err(TriggerError::Fixture)?;
+            let merge_target = format!("refs/remotes/{remote}/{branch}");
+            let output = crate::process::run_output_allow_failure_named(
+                crate::process::Command::new(&git)
+                    .arg("-C")
+                    .arg(&worktree)
+                    .args(["merge", "--no-edit", "--no-ff", &merge_target]),
+                crate::process::ProcessPolicy::LocalMutation,
+                crate::process::ProcessDescriptor::new("workflow.trigger.git.merge"),
+            )
+            .await
+            .map_err(TriggerError::Fixture)?;
+            if output.status.success() {
+                return Ok(MergePreparation {
                     target_remote: remote,
                     target_branch: branch,
-                    has_conflicts: true,
-                })
-            })
+                    has_conflicts: false,
+                });
+            }
+            let unmerged = crate::process::run_capture_named(
+                crate::process::Command::new(&git)
+                    .arg("-C")
+                    .arg(&worktree)
+                    .args(["diff", "--name-only", "--diff-filter=U"]),
+                crate::process::ProcessPolicy::Metadata,
+                crate::process::ProcessDescriptor::new("workflow.trigger.git.conflicts"),
+            )
             .await
-            .map_err(|error| {
-                TriggerError::Fixture(format!("join Git merge preparation: {error}"))
-            })?
+            .map_err(TriggerError::Fixture)?;
+            if unmerged.trim().is_empty() {
+                return Err(TriggerError::Fixture(format!(
+                    "git merge failed without conflict markers: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+            Ok(MergePreparation {
+                target_remote: remote,
+                target_branch: branch,
+                has_conflicts: true,
+            })
         })
     }
 }

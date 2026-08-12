@@ -408,6 +408,71 @@ where
     result
 }
 
+pub async fn phase_async<T, F, Fut>(phase: &str, run: F) -> Result<T, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let started_ms = now_ms();
+    let started = Instant::now();
+    let operation = begin_operation(
+        LogLevel::Info,
+        "startup",
+        "begin",
+        format!("begin {phase}"),
+        Some(json_object(vec![json_string_field("phase", phase)])),
+    );
+    let result = run().await;
+    let elapsed_ms = started.elapsed().as_millis() as i64;
+    let finished_ms = now_ms();
+    match &result {
+        Ok(_) => {
+            operation.finish(
+                LogLevel::Info,
+                "startup",
+                "end",
+                format!("finished {phase}"),
+                Some(json_object(vec![
+                    json_string_field("phase", phase),
+                    json_number_field("elapsed_ms", elapsed_ms),
+                    json_string_field("status", "ok"),
+                ])),
+            );
+            record_phase(PhaseRecord {
+                phase: phase.to_string(),
+                time_started_unix_ms: started_ms,
+                time_finished_unix_ms: Some(finished_ms),
+                status: "ok".to_string(),
+                error: None,
+                elapsed_ms: Some(elapsed_ms),
+            });
+        }
+        Err(error) => {
+            operation.finish(
+                LogLevel::Error,
+                "startup",
+                "end",
+                format!("failed {phase}: {}", truncate(&single_line(error), 300)),
+                Some(json_object(vec![
+                    json_string_field("phase", phase),
+                    json_number_field("elapsed_ms", elapsed_ms),
+                    json_string_field("status", "error"),
+                    json_string_field("error", &truncate(&single_line(error), 500)),
+                ])),
+            );
+            record_phase(PhaseRecord {
+                phase: phase.to_string(),
+                time_started_unix_ms: started_ms,
+                time_finished_unix_ms: Some(finished_ms),
+                status: "error".to_string(),
+                error: Some(truncate(&single_line(error), 500)),
+                elapsed_ms: Some(elapsed_ms),
+            });
+        }
+    }
+    result
+}
+
 fn start_startup_run(id: &str, version: &str) {
     emit(EventInput {
         level: LogLevel::Info,

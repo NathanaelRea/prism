@@ -417,17 +417,17 @@ pub struct WorkspaceState {
 }
 
 impl WorkspaceState {
-    pub fn open(context: WorkspaceContext) -> Result<Self, String> {
+    pub async fn open(context: WorkspaceContext) -> Result<Self, String> {
         let mut sources = Vec::new();
         let mut diagnostics = Vec::new();
         if let Some(path) = context.repo.as_deref() {
             sources.push(RepoSource {
-                repo: Repository::discover(Some(path))?,
+                repo: Repository::discover(Some(path)).await?,
                 shortcut: None,
             });
         } else {
             for entry in workspace::load_entries()? {
-                match Repository::discover(Some(&entry.root)) {
+                match Repository::discover(Some(&entry.root)).await {
                     Ok(repo) => sources.push(RepoSource {
                         repo,
                         shortcut: entry.key,
@@ -443,7 +443,7 @@ impl WorkspaceState {
                 }
             }
             if sources.is_empty()
-                && let Ok(repo) = Repository::discover(Some(&context.cwd))
+                && let Ok(repo) = Repository::discover(Some(&context.cwd)).await
             {
                 sources.push(RepoSource {
                     repo,
@@ -461,7 +461,7 @@ impl WorkspaceState {
         })
     }
 
-    pub fn inspect(&self, request: InspectRequest) -> Result<WorkspaceSnapshot, String> {
+    pub async fn inspect(&self, request: InspectRequest) -> Result<WorkspaceSnapshot, String> {
         let observed = current_unix_ms();
         let mut warnings = self.discovery_diagnostics.clone();
         let daemon = match worker::probe_health() {
@@ -478,7 +478,7 @@ impl WorkspaceState {
                 worker::DaemonHealth::stopped()
             }
         };
-        let ledger_runs = match list_ledger_workflows(&self.sources) {
+        let ledger_runs = match list_ledger_workflows(&self.sources).await {
             Ok(runs) => runs,
             Err(error) => {
                 warnings.push(Diagnostic {
@@ -494,7 +494,7 @@ impl WorkspaceState {
         };
         let mut repositories = Vec::new();
         for source in &self.sources {
-            match inspect_repository(source, request, observed, &ledger_runs) {
+            match inspect_repository(source, request, observed, &ledger_runs).await {
                 Ok((repository, mut repository_warnings)) => {
                     repositories.push(repository);
                     warnings.append(&mut repository_warnings);
@@ -584,11 +584,13 @@ impl WorkspaceState {
         }
     }
 
-    pub fn control(&self, request: ControlRequest) -> Result<ControlReceipt, String> {
-        let snapshot = self.inspect(InspectRequest {
-            include_hidden: true,
-            include_terminal: true,
-        })?;
+    pub async fn control(&self, request: ControlRequest) -> Result<ControlReceipt, String> {
+        let snapshot = self
+            .inspect(InspectRequest {
+                include_hidden: true,
+                include_terminal: true,
+            })
+            .await?;
         let target =
             self.resolve_workflow(&snapshot, request.selector.as_deref(), request.action)?;
         let command = match request.action {
@@ -709,7 +711,9 @@ fn select_ledger_run_summaries(runs: Vec<crate::WorkflowRunState>) -> Vec<crate:
         .collect()
 }
 
-fn list_ledger_workflows(sources: &[RepoSource]) -> Result<Vec<crate::WorkflowRunState>, String> {
+async fn list_ledger_workflows(
+    sources: &[RepoSource],
+) -> Result<Vec<crate::WorkflowRunState>, String> {
     let from_worker = sources.iter().try_fold(Vec::new(), |mut runs, source| {
         runs.extend(select_ledger_run_summaries(worker::list_prompt_workflows(
             Some(&source.repo.root),
@@ -720,22 +724,26 @@ fn list_ledger_workflows(sources: &[RepoSource]) -> Result<Vec<crate::WorkflowRu
     match from_worker {
         Ok(runs) => Ok(runs),
         Err(_) if !crate::PromptWorkflowService::database_path().exists() => Ok(Vec::new()),
-        Err(socket_error) => crate::async_runtime::block_on(async {
+        Err(socket_error) => {
             let store = crate::DurableWorkflowRunStore::open(
                 &crate::PromptWorkflowService::database_path(),
             )
-            .await?;
+            .await
+            .map_err(|error| format!("{socket_error}; direct Workflow read failed: {error}"))?;
             let mut runs = Vec::new();
             for source in sources {
                 runs.extend(select_ledger_run_summaries(
-                    store.list_runs(Some(&source.repo.root), 256).await?,
+                    store
+                        .list_runs(Some(&source.repo.root), 256)
+                        .await
+                        .map_err(|error| {
+                            format!("{socket_error}; direct Workflow read failed: {error}")
+                        })?,
                 ));
             }
             store.close().await;
-            Ok::<_, crate::WorkflowKernelError>(runs)
-        })
-        .map_err(|error| format!("access prompt Workflow runtime: {error}"))?
-        .map_err(|error| format!("{socket_error}; direct Workflow read failed: {error}")),
+            Ok(runs)
+        }
     }
 }
 
@@ -746,14 +754,14 @@ pub enum Subject {
     Workflow(usize, usize),
 }
 
-fn inspect_repository(
+async fn inspect_repository(
     source: &RepoSource,
     request: InspectRequest,
     observed: i64,
     ledger_runs: &[crate::WorkflowRunState],
 ) -> Result<(RepositorySnapshot, Vec<Diagnostic>), String> {
     let config = Config::load(&source.repo);
-    let inventory = lifecycle::list_worktrees(&source.repo, &config)?;
+    let inventory = lifecycle::list_worktrees(&source.repo, &config).await?;
     let db_path = source.repo.prism_dir().join("prism.db");
     let mut warnings = Vec::new();
     let reader = if db_path.exists() {
@@ -771,8 +779,16 @@ fn inspect_repository(
     } else {
         None
     };
-    let hidden = read_projection(&reader, source, &mut warnings, "load_hidden", load_hidden)
-        .unwrap_or_default();
+    let hidden = match reader.as_ref() {
+        Some(reader) => record_projection(
+            load_hidden(reader).await,
+            source,
+            &mut warnings,
+            "load_hidden",
+        )
+        .unwrap_or_default(),
+        None => BTreeSet::new(),
+    };
     let mut workflows = load_ledger_workflows(ledger_runs, &source.repo.root)?;
     let workflow_details = ledger_runs
         .iter()
@@ -815,19 +831,27 @@ fn inspect_repository(
         } else {
             BranchState::Named(entry.branch.clone())
         };
-        let agent = read_projection(&reader, source, &mut warnings, "load_agent", |reader| {
-            load_agent(reader, &entry.branch)
-        })
-        .flatten()
-        .unwrap_or_default();
-        let pull_request = read_projection(
-            &reader,
-            source,
-            &mut warnings,
-            "load_pull_request",
-            |reader| load_pr(reader, &entry.branch, observed),
-        )
-        .flatten();
+        let agent = match reader.as_ref() {
+            Some(reader) => record_projection(
+                load_agent(reader, &entry.branch).await,
+                source,
+                &mut warnings,
+                "load_agent",
+            )
+            .flatten()
+            .unwrap_or_default(),
+            None => AgentStatus::default(),
+        };
+        let pull_request = match reader.as_ref() {
+            Some(reader) => record_projection(
+                load_pr(reader, &entry.branch, observed).await,
+                source,
+                &mut warnings,
+                "load_pull_request",
+            )
+            .flatten(),
+            None => None,
+        };
         if let Some(error) = pull_request
             .as_ref()
             .and_then(|pull_request| pull_request.error.as_ref())
@@ -847,7 +871,7 @@ fn inspect_repository(
             .map(|workflow| workflow.identity.clone())
             .collect();
         worktrees.push(WorktreeSnapshot {
-            git: git::inspect_status(&identity.path, &config),
+            git: git::inspect_status(&identity.path, &config).await,
             identity,
             branch,
             hidden: is_hidden,
@@ -919,15 +943,13 @@ fn retain_recent_terminal_workflows(workflows: &mut Vec<WorkflowSnapshot>, limit
     });
 }
 
-fn read_projection<T>(
-    reader: &Option<workspace_persistence::WorkspaceReader>,
+fn record_projection<T>(
+    result: Result<T, String>,
     source: &RepoSource,
     warnings: &mut Vec<Diagnostic>,
     operation: &'static str,
-    read: impl FnOnce(&workspace_persistence::WorkspaceReader) -> Result<T, String>,
 ) -> Option<T> {
-    let reader = reader.as_ref()?;
-    match read(reader) {
+    match result {
         Ok(value) => Some(value),
         Err(error) => {
             warnings.push(repository_diagnostic(source, operation, error));
@@ -951,17 +973,20 @@ fn repository_diagnostic(
     }
 }
 
-fn load_hidden(
+async fn load_hidden(
     reader: &workspace_persistence::WorkspaceReader,
 ) -> Result<BTreeSet<String>, String> {
-    await_cache(reader.hidden()).map(|branches| branches.into_iter().collect())
+    reader
+        .hidden()
+        .await
+        .map(|branches| branches.into_iter().collect())
 }
 
-fn load_agent(
+async fn load_agent(
     reader: &workspace_persistence::WorkspaceReader,
     branch: &str,
 ) -> Result<Option<AgentStatus>, String> {
-    await_cache(reader.agent(branch))?.map_or(Ok(None), |row| {
+    reader.agent(branch).await?.map_or(Ok(None), |row| {
         let state = AgentState::parse(&row.state)
             .ok_or_else(|| format!("unknown agent state: {}", row.state))?;
         Ok(Some(AgentStatus {
@@ -971,12 +996,12 @@ fn load_agent(
     })
 }
 
-fn load_pr(
+async fn load_pr(
     reader: &workspace_persistence::WorkspaceReader,
     branch: &str,
     observed: i64,
 ) -> Result<Option<CachedPullRequest>, String> {
-    await_cache(reader.pull_request(branch))?.map_or(Ok(None), |row| {
+    reader.pull_request(branch).await?.map_or(Ok(None), |row| {
         let refreshed = row.refreshed_unix_ms.saturating_mul(1_000);
         let age_ms = observed.saturating_sub(refreshed).max(0);
         let error = row.observation_error;
@@ -1004,13 +1029,6 @@ fn load_pr(
             provenance: ObservationProvenance::SqliteCache,
         }))
     })
-}
-
-fn await_cache<T>(
-    future: impl std::future::Future<Output = Result<T, String>>,
-) -> Result<T, String> {
-    crate::async_runtime::block_on(future)
-        .map_err(|error| format!("access repository cache runtime: {error}"))?
 }
 
 fn pull_request_state(value: &str, merged: bool, draft: bool) -> PullRequestState {

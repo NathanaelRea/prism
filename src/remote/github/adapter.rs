@@ -35,7 +35,7 @@ impl<'a> GitHubAdapter<'a> {
     /// Lists issue-shaped records but deliberately excludes pull requests.
     /// `--slurp` preserves page boundaries so a truncated or malformed page
     /// fails the whole observation instead of looking like an empty result.
-    pub(in crate::remote) fn discover_issues(
+    pub(in crate::remote) async fn discover_issues(
         &self,
         state: &str,
     ) -> Result<Vec<ProviderItemObservation>, RemoteError> {
@@ -54,8 +54,7 @@ impl<'a> GitHubAdapter<'a> {
         )
         .map_err(|error| github_invalid_response(operation, error))?;
         let endpoint = github_api_endpoint(self.config, self.repository.host(), &endpoint);
-        let mut command = std::process::Command::new(self.config.tool("gh"));
-        command
+        let command = crate::process::Command::new(self.config.tool("gh"))
             .arg("api")
             .arg(endpoint)
             .arg("--hostname")
@@ -65,14 +64,18 @@ impl<'a> GitHubAdapter<'a> {
             .args(["-H", "Accept: application/vnd.github+json"])
             .current_dir(self.path);
         let output = crate::process::run_output_allow_failure_named(
-            &mut command,
+            command,
             crate::process::ProcessPolicy::NetworkQuery,
             crate::process::ProcessDescriptor::new("gh.api.issue.list"),
         )
+        .await
         .map_err(|error| github_provider_error(operation, error))?;
         if !output.status.success() {
-            return Err(github_provider_error(operation, output.stderr)
-                .with_exit_code(output.status.code().unwrap_or(-1)));
+            return Err(github_provider_error(
+                operation,
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            )
+            .with_exit_code(output.status.code().unwrap_or(-1)));
         }
         if output.stdout_truncated {
             return Err(github_invalid_response(
@@ -81,7 +84,7 @@ impl<'a> GitHubAdapter<'a> {
             ));
         }
         let pages: Vec<Vec<GithubIssue>> =
-            serde_json::from_str(&output.stdout).map_err(|error| {
+            serde_json::from_slice(&output.stdout).map_err(|error| {
                 github_invalid_response(operation, format!("parse GitHub issues: {error}"))
             })?;
         pages
@@ -92,7 +95,7 @@ impl<'a> GitHubAdapter<'a> {
             .collect()
     }
 
-    pub(in crate::remote) fn observe_issue(
+    pub(in crate::remote) async fn observe_issue(
         &self,
         native_id: &str,
     ) -> Result<ProviderItemObservation, RemoteError> {
@@ -108,7 +111,9 @@ impl<'a> GitHubAdapter<'a> {
         let endpoint =
             github_repository_api_endpoint(&self.repository, &format!("issues/{number}"))
                 .map_err(|error| github_invalid_response(operation, error))?;
-        let issue: GithubIssue = self.issue_api_json(operation, &endpoint, "GET", &[])?;
+        let issue: GithubIssue = self
+            .issue_api_json(operation, &endpoint, "GET", &[])
+            .await?;
         if issue.pull_request.is_some() {
             return Err(github_error(
                 operation,
@@ -120,12 +125,12 @@ impl<'a> GitHubAdapter<'a> {
         issue.normalize(self.repository.clone(), operation)
     }
 
-    pub(in crate::remote) fn set_issue_labels(
+    pub(in crate::remote) async fn set_issue_labels(
         &self,
         native_id: &str,
         labels: &[String],
     ) -> Result<ProviderItemObservation, RemoteError> {
-        let before = self.observe_issue(native_id)?;
+        let before = self.observe_issue(native_id).await?;
         let operation = RemoteOperation::MutateLabels;
         let endpoint =
             github_repository_api_endpoint(&self.repository, &format!("issues/{native_id}"))
@@ -134,8 +139,10 @@ impl<'a> GitHubAdapter<'a> {
             .iter()
             .map(|label| format!("labels[]={label}"))
             .collect::<Vec<_>>();
-        let _: serde_json::Value = self.issue_api_json(operation, &endpoint, "PATCH", &fields)?;
-        let after = self.observe_issue(native_id)?;
+        let _: serde_json::Value = self
+            .issue_api_json(operation, &endpoint, "PATCH", &fields)
+            .await?;
+        let after = self.observe_issue(native_id).await?;
         if after.id != before.id {
             return Err(github_invalid_response(
                 operation,
@@ -145,7 +152,7 @@ impl<'a> GitHubAdapter<'a> {
         Ok(after)
     }
 
-    pub(in crate::remote) fn set_issue_assignees(
+    pub(in crate::remote) async fn set_issue_assignees(
         &self,
         native_id: &str,
         assignees: &[String],
@@ -158,11 +165,13 @@ impl<'a> GitHubAdapter<'a> {
             .iter()
             .map(|value| format!("assignees[]={value}"))
             .collect::<Vec<_>>();
-        let _: serde_json::Value = self.issue_api_json(operation, &endpoint, "PATCH", &fields)?;
-        self.observe_issue(native_id)
+        let _: serde_json::Value = self
+            .issue_api_json(operation, &endpoint, "PATCH", &fields)
+            .await?;
+        self.observe_issue(native_id).await
     }
 
-    pub(in crate::remote) fn set_issue_lifecycle(
+    pub(in crate::remote) async fn set_issue_lifecycle(
         &self,
         native_id: &str,
         lifecycle: &str,
@@ -179,16 +188,18 @@ impl<'a> GitHubAdapter<'a> {
         let endpoint =
             github_repository_api_endpoint(&self.repository, &format!("issues/{native_id}"))
                 .map_err(|error| github_invalid_response(operation, error))?;
-        let _: serde_json::Value = self.issue_api_json(
-            operation,
-            &endpoint,
-            "PATCH",
-            &[format!("state={lifecycle}")],
-        )?;
-        self.observe_issue(native_id)
+        let _: serde_json::Value = self
+            .issue_api_json(
+                operation,
+                &endpoint,
+                "PATCH",
+                &[format!("state={lifecycle}")],
+            )
+            .await?;
+        self.observe_issue(native_id).await
     }
 
-    pub(in crate::remote) fn issue_has_comment_marker(
+    pub(in crate::remote) async fn issue_has_comment_marker(
         &self,
         native_id: &str,
         marker: &str,
@@ -199,12 +210,13 @@ impl<'a> GitHubAdapter<'a> {
             &format!("issues/{native_id}/comments?per_page=100"),
         )
         .map_err(|error| github_invalid_response(operation, error))?;
-        let comments: Vec<GithubIssueComment> =
-            self.issue_api_json(operation, &endpoint, "GET", &[])?;
+        let comments: Vec<GithubIssueComment> = self
+            .issue_api_json(operation, &endpoint, "GET", &[])
+            .await?;
         Ok(comments.iter().any(|comment| comment.body.contains(marker)))
     }
 
-    pub(in crate::remote) fn create_issue_comment(
+    pub(in crate::remote) async fn create_issue_comment(
         &self,
         native_id: &str,
         body: &str,
@@ -217,11 +229,13 @@ impl<'a> GitHubAdapter<'a> {
         )
         .map_err(|error| github_invalid_response(operation, error))?;
         let value = format!("body={}\n\n<!-- prism:{marker} -->", body.trim());
-        let _: serde_json::Value = self.issue_api_json(operation, &endpoint, "POST", &[value])?;
+        let _: serde_json::Value = self
+            .issue_api_json(operation, &endpoint, "POST", &[value])
+            .await?;
         Ok(())
     }
 
-    fn issue_api_json<T: serde::de::DeserializeOwned>(
+    async fn issue_api_json<T: serde::de::DeserializeOwned>(
         &self,
         operation: RemoteOperation,
         endpoint: &str,
@@ -229,8 +243,7 @@ impl<'a> GitHubAdapter<'a> {
         fields: &[String],
     ) -> Result<T, RemoteError> {
         let endpoint = github_api_endpoint(self.config, self.repository.host(), endpoint);
-        let mut command = std::process::Command::new(self.config.tool("gh"));
-        command
+        let mut command = crate::process::Command::new(self.config.tool("gh"))
             .arg("api")
             .arg(endpoint)
             .arg("--hostname")
@@ -239,17 +252,21 @@ impl<'a> GitHubAdapter<'a> {
             .args(["-H", "Accept: application/vnd.github+json"])
             .current_dir(self.path);
         for field in fields {
-            command.arg("-f").arg(field);
+            command = command.arg("-f").arg(field);
         }
         let output = crate::process::run_output_allow_failure_named(
-            &mut command,
+            command,
             crate::process::ProcessPolicy::NetworkQuery,
             crate::process::ProcessDescriptor::new("gh.api.issue"),
         )
+        .await
         .map_err(|error| github_provider_error(operation, error))?;
         if !output.status.success() {
-            return Err(github_provider_error(operation, output.stderr)
-                .with_exit_code(output.status.code().unwrap_or(-1)));
+            return Err(github_provider_error(
+                operation,
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            )
+            .with_exit_code(output.status.code().unwrap_or(-1)));
         }
         if output.stdout_truncated {
             return Err(github_invalid_response(
@@ -257,23 +274,29 @@ impl<'a> GitHubAdapter<'a> {
                 "GitHub Issue response was truncated".into(),
             ));
         }
-        serde_json::from_str(&output.stdout).map_err(|error| {
+        serde_json::from_slice(&output.stdout).map_err(|error| {
             github_invalid_response(operation, format!("parse GitHub Issue response: {error}"))
         })
     }
 
-    pub(in crate::remote) fn list_change_requests(
+    pub(in crate::remote) async fn list_change_requests(
         &self,
         head_ref: Option<&str>,
     ) -> Result<Vec<ChangeRequestSummary>, RemoteError> {
         let summaries = match head_ref {
-            Some(head_ref) => fetch_open_pr_summaries_for_repository_head(
-                self.path,
-                self.config,
-                &self.repository,
-                head_ref,
-            ),
-            None => fetch_pr_summary_index_for_repository(self.path, self.config, &self.repository),
+            Some(head_ref) => {
+                fetch_open_pr_summaries_for_repository_head(
+                    self.path,
+                    self.config,
+                    &self.repository,
+                    head_ref,
+                )
+                .await
+            }
+            None => {
+                fetch_pr_summary_index_for_repository(self.path, self.config, &self.repository)
+                    .await
+            }
         }
         .map_err(|error| github_provider_error(RemoteOperation::ListChangeRequests, error))?;
         summaries
@@ -288,31 +311,34 @@ impl<'a> GitHubAdapter<'a> {
             .collect()
     }
 
-    pub(in crate::remote) fn observe_change_request(
+    pub(in crate::remote) async fn observe_change_request(
         &self,
         id: &ChangeRequestId,
     ) -> Result<ChangeRequestSummary, RemoteError> {
-        self.lookup_change_request_for(id, RemoteOperation::ObserveChangeRequest)?
+        self.lookup_change_request_for(id, RemoteOperation::ObserveChangeRequest)
+            .await?
             .ok_or_else(|| github_not_found(RemoteOperation::ObserveChangeRequest))
     }
 
-    pub(in crate::remote) fn lookup_change_request(
+    pub(in crate::remote) async fn lookup_change_request(
         &self,
         id: &ChangeRequestId,
     ) -> Result<Option<ChangeRequestSummary>, RemoteError> {
         self.lookup_change_request_for(id, RemoteOperation::ObserveChangeRequest)
+            .await
     }
 
-    fn observe_change_request_for(
+    async fn observe_change_request_for(
         &self,
         id: &ChangeRequestId,
         operation: RemoteOperation,
     ) -> Result<ChangeRequestSummary, RemoteError> {
-        self.lookup_change_request_for(id, operation)?
+        self.lookup_change_request_for(id, operation)
+            .await?
             .ok_or_else(|| github_not_found(operation))
     }
 
-    fn lookup_change_request_for(
+    async fn lookup_change_request_for(
         &self,
         id: &ChangeRequestId,
         operation: RemoteOperation,
@@ -325,6 +351,7 @@ impl<'a> GitHubAdapter<'a> {
             &self.repository,
             number,
         )
+        .await
         .map_err(|error| github_provider_error(operation, error))?
         else {
             return Ok(None);
@@ -341,19 +368,22 @@ impl<'a> GitHubAdapter<'a> {
         Ok(Some(summary))
     }
 
-    pub(in crate::remote) fn change_request_details(
+    pub(in crate::remote) async fn change_request_details(
         &self,
         change_request: &ChangeRequest,
     ) -> Result<ChangeRequestDetails, RemoteError> {
         self.change_request_details_for(change_request, RemoteOperation::ObserveChangeRequest)
+            .await
     }
 
-    fn change_request_details_for(
+    async fn change_request_details_for(
         &self,
         change_request: &ChangeRequest,
         operation: RemoteOperation,
     ) -> Result<ChangeRequestDetails, RemoteError> {
-        let observed = self.observe_change_request_for(&change_request.id, operation)?;
+        let observed = self
+            .observe_change_request_for(&change_request.id, operation)
+            .await?;
         ensure_association(
             &observed.change_request,
             change_request,
@@ -369,8 +399,11 @@ impl<'a> GitHubAdapter<'a> {
             &change_request.source_branch,
             &change_request.head_sha,
         )
+        .await
         .map_err(|error| github_provider_error(operation, error))?;
-        let after = self.observe_change_request_for(&change_request.id, operation)?;
+        let after = self
+            .observe_change_request_for(&change_request.id, operation)
+            .await?;
         ensure_association(
             &after.change_request,
             change_request,
@@ -380,11 +413,12 @@ impl<'a> GitHubAdapter<'a> {
         Ok(normalize_details(change_request, details, operation))
     }
 
-    pub(in crate::remote) fn repository_policy(
+    pub(in crate::remote) async fn repository_policy(
         &self,
         target_branch: &str,
     ) -> Result<RepositoryPolicy, RemoteError> {
         let policy = fetch_repo_policy(self.path, self.config, &self.repository, target_branch)
+            .await
             .map_err(|error| {
                 github_provider_error(RemoteOperation::ObserveRepositoryPolicy, error)
             })?;
@@ -411,7 +445,7 @@ impl<'a> GitHubAdapter<'a> {
         })
     }
 
-    pub(in crate::remote) fn create_change_request(
+    pub(in crate::remote) async fn create_change_request(
         &self,
         request: &CreateChangeRequest,
     ) -> Result<ChangeRequestSummary, RemoteError> {
@@ -455,6 +489,7 @@ impl<'a> GitHubAdapter<'a> {
             Some(&request.target_branch),
             Some(&source_head),
         )
+        .await
         .map_err(|error| github_provider_error(RemoteOperation::CreateChangeRequest, error))?;
         let summaries = fetch_open_pr_summaries_for_repository_head(
             self.path,
@@ -462,6 +497,7 @@ impl<'a> GitHubAdapter<'a> {
             &self.repository,
             &request.source_branch,
         )
+        .await
         .map_err(|error| github_provider_error(RemoteOperation::CreateChangeRequest, error))?;
         let summary = summaries
             .into_iter()
@@ -492,7 +528,7 @@ impl<'a> GitHubAdapter<'a> {
         Ok(summary)
     }
 
-    pub(in crate::remote) fn merge_change_request(
+    pub(in crate::remote) async fn merge_change_request(
         &self,
         request: &GuardedMerge,
     ) -> Result<MergeMutationResult, RemoteError> {
@@ -502,8 +538,9 @@ impl<'a> GitHubAdapter<'a> {
             RemoteOperation::MergeChangeRequest,
         )?;
         let number = github_number(&request.id, RemoteOperation::MergeChangeRequest)?;
-        let before =
-            self.observe_change_request_for(&request.id, RemoteOperation::MergeChangeRequest)?;
+        let before = self
+            .observe_change_request_for(&request.id, RemoteOperation::MergeChangeRequest)
+            .await?;
         request.validate_observation(&before).map_err(|error| {
             github_error(
                 RemoteOperation::MergeChangeRequest,
@@ -521,9 +558,11 @@ impl<'a> GitHubAdapter<'a> {
             &request.expected_source_sha,
             target_project,
         )
+        .await
         .map_err(|error| github_provider_error(RemoteOperation::MergeChangeRequest, error))?;
-        let summary =
-            self.observe_change_request_for(&request.id, RemoteOperation::MergeChangeRequest)?;
+        let summary = self
+            .observe_change_request_for(&request.id, RemoteOperation::MergeChangeRequest)
+            .await?;
         if summary.change_request.head_sha != request.expected_source_sha {
             return Err(github_error(
                 RemoteOperation::MergeChangeRequest,
@@ -541,14 +580,16 @@ impl<'a> GitHubAdapter<'a> {
         Ok(MergeMutationResult::from_summary(summary, native_state))
     }
 
-    pub(in crate::remote) fn submit_review(
+    pub(in crate::remote) async fn submit_review(
         &self,
         request: &SubmitReview,
     ) -> Result<(), RemoteError> {
         let operation = RemoteOperation::SubmitReview;
         self.validate_change_request_id(&request.id, operation)?;
         let number = github_number(&request.id, operation)?;
-        let observed = self.observe_change_request_for(&request.id, operation)?;
+        let observed = self
+            .observe_change_request_for(&request.id, operation)
+            .await?;
 
         // Keep the authorization checks adjacent to the mutating command.
         self.validate_repository(&observed.change_request.target_repository, operation)?;
@@ -568,8 +609,7 @@ impl<'a> GitHubAdapter<'a> {
             github_repository_api_endpoint(&self.repository, &format!("pulls/{number}/reviews"))
                 .map_err(|error| github_invalid_response(operation, error))?;
         let endpoint = github_api_endpoint(self.config, self.repository.host(), &endpoint);
-        let mut command = std::process::Command::new(self.config.tool("gh"));
-        command
+        let command = crate::process::Command::new(self.config.tool("gh"))
             .arg("api")
             .arg(endpoint)
             .arg("--hostname")
@@ -584,10 +624,11 @@ impl<'a> GitHubAdapter<'a> {
             .arg(format!("body={}", request.body.trim()))
             .current_dir(self.path);
         let output = crate::process::run_output_allow_failure_named(
-            &mut command,
+            command,
             crate::process::ProcessPolicy::NetworkQuery,
             crate::process::ProcessDescriptor::new("gh.api.pull-request-review.create"),
         )
+        .await
         .map_err(|error| github_provider_error(operation, error))?;
         if output.status.success() {
             if output.stdout_truncated {
@@ -597,7 +638,7 @@ impl<'a> GitHubAdapter<'a> {
                 ));
             }
             let response =
-                serde_json::from_str::<GithubCreatedReview>(&output.stdout).map_err(|error| {
+                serde_json::from_slice::<GithubCreatedReview>(&output.stdout).map_err(|error| {
                     github_invalid_response(
                         operation,
                         format!("parse GitHub create pull request review response: {error}"),
@@ -611,13 +652,13 @@ impl<'a> GitHubAdapter<'a> {
             }
             return Ok(());
         }
-        let message = if output.stderr.trim().is_empty() {
+        let message = if output.stderr.iter().all(u8::is_ascii_whitespace) {
             format!(
                 "gh api create pull request review exited with {}",
                 output.status
             )
         } else {
-            output.stderr.trim().to_string()
+            String::from_utf8_lossy(&output.stderr).trim().to_string()
         };
         let error = github_provider_error(operation, message);
         Err(match output.status.code() {
@@ -626,18 +667,22 @@ impl<'a> GitHubAdapter<'a> {
         })
     }
 
-    pub(in crate::remote) fn resolve_review_thread(
+    pub(in crate::remote) async fn resolve_review_thread(
         &self,
         request: &ResolveReviewThread,
     ) -> Result<(), RemoteError> {
         let operation = RemoteOperation::ResolveReviewThread;
         self.validate_change_request_id(&request.id, operation)?;
-        let observed = self.observe_change_request_for(&request.id, operation)?;
+        let observed = self
+            .observe_change_request_for(&request.id, operation)
+            .await?;
         ensure_expected_head(
             &observed.change_request.head_sha,
             &request.expected_head_sha,
         )?;
-        let details = self.change_request_details_for(&observed.change_request, operation)?;
+        let details = self
+            .change_request_details_for(&observed.change_request, operation)
+            .await?;
         if !details
             .association
             .as_ref()
@@ -668,7 +713,9 @@ impl<'a> GitHubAdapter<'a> {
                 "review thread is not unresolved and resolvable",
             ));
         }
-        let immediately_before = self.observe_change_request_for(&request.id, operation)?;
+        let immediately_before = self
+            .observe_change_request_for(&request.id, operation)
+            .await?;
         ensure_association(
             &immediately_before.change_request,
             &observed.change_request,
@@ -685,11 +732,15 @@ impl<'a> GitHubAdapter<'a> {
             self.repository.host(),
             request.thread_id.as_str(),
         )
+        .await
         .map_err(|error| github_provider_error(operation, error))?;
         // The mutation response authoritatively confirms resolution. A successful
         // post-observation can still expose a concurrent head or identity change,
         // but an unavailable refresh must not report the completed mutation as failed.
-        if let Ok(after) = self.observe_change_request_for(&request.id, operation) {
+        if let Ok(after) = self
+            .observe_change_request_for(&request.id, operation)
+            .await
+        {
             ensure_association(
                 &after.change_request,
                 &observed.change_request,
@@ -1104,12 +1155,21 @@ fn github_invalid_response(operation: RemoteOperation, message: String) -> Remot
 }
 
 fn github_provider_error(operation: RemoteOperation, message: String) -> RemoteError {
-    github_error(
-        operation,
-        RemoteErrorClass::Provider,
-        Retryability::Unknown,
-        message,
-    )
+    if crate::process::is_cancellation_error(&message) {
+        github_error(
+            operation,
+            RemoteErrorClass::Cancelled,
+            Retryability::NotRetryable,
+            message,
+        )
+    } else {
+        github_error(
+            operation,
+            RemoteErrorClass::Provider,
+            Retryability::Unknown,
+            message,
+        )
+    }
 }
 
 fn github_error(
@@ -1133,5 +1193,21 @@ fn lifecycle_label(state: &LifecycleState) -> &str {
         LifecycleState::Closed => "CLOSED",
         LifecycleState::Merged => "MERGED",
         LifecycleState::Unknown(native) => native,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_cancellation_stays_cancelled_and_non_retryable() {
+        let error = github_provider_error(
+            RemoteOperation::ObserveChangeRequest,
+            "gh api: subprocess canceled".into(),
+        );
+
+        assert_eq!(error.class(), RemoteErrorClass::Cancelled);
+        assert_eq!(error.retryability(), Retryability::NotRetryable);
     }
 }
