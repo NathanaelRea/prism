@@ -2801,14 +2801,25 @@ fn newest_session_for_worktree<'a>(
 }
 
 fn listed_session_matches_worktree(session: &OpencodeSession, worktree_path: &str) -> bool {
-    session.directory.as_deref() == Some(worktree_path)
+    session
+        .directory
+        .as_deref()
+        .is_some_and(|directory| directory_matches_worktree(directory, worktree_path))
 }
 
 fn session_matches_worktree(session: &OpencodeSession, worktree_path: &str) -> bool {
     session
         .directory
         .as_deref()
-        .is_none_or(|directory| directory == worktree_path)
+        .is_none_or(|directory| directory_matches_worktree(directory, worktree_path))
+}
+
+fn directory_matches_worktree(directory: &str, worktree_path: &str) -> bool {
+    directory == worktree_path
+        || fs::canonicalize(directory)
+            .ok()
+            .zip(fs::canonicalize(worktree_path).ok())
+            .is_some_and(|(directory, worktree)| directory == worktree)
 }
 
 fn request_path(path: &str, directory: Option<&Path>) -> String {
@@ -3587,6 +3598,27 @@ mod tests {
         let selected = newest_session_for_worktree(&sessions, "/repo/wt").unwrap();
 
         assert_eq!(selected.id, "new");
+    }
+
+    #[test]
+    fn session_directory_matches_canonical_worktree_path() {
+        let temp = unique_temp_dir("prism-opencode-session-path");
+        let worktree = temp.join("worktree");
+        fs::create_dir_all(&worktree).unwrap();
+        let canonical = fs::canonicalize(&worktree).unwrap();
+        let session = OpencodeSession {
+            id: "session".to_string(),
+            directory: Some(worktree.display().to_string()),
+            title: None,
+            time_updated: None,
+            parent_id: None,
+        };
+
+        assert!(listed_session_matches_worktree(
+            &session,
+            &canonical.display().to_string()
+        ));
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
