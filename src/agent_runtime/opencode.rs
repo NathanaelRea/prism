@@ -1895,28 +1895,32 @@ pub fn allocate_port(
     port_span: u16,
     mut status: impl FnMut(u16) -> PortStatus,
 ) -> Result<u16, String> {
+    if port_base == 0 || port_span == 0 {
+        return Err("opencode port range must use a nonzero base and span".to_string());
+    }
+    let range_end = u32::from(port_base) + u32::from(port_span) - 1;
+    if range_end > u32::from(u16::MAX) {
+        return Err("opencode port range overflowed".to_string());
+    }
+    let in_range =
+        |port: u16| u32::from(port) >= u32::from(port_base) && u32::from(port) <= range_end;
     if let Some(port) = stored_port
+        && in_range(port)
         && matches!(status(port), PortStatus::Free | PortStatus::OpenCode)
     {
         return Ok(port);
     }
 
-    let span = port_span.max(1);
-    let offset = stable_hash_text(&format!("{repo_root}{worktree_path}")) % u64::from(span);
-    let start = port_base
-        .checked_add(u16::try_from(offset).unwrap_or_default())
-        .ok_or_else(|| "opencode port base overflowed".to_string())?;
-    for step in 0..span {
-        let Some(port) = start.checked_add(step) else {
-            break;
-        };
+    let offset = stable_hash_text(&format!("{repo_root}{worktree_path}")) % u64::from(port_span);
+    for step in 0..port_span {
+        let candidate_offset = (offset + u64::from(step)) % u64::from(port_span);
+        let port = port_base + u16::try_from(candidate_offset).unwrap_or_default();
         if matches!(status(port), PortStatus::Free) {
             return Ok(port);
         }
     }
     Err(format!(
-        "no free opencode port found from {start} through {}",
-        start.saturating_add(span - 1)
+        "no free opencode port found from {port_base} through {range_end}"
     ))
 }
 
@@ -1998,8 +2002,8 @@ fn http_error_message(operation: &str, status_code: u16, body: &str) -> String {
     if body.is_empty() {
         return format!("{operation} failed with HTTP {status_code}");
     }
-    let body = if body.len() > 240 {
-        format!("{}...", &body[..240])
+    let body = if body.chars().count() > 240 {
+        format!("{}...", body.chars().take(240).collect::<String>())
     } else {
         body.to_string()
     };
@@ -3001,6 +3005,35 @@ mod tests {
         let port =
             allocate_port("/repo", "/repo/wt", None, 45_000, 10, |_| PortStatus::Free).unwrap();
 
+        assert!((45_000..45_010).contains(&port));
+    }
+
+    #[test]
+    fn allocate_port_wraps_and_stays_within_the_configured_range() {
+        let first =
+            allocate_port("/repo", "/repo/wt", None, 45_000, 3, |_| PortStatus::Free).unwrap();
+        let mut visited = Vec::new();
+        let port = allocate_port("/repo", "/repo/wt", None, 45_000, 3, |candidate| {
+            visited.push(candidate);
+            if candidate == first || candidate == 45_000 {
+                PortStatus::Occupied
+            } else {
+                PortStatus::Free
+            }
+        })
+        .unwrap();
+        assert!((45_000..45_003).contains(&port));
+        assert!(visited.iter().all(|port| (45_000..45_003).contains(port)));
+    }
+
+    #[test]
+    fn allocate_port_rejects_invalid_ranges_and_outside_stored_ports() {
+        assert!(allocate_port("/repo", "/repo/wt", None, 0, 1, |_| PortStatus::Free).is_err());
+        assert!(allocate_port("/repo", "/repo/wt", None, 65_535, 2, |_| PortStatus::Free).is_err());
+        let port = allocate_port("/repo", "/repo/wt", Some(41_999), 45_000, 10, |_| {
+            PortStatus::Free
+        })
+        .unwrap();
         assert!((45_000..45_010).contains(&port));
     }
 

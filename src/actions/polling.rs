@@ -161,13 +161,7 @@ impl Tui {
                             } else {
                                 Err(adapter.as_ref().unwrap_err().clone())
                             };
-                        let capabilities = if summaries.is_ok() {
-                            crate::remote::dispatcher::capabilities(&path, &config)
-                                .ok()
-                                .or_else(|| adapter.ok())
-                        } else {
-                            adapter.ok()
-                        };
+                        let capabilities = adapter.ok();
                         let observations = match &summaries {
                             Ok(summaries) => Ok(session_snapshots
                                 .into_iter()

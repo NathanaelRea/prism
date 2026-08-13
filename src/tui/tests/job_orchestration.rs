@@ -122,7 +122,7 @@ fn tui_tick_terminal_budget_retains_every_remaining_outcome() {
         let barrier = barrier.clone();
         let completed = completed.clone();
         tui.spawn_tui_job(
-            TuiJobKind::WorkflowMaintenance,
+            TuiJobKind::SessionRefresh,
             TuiJobKey::None,
             0,
             None,

@@ -10,11 +10,12 @@ use crate::remote::request_coordinator::{
 };
 
 use crate::persistence::remote_coordinator::SqliteRemoteCoordinatorStore;
+use crate::persistence::workflow_kernel::DurableWorkflowRunStore;
 
 use super::agent_phase::HarnessAgentExecutor;
 use super::kernel::{
-    DurableWorkflowRunStore, SchedulerProgress, StartPromptWorkflow, WorkflowKernelError,
-    WorkflowRunState, WorkflowRunStore, WorkflowScheduler,
+    SchedulerProgress, StartPromptWorkflow, WorkflowKernelError, WorkflowRunState,
+    WorkflowRunStore, WorkflowScheduler,
 };
 use super::source::CompiledWorkflow;
 use super::standard_remote::{PrismProviderExecutor, ProductionStandardTriggerRemote};

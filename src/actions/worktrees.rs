@@ -233,7 +233,6 @@ impl Tui {
                 self.tmux_generations.entry(slot).or_insert(generation);
             }
             self.session_inventory_generation = self.session_inventory_generation.saturating_add(1);
-            self.request_workflow_maintenance();
             changed = true;
         }
         if restart {
@@ -282,7 +281,6 @@ impl Tui {
         self.reconcile_session_inventory();
         self.worktree_harness_configs =
             crate::tui::load_worktree_harness_configs(&self.repos, &self.sessions);
-        self.request_workflow_maintenance();
         Ok(())
     }
 

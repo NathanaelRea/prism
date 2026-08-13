@@ -37,7 +37,7 @@ if rg -n \
 	fail 'legacy generalized Workflow vocabulary remains in active sources'
 fi
 
-if rg -n -i 'Workflow Graph|Child Runs?|Restart Workflow|restart from|Skip Step|skippable|Approve Effect' src/tui src/view src/repository/workspace_state.rs; then
+if rg -n -i 'Workflow Graph|Child Runs?|Restart Workflow|restart from|Skip Step|skippable|Approve Effect' src/tui src/view src/application/workspace_state.rs; then
 	fail 'legacy graph/effect controls remain in the TUI'
 fi
 

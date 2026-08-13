@@ -90,28 +90,7 @@ impl ForgejoAdapter {
     }
 
     pub(crate) fn capabilities(&self) -> Capabilities {
-        let mut capabilities = Capabilities {
-            list_change_requests: SupportLevel::Supported,
-            change_request_details: SupportLevel::Supported,
-            review_threads: SupportLevel::Conditional,
-            resolve_review_thread: SupportLevel::Unsupported,
-            check_rollup: SupportLevel::Supported,
-            ci_logs: SupportLevel::Conditional,
-            changed_files: SupportLevel::Supported,
-            repository_policy: SupportLevel::Conditional,
-            fetch_change_request: SupportLevel::Supported,
-            create_change_request: SupportLevel::Conditional,
-            submit_review: SupportLevel::Unsupported,
-            guarded_merge: SupportLevel::Conditional,
-            guarded_merge_reason: None,
-            merge_queue: SupportLevel::Unsupported,
-            issue_discovery: SupportLevel::Unsupported,
-            provider_events: SupportLevel::Unsupported,
-            issue_labels: SupportLevel::Unsupported,
-            issue_assignment: SupportLevel::Unsupported,
-            issue_comments: SupportLevel::Unsupported,
-            issue_lifecycle: SupportLevel::Unsupported,
-        };
+        let mut capabilities = Capabilities::for_provider(ProviderKind::Forgejo);
         if let Some(instance) = self.cached_instance() {
             match forgejo_major(&instance.version) {
                 Some(major)

@@ -9,18 +9,16 @@ use crate::tui_jobs::{JobContext, JobId, JobMessage, JobMetadata, JobOutcome};
 use super::{
     DefaultBranchPollResult, DeleteSessionKey, DeleteSessionResult, OpencodeEventResult,
     OpencodeListenerKey, OpencodePollKey, OpencodePollResult, PrPollKey, PrPollResult,
-    RemoteActionDelivery, RemoteActionValue, SessionRefreshResult, TUI_ACTION_JOB_TIMEOUT,
-    TUI_JOB_SHUTDOWN_GRACE, TUI_MUTATION_SHUTDOWN_BOUND, TUI_TICK_ITEM_BUDGET,
-    TUI_TICK_TIME_BUDGET, TmuxPortalResult, Tui, TuiBackgroundChanges,
-    WORKFLOW_MAINTENANCE_INTERVAL, WorkflowPollResult, WtHookLogPollResult, WtPollResult,
-    maintain_workflow_storage, uncertain_remote_mutation_error,
+    RemoteActionDelivery, RemoteActionValue, SessionRefreshResult, TUI_JOB_SHUTDOWN_GRACE,
+    TUI_MUTATION_SHUTDOWN_BOUND, TUI_TICK_ITEM_BUDGET, TUI_TICK_TIME_BUDGET, TmuxPortalResult, Tui,
+    TuiBackgroundChanges, WorkflowPollResult, WtHookLogPollResult, WtPollResult,
+    uncertain_remote_mutation_error,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum TuiJobKind {
     SessionRefresh,
     AgentStatePersistence,
-    WorkflowMaintenance,
     PrSummary,
     PrDetails,
     PrPersistence,
@@ -41,7 +39,6 @@ impl TuiJobKind {
         match self {
             Self::SessionRefresh => "session_refresh",
             Self::AgentStatePersistence => "agent_state_persistence",
-            Self::WorkflowMaintenance => "workflow_maintenance",
             Self::PrSummary => "pr_summary",
             Self::PrDetails => "pr_details",
             Self::PrPersistence => "pr_persistence",
@@ -98,7 +95,6 @@ impl ShutdownReason {
 
 pub(crate) enum TuiJobPayload {
     SessionRefresh(SessionRefreshResult),
-    WorkflowMaintenance,
     PrPoll(PrPollResult),
     WorkflowPoll(WorkflowPollResult),
     DeleteSession(DeleteSessionResult),
@@ -137,7 +133,6 @@ impl Tui {
         self.start_default_branch_status_poll(false);
         self.start_opencode_status_poll(false);
         self.start_opencode_event_listeners();
-        self.poll_workflow_maintenance();
         self.start_agent_state_persistence_jobs();
         self.tui_tick_active = false;
         crate::flight_recorder::record(
@@ -164,45 +159,6 @@ impl Tui {
             return Ok(false);
         }
         Ok(true)
-    }
-
-    pub(crate) fn request_workflow_maintenance(&mut self) {
-        self.workflow_maintenance_due = true;
-    }
-
-    pub(super) fn poll_workflow_maintenance(&mut self) {
-        while self.workflow_maintenance_rx.try_recv().is_ok() {}
-        let due = self.workflow_maintenance_due
-            || self.workflow_maintenance_last_started.elapsed() >= WORKFLOW_MAINTENANCE_INTERVAL;
-        if self.workflow_maintenance_in_flight || !due {
-            return;
-        }
-        let repos = self
-            .repos
-            .iter()
-            .map(|managed| managed.repo.clone())
-            .collect::<Vec<_>>();
-        self.workflow_maintenance_in_flight = true;
-        self.workflow_maintenance_due = false;
-        self.workflow_maintenance_last_started = Instant::now();
-        self.spawn_tui_job(
-            TuiJobKind::WorkflowMaintenance,
-            TuiJobKey::None,
-            0,
-            Some(TUI_ACTION_JOB_TIMEOUT),
-            "prism-tui-maintenance".to_string(),
-            move |_| {
-                for repo in &repos {
-                    if let Err(error) = maintain_workflow_storage(repo) {
-                        let _ = crate::observability::append_runtime_message(
-                            repo,
-                            &format!("workflow maintenance failed: {error}"),
-                        );
-                    }
-                }
-                Ok(Some(TuiJobPayload::WorkflowMaintenance))
-            },
-        );
     }
 
     pub(crate) fn spawn_tui_job<F>(
@@ -661,9 +617,6 @@ impl Tui {
             TuiJobPayload::SessionRefresh(result) => {
                 let _ = self.session_refresh_tx.send(result);
             }
-            TuiJobPayload::WorkflowMaintenance => {
-                let _ = self.workflow_maintenance_tx.send(());
-            }
             TuiJobPayload::PrPoll(result) => {
                 let _ = self.pr_poll_tx.send(result);
             }
@@ -721,7 +674,6 @@ impl Tui {
             (TuiJobKind::AgentStatePersistence, TuiJobKey::AgentStatePersistence(key)) => {
                 self.agent_state_persistence_in_flight.remove(key);
             }
-            (TuiJobKind::WorkflowMaintenance, _) => self.workflow_maintenance_in_flight = false,
             (TuiJobKind::PrSummary, TuiJobKey::Repository(repository)) => {
                 if let Some(repo) = self
                     .repos
@@ -791,10 +743,7 @@ impl Tui {
         metadata: &JobMetadata<TuiJobKind, TuiJobKey>,
     ) -> bool {
         match &metadata.key {
-            TuiJobKey::None => {
-                metadata.kind == TuiJobKind::WorkflowMaintenance
-                    || metadata.generation == self.session_inventory_generation
-            }
+            TuiJobKey::None => metadata.generation == self.session_inventory_generation,
             TuiJobKey::Repository(_) => metadata.generation == self.session_inventory_generation,
             TuiJobKey::WorktrunkHookLogs(repository) => {
                 self.repos.iter().any(|repo| &repo.identity == repository)

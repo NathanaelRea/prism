@@ -802,7 +802,6 @@ fn run_tui(repo_arg: Option<&std::path::Path>) -> Result<(), String> {
         observability::phase("reconcile_worktrees", || {
             for managed in &repos {
                 session::reconcile_worktree_state(&managed.repo, &managed.config)?;
-                crate::tui::maintain_workflow_storage(&managed.repo)?;
             }
             Ok(())
         })?;

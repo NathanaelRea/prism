@@ -76,7 +76,7 @@ use remote_action::{
 #[allow(unused_imports)]
 pub(crate) use repository::{
     ManagedRepo, SelectedRepoContext, SelectedWorktreeContext, WtHookLogInventory,
-    load_worktree_harness_configs, maintain_workflow_storage,
+    load_worktree_harness_configs,
 };
 
 pub struct Tui {
@@ -97,11 +97,6 @@ pub struct Tui {
     pub(crate) session_inventory_generation: u64,
     agent_state_persistence_in_flight: BTreeSet<WorktreeSessionKey>,
     agent_state_persistence_pending: BTreeMap<WorktreeSessionKey, AgentStatePersistenceRequest>,
-    workflow_maintenance_tx: LatestSender<(), ()>,
-    workflow_maintenance_rx: LatestReceiver<(), ()>,
-    workflow_maintenance_in_flight: bool,
-    workflow_maintenance_due: bool,
-    workflow_maintenance_last_started: Instant,
     pub(crate) selected: usize,
     pub(crate) selected_repo_root: Option<PathBuf>,
     pub(crate) focused_panel: PanelFocus,
@@ -188,7 +183,6 @@ pub struct Tui {
 }
 
 const STATUS_MESSAGE_DURATION: Duration = Duration::from_secs(5);
-const WORKFLOW_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 pub(crate) const TUI_ACTION_JOB_TIMEOUT: Duration = Duration::from_secs(120);
 const TUI_JOB_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const TUI_MUTATION_SHUTDOWN_BOUND: Duration = Duration::from_secs(30 * 60);
@@ -262,7 +256,6 @@ impl Tui {
             latest_channel(|result: &WorkflowPollResult| result.repository.clone());
         let (session_refresh_tx, session_refresh_rx) =
             latest_channel(|result: &SessionRefreshResult| result.base_generation);
-        let (workflow_maintenance_tx, workflow_maintenance_rx) = latest_channel(|_| ());
         let (delete_session_tx, delete_session_rx) =
             latest_channel(|result: &DeleteSessionResult| (result.key.clone(), result.delivery_id));
         let (tmux_warmup_tx, tmux_warmup_rx) =
@@ -322,11 +315,6 @@ impl Tui {
             session_inventory_generation: 0,
             agent_state_persistence_in_flight: BTreeSet::new(),
             agent_state_persistence_pending: BTreeMap::new(),
-            workflow_maintenance_tx,
-            workflow_maintenance_rx,
-            workflow_maintenance_in_flight: false,
-            workflow_maintenance_due: false,
-            workflow_maintenance_last_started: Instant::now(),
             selected: 0,
             selected_repo_root: None,
             focused_panel: PanelFocus::Repos,

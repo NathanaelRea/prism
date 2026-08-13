@@ -295,6 +295,7 @@ pub struct RemoteCoordinatorConfig {
     pub maximum_cache_entries: usize,
     pub maximum_response_bytes: usize,
     pub maximum_retries: u32,
+    pub queue_lease_ms: i64,
 }
 
 impl Default for RemoteCoordinatorConfig {
@@ -308,6 +309,7 @@ impl Default for RemoteCoordinatorConfig {
             maximum_cache_entries: 512,
             maximum_response_bytes: 4 * 1024 * 1024,
             maximum_retries: 6,
+            queue_lease_ms: 90_000,
         }
     }
 }
@@ -326,8 +328,9 @@ struct CoordinatorState {
     lanes: BTreeMap<RemoteLaneKey, LaneState>,
     cache: BTreeMap<RemoteObservationKey, CachedObservation>,
     queued_reads: BTreeMap<RemoteObservationKey, QueuedRequest>,
-    queued_mutations: BTreeMap<String, QueuedRequest>,
+    queued_mutations: BTreeMap<RemoteMutationKey, QueuedMutation>,
     in_flight_reads: BTreeSet<RemoteObservationKey>,
+    in_flight_mutations: BTreeMap<RemoteMutationKey, QueuedMutation>,
     subscriptions: BTreeMap<RemoteObservationKey, tokio::sync::watch::Sender<u64>>,
     sequence: u64,
 }
@@ -345,6 +348,34 @@ struct QueuedRequest {
     priority: RemotePriority,
     enqueued_unix_ms: i64,
     sequence: u64,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct RemoteMutationKey {
+    lane: RemoteLaneKey,
+    request_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum QueueIdentity {
+    Observation(RemoteObservationKey),
+    Mutation(RemoteMutationKey),
+}
+
+#[derive(Clone, Debug)]
+struct QueuedMutation {
+    queue: QueuedRequest,
+    operation: String,
+    subject: String,
+    payload: serde_json::Value,
+}
+
+impl QueuedMutation {
+    fn matches(&self, request: &RemoteMutationRequest) -> bool {
+        self.operation == request.operation
+            && self.subject == request.subject
+            && self.payload == request.payload
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -396,8 +427,9 @@ impl RemoteRequestCoordinator {
             ));
         }
         let now = self.clock.now_unix_ms();
-        let (request, lane_to_save) = {
+        let (request, persisted, queued, previous_lane) = {
             let mut state = self.state.lock().await;
+            purge_expired_queue_entries(&mut state, now, self.config.queue_lease_ms);
             if let Some(cached) = state.cache.get(&key)
                 && cached_is_fresh(cached, &freshness, now)
             {
@@ -426,13 +458,13 @@ impl RemoteRequestCoordinator {
                     },
                 );
             }
-            let lane = state.lanes.entry(key.lane.clone()).or_default().clone();
-            if lane.in_flight || lane.next_request_unix_ms > now {
+            let previous_lane = state.lanes.entry(key.lane.clone()).or_default().clone();
+            if previous_lane.in_flight || previous_lane.next_request_unix_ms > now {
                 let wait = queue_wait(&state, &key.lane, Some(&key), now, &self.config);
                 return Ok(RemoteObservationResult::Pending(wait));
             }
             let selected = select_next(&state, &key.lane, now, &self.config);
-            if selected.as_deref() != Some(&queue_identity_for_read(&key)) {
+            if selected != Some(QueueIdentity::Observation(key.clone())) {
                 return Ok(RemoteObservationResult::Pending(queue_wait(
                     &state,
                     &key.lane,
@@ -441,7 +473,10 @@ impl RemoteRequestCoordinator {
                     &self.config,
                 )));
             }
-            state.queued_reads.remove(&key);
+            let queued = state
+                .queued_reads
+                .remove(&key)
+                .expect("selected observation remains queued");
             state.in_flight_reads.insert(key.clone());
             let lane = state.lanes.entry(key.lane.clone()).or_default();
             lane.in_flight = true;
@@ -456,14 +491,39 @@ impl RemoteRequestCoordinator {
                     payload,
                 },
                 persisted,
+                queued,
+                previous_lane,
             )
         };
-        self.store.save_lane(&lane_to_save).await?;
-        let result = self
-            .executor
-            .execute(CoordinatedRemoteOperation::Observe(request))
-            .await;
-        self.finish_observation(&key, result, now).await
+
+        // Admission persistence, provider work, and completion are coordinator-owned so dropping
+        // a caller cannot strand the user-wide lane or discard an uncertain mutation outcome.
+        let coordinator = self.clone();
+        let task_key = key.clone();
+        let task = tokio::spawn(async move {
+            if let Err(error) = coordinator.store.save_lane(&persisted).await {
+                let mut state = coordinator.state.lock().await;
+                state.in_flight_reads.remove(&task_key);
+                state.queued_reads.entry(task_key.clone()).or_insert(queued);
+                state.lanes.insert(task_key.lane.clone(), previous_lane);
+                notify_subscribers(&mut state, &task_key);
+                return Err(error);
+            }
+            let result = coordinator
+                .executor
+                .execute(CoordinatedRemoteOperation::Observe(request))
+                .await;
+            coordinator.finish_observation(&task_key, result, now).await
+        });
+        match task.await {
+            Ok(result) => decode_observation_result(result?),
+            Err(error) => {
+                self.abandon_observation(&key).await;
+                Err(RemoteCoordinatorError::Execution(format!(
+                    "remote observation task failed: {error}"
+                )))
+            }
+        }
     }
 
     pub async fn mutate<T: DeserializeOwned>(
@@ -479,23 +539,50 @@ impl RemoteRequestCoordinator {
             ));
         }
         let now = self.clock.now_unix_ms();
-        let persisted = {
+        let mutation_key = RemoteMutationKey {
+            lane: request.lane.clone(),
+            request_id: request.request_id.clone(),
+        };
+        let (persisted, queued, previous_lane) = {
             let mut state = self.state.lock().await;
-            if !state.queued_mutations.contains_key(&request.request_id) {
+            purge_expired_queue_entries(&mut state, now, self.config.queue_lease_ms);
+            if let Some(in_flight) = state.in_flight_mutations.get(&mutation_key) {
+                if !in_flight.matches(&request) {
+                    return Err(mutation_identity_reused(&request.request_id));
+                }
+                return Ok(RemoteMutationResult::Pending(RemoteWait {
+                    summary: format!(
+                        "waiting for coalesced {} mutation",
+                        request.lane.canonical_host
+                    ),
+                    wake_at_unix_ms: now.saturating_add(self.config.minimum_start_delay_ms.max(1)),
+                    queue_position: 1,
+                }));
+            }
+            if let Some(queued) = state.queued_mutations.get(&mutation_key) {
+                if !queued.matches(&request) {
+                    return Err(mutation_identity_reused(&request.request_id));
+                }
+            } else {
                 ensure_queue_capacity(&state, &self.config)?;
                 let sequence = next_sequence(&mut state);
                 state.queued_mutations.insert(
-                    request.request_id.clone(),
-                    QueuedRequest {
-                        lane: request.lane.clone(),
-                        priority: request.priority,
-                        enqueued_unix_ms: now,
-                        sequence,
+                    mutation_key.clone(),
+                    QueuedMutation {
+                        queue: QueuedRequest {
+                            lane: request.lane.clone(),
+                            priority: request.priority,
+                            enqueued_unix_ms: now,
+                            sequence,
+                        },
+                        operation: request.operation.clone(),
+                        subject: request.subject.clone(),
+                        payload: request.payload.clone(),
                     },
                 );
             }
-            let lane = state.lanes.entry(request.lane.clone()).or_default().clone();
-            if lane.in_flight || lane.next_request_unix_ms > now {
+            let previous_lane = state.lanes.entry(request.lane.clone()).or_default().clone();
+            if previous_lane.in_flight || previous_lane.next_request_unix_ms > now {
                 return Ok(RemoteMutationResult::Pending(queue_wait(
                     &state,
                     &request.lane,
@@ -505,7 +592,7 @@ impl RemoteRequestCoordinator {
                 )));
             }
             let selected = select_next(&state, &request.lane, now, &self.config);
-            if selected.as_deref() != Some(&queue_identity_for_mutation(&request.request_id)) {
+            if selected != Some(QueueIdentity::Mutation(mutation_key.clone())) {
                 return Ok(RemoteMutationResult::Pending(queue_wait(
                     &state,
                     &request.lane,
@@ -514,28 +601,102 @@ impl RemoteRequestCoordinator {
                     &self.config,
                 )));
             }
-            state.queued_mutations.remove(&request.request_id);
+            let queued = state
+                .queued_mutations
+                .remove(&mutation_key)
+                .expect("selected mutation remains queued");
+            state
+                .in_flight_mutations
+                .insert(mutation_key.clone(), queued.clone());
             let lane = state.lanes.entry(request.lane.clone()).or_default();
             lane.in_flight = true;
             lane.next_request_unix_ms = now.saturating_add(self.config.minimum_start_delay_ms);
-            persisted_lane(&request.lane, lane, now)
+            (
+                persisted_lane(&request.lane, lane, now),
+                queued,
+                previous_lane,
+            )
         };
-        self.store.save_lane(&persisted).await?;
+
         let lane_key = request.lane.clone();
-        let result = self
-            .executor
-            .execute(CoordinatedRemoteOperation::Mutate(request))
-            .await;
-        self.finish_mutation(&lane_key, result, now).await
+        let coordinator = self.clone();
+        let task_lane = lane_key.clone();
+        let task_key = mutation_key.clone();
+        let task = tokio::spawn(async move {
+            if let Err(error) = coordinator.store.save_lane(&persisted).await {
+                let mut state = coordinator.state.lock().await;
+                state.in_flight_mutations.remove(&task_key);
+                state
+                    .queued_mutations
+                    .entry(task_key.clone())
+                    .or_insert(queued);
+                state.lanes.insert(task_lane.clone(), previous_lane);
+                return Err(error);
+            }
+            let result = coordinator
+                .executor
+                .execute(CoordinatedRemoteOperation::Mutate(request))
+                .await;
+            let finished = coordinator.finish_mutation(&task_lane, result, now).await;
+            coordinator
+                .state
+                .lock()
+                .await
+                .in_flight_mutations
+                .remove(&task_key);
+            finished
+        });
+        match task.await {
+            Ok(result) => decode_mutation_result(result?),
+            Err(error) => {
+                self.state
+                    .lock()
+                    .await
+                    .in_flight_mutations
+                    .remove(&mutation_key);
+                self.abandon_lane(&lane_key).await;
+                Err(RemoteCoordinatorError::Execution(format!(
+                    "remote mutation task failed: {error}"
+                )))
+            }
+        }
     }
 
     pub async fn subscribe(&self, key: &RemoteObservationKey) -> tokio::sync::watch::Receiver<u64> {
-        let mut state = self.state.lock().await;
-        state
-            .subscriptions
-            .entry(key.clone())
-            .or_insert_with(|| tokio::sync::watch::channel(0).0)
-            .subscribe()
+        let receiver = {
+            let mut state = self.state.lock().await;
+            state
+                .subscriptions
+                .retain(|_, sender| sender.receiver_count() > 0);
+            state
+                .subscriptions
+                .entry(key.clone())
+                .or_insert_with(|| tokio::sync::watch::channel(0).0)
+                .subscribe()
+        };
+        let coordinator = self.clone();
+        let cleanup_key = key.clone();
+        tokio::spawn(async move {
+            loop {
+                let sender = {
+                    let state = coordinator.state.lock().await;
+                    state.subscriptions.get(&cleanup_key).cloned()
+                };
+                let Some(sender) = sender else { return };
+                sender.closed().await;
+                let mut state = coordinator.state.lock().await;
+                if state
+                    .subscriptions
+                    .get(&cleanup_key)
+                    .is_some_and(|current| current.same_channel(&sender))
+                    && sender.receiver_count() == 0
+                {
+                    state.subscriptions.remove(&cleanup_key);
+                    return;
+                }
+            }
+        });
+        receiver
     }
 
     pub async fn lane_cooldown(&self, key: &RemoteLaneKey) -> Option<i64> {
@@ -547,17 +708,19 @@ impl RemoteRequestCoordinator {
             .map(|lane| lane.next_request_unix_ms)
     }
 
-    async fn finish_observation<T: DeserializeOwned>(
+    async fn finish_observation(
         &self,
         key: &RemoteObservationKey,
         result: Result<RemoteOperationOutput, RemoteOperationFailure>,
         started_unix_ms: i64,
-    ) -> Result<RemoteObservationResult<T>, RemoteCoordinatorError> {
+    ) -> Result<RemoteObservationResult<serde_json::Value>, RemoteCoordinatorError> {
         let now = self.clock.now_unix_ms().max(started_unix_ms);
         match result {
             Ok(output) => {
                 if output.response_bytes > self.config.maximum_response_bytes {
-                    self.release_lane(&key.lane, now, None, false).await?;
+                    let released = self.release_lane(&key.lane, now, None, false).await;
+                    self.complete_observation(key, None).await;
+                    released?;
                     return Ok(RemoteObservationResult::Failed(format!(
                         "provider response exceeded {} bytes",
                         self.config.maximum_response_bytes
@@ -565,27 +728,17 @@ impl RemoteRequestCoordinator {
                 }
                 let cooldown =
                     maximum_time([output.retry_after_unix_ms, output.rate_limit_reset_unix_ms]);
-                self.release_lane(&key.lane, now, cooldown, true).await?;
+                let released = self.release_lane(&key.lane, now, cooldown, true).await;
                 let cached = CachedObservation {
                     value: output.value,
                     observed_unix_ms: now,
                     subject_revision: output.subject_revision,
                 };
-                {
-                    let mut state = self.state.lock().await;
-                    state.in_flight_reads.remove(key);
-                    if state.cache.len() >= self.config.maximum_cache_entries
-                        && let Some(oldest) = state
-                            .cache
-                            .iter()
-                            .min_by_key(|(_, value)| value.observed_unix_ms)
-                            .map(|(key, _)| key.clone())
-                    {
-                        state.cache.remove(&oldest);
-                    }
-                    state.cache.insert(key.clone(), cached.clone());
-                    notify_subscribers(&mut state, key);
+                if let Err(error) = released {
+                    self.complete_observation(key, None).await;
+                    return Err(error);
                 }
+                self.complete_observation(key, Some(cached.clone())).await;
                 decode_fresh(&cached)
             }
             Err(failure) if failure.retryable => {
@@ -597,11 +750,9 @@ impl RemoteRequestCoordinator {
                         failure.rate_limit_reset_unix_ms,
                         &failure.reason,
                     )
-                    .await?;
-                let mut state = self.state.lock().await;
-                state.in_flight_reads.remove(key);
-                notify_subscribers(&mut state, key);
-                Ok(match wait {
+                    .await;
+                self.complete_observation(key, None).await;
+                Ok(match wait? {
                     Some(wait) => RemoteObservationResult::Pending(wait),
                     None => RemoteObservationResult::Failed(format!(
                         "provider retry limit exhausted: {}",
@@ -610,10 +761,9 @@ impl RemoteRequestCoordinator {
                 })
             }
             Err(failure) => {
-                self.release_lane(&key.lane, now, None, false).await?;
-                let mut state = self.state.lock().await;
-                state.in_flight_reads.remove(key);
-                notify_subscribers(&mut state, key);
+                let released = self.release_lane(&key.lane, now, None, false).await;
+                self.complete_observation(key, None).await;
+                released?;
                 Ok(RemoteObservationResult::Failed(bounded_reason(
                     &failure.reason,
                 )))
@@ -621,12 +771,12 @@ impl RemoteRequestCoordinator {
         }
     }
 
-    async fn finish_mutation<T: DeserializeOwned>(
+    async fn finish_mutation(
         &self,
         lane: &RemoteLaneKey,
         result: Result<RemoteOperationOutput, RemoteOperationFailure>,
         started_unix_ms: i64,
-    ) -> Result<RemoteMutationResult<T>, RemoteCoordinatorError> {
+    ) -> Result<RemoteMutationResult<serde_json::Value>, RemoteCoordinatorError> {
         let now = self.clock.now_unix_ms().max(started_unix_ms);
         match result {
             Ok(output) => {
@@ -644,9 +794,7 @@ impl RemoteRequestCoordinator {
                     true,
                 )
                 .await?;
-                serde_json::from_value(output.value)
-                    .map(RemoteMutationResult::Applied)
-                    .map_err(|error| RemoteCoordinatorError::Decode(error.to_string()))
+                Ok(RemoteMutationResult::Applied(output.value))
             }
             Err(failure) if failure.retryable => Ok(
                 match self
@@ -675,6 +823,39 @@ impl RemoteRequestCoordinator {
         }
     }
 
+    async fn complete_observation(
+        &self,
+        key: &RemoteObservationKey,
+        cached: Option<CachedObservation>,
+    ) {
+        let mut state = self.state.lock().await;
+        state.in_flight_reads.remove(key);
+        if let Some(cached) = cached {
+            if state.cache.len() >= self.config.maximum_cache_entries
+                && let Some(oldest) = state
+                    .cache
+                    .iter()
+                    .min_by_key(|(_, value)| value.observed_unix_ms)
+                    .map(|(key, _)| key.clone())
+            {
+                state.cache.remove(&oldest);
+            }
+            state.cache.insert(key.clone(), cached);
+        }
+        notify_subscribers(&mut state, key);
+    }
+
+    async fn abandon_observation(&self, key: &RemoteObservationKey) {
+        self.abandon_lane(&key.lane).await;
+        self.complete_observation(key, None).await;
+    }
+
+    async fn abandon_lane(&self, key: &RemoteLaneKey) {
+        if let Some(lane) = self.state.lock().await.lanes.get_mut(key) {
+            lane.in_flight = false;
+        }
+    }
+
     async fn retry_lane(
         &self,
         key: &RemoteLaneKey,
@@ -683,14 +864,13 @@ impl RemoteRequestCoordinator {
         reset: Option<i64>,
         reason: &str,
     ) -> Result<Option<RemoteWait>, RemoteCoordinatorError> {
-        let persisted = {
+        let (persisted, previous_lane) = {
             let mut state = self.state.lock().await;
             let lane = state.lanes.entry(key.clone()).or_default();
-            lane.in_flight = false;
+            let previous_lane = lane.clone();
             lane.retry_count = lane.retry_count.saturating_add(1);
             if lane.retry_count > self.config.maximum_retries {
                 lane.next_request_unix_ms = now;
-                persisted_lane(key, lane, now)
             } else {
                 let exponential = self
                     .config
@@ -715,10 +895,20 @@ impl RemoteRequestCoordinator {
                     reset,
                 ])
                 .unwrap_or(now.saturating_add(exponential));
-                persisted_lane(key, lane, now)
             }
+            (persisted_lane(key, lane, now), previous_lane)
         };
-        self.store.save_lane(&persisted).await?;
+        if let Err(error) = self.store.save_lane(&persisted).await {
+            let mut state = self.state.lock().await;
+            state.lanes.insert(key.clone(), previous_lane);
+            if let Some(lane) = state.lanes.get_mut(key) {
+                lane.in_flight = false;
+            }
+            return Err(error);
+        }
+        if let Some(lane) = self.state.lock().await.lanes.get_mut(key) {
+            lane.in_flight = false;
+        }
         if persisted.retry_count > self.config.maximum_retries {
             Ok(None)
         } else {
@@ -742,19 +932,30 @@ impl RemoteRequestCoordinator {
         cooldown: Option<i64>,
         succeeded: bool,
     ) -> Result<(), RemoteCoordinatorError> {
-        let persisted = {
+        let (persisted, previous_lane) = {
             let mut state = self.state.lock().await;
             let lane = state.lanes.entry(key.clone()).or_default();
-            lane.in_flight = false;
+            let previous_lane = lane.clone();
             if succeeded {
                 lane.retry_count = 0;
             }
             if let Some(cooldown) = cooldown {
                 lane.next_request_unix_ms = lane.next_request_unix_ms.max(cooldown);
             }
-            persisted_lane(key, lane, now)
+            (persisted_lane(key, lane, now), previous_lane)
         };
-        self.store.save_lane(&persisted).await
+        if let Err(error) = self.store.save_lane(&persisted).await {
+            let mut state = self.state.lock().await;
+            state.lanes.insert(key.clone(), previous_lane);
+            if let Some(lane) = state.lanes.get_mut(key) {
+                lane.in_flight = false;
+            }
+            return Err(error);
+        }
+        if let Some(lane) = self.state.lock().await.lanes.get_mut(key) {
+            lane.in_flight = false;
+        }
+        Ok(())
     }
 }
 
@@ -767,12 +968,28 @@ fn validate_config(config: &RemoteCoordinatorConfig) -> Result<(), RemoteCoordin
         || config.maximum_cache_entries == 0
         || config.maximum_response_bytes == 0
         || config.maximum_retries == 0
+        || config.queue_lease_ms <= 0
     {
         return Err(RemoteCoordinatorError::Invalid(
             "remote coordinator limits must be positive and internally consistent".into(),
         ));
     }
     Ok(())
+}
+
+fn purge_expired_queue_entries(state: &mut CoordinatorState, now: i64, lease_ms: i64) {
+    state
+        .queued_reads
+        .retain(|_, queued| now.saturating_sub(queued.enqueued_unix_ms) <= lease_ms);
+    state
+        .queued_mutations
+        .retain(|_, queued| now.saturating_sub(queued.queue.enqueued_unix_ms) <= lease_ms);
+}
+
+fn mutation_identity_reused(request_id: &str) -> RemoteCoordinatorError {
+    RemoteCoordinatorError::Invalid(format!(
+        "remote mutation identity '{request_id}' was reused for a different request"
+    ))
 }
 
 fn ensure_queue_capacity(
@@ -818,23 +1035,53 @@ fn decode_fresh<T: DeserializeOwned>(
         .map_err(|error| RemoteCoordinatorError::Decode(error.to_string()))
 }
 
+fn decode_observation_result<T: DeserializeOwned>(
+    result: RemoteObservationResult<serde_json::Value>,
+) -> Result<RemoteObservationResult<T>, RemoteCoordinatorError> {
+    match result {
+        RemoteObservationResult::Fresh(fresh) => serde_json::from_value(fresh.value)
+            .map(|value| {
+                RemoteObservationResult::Fresh(FreshObservation {
+                    value,
+                    observed_unix_ms: fresh.observed_unix_ms,
+                    subject_revision: fresh.subject_revision,
+                })
+            })
+            .map_err(|error| RemoteCoordinatorError::Decode(error.to_string())),
+        RemoteObservationResult::Pending(wait) => Ok(RemoteObservationResult::Pending(wait)),
+        RemoteObservationResult::Failed(reason) => Ok(RemoteObservationResult::Failed(reason)),
+    }
+}
+
+fn decode_mutation_result<T: DeserializeOwned>(
+    result: RemoteMutationResult<serde_json::Value>,
+) -> Result<RemoteMutationResult<T>, RemoteCoordinatorError> {
+    match result {
+        RemoteMutationResult::Applied(value) => serde_json::from_value(value)
+            .map(RemoteMutationResult::Applied)
+            .map_err(|error| RemoteCoordinatorError::Decode(error.to_string())),
+        RemoteMutationResult::Pending(wait) => Ok(RemoteMutationResult::Pending(wait)),
+        RemoteMutationResult::Failed(reason) => Ok(RemoteMutationResult::Failed(reason)),
+    }
+}
+
 fn select_next(
     state: &CoordinatorState,
     lane: &RemoteLaneKey,
     now: i64,
     config: &RemoteCoordinatorConfig,
-) -> Option<String> {
+) -> Option<QueueIdentity> {
     state
         .queued_reads
         .iter()
         .filter(|(_, queued)| &queued.lane == lane)
-        .map(|(key, queued)| (queue_identity_for_read(key), queued))
+        .map(|(key, queued)| (QueueIdentity::Observation(key.clone()), queued))
         .chain(
             state
                 .queued_mutations
                 .iter()
-                .filter(|(_, queued)| &queued.lane == lane)
-                .map(|(id, queued)| (queue_identity_for_mutation(id), queued)),
+                .filter(|(_, queued)| &queued.queue.lane == lane)
+                .map(|(key, queued)| (QueueIdentity::Mutation(key.clone()), &queued.queue)),
         )
         .min_by_key(|(_, queued)| effective_order(queued, now, config))
         .map(|(identity, _)| identity)
@@ -866,17 +1113,17 @@ fn queue_wait(
         .queued_reads
         .iter()
         .filter(|(_, queued)| &queued.lane == lane)
-        .map(|(key, queued)| (queue_identity_for_read(key), queued))
+        .map(|(key, queued)| (QueueIdentity::Observation(key.clone()), queued))
         .chain(
             state
                 .queued_mutations
                 .iter()
-                .filter(|(_, queued)| &queued.lane == lane)
-                .map(|(id, queued)| (queue_identity_for_mutation(id), queued)),
+                .filter(|(_, queued)| &queued.queue.lane == lane)
+                .map(|(key, queued)| (QueueIdentity::Mutation(key.clone()), &queued.queue)),
         )
         .collect::<Vec<_>>();
     ordered.sort_by_key(|(_, queued)| effective_order(queued, now, config));
-    let identity = read.map(queue_identity_for_read);
+    let identity = read.cloned().map(QueueIdentity::Observation);
     let position = identity
         .as_ref()
         .and_then(|identity| ordered.iter().position(|(item, _)| item == identity))
@@ -902,14 +1149,6 @@ fn queue_wait(
     }
 }
 
-fn queue_identity_for_read(key: &RemoteObservationKey) -> String {
-    format!("read:{}:{}", key.operation, key.subject)
-}
-
-fn queue_identity_for_mutation(id: &str) -> String {
-    format!("mutation:{id}")
-}
-
 fn persisted_lane(key: &RemoteLaneKey, lane: &LaneState, now: i64) -> PersistedRemoteLane {
     PersistedRemoteLane {
         key: key.clone(),
@@ -920,7 +1159,13 @@ fn persisted_lane(key: &RemoteLaneKey, lane: &LaneState, now: i64) -> PersistedR
 }
 
 fn notify_subscribers(state: &mut CoordinatorState, key: &RemoteObservationKey) {
-    if let Some(sender) = state.subscriptions.get(key) {
+    let should_remove = state
+        .subscriptions
+        .get(key)
+        .is_some_and(|sender| sender.receiver_count() == 0);
+    if should_remove {
+        state.subscriptions.remove(key);
+    } else if let Some(sender) = state.subscriptions.get(key) {
         let _ = sender.send(sender.borrow().saturating_add(1));
     }
 }
@@ -952,6 +1197,7 @@ pub enum RemoteCoordinatorError {
     Invalid(String),
     QueueFull(usize),
     Decode(String),
+    Execution(String),
     Persistence(String),
     Io(std::io::Error),
 }
@@ -959,9 +1205,10 @@ pub enum RemoteCoordinatorError {
 impl std::fmt::Display for RemoteCoordinatorError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Invalid(error) | Self::Decode(error) | Self::Persistence(error) => {
-                formatter.write_str(error)
-            }
+            Self::Invalid(error)
+            | Self::Decode(error)
+            | Self::Execution(error)
+            | Self::Persistence(error) => formatter.write_str(error),
             Self::QueueFull(limit) => write!(formatter, "remote request queue is full ({limit})"),
             Self::Io(error) => error.fmt(formatter),
         }
@@ -979,6 +1226,7 @@ mod tests {
     struct RecordingExecutor {
         calls: AtomicUsize,
         retry_after: AtomicI64,
+        response_bytes: AtomicUsize,
     }
 
     impl RemoteOperationExecutor for RecordingExecutor {
@@ -1012,10 +1260,63 @@ mod tests {
                 Ok(RemoteOperationOutput {
                     value: serde_json::json!({"head": revision}),
                     subject_revision: revision,
-                    response_bytes: 32,
+                    response_bytes: self.response_bytes.load(Ordering::Acquire).max(32),
                     retry_after_unix_ms: None,
                     rate_limit_reset_unix_ms: None,
                 })
+            })
+        }
+    }
+
+    struct FailOnceStore {
+        lanes: std::sync::Mutex<BTreeMap<RemoteLaneKey, PersistedRemoteLane>>,
+        failures: AtomicUsize,
+    }
+
+    struct FailNthStore {
+        lanes: std::sync::Mutex<BTreeMap<RemoteLaneKey, PersistedRemoteLane>>,
+        calls: AtomicUsize,
+        fail_at: usize,
+    }
+
+    impl RemoteCoordinatorStore for FailNthStore {
+        fn load_lanes<'a>(&'a self) -> RemoteFuture<'a, Vec<PersistedRemoteLane>> {
+            Box::pin(async move { Ok(self.lanes.lock().unwrap().values().cloned().collect()) })
+        }
+
+        fn save_lane<'a>(&'a self, lane: &'a PersistedRemoteLane) -> RemoteFuture<'a, ()> {
+            Box::pin(async move {
+                if self.calls.fetch_add(1, Ordering::AcqRel) + 1 == self.fail_at {
+                    return Err(RemoteCoordinatorError::Persistence(
+                        "injected lane persistence failure".into(),
+                    ));
+                }
+                self.lanes
+                    .lock()
+                    .unwrap()
+                    .insert(lane.key.clone(), lane.clone());
+                Ok(())
+            })
+        }
+    }
+
+    impl RemoteCoordinatorStore for FailOnceStore {
+        fn load_lanes<'a>(&'a self) -> RemoteFuture<'a, Vec<PersistedRemoteLane>> {
+            Box::pin(async move { Ok(self.lanes.lock().unwrap().values().cloned().collect()) })
+        }
+
+        fn save_lane<'a>(&'a self, lane: &'a PersistedRemoteLane) -> RemoteFuture<'a, ()> {
+            Box::pin(async move {
+                if self.failures.fetch_add(1, Ordering::AcqRel) == 0 {
+                    return Err(RemoteCoordinatorError::Persistence(
+                        "injected lane persistence failure".into(),
+                    ));
+                }
+                self.lanes
+                    .lock()
+                    .unwrap()
+                    .insert(lane.key.clone(), lane.clone());
+                Ok(())
             })
         }
     }
@@ -1156,6 +1457,311 @@ mod tests {
             RemoteMutationResult::Applied(_)
         ));
         assert_eq!(executor.calls.load(Ordering::Acquire), 2);
+    }
+
+    #[tokio::test]
+    async fn persistence_failure_rolls_back_observation_and_mutation_claims() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let clock = Arc::new(FakeRemoteClock::new(100));
+        let coordinator = RemoteRequestCoordinator::new(
+            executor.clone(),
+            clock.clone(),
+            Arc::new(FailOnceStore {
+                lanes: std::sync::Mutex::new(BTreeMap::new()),
+                failures: AtomicUsize::new(0),
+            }),
+            RemoteCoordinatorConfig {
+                minimum_start_delay_ms: 0,
+                ..RemoteCoordinatorConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            coordinator
+                .observe::<serde_json::Value>(
+                    key("pr:failure"),
+                    ObservationFreshness::any(0),
+                    RemotePriority::WorkflowObservation,
+                    serde_json::Value::Null,
+                )
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            coordinator
+                .observe::<serde_json::Value>(
+                    key("pr:failure"),
+                    ObservationFreshness::any(0),
+                    RemotePriority::WorkflowObservation,
+                    serde_json::Value::Null,
+                )
+                .await
+                .unwrap(),
+            RemoteObservationResult::Fresh(_)
+        ));
+        assert_eq!(executor.calls.load(Ordering::Acquire), 1);
+
+        let mutation_executor = Arc::new(RecordingExecutor::default());
+        let mutation = RemoteMutationRequest {
+            lane: lane(),
+            request_id: "same-id".into(),
+            operation: "resolve".into(),
+            subject: "repo:1".into(),
+            priority: RemotePriority::WorkflowHook,
+            payload: serde_json::json!({"thread": 1}),
+        };
+        let mutation_coordinator = RemoteRequestCoordinator::new(
+            mutation_executor.clone(),
+            clock,
+            Arc::new(FailOnceStore {
+                lanes: std::sync::Mutex::new(BTreeMap::new()),
+                failures: AtomicUsize::new(0),
+            }),
+            RemoteCoordinatorConfig {
+                minimum_start_delay_ms: 0,
+                ..RemoteCoordinatorConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            mutation_coordinator
+                .mutate::<serde_json::Value>(mutation.clone())
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            mutation_coordinator
+                .mutate::<serde_json::Value>(mutation)
+                .await
+                .unwrap(),
+            RemoteMutationResult::Applied(_)
+        ));
+        assert_eq!(mutation_executor.calls.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn completion_persistence_failure_still_clears_the_observation_marker() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let clock = Arc::new(FakeRemoteClock::new(100));
+        let coordinator = RemoteRequestCoordinator::new(
+            executor.clone(),
+            clock.clone(),
+            Arc::new(FailNthStore {
+                lanes: std::sync::Mutex::new(BTreeMap::new()),
+                calls: AtomicUsize::new(0),
+                fail_at: 2,
+            }),
+            RemoteCoordinatorConfig {
+                minimum_start_delay_ms: 0,
+                ..RemoteCoordinatorConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            coordinator
+                .observe::<serde_json::Value>(
+                    key("pr:completion-failure"),
+                    ObservationFreshness::any(0),
+                    RemotePriority::WorkflowObservation,
+                    serde_json::Value::Null,
+                )
+                .await
+                .is_err()
+        );
+        {
+            let state = coordinator.state.lock().await;
+            assert!(
+                !state
+                    .in_flight_reads
+                    .contains(&key("pr:completion-failure"))
+            );
+            assert!(
+                !state.lanes.get(&lane()).is_some_and(|lane| lane.in_flight),
+                "lane remained in flight: {:?}",
+                state.lanes.get(&lane())
+            );
+        }
+        clock.advance(250);
+        let retry = coordinator
+            .observe::<serde_json::Value>(
+                key("pr:completion-failure"),
+                ObservationFreshness::any(0),
+                RemotePriority::WorkflowObservation,
+                serde_json::Value::Null,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(retry, RemoteObservationResult::Fresh(_)),
+            "unexpected retry result: {retry:?}; cooldown={:?}",
+            coordinator.lane_cooldown(&lane()).await
+        );
+        assert_eq!(executor.calls.load(Ordering::Acquire), 2);
+    }
+
+    #[tokio::test]
+    async fn oversized_observation_releases_the_key_for_a_later_attempt() {
+        let executor = Arc::new(RecordingExecutor::default());
+        executor.response_bytes.store(65, Ordering::Release);
+        let clock = Arc::new(FakeRemoteClock::new(100));
+        let coordinator = RemoteRequestCoordinator::new(
+            executor.clone(),
+            clock,
+            Arc::new(MemoryRemoteCoordinatorStore::default()),
+            RemoteCoordinatorConfig {
+                minimum_start_delay_ms: 0,
+                maximum_response_bytes: 64,
+                ..RemoteCoordinatorConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                coordinator
+                    .observe::<serde_json::Value>(
+                        key("pr:oversized"),
+                        ObservationFreshness::any(0),
+                        RemotePriority::WorkflowObservation,
+                        serde_json::Value::Null,
+                    )
+                    .await
+                    .unwrap(),
+                RemoteObservationResult::Failed(_)
+            ));
+        }
+        assert_eq!(executor.calls.load(Ordering::Acquire), 2);
+    }
+
+    #[tokio::test]
+    async fn mutation_identity_is_lane_scoped_and_payload_stable() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let clock = Arc::new(FakeRemoteClock::new(100));
+        let coordinator = coordinator(
+            executor,
+            clock,
+            Arc::new(MemoryRemoteCoordinatorStore::default()),
+        )
+        .await;
+        let first = RemoteMutationRequest {
+            lane: lane(),
+            request_id: "shared".into(),
+            operation: "resolve".into(),
+            subject: "repo:1".into(),
+            priority: RemotePriority::WorkflowHook,
+            payload: serde_json::json!({"thread": 1}),
+        };
+        {
+            let mut state = coordinator.state.lock().await;
+            state.queued_mutations.insert(
+                RemoteMutationKey {
+                    lane: first.lane.clone(),
+                    request_id: first.request_id.clone(),
+                },
+                QueuedMutation {
+                    queue: QueuedRequest {
+                        lane: first.lane.clone(),
+                        priority: first.priority,
+                        enqueued_unix_ms: 100,
+                        sequence: 1,
+                    },
+                    operation: first.operation.clone(),
+                    subject: first.subject.clone(),
+                    payload: first.payload.clone(),
+                },
+            );
+        }
+        let error = coordinator
+            .mutate::<serde_json::Value>(RemoteMutationRequest {
+                payload: serde_json::json!({"thread": 2}),
+                ..first.clone()
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("reused for a different request"));
+
+        let other_lane = RemoteLaneKey::new("gitlab.com", "default").unwrap();
+        assert!(matches!(
+            coordinator
+                .mutate::<serde_json::Value>(RemoteMutationRequest {
+                    lane: other_lane,
+                    ..first
+                })
+                .await
+                .unwrap(),
+            RemoteMutationResult::Applied(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn expired_abandoned_queue_entry_does_not_block_the_lane() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let clock = Arc::new(FakeRemoteClock::new(100));
+        let coordinator = RemoteRequestCoordinator::new(
+            executor,
+            clock.clone(),
+            Arc::new(MemoryRemoteCoordinatorStore::default()),
+            RemoteCoordinatorConfig {
+                minimum_start_delay_ms: 0,
+                queue_lease_ms: 10,
+                ..RemoteCoordinatorConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        {
+            let mut state = coordinator.state.lock().await;
+            state.queued_reads.insert(
+                key("abandoned"),
+                QueuedRequest {
+                    lane: lane(),
+                    priority: RemotePriority::InteractiveMutation,
+                    enqueued_unix_ms: 100,
+                    sequence: 1,
+                },
+            );
+        }
+        clock.advance(11);
+        assert!(matches!(
+            coordinator
+                .observe::<serde_json::Value>(
+                    key("live"),
+                    ObservationFreshness::any(0),
+                    RemotePriority::BackgroundRefresh,
+                    serde_json::Value::Null,
+                )
+                .await
+                .unwrap(),
+            RemoteObservationResult::Fresh(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn dropped_subscription_is_reaped() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let clock = Arc::new(FakeRemoteClock::new(100));
+        let coordinator = coordinator(
+            executor,
+            clock,
+            Arc::new(MemoryRemoteCoordinatorStore::default()),
+        )
+        .await;
+        let receiver = coordinator.subscribe(&key("subscription")).await;
+        assert_eq!(coordinator.state.lock().await.subscriptions.len(), 1);
+        drop(receiver);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if coordinator.state.lock().await.subscriptions.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("subscription cleanup must be bounded");
     }
 
     #[tokio::test]

@@ -694,16 +694,10 @@ fn capability_gap(
             "provider policy observation is unavailable: {error}"
         ));
     }
-    match provider {
-        crate::remote::ProviderKind::GitHub => None,
-        crate::remote::ProviderKind::GitLab if details.check_contexts.is_empty() => Some(
-            "GitLab required-check observations are not supported for this Change Request".into(),
-        ),
-        crate::remote::ProviderKind::Forgejo if details.check_contexts.is_empty() => Some(
-            "Forgejo required-check observations are not supported for this Change Request".into(),
-        ),
-        _ => None,
-    }
+    let _ = (provider, details);
+    // An authoritative empty observation means there are no checks, not that the provider lacks
+    // the capability. Unsupported or failed observations must carry explicit evidence.
+    None
 }
 
 fn output(
@@ -907,18 +901,31 @@ fn classify_failure(reason: String) -> RemoteOperationFailure {
     let normalized = reason.to_ascii_lowercase();
     let retry_after_unix_ms = retry_after_delay_ms(&normalized)
         .map(|delay| crate::workflow::prompt_worker::now_unix_ms().saturating_add(delay));
-    let retryable = !normalized.contains("unsupported")
-        && !normalized.contains("not support")
-        && !normalized.contains("unauthorized")
-        && !normalized.contains("authentication")
-        && !normalized.contains("no open change request")
-        && !normalized.contains("different change request")
-        && !normalized.contains("change request head changed")
-        && !normalized.contains("detached head")
-        && !normalized.contains("configuration");
+    // Dispatcher compatibility APIs still return display strings. Fail closed unless the retained
+    // classified metadata or a narrow transport allowlist explicitly proves the failure retryable.
+    let explicitly_retryable = normalized.contains("retry=retryable")
+        || normalized.contains("rate_limited")
+        || normalized.contains("timed out")
+        || normalized.contains("timeout")
+        || normalized.contains("transport");
+    let explicitly_permanent = normalized.contains("retry=not_retryable")
+        || normalized.contains("retry=unknown")
+        || normalized.contains("unsupported")
+        || normalized.contains("not support")
+        || normalized.contains("unauthorized")
+        || normalized.contains("authorization")
+        || normalized.contains("authentication")
+        || normalized.contains("validation")
+        || normalized.contains("conflict")
+        || normalized.contains("not_found")
+        || normalized.contains("no open change request")
+        || normalized.contains("different change request")
+        || normalized.contains("change request head changed")
+        || normalized.contains("detached head")
+        || normalized.contains("configuration");
     RemoteOperationFailure {
         reason,
-        retryable,
+        retryable: explicitly_retryable && !explicitly_permanent,
         retry_after_unix_ms,
         rate_limit_reset_unix_ms: None,
     }
@@ -1004,6 +1011,20 @@ mod tests {
             !classify_failure("Change Request head changed before workflow observation".into())
                 .retryable
         );
+    }
+
+    #[test]
+    fn unclassified_failures_are_not_retried_without_positive_evidence() {
+        for reason in [
+            "provider authorization failed",
+            "validation failed",
+            "conflict",
+            "provider failed: retry=unknown",
+            "opaque provider failure",
+        ] {
+            assert!(!classify_failure(reason.into()).retryable, "{reason}");
+        }
+        assert!(classify_failure("provider transport timeout".into()).retryable);
     }
 
     #[test]

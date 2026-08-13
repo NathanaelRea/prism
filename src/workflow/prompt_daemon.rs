@@ -21,6 +21,8 @@ const TRANSITION_TIMEOUT: Duration = Duration::from_secs(3);
 const SOCKET_PATH_BUDGET: usize = 103;
 const AUTHENTICATION_FAILED_RESPONSE: &str = "error authentication-failed";
 const AUTHENTICATION_SECRET_BYTES: usize = 32;
+const SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_CONNECTIONS: usize = 16;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -135,12 +137,22 @@ pub fn shutdown() -> Result<(), String> {
 fn wait_stopped(timeout: Duration) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if probe_health()?.state == DaemonState::Stopped {
-            return Ok(());
+        match probe_health() {
+            Ok(health) if health.state == DaemonState::Stopped => return Ok(()),
+            Ok(_) => {}
+            Err(error) if is_worker_transition_error(&error) => return Ok(()),
+            Err(error) => return Err(error),
         }
         thread::sleep(Duration::from_millis(25));
     }
     Err("timed out waiting for Prism worker daemon to stop".into())
+}
+
+fn is_worker_transition_error(error: &str) -> bool {
+    error.contains("Connection reset by peer")
+        || error.contains("Broken pipe")
+        || error.contains("connection refused")
+        || error.contains("Connection refused")
 }
 
 pub fn serve() -> Result<(), String> {
@@ -148,6 +160,10 @@ pub fn serve() -> Result<(), String> {
         .ok()
         .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
         .map_or_else(binary_generation, Ok)?;
+    let directory = runtime_dir();
+    secure_runtime_directory(&directory)?;
+    // Exclusivity must cover storage opening because opening may replace a pre-cutover database.
+    let lock = acquire_lock(&directory.join("worker.lock"))?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -180,7 +196,7 @@ pub fn serve() -> Result<(), String> {
             }
         }
     });
-    let result = serve_socket(&runtime, &service, &generation);
+    let result = serve_socket(&runtime, &service, &generation, lock);
     let _ = shutdown.send(true);
     runtime
         .block_on(scheduler)
@@ -192,10 +208,8 @@ fn serve_socket(
     runtime: &tokio::runtime::Runtime,
     service: &crate::PromptWorkflowService,
     generation: &str,
+    _lock: File,
 ) -> Result<(), String> {
-    let directory = runtime_dir();
-    secure_runtime_directory(&directory)?;
-    let _lock = acquire_lock(&directory.join("worker.lock"))?;
     let socket = validated_socket_path()?;
     if socket.exists() {
         match UnixStream::connect(&socket) {
@@ -206,8 +220,11 @@ fn serve_socket(
                     std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
                 ) =>
             {
-                fs::remove_file(&socket)
-                    .map_err(|error| format!("remove stale worker socket: {error}"))?;
+                match fs::remove_file(&socket) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(format!("remove stale worker socket: {error}")),
+                }
             }
             Err(error) => return Err(format!("inspect existing worker socket: {error}")),
         }
@@ -224,41 +241,77 @@ fn serve_socket(
         std::process::id(),
         crate::workflow::prompt_worker::now_unix_ms()
     );
+    let (response_sender, response_receiver) = std::sync::mpsc::channel();
+    let active_connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut handlers = Vec::new();
     let mut draining = false;
     loop {
-        match listener.accept() {
-            Ok((mut stream, _)) => {
-                draining |= respond(
-                    runtime,
-                    service,
-                    &mut stream,
-                    &instance,
-                    generation,
-                    draining,
-                );
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(error) => return Err(format!("accept Prism worker connection: {error}")),
+        while let Ok(requested_shutdown) = response_receiver.try_recv() {
+            draining |= requested_shutdown;
         }
         if draining {
             break;
         }
+        match listener.accept() {
+            Ok((stream, _)) => {
+                if active_connections.load(std::sync::atomic::Ordering::Acquire) >= MAX_CONNECTIONS
+                {
+                    let mut stream = stream;
+                    let _ = stream.write_all(b"error worker-busy\n");
+                } else {
+                    let service = service.clone();
+                    let handle = runtime.handle().clone();
+                    let instance = instance.clone();
+                    let generation = generation.to_string();
+                    let response_sender = response_sender.clone();
+                    let active_connections = active_connections.clone();
+                    active_connections.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    handlers.push(thread::spawn(move || {
+                        let _active = ActiveConnection(active_connections);
+                        let requested_shutdown =
+                            respond(&handle, &service, stream, &instance, &generation, draining);
+                        let _ = response_sender.send(requested_shutdown);
+                    }));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(format!("accept Prism worker connection: {error}")),
+        }
         thread::sleep(Duration::from_millis(25));
     }
     drop(listener);
-    fs::remove_file(&socket).map_err(|error| format!("remove Prism worker socket: {error}"))
+    // Connection workers own cloned service/runtime handles. Socket I/O is bounded, so join every
+    // handler before unlinking the socket or releasing the daemon ownership lock.
+    for handler in handlers {
+        let _ = handler.join();
+    }
+    match fs::remove_file(&socket) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("remove Prism worker socket: {error}")),
+    }
+}
+
+struct ActiveConnection(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for ActiveConnection {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 fn respond(
-    runtime: &tokio::runtime::Runtime,
+    runtime: &tokio::runtime::Handle,
     service: &crate::PromptWorkflowService,
-    stream: &mut UnixStream,
+    mut stream: UnixStream,
     instance: &str,
     generation: &str,
     draining: bool,
 ) -> bool {
+    let _ = stream.set_read_timeout(Some(SOCKET_IO_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(SOCKET_IO_TIMEOUT));
     let mut request = String::new();
-    if BufReader::new(&mut *stream)
+    if BufReader::new(&mut stream)
         .take(1024 * 1024 + 1)
         .read_line(&mut request)
         .is_err()
@@ -268,22 +321,41 @@ fn respond(
         return false;
     }
     let request = request.trim();
-    let active = runtime
+    let response = match request {
+        "health" | "wake" => health_line(
+            instance,
+            generation,
+            draining,
+            active_run_count(runtime, service),
+        ),
+        "shutdown" => health_line(
+            instance,
+            generation,
+            true,
+            active_run_count(runtime, service),
+        ),
+        request if request.starts_with('{') => prompt_response(runtime, service, request),
+        _ => "error unknown-command\n".into(),
+    };
+    let requested_shutdown = request == "shutdown";
+    if stream.write_all(response.as_bytes()).is_ok() {
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+    }
+    requested_shutdown
+}
+
+fn active_run_count(
+    runtime: &tokio::runtime::Handle,
+    service: &crate::PromptWorkflowService,
+) -> usize {
+    runtime
         .block_on(service.list(None, 10_000))
         .map(|runs| {
             runs.into_iter()
                 .filter(|run| !run.status.terminal())
                 .count()
         })
-        .unwrap_or(0);
-    let response = match request {
-        "health" | "wake" => health_line(instance, generation, draining, active),
-        "shutdown" => health_line(instance, generation, true, active),
-        request if request.starts_with('{') => prompt_response(runtime, service, request),
-        _ => "error unknown-command\n".into(),
-    };
-    let _ = stream.write_all(response.as_bytes());
-    request == "shutdown"
+        .unwrap_or(0)
 }
 
 fn health_line(instance: &str, generation: &str, draining: bool, active: usize) -> String {
@@ -344,7 +416,7 @@ enum SocketControl {
 }
 
 fn prompt_response(
-    runtime: &tokio::runtime::Runtime,
+    runtime: &tokio::runtime::Handle,
     service: &crate::PromptWorkflowService,
     request: &str,
 ) -> String {
@@ -703,7 +775,10 @@ fn read_authentication_secret(socket_path: &Path) -> Result<String, String> {
 fn request_stream(mut stream: UnixStream, command: &str) -> Result<String, String> {
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
-        .map_err(|error| format!("configure Prism worker socket: {error}"))?;
+        .map_err(|error| format!("configure Prism worker socket read timeout: {error}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(30)))
+        .map_err(|error| format!("configure Prism worker socket write timeout: {error}"))?;
     stream
         .write_all(format!("{command}\n").as_bytes())
         .map_err(|error| format!("write Prism worker request: {error}"))?;
