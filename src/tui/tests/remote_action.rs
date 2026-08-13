@@ -8,9 +8,9 @@ use crate::remote::{PrCache, PrDetails, PrReview, PrReviewComment};
 use crate::repo::Repository;
 
 use super::super::{
+    remote_action_abandon_requested, remote_action_timeout, remote_mutation_targets_overlap,
     RemoteActionDelivery, RemoteActionReconciliationContext, RemoteActionValue,
     RemoteMutationTarget, Tui, TuiJobKey, TuiJobKind, TuiJobPayload,
-    remote_action_abandon_requested, remote_action_timeout, remote_mutation_targets_overlap,
 };
 use super::support::{
     test_change_request_identity, test_config, test_pr_summary, test_session, test_tui,
@@ -159,7 +159,7 @@ fn reconciliation_clears_only_markers_with_matched_authoritative_evidence() {
     let mut create = test_pr_summary(false);
     create.change_request_identity = Some(identity.clone());
     let mut pending_merge = create.clone();
-    pending_merge.queue_state = "queued".to_string();
+    pending_merge.queue_state = "AWAITING_CHECKS".to_string();
     tui.reconcile_remote_mutation_summaries(
         &repository,
         &[create, pending_merge.clone()],
@@ -191,10 +191,9 @@ fn reconciliation_clears_only_markers_with_matched_authoritative_evidence() {
         &repository,
         &PrCache::observed(pending_merge, Some(details)),
     );
-    assert!(
-        !tui.remote_mutations_requiring_reconciliation
-            .contains_key(&repository.root)
-    );
+    assert!(!tui
+        .remote_mutations_requiring_reconciliation
+        .contains_key(&repository.root));
     fs::remove_dir_all(temp).unwrap();
 }
 
@@ -371,6 +370,63 @@ fn queued_remote_timing_updates_the_visible_progress_dialog() {
             if message.contains("position 2")
     ));
     let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
+fn merge_summary_refresh_preserves_matching_details() {
+    let summary = test_pr_summary(false);
+    let details = PrDetails {
+        comments: vec![crate::remote::PrComment {
+            id: "comment-1".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut cache = PrCache::observed(summary.clone(), Some(details));
+    let mut queued = summary;
+    queued.queue_state = "AWAITING_CHECKS".into();
+
+    cache.apply_worker_summary(queued);
+
+    assert_eq!(cache.summary().unwrap().queue_state, "AWAITING_CHECKS");
+    assert_eq!(cache.details().unwrap().comments.len(), 1);
+}
+
+#[test]
+fn uncertain_merge_summary_remains_untrusted_until_reobserved() {
+    let mut cache = PrCache::observed(test_pr_summary(false), None);
+    cache.require_reconciliation(
+        "provider merge outcome is uncertain; authoritative re-observation required",
+    );
+
+    assert!(cache.trusted_summary().is_err());
+}
+
+#[test]
+fn uncertain_merge_result_requires_authoritative_reconciliation() {
+    let rejected = Ok(RemoteActionValue::MergeRejected(
+        "provider policy does not currently authorize merge".into(),
+    ));
+    assert!(super::super::uncertain_remote_mutation_error(&rejected).is_none());
+
+    let cache = PrCache::observed(test_pr_summary(false), None);
+    let result = Ok(RemoteActionValue::Merge {
+        cache: Box::new(cache),
+        outcome: crate::workflow::standard_remote::TuiRemoteMergeOutcome::Uncertain,
+    });
+    assert!(super::super::uncertain_remote_mutation_error(&result)
+        .is_some_and(|error| error.contains("not authoritative")));
+
+    for outcome in [
+        crate::workflow::standard_remote::TuiRemoteMergeOutcome::Merged,
+        crate::workflow::standard_remote::TuiRemoteMergeOutcome::Pending,
+    ] {
+        let result = Ok(RemoteActionValue::Merge {
+            cache: Box::new(PrCache::observed(test_pr_summary(false), None)),
+            outcome,
+        });
+        assert!(super::super::uncertain_remote_mutation_error(&result).is_none());
+    }
 }
 
 #[test]

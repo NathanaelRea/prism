@@ -10,16 +10,9 @@ use crate::tui_runtime::{RuntimeEvent, TerminalRuntime};
 use crate::view;
 
 use super::{
-    REMOTE_MUTATION_RECONCILIATION_KEY, TUI_ACTION_JOB_TIMEOUT, Tui, TuiJobKey, TuiJobKind,
-    TuiJobPayload, ctrl_key,
+    ctrl_key, Tui, TuiJobKey, TuiJobKind, TuiJobPayload, REMOTE_MUTATION_RECONCILIATION_KEY,
+    TUI_ACTION_JOB_TIMEOUT,
 };
-
-fn merge_is_authoritatively_pending(queue_state: &str) -> bool {
-    matches!(
-        queue_state.trim().to_ascii_lowercase().as_str(),
-        "queued" | "running" | "blocked"
-    )
-}
 
 fn current_unix_ms() -> u64 {
     std::time::SystemTime::now()
@@ -122,7 +115,15 @@ pub(crate) enum RemoteActionValue {
     WorktrunkUserConfig(crate::worktrunk::UserConfigLocation),
     ChangeRequests(Vec<PrSummary>),
     Cache(Box<PrCache>),
-    Resolved { cache: Box<PrCache>, count: usize },
+    Resolved {
+        cache: Box<PrCache>,
+        count: usize,
+    },
+    Merge {
+        cache: Box<PrCache>,
+        outcome: crate::workflow::standard_remote::TuiRemoteMergeOutcome,
+    },
+    MergeRejected(String),
     Complete,
 }
 
@@ -231,6 +232,10 @@ pub(super) fn uncertain_remote_mutation_error(
 ) -> Option<&str> {
     match result {
         Err(error) => Some(error),
+        Ok(RemoteActionValue::Merge {
+            outcome: crate::workflow::standard_remote::TuiRemoteMergeOutcome::Uncertain,
+            ..
+        }) => Some("provider accepted the merge request but its outcome is not authoritative"),
         Ok(_) => None,
     }
 }
@@ -463,8 +468,9 @@ impl Tui {
                 expected_head_sha,
             } => !summaries.iter().any(|summary| {
                 summary.change_request_identity.as_ref() == Some(change_request)
-                    && summary.head_sha == *expected_head_sha
-                    && (summary.merged || merge_is_authoritatively_pending(&summary.queue_state))
+                    && (summary.head_sha != *expected_head_sha
+                        || summary.merged
+                        || summary.merge_is_authoritatively_pending())
             }),
             RemoteMutationTarget::Review { .. } | RemoteMutationTarget::Resolve { .. } => true,
         });

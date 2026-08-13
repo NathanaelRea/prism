@@ -15,6 +15,38 @@ pub(crate) enum GitAction {
     ResolveAllComments,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GitActionExecution {
+    ProviderMerge,
+    Stabilize,
+}
+
+pub(crate) fn git_action_for_key(key: crate::input::Key) -> Option<GitAction> {
+    match key {
+        crate::input::Key::Merge => Some(GitAction::Merge),
+        crate::input::Key::CiFix => Some(GitAction::CiFix),
+        crate::input::Key::ReviewFix => Some(GitAction::ReviewFix),
+        _ => None,
+    }
+}
+
+pub(crate) fn git_action_execution(action: GitAction) -> GitActionExecution {
+    match action {
+        GitAction::Merge => GitActionExecution::ProviderMerge,
+        GitAction::CiFix | GitAction::ReviewFix => GitActionExecution::Stabilize,
+        _ => GitActionExecution::Stabilize,
+    }
+}
+
+pub(crate) fn git_action_error_title(action: GitAction) -> &'static str {
+    match action {
+        GitAction::Merge => "merge failed",
+        GitAction::CiFix => "CI repair workflow failed",
+        GitAction::ReviewFix => "review repair workflow failed",
+        _ => "Git action failed",
+    }
+}
+
 impl Tui {
     pub(super) fn git_action_enabled(&self, action: GitAction) -> bool {
         if action == GitAction::LazyGit {
@@ -175,5 +207,26 @@ impl Tui {
             ),
             None => view::KeyChoice::disabled("C", "open remote PR (adapter unavailable)"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_key_uses_provider_mutation_while_repairs_only_stabilize() {
+        assert_eq!(
+            git_action_execution(git_action_for_key(crate::input::Key::Merge).unwrap()),
+            GitActionExecution::ProviderMerge
+        );
+        assert_eq!(
+            git_action_execution(git_action_for_key(crate::input::Key::CiFix).unwrap()),
+            GitActionExecution::Stabilize
+        );
+        assert_eq!(
+            git_action_execution(git_action_for_key(crate::input::Key::ReviewFix).unwrap()),
+            GitActionExecution::Stabilize
+        );
     }
 }

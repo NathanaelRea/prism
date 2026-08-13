@@ -550,6 +550,15 @@ impl PrSummary {
         PrCheckState::from_label(&self.check_status)
     }
 
+    pub(crate) fn merge_is_authoritatively_pending(&self) -> bool {
+        crate::remote::native_queue_evidence_is_positive(&self.queue_state)
+            || self
+                .native_state_evidence
+                .queue
+                .iter()
+                .any(|state| crate::remote::native_queue_evidence_is_positive(state))
+    }
+
     pub(crate) fn provider_noun(&self) -> &'static str {
         match self
             .change_request_identity
@@ -633,6 +642,24 @@ impl WorkerPrCacheSnapshot {
 }
 
 impl PrCache {
+    pub(crate) fn apply_worker_summary(&mut self, summary: PrSummary) {
+        let association = PrDetailsAssociation::from_summary(&summary);
+        if self.details_association.as_ref() != Some(&association) {
+            self.details = None;
+            self.details_association = None;
+            self.details_quality = PrObservationQuality::Unknown;
+            self.details_errors.clear();
+            self.details_warnings.clear();
+        }
+        self.signature = Some(summary.signature());
+        self.summary = Some(summary);
+        self.summary_quality = PrObservationQuality::Fresh;
+        self.summary_error = None;
+        self.last_refreshed = Some(crate::util::timestamp_label());
+        self.summary_observed_in_process = true;
+        self.rebuild_error();
+    }
+
     pub(crate) fn apply_worker_snapshot(&mut self, snapshot: WorkerPrCacheSnapshot) {
         self.summary = snapshot.summary;
         self.details = snapshot.details;

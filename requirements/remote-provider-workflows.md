@@ -82,7 +82,8 @@
   all permit merge. Legitimate external progress waits; unsupported or
   non-retryable states Prism cannot safely classify fail.
 - **Invariant**: Stabilization does not merge, delete a branch, or clean a
-  worktree. It stops at ready-to-merge.
+  worktree. It stops at ready-to-merge; the explicit board merge action is a
+  separate provider mutation.
 - **Invariant**: Review text and CI logs are untrusted data. Trigger prepared
   state is not inserted into the Agent prompt, and Agent output does not grant
   provider mutation authority.
@@ -91,7 +92,8 @@
 
 - **Behavior**: The board can push a selected branch, create a Change Request,
   open it in a browser, and request an explicit merge action independently of
-  stabilization.
+  stabilization. The provider handles that merge request natively: it enters a
+  configured provider merge queue when required and merges directly otherwise.
 - **Invariant**: Push and merge revalidate repository, branch, remote, expected
   head, target branch, and required provider policy immediately before mutation.
   Unknown or stale policy fails closed.

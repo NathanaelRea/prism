@@ -46,6 +46,9 @@ use dialog::{
     toggle_item_in_place, toggle_ordered_item, update_create_session_variant_field,
 };
 pub(crate) use git_actions::GitAction;
+use git_actions::{
+    GitActionExecution, git_action_error_title, git_action_execution, git_action_for_key,
+};
 use job_orchestration::ShutdownReason;
 pub(crate) use job_orchestration::{TuiJobKey, TuiJobKind, TuiJobPayload};
 use job_protocol::pr_delivery_key;
@@ -864,31 +867,22 @@ impl Tui {
                         self.show_error("push failed", &error)?;
                     }
                 }
-                Key::Merge => {
+                Key::Merge | Key::CiFix | Key::ReviewFix => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    if self.git_action_enabled(GitAction::Merge)
-                        && let Err(error) = self.launch_stabilization_workflow(runtime)
-                    {
-                        self.show_error("merge workflow failed", &error)?;
-                    }
-                }
-                Key::CiFix => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if self.git_action_enabled(GitAction::CiFix)
-                        && let Err(error) = self.launch_stabilization_workflow(runtime)
-                    {
-                        self.show_error("CI repair workflow failed", &error)?;
-                    }
-                }
-                Key::ReviewFix => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if self.git_action_enabled(GitAction::ReviewFix)
-                        && let Err(error) = self.launch_stabilization_workflow(runtime)
-                    {
-                        self.show_error("review repair workflow failed", &error)?;
+                    let action = git_action_for_key(key).expect("matched Git action key");
+                    if self.git_action_enabled(action) {
+                        let result = match git_action_execution(action) {
+                            GitActionExecution::ProviderMerge => {
+                                self.merge_selected_change_request(runtime)
+                            }
+                            GitActionExecution::Stabilize => {
+                                self.launch_stabilization_workflow(runtime)
+                            }
+                        };
+                        if let Err(error) = result {
+                            self.show_error(git_action_error_title(action), &error)?;
+                        }
                     }
                 }
                 Key::ResolveAllComments => {

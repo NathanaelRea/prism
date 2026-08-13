@@ -192,6 +192,119 @@ impl Tui {
         self.queue_pr_persistence(session_index, false, true);
     }
 
+    pub(crate) fn merge_selected_change_request(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<(), String> {
+        let context = self
+            .selected_worktree_context()
+            .ok_or_else(|| "no worktree selected".to_string())?;
+        let selected = context.session_index;
+        let path = self.sessions[selected].path.clone();
+        let summary = self.sessions[selected]
+            .pr
+            .trusted_summary()?
+            .cloned()
+            .ok_or_else(|| "pull request summary is unavailable".to_string())?;
+        let change_request = summary
+            .change_request_identity
+            .clone()
+            .ok_or_else(|| "pull request identity is unavailable".to_string())?;
+        let expected_head_sha = summary.head_sha.clone();
+        if expected_head_sha.trim().is_empty() {
+            return Err("pull request head is unavailable".to_string());
+        }
+
+        let repo = context.repo;
+        let mut cache = self.sessions[selected].pr.clone();
+        let worktree = self.sessions[selected]
+            .identity_key(&self.repos[self.sessions[selected].repo_index].identity);
+        let generation = self
+            .worktree_generations
+            .get(&worktree)
+            .copied()
+            .unwrap_or_default();
+        let mutation = crate::tui::RemoteMutationTarget::Merge {
+            change_request: change_request.clone(),
+            expected_head_sha: expected_head_sha.clone(),
+        };
+        let result = self.run_remote_action(
+            raw,
+            crate::tui::RemoteActionRequest {
+                key: TuiJobKey::Worktree(worktree),
+                generation,
+                name: "prism-merge-change-request",
+                title: "Merge Pull Request",
+                message: "Requesting guarded merge from the provider",
+                abandon_cancelable: false,
+                mutation: Some(mutation),
+            },
+            move |context| {
+                let progress = context.clone();
+                let cancellation = context;
+                let result: crate::workflow::standard_remote::TuiRemoteMergeResult =
+                    crate::worker::mutate_remote_with_progress(
+                        &repo.root,
+                        &path,
+                        &format!("merge:{}:{}", summary.number, expected_head_sha),
+                        "tui.merge_change_request",
+                        &format!("{}#{}", path.display(), summary.number),
+                        crate::workflow::standard_remote::TuiRemoteMergePayload {
+                            repository: repo.root.clone(),
+                            worktree: path.clone(),
+                            change_request,
+                            display_number: summary.number,
+                            expected_head_sha,
+                        },
+                        crate::worker::RemoteRequestProgress::new(
+                            move |wait| report_remote_wait(&progress, wait),
+                            move || cancellation.is_canceled(),
+                        ),
+                    )?;
+                match result {
+                    crate::workflow::standard_remote::TuiRemoteMergeResult::Accepted {
+                        outcome,
+                        summary,
+                    } => {
+                        cache.apply_worker_summary(*summary);
+                        if outcome
+                            == crate::workflow::standard_remote::TuiRemoteMergeOutcome::Uncertain
+                        {
+                            cache.require_reconciliation(
+                                "provider merge outcome is uncertain; authoritative re-observation required",
+                            );
+                        }
+                        Ok(RemoteActionValue::Merge {
+                            cache: Box::new(cache),
+                            outcome,
+                        })
+                    }
+                    crate::workflow::standard_remote::TuiRemoteMergeResult::Rejected { reason } => {
+                        Ok(RemoteActionValue::MergeRejected(reason))
+                    }
+                }
+            },
+        )?;
+        let (cache, outcome) = match result {
+            RemoteActionValue::Merge { cache, outcome } => (cache, outcome),
+            RemoteActionValue::MergeRejected(reason) => return Err(reason),
+            _ => return Err("merge returned an unexpected result".to_string()),
+        };
+        self.apply_remote_cache_result(selected, *cache);
+        match outcome {
+            crate::workflow::standard_remote::TuiRemoteMergeOutcome::Merged => {
+                self.show_message("pull request merged")
+            }
+            crate::workflow::standard_remote::TuiRemoteMergeOutcome::Pending => {
+                self.show_message("pull request accepted by the provider and is pending merge")
+            }
+            crate::workflow::standard_remote::TuiRemoteMergeOutcome::Uncertain => Err(
+                "provider merge outcome is uncertain; authoritative re-observation required"
+                    .to_string(),
+            ),
+        }
+    }
+
     pub(crate) fn push_selected_branch(
         &mut self,
         raw: &mut crate::tui_runtime::TerminalRuntime,
