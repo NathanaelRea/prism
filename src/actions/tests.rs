@@ -15,8 +15,9 @@ use crate::tui::{
 use super::worktrees::development_url_opened_message;
 use super::{
     apply_bulk_review_resolution, archived_picker_overflow_message, discover_wt_columns,
-    open_http_url_in_browser, remote_pr_choice_keys, remote_pr_worktree_branch, run_browser_opener,
-    status_label_with_behind, unresolved_review_thread_ids, worktree_column_choices,
+    open_http_url_in_browser, pr_target_choice_list, remote_create_mutation_target,
+    remote_pr_choice_keys, remote_pr_worktree_branch, run_browser_opener, status_label_with_behind,
+    unresolved_review_thread_ids, worktree_column_choices,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -222,6 +223,50 @@ fn remote_pr_picker_uses_stable_keys_and_preserves_branch_names() {
         remote_pr_worktree_branch("feature/exact-name"),
         "feature/exact-name"
     );
+}
+
+#[test]
+fn push_without_change_request_prepares_create_target_and_dialog() {
+    let source = crate::remote::RemoteRepositoryId::new(
+        crate::remote::ProviderKind::GitHub,
+        crate::remote::HostIdentity::new("github.com", None).unwrap(),
+        "contributor/repo",
+    )
+    .unwrap();
+    let target = crate::remote::RemoteRepositoryId::new(
+        crate::remote::ProviderKind::GitHub,
+        crate::remote::HostIdentity::new("github.com", None).unwrap(),
+        "upstream/repo",
+    )
+    .unwrap();
+    let preparation = crate::workflow::standard_remote::TuiRemoteCreatePreparation {
+        source_push: crate::remote::dispatcher::PushGuard {
+            repository: source,
+            remote: "origin".into(),
+            remote_branch: "feature".into(),
+            local_branch: "feature".into(),
+            expected_head_sha: "abc123".into(),
+            set_upstream: true,
+        },
+        origin_repository: target.clone(),
+        upstream_repository: None,
+    };
+
+    let mutation = remote_create_mutation_target(&preparation, &target, "main");
+    assert!(matches!(
+        mutation,
+        crate::tui::RemoteMutationTarget::Create {
+            source_branch,
+            expected_head_sha,
+            target_branch,
+            ..
+        } if source_branch == "feature"
+            && expected_head_sha == "abc123"
+            && target_branch == "main"
+    ));
+    let choices = pr_target_choice_list("origin/repo", "upstream/repo");
+    assert_eq!(choices.choices[0].key, "u");
+    assert_eq!(choices.choices[1].key, "o");
 }
 
 #[test]

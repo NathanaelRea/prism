@@ -57,8 +57,9 @@ use crate::worktrunk::discover_columns as discover_wt_columns;
 use polling::status_label_with_behind;
 #[cfg(test)]
 use pull_requests::{
-    apply_bulk_review_resolution, open_http_url_in_browser, remote_pr_choice_keys,
-    remote_pr_worktree_branch, run_browser_opener, unresolved_review_thread_ids,
+    apply_bulk_review_resolution, open_http_url_in_browser, pr_target_choice_list,
+    remote_create_mutation_target, remote_pr_choice_keys, remote_pr_worktree_branch,
+    run_browser_opener, unresolved_review_thread_ids,
 };
 #[cfg(test)]
 use repositories::worktree_column_choices;
