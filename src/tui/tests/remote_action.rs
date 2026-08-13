@@ -8,9 +8,9 @@ use crate::remote::{PrCache, PrDetails, PrReview, PrReviewComment};
 use crate::repo::Repository;
 
 use super::super::{
-    remote_action_abandon_requested, remote_action_timeout, remote_mutation_targets_overlap,
     RemoteActionDelivery, RemoteActionReconciliationContext, RemoteActionValue,
     RemoteMutationTarget, Tui, TuiJobKey, TuiJobKind, TuiJobPayload,
+    remote_action_abandon_requested, remote_action_timeout, remote_mutation_targets_overlap,
 };
 use super::support::{
     test_change_request_identity, test_config, test_pr_summary, test_session, test_tui,
@@ -191,9 +191,10 @@ fn reconciliation_clears_only_markers_with_matched_authoritative_evidence() {
         &repository,
         &PrCache::observed(pending_merge, Some(details)),
     );
-    assert!(!tui
-        .remote_mutations_requiring_reconciliation
-        .contains_key(&repository.root));
+    assert!(
+        !tui.remote_mutations_requiring_reconciliation
+            .contains_key(&repository.root)
+    );
     fs::remove_dir_all(temp).unwrap();
 }
 
@@ -414,8 +415,10 @@ fn uncertain_merge_result_requires_authoritative_reconciliation() {
         cache: Box::new(cache),
         outcome: crate::workflow::standard_remote::TuiRemoteMergeOutcome::Uncertain,
     });
-    assert!(super::super::uncertain_remote_mutation_error(&result)
-        .is_some_and(|error| error.contains("not authoritative")));
+    assert!(
+        super::super::uncertain_remote_mutation_error(&result)
+            .is_some_and(|error| error.contains("not authoritative"))
+    );
 
     for outcome in [
         crate::workflow::standard_remote::TuiRemoteMergeOutcome::Merged,

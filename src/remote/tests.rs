@@ -162,17 +162,21 @@ fn temporary_file_cache_interface_rejects_malformed_json() {
 
     let loaded = super::store::load_pr_cache(&repo, "topic");
     assert!(loaded.summary().is_none());
-    assert!(loaded
-        .display_error()
-        .is_some_and(|error| error.contains("decode pr_details_cache.comments")));
+    assert!(
+        loaded
+            .display_error()
+            .is_some_and(|error| error.contains("decode pr_details_cache.comments"))
+    );
 
     details.comments = "[]".to_string();
     details.pr_number = -1;
     crate::persistence::remote::save_details(&path, &details, 2).unwrap();
     let loaded = super::store::load_pr_cache(&repo, "topic");
-    assert!(loaded
-        .display_error()
-        .is_some_and(|error| error.contains("pr_details_cache.pr_number: -1")));
+    assert!(
+        loaded
+            .display_error()
+            .is_some_and(|error| error.contains("pr_details_cache.pr_number: -1"))
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -737,13 +741,15 @@ fn explicit_profile_ports_and_credential_names_remain_configuration_not_secrets(
         profile.credential_environment.as_deref(),
         Some("FORGEJO_TOKEN")
     );
-    assert!(HostProfile::new(
-        HostIdentity::new("forge.example", None).unwrap(),
-        ProviderKind::Forgejo
-    )
-    .unwrap()
-    .with_credential_environment("not-a-variable")
-    .is_err());
+    assert!(
+        HostProfile::new(
+            HostIdentity::new("forge.example", None).unwrap(),
+            ProviderKind::Forgejo
+        )
+        .unwrap()
+        .with_credential_environment("not-a-variable")
+        .is_err()
+    );
 }
 
 #[test]

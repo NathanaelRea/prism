@@ -10,8 +10,8 @@ use crate::tui_runtime::{RuntimeEvent, TerminalRuntime};
 use crate::view;
 
 use super::{
-    ctrl_key, Tui, TuiJobKey, TuiJobKind, TuiJobPayload, REMOTE_MUTATION_RECONCILIATION_KEY,
-    TUI_ACTION_JOB_TIMEOUT,
+    REMOTE_MUTATION_RECONCILIATION_KEY, TUI_ACTION_JOB_TIMEOUT, Tui, TuiJobKey, TuiJobKind,
+    TuiJobPayload, ctrl_key,
 };
 
 fn current_unix_ms() -> u64 {
