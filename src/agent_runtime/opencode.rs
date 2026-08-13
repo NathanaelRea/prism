@@ -683,6 +683,7 @@ pub fn submit_prompt(server_url: &str, session_id: &str, prompt: &str) -> Result
         session_id,
         prompt,
         directory.as_deref().map(Path::new),
+        crate::harness::AgentSelection::default(),
     )
 }
 
@@ -692,7 +693,23 @@ pub(crate) fn submit_prompt_for_worktree(
     prompt: &str,
     worktree: &Path,
 ) -> Result<(), String> {
-    submit_prompt_in_directory(server_url, session_id, prompt, Some(worktree))
+    submit_prompt_for_worktree_with_selection(
+        server_url,
+        session_id,
+        prompt,
+        worktree,
+        crate::harness::AgentSelection::default(),
+    )
+}
+
+pub(crate) fn submit_prompt_for_worktree_with_selection(
+    server_url: &str,
+    session_id: &str,
+    prompt: &str,
+    worktree: &Path,
+    selection: crate::harness::AgentSelection<'_>,
+) -> Result<(), String> {
+    submit_prompt_in_directory(server_url, session_id, prompt, Some(worktree), selection)
 }
 
 fn submit_prompt_in_directory(
@@ -700,8 +717,9 @@ fn submit_prompt_in_directory(
     session_id: &str,
     prompt: &str,
     directory: Option<&Path>,
+    selection: crate::harness::AgentSelection<'_>,
 ) -> Result<(), String> {
-    let body = prompt_async_body(prompt);
+    let body = prompt_async_body(prompt, selection)?;
     let path = request_path(
         &format!("/session/{}/prompt_async", url_path_segment(session_id)),
         directory,
@@ -1658,11 +1676,33 @@ fn parse_event_payload_classified(
     .then_some((event, snapshot_facet))
 }
 
-fn prompt_async_body(prompt: &str) -> String {
-    format!(
-        r#"{{"parts":[{{"type":"text","text":"{}"}}]}}"#,
+fn prompt_async_body(
+    prompt: &str,
+    selection: crate::harness::AgentSelection<'_>,
+) -> Result<String, String> {
+    let mut fields = vec![format!(
+        r#""parts":[{{"type":"text","text":"{}"}}]"#,
         json_escape(prompt)
-    )
+    )];
+    if let Some(model) = selection.model {
+        let (provider_id, model_id) = model
+            .split_once('/')
+            .ok_or_else(|| format!("OpenCode model '{model}' must use provider/model format"))?;
+        if provider_id.is_empty() || model_id.is_empty() {
+            return Err(format!(
+                "OpenCode model '{model}' must use provider/model format"
+            ));
+        }
+        fields.push(format!(
+            r#""model":{{"providerID":"{}","modelID":"{}"}}"#,
+            json_escape(provider_id),
+            json_escape(model_id)
+        ));
+    }
+    if let Some(variant) = selection.variant {
+        fields.push(format!(r#""variant":"{}""#, json_escape(variant)));
+    }
+    Ok(format!("{{{}}}", fields.join(",")))
 }
 
 #[derive(Default)]
@@ -3774,10 +3814,43 @@ mod tests {
     }
 
     #[test]
-    fn async_prompt_body_escapes_text() {
+    fn async_prompt_body_escapes_text_and_includes_agent_selection() {
         assert_eq!(
-            prompt_async_body("  hello world\n\"quotes\" and $PATH && true\n--leading-dash"),
+            prompt_async_body(
+                "  hello world\n\"quotes\" and $PATH && true\n--leading-dash",
+                crate::harness::AgentSelection::default(),
+            )
+            .unwrap(),
             r#"{"parts":[{"type":"text","text":"  hello world\n\"quotes\" and $PATH && true\n--leading-dash"}]}"#
+        );
+        let body = prompt_async_body(
+            "build it",
+            crate::harness::AgentSelection {
+                model: Some("provider/model/with/slashes"),
+                variant: Some("high"),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({
+                "parts": [{"type": "text", "text": "build it"}],
+                "model": {
+                    "providerID": "provider",
+                    "modelID": "model/with/slashes",
+                },
+                "variant": "high",
+            })
+        );
+        assert!(
+            prompt_async_body(
+                "build it",
+                crate::harness::AgentSelection {
+                    model: Some("malformed"),
+                    variant: None,
+                },
+            )
+            .is_err()
         );
     }
 

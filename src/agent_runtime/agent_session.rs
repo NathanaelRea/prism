@@ -342,14 +342,16 @@ pub(crate) async fn retire_generation(
     let _ = tmux::kill_agent_session(repo, config, branch, generation).await;
 }
 
-pub(crate) async fn submit_prompt(
+pub(crate) async fn submit_prompt_with_selection(
     repo: &Repository,
     config: &crate::config::Config,
     session: &Session,
     generation: u64,
     prompt: &str,
+    selection: crate::harness::AgentSelection<'_>,
 ) -> Result<bool, String> {
-    tmux::paste_agent_prompt(repo, config, session, generation, prompt).await?;
+    tmux::paste_agent_prompt_with_selection(repo, config, session, generation, prompt, selection)
+        .await?;
     Ok(tmux::agent_session_running(repo, config, session, generation).await)
 }
 

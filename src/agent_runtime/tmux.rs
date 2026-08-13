@@ -169,8 +169,7 @@ async fn ensure_tmux_agent_session(
                 session,
                 runtime_session,
                 runtime.as_ref(),
-                None,
-                None,
+                InteractiveAgentLaunch::default(),
             )
             .await?;
             ensure_companion_windows(config, session, runtime_session).await?;
@@ -200,8 +199,7 @@ async fn ensure_tmux_agent_session(
         session,
         runtime_session,
         runtime.as_ref(),
-        None,
-        None,
+        InteractiveAgentLaunch::default(),
     )
     .await?;
     ensure_companion_windows(config, session, runtime_session).await?;
@@ -215,6 +213,25 @@ pub async fn paste_agent_prompt(
     generation: u64,
     prompt: &str,
 ) -> Result<(), String> {
+    paste_agent_prompt_with_selection(
+        repo,
+        config,
+        session,
+        generation,
+        prompt,
+        crate::harness::AgentSelection::default(),
+    )
+    .await
+}
+
+pub async fn paste_agent_prompt_with_selection(
+    repo: &Repository,
+    config: &Config,
+    session: &Session,
+    generation: u64,
+    prompt: &str,
+    selection: crate::harness::AgentSelection<'_>,
+) -> Result<(), String> {
     let runtime_session = TmuxAgentSession::for_worktree_session(repo, &session.branch, generation);
     if selected_adapter_is(config, "opencode") && !config.is_default_branch(&session.branch) {
         let harness_config = config.harness_config(&config.default_harness)?;
@@ -227,17 +244,24 @@ pub async fn paste_agent_prompt(
             .as_deref()
             .ok_or_else(|| "OpenCode session ID is not available".to_string())?;
         ensure_agent_session(repo, config, session, generation).await?;
-        return crate::opencode::submit_prompt_for_worktree(
+        return crate::opencode::submit_prompt_for_worktree_with_selection(
             &runtime.server_url,
             session_id,
             prompt,
             &session.path,
+            selection,
         )
         .map_err(|error| format!("submit prompt through harness protocol: {error}"));
     }
     if uses_legacy_agent_override(config)
         || (selected_adapter_is(config, "opencode") && config.is_default_branch(&session.branch))
     {
+        if selection != crate::harness::AgentSelection::default() {
+            return Err(format!(
+                "harness '{}' cannot apply model or variant overrides when pasting into an existing interactive session",
+                config.default_harness
+            ));
+        }
         if !ensure_agent_session(repo, config, session, generation).await? {
             return Err("agent session did not become ready".to_string());
         }
@@ -259,8 +283,11 @@ pub async fn paste_agent_prompt(
         session,
         &runtime_session,
         runtime.as_ref(),
-        Some(prompt),
-        None,
+        InteractiveAgentLaunch {
+            prompt: Some(prompt),
+            resume_session_id: None,
+            selection,
+        },
     )
     .await?;
     configure_agent_session(config, runtime_session.name(), runtime.as_ref()).await?;
@@ -555,16 +582,30 @@ async fn attach_target(
     run_status_attached_named(command, descriptor).await
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct InteractiveAgentLaunch<'a> {
+    prompt: Option<&'a str>,
+    resume_session_id: Option<&'a str>,
+    selection: crate::harness::AgentSelection<'a>,
+}
+
 async fn create_detached_agent_session(
     repo: &Repository,
     config: &Config,
     session: &Session,
     runtime_session: &TmuxAgentSession,
     runtime: Option<&OpencodeRuntime>,
-    prompt: Option<&str>,
-    resume_session_id: Option<&str>,
+    launch: InteractiveAgentLaunch<'_>,
 ) -> Result<(), String> {
-    let command = agent_shell_command(repo, config, session, runtime, prompt, resume_session_id)?;
+    let command = agent_shell_command(
+        repo,
+        config,
+        session,
+        runtime,
+        launch.prompt,
+        launch.resume_session_id,
+        launch.selection,
+    )?;
     run_tmux_daemonizing_status(
         Command::new(config.tool("tmux"))
             .env_remove("TMUX")
@@ -595,8 +636,11 @@ pub async fn attach_resumable_harness_session(
         session,
         &runtime_session,
         None,
-        None,
-        Some(session_id),
+        InteractiveAgentLaunch {
+            prompt: None,
+            resume_session_id: Some(session_id),
+            selection: crate::harness::AgentSelection::default(),
+        },
     )
     .await?;
     configure_agent_session(config, runtime_session.name(), None).await?;
@@ -610,20 +654,11 @@ async fn create_configured_agent_session(
     session: &Session,
     runtime_session: &TmuxAgentSession,
     runtime: Option<&OpencodeRuntime>,
-    prompt: Option<&str>,
-    resume_session_id: Option<&str>,
+    launch: InteractiveAgentLaunch<'_>,
 ) -> Result<(), String> {
     for _ in 0..2 {
-        create_detached_agent_session(
-            repo,
-            config,
-            session,
-            runtime_session,
-            runtime,
-            prompt,
-            resume_session_id,
-        )
-        .await?;
+        create_detached_agent_session(repo, config, session, runtime_session, runtime, launch)
+            .await?;
         if configure_agent_session(config, runtime_session.name(), runtime).await? {
             return Ok(());
         }
@@ -1042,9 +1077,17 @@ fn agent_shell_command(
     runtime: Option<&OpencodeRuntime>,
     prompt: Option<&str>,
     resume_session_id: Option<&str>,
+    selection: crate::harness::AgentSelection<'_>,
 ) -> Result<String, String> {
-    let invocation =
-        interactive_agent_invocation(repo, config, session, runtime, prompt, resume_session_id)?;
+    let invocation = interactive_agent_invocation(
+        repo,
+        config,
+        session,
+        runtime,
+        prompt,
+        resume_session_id,
+        selection,
+    )?;
     let argv = invocation.argv;
     if argv.is_empty() {
         return Err(format!(
@@ -1073,6 +1116,7 @@ fn interactive_agent_invocation(
     runtime: Option<&OpencodeRuntime>,
     prompt: Option<&str>,
     resume_session_id: Option<&str>,
+    selection: crate::harness::AgentSelection<'_>,
 ) -> Result<crate::harness::Invocation, String> {
     if uses_legacy_agent_override(config) {
         let argv = split_command_words(&config.agent_command(&config.default_agent));
@@ -1097,16 +1141,18 @@ fn interactive_agent_invocation(
             .flatten()
     });
     let harness_config = config.harness_config(&config.default_harness)?;
-    crate::harness::Harness::new(&config.default_harness, &harness_config).interactive_argv(
-        prompt,
-        runtime.as_ref().map(|runtime| runtime.server_url.as_str()),
-        resume_session_id.or_else(|| {
-            runtime
-                .as_ref()
-                .and_then(|runtime| runtime.opencode_session_id.as_deref())
-        }),
-        &session.path,
-    )
+    crate::harness::Harness::new(&config.default_harness, &harness_config)
+        .interactive_argv_with_model(
+            prompt,
+            runtime.as_ref().map(|runtime| runtime.server_url.as_str()),
+            resume_session_id.or_else(|| {
+                runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.opencode_session_id.as_deref())
+            }),
+            &session.path,
+            selection,
+        )
 }
 
 async fn opencode_runtime_for_session(
@@ -1323,10 +1369,11 @@ mod tests {
     use crate::session::Session;
 
     use super::{
-        TmuxAgentSession, TmuxWindow, attach_or_create_agent, attach_or_create_window,
-        capture_agent_pane, create_configured_agent_session, ensure_agent_session,
-        latest_agent_session_generation, migrate_legacy_agent_sessions, pane_command_matches_agent,
-        pane_start_command_matches_agent, paste_agent_prompt, session_exists,
+        InteractiveAgentLaunch, TmuxAgentSession, TmuxWindow, attach_or_create_agent,
+        attach_or_create_window, capture_agent_pane, create_configured_agent_session,
+        ensure_agent_session, latest_agent_session_generation, migrate_legacy_agent_sessions,
+        pane_command_matches_agent, pane_start_command_matches_agent, paste_agent_prompt,
+        session_exists,
     };
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1393,8 +1440,16 @@ mod tests {
         };
         let session = test_session(unique_temp_dir("prism-tmux-placeholder-test"), "feature");
 
-        let error =
-            super::agent_shell_command(&repo, &config, &session, None, None, None).unwrap_err();
+        let error = super::agent_shell_command(
+            &repo,
+            &config,
+            &session,
+            None,
+            None,
+            None,
+            crate::harness::AgentSelection::default(),
+        )
+        .unwrap_err();
 
         assert!(error.contains("prompt placeholder"));
     }
@@ -2447,8 +2502,7 @@ exit 0
             &session,
             &runtime_session,
             None,
-            None,
-            None,
+            InteractiveAgentLaunch::default(),
         )
         .await;
 

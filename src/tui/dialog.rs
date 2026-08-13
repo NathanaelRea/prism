@@ -121,6 +121,86 @@ fn cycle_enum_field(value: &mut String, options: &[String], forward: bool) {
     *value = options[next].clone();
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CreateSessionInput {
+    pub initial_prompt: String,
+    pub model: Option<String>,
+    pub variant: Option<String>,
+}
+
+fn default_option(options: &[String]) -> Vec<String> {
+    std::iter::once("Harness default".to_string())
+        .chain(options.iter().cloned())
+        .collect()
+}
+
+pub(super) fn create_session_fields(
+    options: &crate::harness::AgentSelectionOptions,
+) -> Vec<view::FormField> {
+    vec![
+        view::FormField {
+            name: "Initial prompt".into(),
+            value: String::new(),
+            description: Some("Optional. Enter adds a line; Tab moves to model.".into()),
+            constraint: None,
+            required: false,
+            kind: view::FormFieldKind::TextArea { height: 6 },
+        },
+        view::FormField {
+            name: "Model".into(),
+            value: "Harness default".into(),
+            description: Some("Models reported by the selected harness, when available.".into()),
+            constraint: Some(format!("{} available", options.models.len())),
+            required: false,
+            kind: view::FormFieldKind::Enum {
+                options: default_option(
+                    &options
+                        .models
+                        .iter()
+                        .map(|model| model.id.clone())
+                        .collect::<Vec<_>>(),
+                ),
+            },
+        },
+        view::FormField {
+            name: "Variant / thinking".into(),
+            value: "Harness default".into(),
+            description: Some("Reasoning level or model variant for the initial turn.".into()),
+            constraint: Some(format!("{} available", options.variants.len())),
+            required: false,
+            kind: view::FormFieldKind::Enum {
+                options: default_option(&options.variants),
+            },
+        },
+    ]
+}
+
+fn optional_selection(value: &str) -> Option<String> {
+    (value != "Harness default" && !value.trim().is_empty()).then(|| value.to_string())
+}
+
+fn model_variants(options: &crate::harness::AgentSelectionOptions, model: &str) -> Vec<String> {
+    let variants = options
+        .models
+        .iter()
+        .find(|option| option.id == model)
+        .map(|option| option.variants.as_slice())
+        .unwrap_or(&options.variants);
+    default_option(variants)
+}
+
+pub(super) fn update_create_session_variant_field(
+    fields: &mut [view::FormField],
+    options: &crate::harness::AgentSelectionOptions,
+) {
+    let variants = model_variants(options, &fields[1].value);
+    if !variants.contains(&fields[2].value) {
+        fields[2].value = "Harness default".into();
+    }
+    fields[2].constraint = Some(format!("{} available", variants.len().saturating_sub(1)));
+    fields[2].kind = view::FormFieldKind::Enum { options: variants };
+}
+
 fn validate_workflow_form(
     workflow: &crate::CompiledWorkflow,
     worktree: &Path,
@@ -470,6 +550,184 @@ impl Tui {
         }
     }
 
+    pub(crate) fn prompt_create_session_form(
+        &mut self,
+        runtime: &mut TerminalRuntime,
+        catalog: &crate::harness::AgentSelectionOptions,
+    ) -> Result<Option<CreateSessionInput>, String> {
+        let mut fields = create_session_fields(catalog);
+        update_create_session_variant_field(&mut fields, catalog);
+        let mut selected = 0usize;
+        let mut dropdown = None;
+        let mut error = None;
+        loop {
+            self.dialog = Some(view::DialogModel::Form {
+                title: "Create Session".into(),
+                instructions: "Configure the first Agent turn".into(),
+                submit_label: "Create Session".into(),
+                fields: fields.clone(),
+                selected,
+                dropdown,
+                error: error.clone(),
+            });
+            self.draw(runtime)?;
+            if self.tick_tui_action_jobs().any() {
+                self.draw(runtime)?;
+            }
+            let Some(event) = runtime.poll_event(Duration::from_millis(100))? else {
+                continue;
+            };
+            let RuntimeEvent::Key(event) = event else {
+                continue;
+            };
+            if event.kind != KeyEventKind::Press {
+                continue;
+            }
+            error = None;
+
+            if let Some(mut menu) = dropdown {
+                let Some(view::FormField {
+                    kind: view::FormFieldKind::Enum { options },
+                    ..
+                }) = fields.get_mut(selected)
+                else {
+                    dropdown = None;
+                    continue;
+                };
+                match event.code {
+                    KeyCode::Esc => dropdown = None,
+                    KeyCode::Enter if plain_key(event) => {
+                        if let Some(value) = options.get(menu.selected) {
+                            fields[selected].value = value.clone();
+                        }
+                        dropdown = None;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') if plain_key(event) => {
+                        menu.selected = menu.selected.saturating_sub(1);
+                        dropdown = Some(menu);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') if plain_key(event) => {
+                        menu.selected = menu
+                            .selected
+                            .saturating_add(1)
+                            .min(options.len().saturating_sub(1));
+                        dropdown = Some(menu);
+                    }
+                    KeyCode::Home if plain_key(event) => {
+                        menu.selected = 0;
+                        dropdown = Some(menu);
+                    }
+                    KeyCode::End if plain_key(event) => {
+                        menu.selected = options.len().saturating_sub(1);
+                        dropdown = Some(menu);
+                    }
+                    KeyCode::Char('c') if ctrl_key(event) => {
+                        self.dialog = None;
+                        self.draw(runtime)?;
+                        return Ok(None);
+                    }
+                    _ => dropdown = Some(menu),
+                }
+                if dropdown.is_none() && selected == 1 {
+                    update_create_session_variant_field(&mut fields, catalog);
+                }
+                continue;
+            }
+
+            let field_kind = fields.get(selected).map(|field| field.kind.clone());
+            match event.code {
+                KeyCode::Esc | KeyCode::Char('c')
+                    if event.code == KeyCode::Esc || ctrl_key(event) =>
+                {
+                    self.dialog = None;
+                    self.draw(runtime)?;
+                    return Ok(None);
+                }
+                KeyCode::Tab | KeyCode::Down if plain_key(event) => {
+                    selected = selected.saturating_add(1).min(fields.len());
+                }
+                KeyCode::BackTab | KeyCode::Up if plain_key(event) => {
+                    selected = selected.saturating_sub(1);
+                }
+                KeyCode::Enter if plain_key(event) && selected == fields.len() => {
+                    let model = optional_selection(&fields[1].value);
+                    let variant = optional_selection(&fields[2].value);
+                    if fields[0].value.trim().is_empty() && (model.is_some() || variant.is_some()) {
+                        selected = 0;
+                        error = Some(
+                            "model and variant selections require an initial prompt".to_string(),
+                        );
+                    } else {
+                        self.dialog = None;
+                        self.draw(runtime)?;
+                        return Ok(Some(CreateSessionInput {
+                            initial_prompt: fields[0].value.clone(),
+                            model,
+                            variant,
+                        }));
+                    }
+                }
+                KeyCode::Enter if plain_key(event) => match field_kind {
+                    Some(view::FormFieldKind::TextArea { .. }) => {
+                        fields[selected].value.push('\n');
+                    }
+                    Some(view::FormFieldKind::Enum { ref options }) => {
+                        dropdown = Some(view::FormDropdown {
+                            selected: selected_option(options, &fields[selected].value),
+                        });
+                    }
+                    _ => {}
+                },
+                KeyCode::Char(' ') if plain_key(event) => match field_kind {
+                    Some(view::FormFieldKind::Enum { ref options }) => {
+                        dropdown = Some(view::FormDropdown {
+                            selected: selected_option(options, &fields[selected].value),
+                        });
+                    }
+                    Some(view::FormFieldKind::TextArea { .. }) => {
+                        fields[selected].value.push(' ');
+                    }
+                    _ => {}
+                },
+                KeyCode::Left | KeyCode::Right if plain_key(event) => {
+                    if let Some(view::FormFieldKind::Enum {
+                        options: ref field_options,
+                    }) = field_kind
+                    {
+                        cycle_enum_field(
+                            &mut fields[selected].value,
+                            field_options,
+                            event.code == KeyCode::Right,
+                        );
+                        if selected == 1 {
+                            update_create_session_variant_field(&mut fields, catalog);
+                        }
+                    }
+                }
+                KeyCode::Backspace if plain_key(event) => {
+                    if let Some(field) = fields.get_mut(selected)
+                        && matches!(field.kind, view::FormFieldKind::TextArea { .. })
+                    {
+                        field.value.pop();
+                    }
+                }
+                KeyCode::Delete if plain_key(event) => {
+                    if let Some(field) = fields.get_mut(selected) {
+                        field.value.clear();
+                    }
+                }
+                KeyCode::Char(ch) if plain_key(event) && !ch.is_control() => {
+                    if let Some(field) = fields.get_mut(selected)
+                        && matches!(field.kind, view::FormFieldKind::TextArea { .. })
+                    {
+                        field.value.push(ch);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     pub(crate) async fn prompt_workflow_input_form(
         &mut self,
         runtime: &mut TerminalRuntime,
@@ -531,6 +789,8 @@ impl Tui {
         loop {
             self.dialog = Some(view::DialogModel::Form {
                 title: format!("Run {}", workflow.name),
+                instructions: "Complete the Workflow inputs".to_string(),
+                submit_label: "Launch Workflow".to_string(),
                 fields: fields.clone(),
                 selected,
                 dropdown,
@@ -629,6 +889,9 @@ impl Tui {
                     Some(view::FormFieldKind::String | view::FormFieldKind::Number) => {
                         selected = selected.saturating_add(1).min(fields.len());
                     }
+                    Some(view::FormFieldKind::TextArea { .. }) => {
+                        fields[selected].value.push('\n');
+                    }
                     Some(view::FormFieldKind::Bool) => {
                         toggle_bool_field(&mut fields[selected].value);
                     }
@@ -678,7 +941,9 @@ impl Tui {
                             Err(problem) => error = Some(problem),
                         }
                     }
-                    Some(view::FormFieldKind::String) => fields[selected].value.push(' '),
+                    Some(view::FormFieldKind::String | view::FormFieldKind::TextArea { .. }) => {
+                        fields[selected].value.push(' ')
+                    }
                     _ => {}
                 },
                 KeyCode::Left | KeyCode::Right if plain_key(event) => match field_kind {
@@ -701,7 +966,9 @@ impl Tui {
                 KeyCode::Backspace if plain_key(event) => {
                     if let Some(field) = fields.get_mut(selected) {
                         match field.kind {
-                            view::FormFieldKind::String | view::FormFieldKind::Number => {
+                            view::FormFieldKind::String
+                            | view::FormFieldKind::TextArea { .. }
+                            | view::FormFieldKind::Number => {
                                 field.value.pop();
                             }
                             view::FormFieldKind::File { .. } => field.value.clear(),
@@ -718,7 +985,9 @@ impl Tui {
                     if let Some(field) = fields.get_mut(selected)
                         && matches!(
                             field.kind,
-                            view::FormFieldKind::String | view::FormFieldKind::Number
+                            view::FormFieldKind::String
+                                | view::FormFieldKind::TextArea { .. }
+                                | view::FormFieldKind::Number
                         )
                     {
                         field.value.push(ch);
