@@ -407,6 +407,15 @@ fn execute_blocking(
                 current.set_upstream,
             )
             .map_err(classify_failure)?;
+            let pushed = crate::remote::dispatcher::prepare_push(
+                &payload.worktree,
+                &config,
+                &payload.branch,
+            )
+            .map_err(classify_failure)?;
+            if !crate::remote::dispatcher::same_push_target(&current, &pushed) {
+                return Err(permanent("push destination changed while pushing".into()));
+            }
             let mut cache = crate::remote::load_pr_cache(&repository, &payload.branch);
             crate::remote::dispatcher::refresh_change_request_cache(
                 &repository,
@@ -414,7 +423,72 @@ fn execute_blocking(
                 &mut cache,
                 &payload.worktree,
                 &config,
-                true,
+                false,
+            )
+            .map_err(classify_failure)?;
+            let create = if cache.has_summary() {
+                None
+            } else {
+                let (origin_repository, upstream_repository) =
+                    crate::remote::dispatcher::create_change_request_targets(
+                        &payload.worktree,
+                        &config,
+                    )
+                    .map_err(classify_failure)?;
+                Some(TuiRemoteCreatePreparation {
+                    source_push: pushed,
+                    origin_repository,
+                    upstream_repository,
+                })
+            };
+            output(
+                TuiRemotePushResult {
+                    cache: crate::remote::WorkerPrCacheSnapshot::capture(&cache),
+                    create,
+                },
+                "mutation",
+            )
+        }
+        CoordinatedRemoteOperation::Mutate(request)
+            if request.operation == "tui.create_change_request" =>
+        {
+            let payload: TuiRemoteCreatePayload = serde_json::from_value(request.payload)
+                .map_err(|error| permanent(format!("invalid TUI create request: {error}")))?;
+            let repository = crate::repo::Repository {
+                root: payload.repository,
+            };
+            let config = crate::config::Config::load(&repository);
+            let mut cache = crate::remote::load_pr_cache(&repository, &payload.branch);
+            crate::remote::dispatcher::refresh_change_request_cache(
+                &repository,
+                &payload.branch,
+                &mut cache,
+                &payload.worktree,
+                &config,
+                false,
+            )
+            .map_err(classify_failure)?;
+            if cache.has_summary() {
+                return output(
+                    crate::remote::WorkerPrCacheSnapshot::capture(&cache),
+                    "mutation",
+                );
+            }
+            let guard = crate::remote::dispatcher::prepare_create_change_request(
+                &payload.worktree,
+                &config,
+                &payload.branch,
+                &payload.target_repository,
+                &payload.source_push,
+            )
+            .map_err(classify_failure)?;
+            crate::remote::dispatcher::create_change_request(
+                &repository,
+                &config,
+                &payload.worktree,
+                &payload.body,
+                &guard,
+                &mut cache,
             )
             .map_err(classify_failure)?;
             output(
@@ -812,6 +886,29 @@ pub(crate) struct TuiRemotePushPayload {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct TuiRemotePushResult {
+    pub cache: crate::remote::WorkerPrCacheSnapshot,
+    pub create: Option<TuiRemoteCreatePreparation>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct TuiRemoteCreatePreparation {
+    pub source_push: crate::remote::dispatcher::PushGuard,
+    pub origin_repository: crate::remote::RemoteRepositoryId,
+    pub upstream_repository: Option<crate::remote::RemoteRepositoryId>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct TuiRemoteCreatePayload {
+    pub repository: std::path::PathBuf,
+    pub worktree: std::path::PathBuf,
+    pub branch: String,
+    pub body: String,
+    pub target_repository: crate::remote::RemoteRepositoryId,
+    pub source_push: crate::remote::dispatcher::PushGuard,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct TuiRemoteFetchPayload {
     pub repository: std::path::PathBuf,
     pub worktree: std::path::PathBuf,
@@ -976,6 +1073,38 @@ mod tests {
         assert_eq!(decoded.change_request, identity);
         assert_eq!(decoded.display_number, 42);
         assert_eq!(decoded.expected_head_sha, "abc123");
+    }
+
+    #[test]
+    fn tui_push_result_round_trip_preserves_create_preparation() {
+        let repository = crate::remote::RemoteRepositoryId::new(
+            crate::remote::ProviderKind::GitHub,
+            crate::remote::HostIdentity::new("github.com", None).unwrap(),
+            "example/repo",
+        )
+        .unwrap();
+        let source_push = crate::remote::dispatcher::PushGuard {
+            repository: repository.clone(),
+            remote: "origin".into(),
+            remote_branch: "feature".into(),
+            local_branch: "feature".into(),
+            expected_head_sha: "abc123".into(),
+            set_upstream: true,
+        };
+        let result = TuiRemotePushResult {
+            cache: crate::remote::WorkerPrCacheSnapshot::capture(&crate::remote::PrCache::default()),
+            create: Some(TuiRemoteCreatePreparation {
+                source_push,
+                origin_repository: repository,
+                upstream_repository: None,
+            }),
+        };
+
+        let encoded = serde_json::to_value(&result).unwrap();
+        let decoded: TuiRemotePushResult = serde_json::from_value(encoded).unwrap();
+        let create = decoded.create.unwrap();
+        assert_eq!(create.source_push.remote_branch, "feature");
+        assert_eq!(create.origin_repository.project_path(), "example/repo");
     }
 
     #[test]

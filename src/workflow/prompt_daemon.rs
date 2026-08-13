@@ -8,7 +8,8 @@ use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -16,8 +17,10 @@ use sha2::{Digest as _, Sha256};
 
 use crate::platform::SupportedOs;
 
-const PROTOCOL_VERSION: u32 = 4;
+const PROTOCOL_VERSION: u32 = 5;
 const TRANSITION_TIMEOUT: Duration = Duration::from_secs(3);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(6);
+const MAX_CONNECTION_HANDLERS: usize = 32;
 const SOCKET_PATH_BUDGET: usize = 103;
 const AUTHENTICATION_FAILED_RESPONSE: &str = "error authentication-failed";
 const AUTHENTICATION_SECRET_BYTES: usize = 32;
@@ -116,6 +119,17 @@ pub fn ensure_running() -> Result<(), String> {
     Err(last)
 }
 
+fn ensure_compatible_running() -> Result<(), String> {
+    let health = probe_health()?;
+    if health.state == DaemonState::Running && health.protocol_version == Some(PROTOCOL_VERSION) {
+        return Ok(());
+    }
+    if health.state == DaemonState::Draining {
+        wait_stopped(TRANSITION_TIMEOUT)?;
+    }
+    ensure_running()
+}
+
 pub fn health_response() -> Result<String, String> {
     request("health")
 }
@@ -129,7 +143,7 @@ pub fn shutdown() -> Result<(), String> {
     if health.state != DaemonState::Draining {
         return Err(format!("Prism worker rejected shutdown: {response}"));
     }
-    wait_stopped(TRANSITION_TIMEOUT)
+    wait_stopped(SHUTDOWN_TIMEOUT)
 }
 
 fn wait_stopped(timeout: Duration) -> Result<(), String> {
@@ -188,6 +202,13 @@ pub fn serve() -> Result<(), String> {
     result
 }
 
+#[derive(Default)]
+struct DaemonControl {
+    draining: AtomicBool,
+    handlers: AtomicUsize,
+    requests: AtomicUsize,
+}
+
 fn serve_socket(
     runtime: &tokio::runtime::Runtime,
     service: &crate::PromptWorkflowService,
@@ -224,39 +245,62 @@ fn serve_socket(
         std::process::id(),
         crate::workflow::prompt_worker::now_unix_ms()
     );
-    let mut draining = false;
+    let control = Arc::new(DaemonControl::default());
     loop {
         match listener.accept() {
             Ok((mut stream, _)) => {
-                draining |= respond(
-                    runtime,
-                    service,
-                    &mut stream,
-                    &instance,
-                    generation,
-                    draining,
-                );
+                if control.handlers.load(Ordering::Acquire) >= MAX_CONNECTION_HANDLERS {
+                    let _ = stream.write_all(b"error worker-busy\n");
+                    continue;
+                }
+                control.handlers.fetch_add(1, Ordering::AcqRel);
+                let handle = runtime.handle().clone();
+                let service = service.clone();
+                let instance = instance.clone();
+                let generation = generation.to_string();
+                let handler_control = Arc::clone(&control);
+                if let Err(error) = thread::Builder::new()
+                    .name("prism-worker-connection".to_string())
+                    .spawn(move || {
+                        respond(
+                            &handle,
+                            &service,
+                            &mut stream,
+                            &instance,
+                            &generation,
+                            &handler_control,
+                        );
+                        handler_control.handlers.fetch_sub(1, Ordering::AcqRel);
+                    })
+                {
+                    control.handlers.fetch_sub(1, Ordering::AcqRel);
+                    return Err(format!("spawn Prism worker connection handler: {error}"));
+                }
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(error) => return Err(format!("accept Prism worker connection: {error}")),
         }
-        if draining {
+        if control.draining.load(Ordering::Acquire)
+            && control.handlers.load(Ordering::Acquire) == 0
+            && control.requests.load(Ordering::Acquire) == 0
+        {
             break;
         }
-        thread::sleep(Duration::from_millis(25));
+        thread::sleep(Duration::from_millis(10));
     }
     drop(listener);
     fs::remove_file(&socket).map_err(|error| format!("remove Prism worker socket: {error}"))
 }
 
 fn respond(
-    runtime: &tokio::runtime::Runtime,
+    runtime: &tokio::runtime::Handle,
     service: &crate::PromptWorkflowService,
     stream: &mut UnixStream,
     instance: &str,
     generation: &str,
-    draining: bool,
-) -> bool {
+    control: &DaemonControl,
+) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let mut request = String::new();
     if BufReader::new(&mut *stream)
         .take(1024 * 1024 + 1)
@@ -265,7 +309,7 @@ fn respond(
         || request.len() > 1024 * 1024
     {
         let _ = stream.write_all(b"error invalid-request\n");
-        return false;
+        return;
     }
     let request = request.trim();
     let active = runtime
@@ -277,13 +321,29 @@ fn respond(
         })
         .unwrap_or(0);
     let response = match request {
-        "health" | "wake" => health_line(instance, generation, draining, active),
-        "shutdown" => health_line(instance, generation, true, active),
-        request if request.starts_with('{') => prompt_response(runtime, service, request),
+        "health" | "wake" => health_line(
+            instance,
+            generation,
+            control.draining.load(Ordering::Acquire),
+            active,
+        ),
+        "shutdown" => {
+            control.draining.store(true, Ordering::Release);
+            health_line(instance, generation, true, active)
+        }
+        request if request.starts_with('{') => {
+            if control.draining.load(Ordering::Acquire) {
+                json_error("Prism worker is draining".to_string())
+            } else {
+                control.requests.fetch_add(1, Ordering::AcqRel);
+                let response = prompt_response(runtime, service, request);
+                control.requests.fetch_sub(1, Ordering::AcqRel);
+                response
+            }
+        }
         _ => "error unknown-command\n".into(),
     };
     let _ = stream.write_all(response.as_bytes());
-    request == "shutdown"
 }
 
 fn health_line(instance: &str, generation: &str, draining: bool, active: usize) -> String {
@@ -344,7 +404,7 @@ enum SocketControl {
 }
 
 fn prompt_response(
-    runtime: &tokio::runtime::Runtime,
+    runtime: &tokio::runtime::Handle,
     service: &crate::PromptWorkflowService,
     request: &str,
 ) -> String {
@@ -557,7 +617,7 @@ where
     F: FnMut(crate::remote::request_coordinator::RemoteWait),
     C: Fn() -> bool,
 {
-    ensure_running()?;
+    ensure_compatible_running()?;
     let payload = serde_json::to_value(payload)
         .map_err(|error| format!("encode remote observation: {error}"))?;
     coordinated_remote_request(
@@ -603,7 +663,7 @@ where
     F: FnMut(crate::remote::request_coordinator::RemoteWait),
     C: Fn() -> bool,
 {
-    ensure_running()?;
+    ensure_compatible_running()?;
     let payload = serde_json::to_value(payload)
         .map_err(|error| format!("encode remote mutation: {error}"))?;
     coordinated_remote_request(
@@ -868,6 +928,63 @@ pub(crate) fn subscribe_notifications() -> Result<NotificationSubscription, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_connection_handler_keeps_health_responsive() {
+        let temporary = crate::compact_runtime::CompactTempDir::new("worker-concurrency");
+        let database = temporary.path().join("workflow.db");
+        let state_root = temporary.path().join("state");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("create test runtime");
+        let service = runtime
+            .block_on(crate::PromptWorkflowService::open(&database, &state_root))
+            .expect("open test service");
+        let control = Arc::new(DaemonControl::default());
+        let (slow_server, _slow_client) = UnixStream::pair().expect("create slow socket pair");
+        let (mut health_server, mut health_client) =
+            UnixStream::pair().expect("create health socket pair");
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let slow_control = Arc::clone(&control);
+        slow_control.handlers.fetch_add(1, Ordering::AcqRel);
+        let slow = thread::spawn(move || {
+            release_rx.recv().expect("release slow handler");
+            drop(slow_server);
+            slow_control.handlers.fetch_sub(1, Ordering::AcqRel);
+        });
+        let health_control = Arc::clone(&control);
+        let handle = runtime.handle().clone();
+        let health_service = service.clone();
+        let health = thread::spawn(move || {
+            respond(
+                &handle,
+                &health_service,
+                &mut health_server,
+                "test-instance",
+                "test-generation",
+                &health_control,
+            );
+        });
+
+        health_client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("configure health timeout");
+        health_client
+            .write_all(b"health\n")
+            .expect("write health request");
+        let mut response = String::new();
+        health_client
+            .read_to_string(&mut response)
+            .expect("read health response");
+        assert!(response.starts_with("ok 5 test-instance"), "{response}");
+        assert_eq!(control.handlers.load(Ordering::Acquire), 1);
+
+        release_tx.send(()).expect("release slow handler");
+        slow.join().expect("join slow handler");
+        health.join().expect("join health handler");
+    }
 
     #[test]
     fn runtime_paths_cover_supported_platforms() {

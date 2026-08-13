@@ -115,6 +115,10 @@ pub(crate) enum RemoteActionValue {
     WorktrunkUserConfig(crate::worktrunk::UserConfigLocation),
     ChangeRequests(Vec<PrSummary>),
     Cache(Box<PrCache>),
+    Push {
+        cache: Box<PrCache>,
+        create: Option<Box<crate::workflow::standard_remote::TuiRemoteCreatePreparation>>,
+    },
     Resolved {
         cache: Box<PrCache>,
         count: usize,
