@@ -769,7 +769,7 @@ fn list_change_requests_for_head(
             .list_change_requests(&repository, head_ref)
             .map_err(|error| error.to_string())?
             .into_iter()
-            .map(to_legacy_summary)
+            .map(legacy_summary)
             .collect::<Result<Vec<_>, _>>()?;
         for summary in observed {
             if !summaries.iter().any(|existing: &PrSummary| {
@@ -1119,7 +1119,7 @@ pub(crate) fn refresh_change_request_cache(
             target_adapter
                 .lookup_change_request(&change_request.id)
                 .map_err(|error| error.to_string())
-                .and_then(|summary| summary.map(to_legacy_summary).transpose())
+                .and_then(|summary| summary.map(legacy_summary).transpose())
                 .and_then(|summary| match summary {
                     Some(summary) => authoritative_active_summary(summary),
                     None => Ok(None),
@@ -1348,12 +1348,7 @@ pub(crate) fn create_change_request(
     let summary = adapter
         .create_change_request(&request)
         .map_err(|error| error.to_string())?;
-    super::store::record_pr_summary(
-        repo,
-        &guard.local_branch,
-        cache,
-        to_legacy_summary(summary)?,
-    );
+    super::store::record_pr_summary(repo, &guard.local_branch, cache, legacy_summary(summary)?);
     refresh_change_request_cache(repo, &guard.local_branch, cache, path, config, true)
 }
 
@@ -1364,6 +1359,23 @@ pub(crate) fn merge_change_request(
     display_number: u64,
     expected_head_sha: &str,
 ) -> Result<MergeMutationResult, String> {
+    let request = prepare_merge_change_request(
+        config,
+        path,
+        authorized_identity,
+        display_number,
+        expected_head_sha,
+    )?;
+    execute_guarded_merge(config, path, &request)
+}
+
+pub(crate) fn prepare_merge_change_request(
+    config: &Config,
+    path: &Path,
+    authorized_identity: &CanonicalChangeRequestIdentity,
+    display_number: u64,
+    expected_head_sha: &str,
+) -> Result<GuardedMerge, String> {
     let remotes = configured_remote_repositories(path, config)?;
     let authorized_id = authorized_identity
         .change_request_id(Some(display_number))
@@ -1408,9 +1420,66 @@ pub(crate) fn merge_change_request(
     request
         .validate_observation(&summary)
         .map_err(|error| error.to_string())?;
-    adapter
-        .merge_change_request(&request)
-        .map_err(|error| error.to_string())
+    let policy = adapter
+        .repository_policy(
+            &summary.change_request.target_repository,
+            &summary.change_request.target_branch,
+        )
+        .map_err(|error| error.to_string())?;
+    let details = adapter
+        .change_request_details(&summary.change_request)
+        .map_err(|error| error.to_string())?;
+    if !policy_satisfied(&policy, &details, &summary) {
+        return Err("provider policy does not currently authorize merge".to_string());
+    }
+    Ok(request)
+}
+
+pub(crate) enum GuardedMergeExecution {
+    Applied(Box<MergeMutationResult>),
+    Rejected(String),
+    Uncertain(String),
+}
+
+pub(crate) fn execute_guarded_merge(
+    config: &Config,
+    path: &Path,
+    request: &GuardedMerge,
+) -> Result<MergeMutationResult, String> {
+    match execute_guarded_merge_reconciled(config, path, request) {
+        GuardedMergeExecution::Applied(result) => Ok(*result),
+        GuardedMergeExecution::Rejected(reason) | GuardedMergeExecution::Uncertain(reason) => {
+            Err(reason)
+        }
+    }
+}
+
+pub(crate) fn execute_guarded_merge_reconciled(
+    config: &Config,
+    path: &Path,
+    request: &GuardedMerge,
+) -> GuardedMergeExecution {
+    let adapter = match Adapter::for_repository(path, config, &request.target_repository) {
+        Ok(adapter) => adapter,
+        Err(reason) => return GuardedMergeExecution::Rejected(reason),
+    };
+    let error = match adapter.merge_change_request(request) {
+        Ok(result) => return GuardedMergeExecution::Applied(Box::new(result)),
+        Err(error) => error.to_string(),
+    };
+    let observed = match adapter.observe_change_request(&request.id) {
+        Ok(observed) => observed,
+        Err(_) => return GuardedMergeExecution::Uncertain(error),
+    };
+    if observed.change_request.head_sha != request.expected_source_sha {
+        return GuardedMergeExecution::Rejected(error);
+    }
+    let reconciled = MergeMutationResult::from_summary(observed, "reobserved after merge error");
+    if reconciled.outcome == MergeMutationOutcome::Uncertain {
+        GuardedMergeExecution::Uncertain(error)
+    } else {
+        GuardedMergeExecution::Applied(Box::new(reconciled))
+    }
 }
 
 pub(crate) fn resolve_review_thread(
@@ -1781,18 +1850,15 @@ fn policy_satisfied(
         | Observation::AuthoritativelyAbsent => true,
         _ => false,
     };
-    let queue_ready = match policy.facts.queue_required {
-        Observation::Known(true) => !matches!(summary.queue_state, QueueState::Blocked),
-        Observation::Known(false)
-        | Observation::EmptyKnown
-        | Observation::AuthoritativelyAbsent => true,
-        _ => false,
-    };
+    let queue_policy_known = matches!(
+        policy.facts.queue_required,
+        Observation::Known(_) | Observation::EmptyKnown | Observation::AuthoritativelyAbsent
+    );
     checks_pass
         && approvals >= required_approvals
         && conversations_resolved
         && up_to_date
-        && queue_ready
+        && queue_policy_known
 }
 
 pub(crate) fn observe_change_request_identity(
@@ -1935,7 +2001,7 @@ fn displayable_vec<T>(
     }
 }
 
-fn to_legacy_summary(summary: ChangeRequestSummary) -> Result<PrSummary, String> {
+pub(crate) fn legacy_summary(summary: ChangeRequestSummary) -> Result<PrSummary, String> {
     let request = summary.change_request;
     let number = request
         .id
@@ -2038,7 +2104,7 @@ pub(crate) fn record_change_request_summary(
     cache: &mut PrCache,
     summary: ChangeRequestSummary,
 ) -> Result<(), String> {
-    super::store::record_pr_summary(repo, branch, cache, to_legacy_summary(summary)?);
+    super::store::record_pr_summary(repo, branch, cache, legacy_summary(summary)?);
     Ok(())
 }
 
@@ -2306,7 +2372,7 @@ esac
         std::fs::remove_dir_all(directory).unwrap();
     }
 
-    fn legacy_summary() -> PrSummary {
+    fn legacy_summary_fixture() -> PrSummary {
         PrSummary {
             number: 42,
             change_request_identity: Some(crate::remote::test_change_request_identity()),
@@ -2401,7 +2467,7 @@ esac
         );
         let source = repository(ProviderKind::GitHub, "contributor/widget");
         let target = repository(ProviderKind::GitHub, "acme/widget");
-        let mut summary = legacy_summary();
+        let mut summary = legacy_summary_fixture();
         summary.change_request_identity = Some(CanonicalChangeRequestIdentity::new(
             &target,
             &super::super::NativeChangeRequestId::new("PR_42").unwrap(),
@@ -2481,7 +2547,7 @@ esac
         );
         let source = repository(ProviderKind::GitHub, "contributor/widget");
         let target = repository(ProviderKind::GitHub, "acme/widget");
-        let mut summary = legacy_summary();
+        let mut summary = legacy_summary_fixture();
         summary.change_request_identity = Some(CanonicalChangeRequestIdentity::new(
             &target,
             &super::super::NativeChangeRequestId::new("PR_42").unwrap(),
@@ -2863,9 +2929,16 @@ esac
                 r#"#!/bin/sh
 printf '%s\n' "$*" >> '{}'
 case "$*" in
+  *"reviewThreads(first: 100"*)
+    printf '%s\n' '[{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"totalCount":0,"pageInfo":{{"hasNextPage":false}},"nodes":[]}}}}}}}}}}]'
+    ;;
   *"api graphql"*)
     printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_stale","number":42,"title":"Fork change","state":"OPEN","headRefName":"topic","baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRepository":{{"nameWithOwner":"former-contributor/widget"}},"baseRepository":{{"nameWithOwner":"acme/widget"}}}}}}}}}}'
     ;;
+  *"branches/main/protection"*) printf '%s\n' '{{"url":"https://api.github.com/repos/acme/widget/branches/main/protection"}}' ;;
+  *"rules/branches/main"*) printf '%s\n' '[[]]' ;;
+  *"check-runs"*) printf '%s\n' '[{{"total_count":0,"check_runs":[]}}]' ;;
+  *"/comments?per_page=100"*|*"/reviews?per_page=100"*|*"/files?per_page=100"*|*"/statuses?per_page=100"*) printf '%s\n' '[[]]' ;;
   *"pr merge 42"*) exit 0 ;;
   *) exit 1 ;;
 esac
@@ -2955,7 +3028,7 @@ esac
         );
         let source = repository(ProviderKind::GitHub, "contributor/widget");
         let target = repository(ProviderKind::GitHub, "acme/widget");
-        let mut summary = legacy_summary();
+        let mut summary = legacy_summary_fixture();
         summary.change_request_identity = Some(CanonicalChangeRequestIdentity::new(
             &target,
             &super::super::NativeChangeRequestId::new("PR_42").unwrap(),
@@ -2970,7 +3043,7 @@ esac
 
     #[test]
     fn unknown_lifecycle_is_not_converted_to_authoritative_absence() {
-        let mut summary = legacy_summary();
+        let mut summary = legacy_summary_fixture();
         summary.state = "SUPERSEDED_BY_TRAIN".to_string();
 
         let observed = authoritative_active_summary(summary.clone())
@@ -2983,14 +3056,68 @@ esac
             LifecycleState::Unknown("SUPERSEDED_BY_TRAIN".to_string())
         );
         assert_eq!(
-            to_legacy_summary(normalized).unwrap().state,
+            legacy_summary(normalized).unwrap().state,
             "SUPERSEDED_BY_TRAIN"
         );
     }
 
     #[test]
+    fn policy_readiness_delegates_authoritative_queue_blocking_to_the_provider() {
+        let repository = repository(ProviderKind::GitHub, "example/repo");
+        let change_request = ChangeRequest {
+            id: ChangeRequestId::new(
+                repository.clone(),
+                super::super::NativeChangeRequestId::new("PR_42").unwrap(),
+                Some(42),
+            ),
+            source_repository: repository.clone(),
+            target_repository: repository.clone(),
+            source_branch: "feature".into(),
+            target_branch: "main".into(),
+            head_sha: "abc123".into(),
+        };
+        let summary = ChangeRequestSummary {
+            change_request,
+            title: String::new(),
+            author: String::new(),
+            body: String::new(),
+            web_url: None,
+            lifecycle: LifecycleState::Open,
+            review_decision: ReviewDecision::Approved,
+            requested_reviewers: Vec::new(),
+            mergeability: MergeabilityState::Blocked,
+            check_state: CheckState::Passed,
+            queue_state: QueueState::Blocked,
+            native_state_evidence: Default::default(),
+            comment_count: 0,
+            draft: false,
+            updated_at: None,
+        };
+        let details = ChangeRequestDetails {
+            reviews: Observation::EmptyKnown,
+            review_threads: Observation::EmptyKnown,
+            checks: Observation::EmptyKnown,
+            ..Default::default()
+        };
+        let mut policy = RepositoryPolicy {
+            repository: Some(repository),
+            target_branch: "main".into(),
+            facts: super::super::PolicyFacts {
+                required_checks: Observation::EmptyKnown,
+                required_approvals: Observation::Known(0),
+                conversations_must_be_resolved: Observation::Known(false),
+                source_must_be_up_to_date: Observation::Known(false),
+                queue_required: Observation::Known(true),
+            },
+        };
+        assert!(policy_satisfied(&policy, &details, &summary));
+        policy.facts.queue_required = Observation::NotLoaded;
+        assert!(!policy_satisfied(&policy, &details, &summary));
+    }
+
+    #[test]
     fn compatibility_conversion_preserves_unknown_native_queue_state() {
-        let mut summary = legacy_summary();
+        let mut summary = legacy_summary_fixture();
         summary.queue_state = "preparing_merged_result".to_string();
         summary.native_state_evidence = super::super::NativeStateEvidence {
             lifecycle: vec!["OPEN".to_string()],
@@ -3010,7 +3137,7 @@ esac
             normalized.native_state_evidence.check,
             ["COMPLETED", "NEUTRAL"]
         );
-        let round_trip = to_legacy_summary(normalized).unwrap();
+        let round_trip = legacy_summary(normalized).unwrap();
         assert_eq!(round_trip.queue_state, "preparing_merged_result");
         assert_eq!(round_trip.native_state_evidence.queue, ["PREPARING"]);
     }
@@ -3027,13 +3154,13 @@ esac
         ];
 
         for (legacy, expected) in labels {
-            let mut summary = legacy_summary();
+            let mut summary = legacy_summary_fixture();
             summary.comment_count = 17;
             summary.check_status = legacy.to_string();
 
             let normalized = change_request_summary_from_legacy(summary).unwrap();
             assert_eq!(normalized.comment_count, 17);
-            let round_trip = to_legacy_summary(normalized).unwrap();
+            let round_trip = legacy_summary(normalized).unwrap();
             assert_eq!(round_trip.comment_count, 17);
             assert_eq!(round_trip.check_status, expected);
             assert_eq!(
@@ -3043,10 +3170,10 @@ esac
             );
         }
 
-        let mut unknown = legacy_summary();
+        let mut unknown = legacy_summary_fixture();
         unknown.check_status = "unknown".to_string();
         let round_trip =
-            to_legacy_summary(change_request_summary_from_legacy(unknown).unwrap()).unwrap();
+            legacy_summary(change_request_summary_from_legacy(unknown).unwrap()).unwrap();
         assert_eq!(round_trip.check_state(), PrCheckState::Unknown);
     }
 
@@ -3087,7 +3214,7 @@ printf '%s\n' '{"data":{"repository":{"pullRequest":null}}}'
         );
         let repo =
             Repository::with_config_dir_for_test(directory.clone(), directory.join("config"));
-        let mut cache = PrCache::observed(legacy_summary(), None);
+        let mut cache = PrCache::observed(legacy_summary_fixture(), None);
 
         refresh_change_request_cache(&repo, "topic", &mut cache, &directory, &config, false)
             .unwrap();
@@ -3159,7 +3286,7 @@ printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_fork","number"
 
     #[test]
     fn unavailable_ci_logs_do_not_invalidate_other_legacy_details() {
-        let mut cache = PrCache::observed(legacy_summary(), None);
+        let mut cache = PrCache::observed(legacy_summary_fixture(), None);
         let details = ChangeRequestDetails {
             association: None,
             comments: Observation::EmptyKnown,
@@ -3207,7 +3334,7 @@ printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_fork","number"
     #[test]
     fn stale_current_details_update_display_but_remain_untrusted() {
         let mut cache = PrCache::observed(
-            legacy_summary(),
+            legacy_summary_fixture(),
             Some(PrDetails {
                 comments: vec![PrComment {
                     body: "previous comment".to_string(),
@@ -3288,7 +3415,7 @@ exit 1
                 log.display()
             ),
         );
-        let summary = legacy_summary();
+        let summary = legacy_summary_fixture();
 
         let error =
             fetch_change_request_branch(&directory, &config, &summary, "pr/42").unwrap_err();
@@ -3334,7 +3461,8 @@ exit 1
             ),
         );
 
-        fetch_change_request_branch(&directory, &config, &legacy_summary(), "pr/42").unwrap();
+        fetch_change_request_branch(&directory, &config, &legacy_summary_fixture(), "pr/42")
+            .unwrap();
 
         let commands = std::fs::read_to_string(&log).unwrap();
         assert!(!commands.contains("fetch origin"));
@@ -3379,8 +3507,9 @@ exit 1
             ),
         );
 
-        let error = fetch_change_request_branch(&directory, &config, &legacy_summary(), "pr/42")
-            .unwrap_err();
+        let error =
+            fetch_change_request_branch(&directory, &config, &legacy_summary_fixture(), "pr/42")
+                .unwrap_err();
 
         assert!(error.contains("update-ref"));
         let commands = std::fs::read_to_string(&log).unwrap();
@@ -3427,7 +3556,7 @@ exit 1
         );
         let source = repository(ProviderKind::Forgejo, "contributor/widget");
         let target = repository(ProviderKind::Forgejo, "acme/widget");
-        let mut summary = legacy_summary();
+        let mut summary = legacy_summary_fixture();
         summary.change_request_identity = Some(CanonicalChangeRequestIdentity::new(
             &target,
             &super::super::NativeChangeRequestId::new("42").unwrap(),

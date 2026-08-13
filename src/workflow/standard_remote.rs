@@ -457,6 +457,55 @@ fn execute_blocking(
             .map_err(classify_failure)?;
             output(serde_json::json!({"submitted": true}), "mutation")
         }
+        CoordinatedRemoteOperation::Mutate(request)
+            if request.operation == "tui.merge_change_request" =>
+        {
+            let payload: TuiRemoteMergePayload = serde_json::from_value(request.payload)
+                .map_err(|error| permanent(format!("invalid TUI merge request: {error}")))?;
+            let repository = crate::repo::Repository {
+                root: payload.repository,
+            };
+            let config = crate::config::Config::load(&repository);
+            let prepared = match crate::remote::dispatcher::prepare_merge_change_request(
+                &config,
+                &payload.worktree,
+                &payload.change_request,
+                payload.display_number,
+                &payload.expected_head_sha,
+            ) {
+                Ok(prepared) => prepared,
+                Err(reason) => {
+                    return output(TuiRemoteMergeResult::Rejected { reason }, "mutation");
+                }
+            };
+            let result = match crate::remote::dispatcher::execute_guarded_merge_reconciled(
+                &config,
+                &payload.worktree,
+                &prepared,
+            ) {
+                crate::remote::dispatcher::GuardedMergeExecution::Applied(result) => *result,
+                crate::remote::dispatcher::GuardedMergeExecution::Rejected(reason) => {
+                    return output(TuiRemoteMergeResult::Rejected { reason }, "mutation");
+                }
+                crate::remote::dispatcher::GuardedMergeExecution::Uncertain(reason) => {
+                    return Err(permanent(reason));
+                }
+            };
+            let outcome = match result.outcome {
+                crate::remote::MergeMutationOutcome::Merged => TuiRemoteMergeOutcome::Merged,
+                crate::remote::MergeMutationOutcome::Pending => TuiRemoteMergeOutcome::Pending,
+                crate::remote::MergeMutationOutcome::Uncertain => TuiRemoteMergeOutcome::Uncertain,
+            };
+            let summary = crate::remote::dispatcher::legacy_summary(result.summary)
+                .map_err(classify_failure)?;
+            output(
+                TuiRemoteMergeResult::Accepted {
+                    outcome,
+                    summary: Box::new(summary),
+                },
+                "mutation",
+            )
+        }
         CoordinatedRemoteOperation::Observe(request) => Err(permanent(format!(
             "unsupported coordinated observation '{}'",
             request.key.operation
@@ -569,11 +618,7 @@ fn observe_change_request(subject: &TriggerSubject) -> Result<ChangeRequestObser
         })
         .collect::<Vec<_>>();
     let required_checks = required_checks(&policy.required_checks, &details.check_contexts);
-    let mut policy_blockers = Vec::new();
-    if policy.merge_queue_required {
-        policy_blockers
-            .push("merge queue is required and automatic queueing is not supported".into());
-    }
+    let policy_blockers = Vec::new();
     let unsupported = capability_gap(identity.provider(), &policy, &details);
     let observation_revision =
         observation_revision(&summary, &unresolved_threads, &required_checks);
@@ -597,6 +642,7 @@ fn observe_change_request(subject: &TriggerSubject) -> Result<ChangeRequestObser
         required_checks,
         draft: summary.draft,
         lifecycle_open: summary.state.eq_ignore_ascii_case("open") && !summary.merged,
+        merge_queue_required: policy.merge_queue_required,
         policy_blockers,
         unsupported,
     })
@@ -791,6 +837,35 @@ pub(crate) struct TuiRemoteReviewPayload {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct TuiRemoteMergePayload {
+    pub repository: std::path::PathBuf,
+    pub worktree: std::path::PathBuf,
+    pub change_request: crate::remote::CanonicalChangeRequestIdentity,
+    pub display_number: u64,
+    pub expected_head_sha: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TuiRemoteMergeOutcome {
+    Merged,
+    Pending,
+    Uncertain,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub(crate) enum TuiRemoteMergeResult {
+    Accepted {
+        outcome: TuiRemoteMergeOutcome,
+        summary: Box<crate::remote::PrSummary>,
+    },
+    Rejected {
+        reason: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct ResolveThreadsPayload {
     subject: TriggerSubject,
     observation_revision: String,
@@ -884,6 +959,23 @@ mod tests {
             },
             cancellation_requested: false,
         }
+    }
+
+    #[test]
+    fn merge_payload_round_trip_preserves_canonical_identity_and_exact_head() {
+        let identity = crate::remote::test_change_request_identity();
+        let payload = TuiRemoteMergePayload {
+            repository: "/repo".into(),
+            worktree: "/repo/wt".into(),
+            change_request: identity.clone(),
+            display_number: 42,
+            expected_head_sha: "abc123".into(),
+        };
+        let decoded: TuiRemoteMergePayload =
+            serde_json::from_value(serde_json::to_value(payload).unwrap()).unwrap();
+        assert_eq!(decoded.change_request, identity);
+        assert_eq!(decoded.display_number, 42);
+        assert_eq!(decoded.expected_head_sha, "abc123");
     }
 
     #[test]
