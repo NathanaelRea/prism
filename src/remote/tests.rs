@@ -622,6 +622,16 @@ fn merge_result_preserves_immediate_merge_and_native_queue_acceptance() {
         );
     }
 
+    for evidence in ["LOCKED", "MERGEABLE", "UNMERGEABLE"] {
+        let mut native_queue_entry = summary.clone();
+        native_queue_entry.queue_state = QueueState::Unknown(evidence.into());
+        native_queue_entry.native_state_evidence.queue = vec![evidence.into()];
+        assert_eq!(
+            MergeMutationResult::from_summary(native_queue_entry, "open").outcome,
+            MergeMutationOutcome::Pending
+        );
+    }
+
     let mut merged = summary;
     merged.lifecycle = LifecycleState::Merged;
     merged.queue_state = QueueState::NotQueued;

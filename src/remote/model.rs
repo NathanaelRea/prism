@@ -1156,6 +1156,9 @@ pub(crate) fn native_queue_evidence_is_positive(state: &str) -> bool {
             | "awaiting_merge"
             | "preparing"
             | "merge_train"
+            | "locked"
+            | "mergeable"
+            | "unmergeable"
     )
 }
 

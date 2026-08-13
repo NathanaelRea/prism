@@ -92,6 +92,15 @@ impl Tui {
         if action == GitAction::Push {
             return true;
         }
+        if action == GitAction::Merge {
+            let Ok(Some(summary)) = session.pr.trusted_summary() else {
+                return false;
+            };
+            return !summary.merged
+                && summary.state.eq_ignore_ascii_case("OPEN")
+                && self.remote_support_for_action(action, Some(summary))
+                    == Some(crate::remote::SupportLevel::Supported);
+        }
         let Some(summary) = session.pr.summary() else {
             return false;
         };
