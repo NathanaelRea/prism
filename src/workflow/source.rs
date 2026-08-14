@@ -2407,6 +2407,13 @@ mod tests {
         compile_workflow(Path::new(name), source, &TriggerCatalog::builtins())
     }
 
+    fn canonical_temp(name: &str) -> PathBuf {
+        std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("{name}-{}", std::process::id()))
+    }
+
     #[test]
     fn stabilization_is_short_and_compiles_to_linear_graph() {
         let non_comment = DEFAULT_STABILIZE_SOURCE
@@ -2811,8 +2818,7 @@ prompt = "{{title}} publish={{publish}} count={{count}} mode={{mode}}"
 
     #[test]
     fn repository_workflow_trust_is_invalidated_by_resource_edits() {
-        let root =
-            std::env::temp_dir().join(format!("prism-workflow-trust-{}", std::process::id()));
+        let root = canonical_temp("prism-workflow-trust");
         let _ = fs::remove_dir_all(&root);
         let global = root.join("global");
         let repository = root.join("repo");
@@ -2837,10 +2843,7 @@ prompt = "{{title}} publish={{publish}} count={{count}} mode={{mode}}"
 
     #[test]
     fn snapshot_revision_encoding_is_injective_and_rejects_symlink_roots() {
-        let root = std::env::temp_dir().join(format!(
-            "prism-workflow-snapshot-encoding-{}",
-            std::process::id()
-        ));
+        let root = canonical_temp("prism-workflow-snapshot-encoding");
         let _ = fs::remove_dir_all(&root);
         let one = root.join("one");
         let two = root.join("two");
@@ -2888,10 +2891,7 @@ prompt = "{{title}} publish={{publish}} count={{count}} mode={{mode}}"
 
     #[test]
     fn trusted_snapshot_discovery_never_rereads_workflow_trigger_or_package_bytes() {
-        let root = std::env::temp_dir().join(format!(
-            "prism-workflow-snapshot-toctou-{}",
-            std::process::id()
-        ));
+        let root = canonical_temp("prism-workflow-snapshot-toctou");
         let _ = fs::remove_dir_all(&root);
         let global = root.join("global");
         let repository = root.join("repo");
