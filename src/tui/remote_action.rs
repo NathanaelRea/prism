@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
@@ -116,10 +117,40 @@ pub(crate) struct RemoteMutationReconciliationMarker {
     pub(super) target: RemoteMutationTarget,
     pub(super) ledger: Option<RemoteMutationLedgerContext>,
     #[serde(skip)]
-    pub(super) database_path: std::path::PathBuf,
+    pub(super) database_path: PathBuf,
     pub(super) job_id: JobId,
     pub(super) reason: String,
     pub(super) recorded_unix_ms: u64,
+}
+
+pub(super) fn update_persisted_remote_mutation_markers<T>(
+    path: &Path,
+    update: impl FnOnce(&mut Vec<RemoteMutationReconciliationMarker>) -> T,
+) -> Result<T, String> {
+    let mut output = None;
+    crate::persistence::database::update_metadata(
+        path,
+        REMOTE_MUTATION_RECONCILIATION_KEY,
+        |value| {
+            let mut markers = value
+                .map(|value| {
+                    serde_json::from_str::<Vec<RemoteMutationReconciliationMarker>>(&value)
+                })
+                .transpose()
+                .map_err(|error| format!("decode remote mutation reconciliation markers: {error}"))?
+                .unwrap_or_default();
+            output = Some(update(&mut markers));
+            if markers.is_empty() {
+                Ok(None)
+            } else {
+                serde_json::to_string(&markers).map(Some).map_err(|error| {
+                    format!("encode remote mutation reconciliation markers: {error}")
+                })
+            }
+        },
+    )
+    .map_err(|error| format!("update remote mutation reconciliation markers: {error}"))?;
+    output.ok_or_else(|| "remote mutation marker update did not run".to_string())
 }
 
 #[derive(Clone)]
@@ -270,23 +301,36 @@ pub(super) fn uncertain_remote_mutation_error(
 }
 
 pub(crate) struct LoadedRemoteMutationMarkers {
-    pub markers: BTreeMap<std::path::PathBuf, Vec<RemoteMutationReconciliationMarker>>,
-    pub errors: Vec<String>,
+    pub repositories: std::collections::BTreeSet<WorktreeRepositoryKey>,
+    pub markers: BTreeMap<WorktreeRepositoryKey, Vec<RemoteMutationReconciliationMarker>>,
+    pub errors: Vec<RemoteMutationMarkerLoadError>,
+}
+
+pub(crate) struct RemoteMutationMarkerLoadError {
+    pub repository: WorktreeRepositoryKey,
+    pub database_path: PathBuf,
+    pub message: String,
 }
 
 impl Tui {
-    pub(super) fn load_remote_mutation_reconciliation_markers(&mut self) {
-        let repositories = self
+    pub(crate) fn load_remote_mutation_reconciliation_markers(&mut self) {
+        let candidates = self
             .repos
             .iter()
             .map(|managed| {
                 (
                     managed.identity.clone(),
-                    managed.repo.root.clone(),
                     crate::observability::db_path(&managed.repo),
                 )
             })
             .collect::<Vec<_>>();
+        let repositories = candidates
+            .into_iter()
+            .filter(|(repository, _)| self.background.begin_marker_load(repository.clone()))
+            .collect::<Vec<_>>();
+        if repositories.is_empty() {
+            return;
+        }
         self.spawn_tui_job(
             TuiJobKind::RemoteReconciliation,
             TuiJobKey::System,
@@ -294,9 +338,11 @@ impl Tui {
             None,
             "prism-load-remote-reconciliation".to_string(),
             move |_| {
+                let mut loaded_repositories = std::collections::BTreeSet::new();
                 let mut marked = BTreeMap::new();
                 let mut errors = Vec::new();
-                for (_identity, root, database_path) in repositories {
+                for (repository, database_path) in repositories {
+                    loaded_repositories.insert(repository.clone());
                     let loaded = if database_path.exists() {
                         crate::persistence::database::load_metadata_readonly(
                             &database_path,
@@ -325,14 +371,19 @@ impl Tui {
                                 marker.database_path = database_path.clone();
                             }
                             if !markers.is_empty() {
-                                marked.insert(root, markers);
+                                marked.insert(repository, markers);
                             }
                         }
-                        Err(error) => errors.push(error),
+                        Err(message) => errors.push(RemoteMutationMarkerLoadError {
+                            repository,
+                            database_path,
+                            message,
+                        }),
                     }
                 }
                 Ok(Some(TuiJobPayload::RemoteMarkersLoaded(
                     LoadedRemoteMutationMarkers {
+                        repositories: loaded_repositories,
                         markers: marked,
                         errors,
                     },
@@ -345,21 +396,70 @@ impl Tui {
         &mut self,
         loaded: LoadedRemoteMutationMarkers,
     ) {
-        for error in loaded.errors {
-            self.background.push_shutdown_error(error);
-        }
+        let LoadedRemoteMutationMarkers {
+            repositories,
+            markers,
+            errors,
+        } = loaded;
+        self.background.finish_marker_loads(&repositories);
+        let current_repositories = self
+            .repos
+            .iter()
+            .map(|managed| managed.identity.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let loaded_repositories = repositories
+            .intersection(&current_repositories)
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let markers = markers
+            .into_iter()
+            .filter(|(repository, _)| loaded_repositories.contains(repository))
+            .collect::<BTreeMap<_, _>>();
+        let errors = errors
+            .into_iter()
+            .filter(|error| loaded_repositories.contains(&error.repository))
+            .collect::<Vec<_>>();
         for session in &mut self.sessions {
-            if self
-                .repos
-                .get(session.repo_index)
-                .is_some_and(|managed| loaded.markers.contains_key(&managed.repo.root))
-            {
+            if self.repos.get(session.repo_index).is_some_and(|managed| {
+                markers.contains_key(&managed.identity)
+                    || errors
+                        .iter()
+                        .any(|error| error.repository == managed.identity)
+            }) {
                 session.pr.require_reconciliation(
                     "remote mutation completion is unknown; authoritative re-observation required",
                 );
             }
         }
-        self.background.replace_markers(loaded.markers);
+        self.background.apply_loaded_markers(
+            loaded_repositories,
+            markers
+                .into_iter()
+                .map(|(repository, markers)| (repository.root, markers))
+                .collect(),
+        );
+        for error in errors {
+            self.background.push_shutdown_error(error.message.clone());
+            self.background.upsert_marker(
+                error.repository.root,
+                RemoteMutationReconciliationMarker {
+                    target: RemoteMutationTarget::Unknown {
+                        marker_id: format!("marker-load-error:{}", error.database_path.display()),
+                    },
+                    ledger: None,
+                    database_path: error.database_path,
+                    job_id: 0,
+                    reason: error.message,
+                    recorded_unix_ms: 0,
+                },
+            );
+        }
+        if current_repositories
+            .iter()
+            .any(|repository| !self.background.markers_are_loaded(repository))
+        {
+            self.load_remote_mutation_reconciliation_markers();
+        }
     }
 
     pub(super) fn record_remote_mutation_reconciliation(
@@ -449,8 +549,8 @@ impl Tui {
         key: &TuiJobKey,
         target: &RemoteMutationTarget,
     ) -> bool {
-        self.repository_root_for_job_key(key)
-            .is_some_and(|root| self.background.marker_blocks(&root, target))
+        self.repository_key_for_job_key(key)
+            .is_some_and(|repository| self.background.marker_blocks(repository, target))
     }
 
     pub(crate) fn run_remote_action<F>(

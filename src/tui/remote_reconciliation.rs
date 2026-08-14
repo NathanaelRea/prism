@@ -1,8 +1,7 @@
-use super::remote_action::RemoteMutationReconciliationMarker;
-use super::{
-    REMOTE_MUTATION_RECONCILIATION_KEY, RemoteMutationTarget, Tui, TuiJobKey, TuiJobKind,
-    TuiJobPayload,
+use super::remote_action::{
+    RemoteMutationReconciliationMarker, update_persisted_remote_mutation_markers,
 };
+use super::{RemoteMutationTarget, Tui, TuiJobKey, TuiJobKind, TuiJobPayload};
 
 use crate::remote::{PrCache, PrSummary};
 use crate::session::WorktreeRepositoryKey;
@@ -182,25 +181,6 @@ pub(crate) fn classify_details_evidence(
         .collect()
 }
 
-fn persist_markers(
-    path: &std::path::Path,
-    markers: &[RemoteMutationReconciliationMarker],
-) -> Result<(), String> {
-    if markers.is_empty() {
-        crate::persistence::database::delete_metadata(path, REMOTE_MUTATION_RECONCILIATION_KEY)
-            .map_err(|error| format!("clear remote mutation reconciliation marker: {error}"))
-    } else {
-        let value = serde_json::to_string(markers)
-            .map_err(|error| format!("encode remote mutation reconciliation marker: {error}"))?;
-        crate::persistence::database::upsert_metadata(
-            path,
-            REMOTE_MUTATION_RECONCILIATION_KEY,
-            &value,
-        )
-        .map_err(|error| format!("write remote mutation reconciliation marker: {error}"))
-    }
-}
-
 impl Tui {
     pub(crate) fn enqueue_summary_reconciliation(
         &mut self,
@@ -257,85 +237,83 @@ impl Tui {
                 command.marker.recorded_unix_ms,
                 command.marker.job_id,
             );
-            if !self.background.begin_reconciliation(key) {
+            if !self.background.begin_reconciliation(key.clone()) {
                 continue;
             }
             let repository = command.repository.clone();
             let marker_version = command.marker.recorded_unix_ms;
             let marker_job_id = command.marker.job_id;
-            self.spawn_tui_job(
+            let job_id = self.spawn_tui_job(
                 TuiJobKind::RemoteReconciliation,
                 TuiJobKey::Repository(repository.clone()),
                 marker_version,
                 None,
                 "prism-remote-reconciliation".to_string(),
                 move |_| {
-                    let mut applied = command.applied;
-                    match command.observation {
-                        Some(ReconciliationObservation::Cache(payload)) => {
-                            applied = serde_json::to_value(crate::worker::observe_remote::<
-                                crate::remote::WorkerPrCacheSnapshot,
-                            >(
-                                &payload.repository,
-                                &payload.worktree,
-                                crate::workflow::remote_operation::RemoteObservationOperation::TuiChangeRequestCache(payload.clone()),
-                                &format!("{}:{}:reconcile", payload.worktree.display(), payload.branch),
-                            )?)
-                            .map_err(|error| format!("encode authoritative cache snapshot: {error}"))?;
-                        }
-                        Some(ReconciliationObservation::LocalBranch(payload)) => {
-                            let expected = match &command.marker.target {
-                                RemoteMutationTarget::Fetch { expected_head_sha, .. } => expected_head_sha,
-                                _ => return Err("local branch evidence requested for non-fetch mutation".to_string()),
-                            };
-                            let head = crate::worker::observe_remote::<Option<String>>(
-                                &payload.repository,
-                                &payload.worktree,
-                                crate::workflow::remote_operation::RemoteObservationOperation::TuiLocalBranchHead(payload.clone()),
-                                &format!("{}:{}:local-ref", payload.worktree.display(), payload.branch),
-                            )?;
-                            if head.as_deref() != Some(expected.as_str()) {
-                                return Err("fetched local branch has not reached the expected authoritative head".to_string());
+                    let target = command.marker.target.clone();
+                    let result = (|| {
+                        let mut applied = command.applied;
+                        match command.observation {
+                            Some(ReconciliationObservation::Cache(payload)) => {
+                                applied = serde_json::to_value(crate::worker::observe_remote::<
+                                    crate::remote::WorkerPrCacheSnapshot,
+                                >(
+                                    &payload.repository,
+                                    &payload.worktree,
+                                    crate::workflow::remote_operation::RemoteObservationOperation::TuiChangeRequestCache(payload.clone()),
+                                    &format!("{}:{}:reconcile", payload.worktree.display(), payload.branch),
+                                )?)
+                                .map_err(|error| format!("encode authoritative cache snapshot: {error}"))?;
                             }
+                            Some(ReconciliationObservation::LocalBranch(payload)) => {
+                                let expected = match &target {
+                                    RemoteMutationTarget::Fetch { expected_head_sha, .. } => expected_head_sha,
+                                    _ => return Err("local branch evidence requested for non-fetch mutation".to_string()),
+                                };
+                                let head = crate::worker::observe_remote::<Option<String>>(
+                                    &payload.repository,
+                                    &payload.worktree,
+                                    crate::workflow::remote_operation::RemoteObservationOperation::TuiLocalBranchHead(payload.clone()),
+                                    &format!("{}:{}:local-ref", payload.worktree.display(), payload.branch),
+                                )?;
+                                if head.as_deref() != Some(expected.as_str()) {
+                                    return Err("fetched local branch has not reached the expected authoritative head".to_string());
+                                }
+                            }
+                            None => {}
                         }
-                        None => {}
-                    }
-                    let ledger = command.marker.ledger.as_ref().ok_or_else(|| "remote reconciliation marker has no durable ledger identity".to_string())?;
-                    crate::worker::reconcile_remote_mutation(
-                        &ledger.repository,
-                        &ledger.worktree,
-                        &ledger.request_id,
-                        ledger.operation.clone(),
-                        &ledger.subject,
-                        crate::RemoteMutationReconciliation::Applied(applied),
-                    )?;
-                    let path = command.marker.database_path.clone();
-                    let mut markers = crate::persistence::database::load_metadata(
-                        &path,
-                        REMOTE_MUTATION_RECONCILIATION_KEY,
-                    )
-                    .map_err(|error| format!("read remote mutation reconciliation markers: {error}"))?
-                    .map(|value| serde_json::from_str::<Vec<RemoteMutationReconciliationMarker>>(&value))
-                    .transpose()
-                    .map_err(|error| format!("decode remote mutation reconciliation markers: {error}"))?
-                    .unwrap_or_default();
-                    markers.retain(|existing| {
-                        !(existing.target == command.marker.target
-                            && existing.recorded_unix_ms == marker_version
-                            && existing.job_id == marker_job_id)
-                    });
-                    persist_markers(&path, &markers)?;
+                        let ledger = command.marker.ledger.as_ref().ok_or_else(|| "remote reconciliation marker has no durable ledger identity".to_string())?;
+                        crate::worker::reconcile_remote_mutation(
+                            &ledger.repository,
+                            &ledger.worktree,
+                            &ledger.request_id,
+                            ledger.operation.clone(),
+                            &ledger.subject,
+                            crate::RemoteMutationReconciliation::Applied(applied),
+                        )?;
+                        update_persisted_remote_mutation_markers(
+                            &command.marker.database_path,
+                            |markers| {
+                                markers.retain(|existing| {
+                                    !(existing.target == target
+                                        && existing.recorded_unix_ms == marker_version
+                                        && existing.job_id == marker_job_id)
+                                });
+                            },
+                        )
+                    })();
                     Ok(Some(TuiJobPayload::RemoteReconciliation(
                         RemoteReconciliationResult {
                             repository,
                             marker_version,
                             marker_job_id,
-                            target: command.marker.target,
-                            result: Ok(()),
+                            target,
+                            result,
                         },
                     )))
                 },
             );
+            self.background.track_reconciliation_job(job_id, key);
         }
     }
 
@@ -343,6 +321,20 @@ impl Tui {
         &mut self,
         result: RemoteReconciliationResult,
     ) {
+        if let Err(error) = &result.result {
+            crate::flight_recorder::record(
+                "remote",
+                "reconciliation_failed",
+                None,
+                vec![
+                    crate::flight_recorder::text(
+                        "repository",
+                        result.repository.root.display().to_string(),
+                    ),
+                    crate::flight_recorder::text("error", crate::util::single_line(error)),
+                ],
+            );
+        }
         self.background.finish_reconciliation(
             &result.repository.root,
             result.marker_version,

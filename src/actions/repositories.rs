@@ -669,6 +669,13 @@ impl Tui {
             repos.push(managed);
         }
         self.repos = repos;
+        self.background.retain_repositories(
+            &self
+                .repos
+                .iter()
+                .map(|managed| managed.identity.clone())
+                .collect(),
+        );
         crate::flight_recorder::register_repositories(
             self.repos.iter().map(|managed| &managed.repo),
         );
@@ -679,6 +686,7 @@ impl Tui {
             .map(|repo| repo.repo.root.clone());
         self.refresh_sessions()?;
         self.sync_selected_repo_context();
+        self.load_remote_mutation_reconciliation_markers();
         Ok(())
     }
 }

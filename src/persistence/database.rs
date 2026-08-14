@@ -73,6 +73,7 @@ fn connect(path: &Path, options: SqliteConnectOptions) -> Result<SqliteConnectio
         })
 }
 
+#[cfg(test)]
 pub(crate) fn load_metadata(path: &Path, key: &str) -> Result<Option<String>, DatabaseError> {
     let mut connection = open_writable(path)?;
     let result = block_on(async {
@@ -96,6 +97,7 @@ pub(crate) fn load_metadata_readonly(
     finish_connection(connection, result)
 }
 
+#[cfg(test)]
 pub(crate) fn upsert_metadata(path: &Path, key: &str, value: &str) -> Result<(), DatabaseError> {
     let mut connection = open_writable(path)?;
     let result = block_on(async {
@@ -107,14 +109,44 @@ pub(crate) fn upsert_metadata(path: &Path, key: &str, value: &str) -> Result<(),
     finish_connection(connection, result)
 }
 
-pub(crate) fn delete_metadata(path: &Path, key: &str) -> Result<(), DatabaseError> {
+pub(crate) fn update_metadata(
+    path: &Path,
+    key: &str,
+    update: impl FnOnce(Option<String>) -> Result<Option<String>, String>,
+) -> Result<(), DatabaseError> {
     let mut connection = open_writable(path)?;
-    let result = block_on(async {
-        sqlx::query_file!("sql/metadata/delete.sql", key)
-            .execute(&mut connection)
-            .await?;
+    let result = (|| {
+        block_on(begin_immediate_query().execute(&mut connection))?;
+        let current = block_on(async {
+            sqlx::query_file_scalar!("sql/metadata/load.sql", key)
+                .fetch_optional(&mut connection)
+                .await
+        })?;
+        let replacement = update(current).map_err(|value| DatabaseError::InvalidValue {
+            field: "metadata update",
+            value,
+        })?;
+        if let Some(value) = replacement {
+            block_on(async {
+                sqlx::query_file!("sql/metadata/upsert.sql", key, value)
+                    .execute(&mut connection)
+                    .await?;
+                Ok(())
+            })?;
+        } else {
+            block_on(async {
+                sqlx::query_file!("sql/metadata/delete.sql", key)
+                    .execute(&mut connection)
+                    .await?;
+                Ok(())
+            })?;
+        }
+        block_on(commit_query().execute(&mut connection))?;
         Ok(())
-    });
+    })();
+    if result.is_err() {
+        let _ = block_on(rollback_query().execute(&mut connection));
+    }
     finish_connection(connection, result)
 }
 
@@ -441,6 +473,79 @@ impl Drop for TestConnection {
     fn drop(&mut self) {
         if let Some(connection) = self.connection.take() {
             let _ = crate::async_runtime::block_on(connection.close());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc;
+
+    static SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn metadata_updates_serialize_the_complete_read_modify_write() {
+        let path = std::env::temp_dir().join(format!(
+            "prism-metadata-update-{}-{}.db",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        upsert_metadata(&path, "test-key", "first").unwrap();
+        let (first_started_tx, first_started_rx) = mpsc::channel();
+        let (release_first_tx, release_first_rx) = mpsc::channel();
+        let first_path = path.clone();
+        let first = std::thread::spawn(move || {
+            update_metadata(&first_path, "test-key", |current| {
+                assert_eq!(current.as_deref(), Some("first"));
+                first_started_tx.send(()).unwrap();
+                release_first_rx.recv().unwrap();
+                Ok(None)
+            })
+            .unwrap();
+        });
+        first_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+
+        let (second_started_tx, second_started_rx) = mpsc::channel();
+        let second_path = path.clone();
+        let second = std::thread::spawn(move || {
+            update_metadata(&second_path, "test-key", |current| {
+                assert!(current.is_none());
+                second_started_tx.send(()).unwrap();
+                Ok(Some("second".to_string()))
+            })
+            .unwrap();
+        });
+
+        assert!(
+            second_started_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "a concurrent updater entered before the first transaction committed"
+        );
+        release_first_tx.send(()).unwrap();
+        first.join().unwrap();
+        second_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        second.join().unwrap();
+        assert_eq!(
+            load_metadata(&path, "test-key").unwrap().as_deref(),
+            Some("second")
+        );
+
+        remove_database(&path);
+    }
+
+    fn remove_database(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(sidecar));
         }
     }
 }

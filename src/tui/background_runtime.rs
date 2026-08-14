@@ -8,6 +8,7 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::session::WorktreeRepositoryKey;
 use crate::tui_jobs::{
     JobContext, JobId, JobMessage, JobMetadata, JobRegistry, LatestReceiver, LatestSender,
     QueueStats, latest_channel,
@@ -15,7 +16,7 @@ use crate::tui_jobs::{
 
 use super::remote_action::{
     RemoteActionDelivery, RemoteActionReconciliationContext, RemoteMutationReconciliationMarker,
-    RemoteMutationTarget,
+    RemoteMutationTarget, update_persisted_remote_mutation_markers,
 };
 use super::{TuiJobKey, TuiJobKind, TuiJobPayload};
 
@@ -28,7 +29,7 @@ struct MarkerPersistenceRequest {
 
 pub(super) struct MarkerPersistenceResult {
     pub key: MarkerKey,
-    pub result: Result<(), String>,
+    pub result: Result<bool, String>,
 }
 
 enum MarkerWriterCommand {
@@ -49,7 +50,7 @@ fn retry_backoff(failures: u32, maximum: Duration) -> Duration {
 fn persist_marker_once(
     request: &MarkerPersistenceRequest,
     #[cfg(test)] write_failures: &std::sync::atomic::AtomicUsize,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     #[cfg(test)]
     if write_failures
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
@@ -61,34 +62,23 @@ fn persist_marker_once(
     }
 
     let marker = &request.marker;
-    let path = &marker.database_path;
-    let mut persisted = crate::persistence::database::load_metadata(
-        path,
-        super::REMOTE_MUTATION_RECONCILIATION_KEY,
-    )
-    .map_err(|error| format!("read remote mutation reconciliation markers: {error}"))?
-    .map(|value| serde_json::from_str::<Vec<RemoteMutationReconciliationMarker>>(&value))
-    .transpose()
-    .map_err(|error| format!("decode remote mutation reconciliation markers: {error}"))?
-    .unwrap_or_default();
-    if let Some(existing) = persisted
-        .iter_mut()
-        .find(|existing| existing.target == marker.target)
-    {
-        if existing.recorded_unix_ms <= marker.recorded_unix_ms {
-            *existing = marker.clone();
+    update_persisted_remote_mutation_markers(&marker.database_path, |persisted| {
+        if let Some(existing) = persisted
+            .iter_mut()
+            .find(|existing| existing.target == marker.target)
+        {
+            if existing.recorded_unix_ms <= marker.recorded_unix_ms {
+                *existing = marker.clone();
+            }
+        } else {
+            persisted.push(marker.clone());
         }
-    } else {
-        persisted.push(marker.clone());
-    }
-    let value = serde_json::to_string(&persisted)
-        .map_err(|error| format!("encode remote mutation reconciliation markers: {error}"))?;
-    crate::persistence::database::upsert_metadata(
-        path,
-        super::REMOTE_MUTATION_RECONCILIATION_KEY,
-        &value,
-    )
-    .map_err(|error| format!("write remote mutation reconciliation marker: {error}"))
+        persisted.iter().any(|existing| {
+            existing.target == marker.target
+                && existing.recorded_unix_ms == marker.recorded_unix_ms
+                && existing.job_id == marker.job_id
+        })
+    })
 }
 
 fn run_marker_writer(
@@ -108,10 +98,10 @@ fn run_marker_writer(
                 #[cfg(test)]
                 &write_failures,
             ) {
-                Ok(()) => {
+                Ok(persisted) => {
                     let _ = result_sender.send(MarkerPersistenceResult {
                         key,
-                        result: Ok(()),
+                        result: Ok(persisted),
                     });
                     break;
                 }
@@ -137,7 +127,10 @@ pub(crate) struct BackgroundRuntime {
     remote_action_reconciliation_contexts: BTreeMap<JobId, RemoteActionReconciliationContext>,
     remote_mutations_requiring_reconciliation:
         BTreeMap<PathBuf, Vec<RemoteMutationReconciliationMarker>>,
+    remote_markers_loaded: BTreeSet<WorktreeRepositoryKey>,
+    remote_marker_loads_in_flight: BTreeSet<WorktreeRepositoryKey>,
     remote_reconciliations_in_flight: BTreeSet<MarkerKey>,
+    remote_reconciliation_jobs: BTreeMap<JobId, MarkerKey>,
     persisted_remote_reconciliation_markers: BTreeSet<MarkerKey>,
     marker_persistence_tx: mpsc::Sender<MarkerPersistenceResult>,
     marker_persistence_rx: mpsc::Receiver<MarkerPersistenceResult>,
@@ -171,7 +164,10 @@ impl Default for BackgroundRuntime {
             remote_actions_requiring_reconciliation: BTreeSet::new(),
             remote_action_reconciliation_contexts: BTreeMap::new(),
             remote_mutations_requiring_reconciliation: BTreeMap::new(),
+            remote_markers_loaded: BTreeSet::new(),
+            remote_marker_loads_in_flight: BTreeSet::new(),
             remote_reconciliations_in_flight: BTreeSet::new(),
+            remote_reconciliation_jobs: BTreeMap::new(),
             persisted_remote_reconciliation_markers: BTreeSet::new(),
             marker_persistence_tx,
             marker_persistence_rx,
@@ -410,21 +406,64 @@ impl BackgroundRuntime {
             .map(Vec::as_slice)
     }
 
-    pub(super) fn replace_markers(
+    pub(super) fn begin_marker_load(&mut self, repository: WorktreeRepositoryKey) -> bool {
+        !self.remote_markers_loaded.contains(&repository)
+            && self.remote_marker_loads_in_flight.insert(repository)
+    }
+
+    pub(super) fn finish_marker_loads(&mut self, repositories: &BTreeSet<WorktreeRepositoryKey>) {
+        self.remote_marker_loads_in_flight
+            .retain(|repository| !repositories.contains(repository));
+    }
+
+    pub(super) fn fail_marker_loads(&mut self) {
+        self.remote_marker_loads_in_flight.clear();
+    }
+
+    pub(super) fn markers_are_loaded(&self, repository: &WorktreeRepositoryKey) -> bool {
+        self.remote_markers_loaded.contains(repository)
+    }
+
+    pub(super) fn apply_loaded_markers(
         &mut self,
-        markers: BTreeMap<PathBuf, Vec<RemoteMutationReconciliationMarker>>,
+        repositories: BTreeSet<WorktreeRepositoryKey>,
+        mut markers: BTreeMap<PathBuf, Vec<RemoteMutationReconciliationMarker>>,
     ) {
-        self.persisted_remote_reconciliation_markers.clear();
-        for (root, entries) in &markers {
-            for marker in entries {
-                self.persisted_remote_reconciliation_markers.insert((
-                    root.clone(),
-                    marker.recorded_unix_ms,
-                    marker.job_id,
-                ));
+        for repository in repositories {
+            self.remote_markers_loaded
+                .retain(|loaded| loaded.root != repository.root);
+            self.remote_markers_loaded.insert(repository.clone());
+            self.persisted_remote_reconciliation_markers
+                .retain(|(root, _, _)| root != &repository.root);
+            self.remote_mutations_requiring_reconciliation
+                .remove(&repository.root);
+            if let Some(entries) = markers.remove(&repository.root) {
+                for marker in &entries {
+                    self.persisted_remote_reconciliation_markers.insert((
+                        repository.root.clone(),
+                        marker.recorded_unix_ms,
+                        marker.job_id,
+                    ));
+                }
+                self.remote_mutations_requiring_reconciliation
+                    .insert(repository.root, entries);
             }
         }
-        self.remote_mutations_requiring_reconciliation = markers;
+    }
+
+    pub(crate) fn retain_repositories(&mut self, repositories: &BTreeSet<WorktreeRepositoryKey>) {
+        self.remote_markers_loaded
+            .retain(|repository| repositories.contains(repository));
+        self.remote_marker_loads_in_flight
+            .retain(|repository| repositories.contains(repository));
+        let roots = repositories
+            .iter()
+            .map(|repository| &repository.root)
+            .collect::<BTreeSet<_>>();
+        self.remote_mutations_requiring_reconciliation
+            .retain(|root, _| roots.contains(root));
+        self.persisted_remote_reconciliation_markers
+            .retain(|(root, _, _)| roots.contains(root));
     }
 
     pub(super) fn upsert_marker(
@@ -446,13 +485,21 @@ impl BackgroundRuntime {
         }
     }
 
-    pub(super) fn marker_blocks(&self, root: &Path, target: &RemoteMutationTarget) -> bool {
-        self.markers(root).is_some_and(|markers| {
-            markers.iter().any(|marker| {
-                matches!(marker.target, RemoteMutationTarget::Unknown { .. })
-                    || super::remote_action::remote_mutation_targets_overlap(&marker.target, target)
+    pub(super) fn marker_blocks(
+        &self,
+        repository: &WorktreeRepositoryKey,
+        target: &RemoteMutationTarget,
+    ) -> bool {
+        !self.remote_markers_loaded.contains(repository)
+            || self.markers(&repository.root).is_some_and(|markers| {
+                markers.iter().any(|marker| {
+                    matches!(marker.target, RemoteMutationTarget::Unknown { .. })
+                        || super::remote_action::remote_mutation_targets_overlap(
+                            &marker.target,
+                            target,
+                        )
+                })
             })
-        })
     }
 
     pub(super) fn persist_marker(
@@ -476,7 +523,7 @@ impl BackgroundRuntime {
         while let Ok(result) = self.marker_persistence_rx.try_recv() {
             self.marker_persistence_pending.remove(&result.key);
             self.marker_writer_enqueued.remove(&result.key);
-            if result.result.is_ok() {
+            if result.result.as_ref().is_ok_and(|persisted| *persisted) {
                 self.persisted_remote_reconciliation_markers
                     .insert(result.key.clone());
             }
@@ -581,6 +628,16 @@ impl BackgroundRuntime {
         self.remote_reconciliations_in_flight.insert(key)
     }
 
+    pub(super) fn track_reconciliation_job(&mut self, job_id: JobId, key: MarkerKey) {
+        self.remote_reconciliation_jobs.insert(job_id, key);
+    }
+
+    pub(super) fn fail_reconciliation_job(&mut self, job_id: JobId) {
+        if let Some(key) = self.remote_reconciliation_jobs.remove(&job_id) {
+            self.remote_reconciliations_in_flight.remove(&key);
+        }
+    }
+
     pub(super) fn finish_reconciliation(
         &mut self,
         root: &Path,
@@ -591,6 +648,8 @@ impl BackgroundRuntime {
     ) {
         let key = (root.to_path_buf(), version, job_id);
         self.remote_reconciliations_in_flight.remove(&key);
+        self.remote_reconciliation_jobs
+            .retain(|_, tracked| tracked != &key);
         if !succeeded {
             return;
         }
@@ -760,6 +819,81 @@ mod tests {
             stale_canceled,
             "stale generation must route a canceled terminal"
         );
+    }
+
+    #[test]
+    fn marker_admission_stays_closed_until_startup_load_finishes() {
+        let mut runtime = BackgroundRuntime::default();
+        let repository = WorktreeRepositoryKey::new(PathBuf::from("repo"));
+        let target = RemoteMutationTarget::Unknown {
+            marker_id: "startup".into(),
+        };
+
+        assert!(runtime.marker_blocks(&repository, &target));
+        runtime.apply_loaded_markers(BTreeSet::from([repository.clone()]), BTreeMap::new());
+        assert!(!runtime.marker_blocks(&repository, &target));
+    }
+
+    #[test]
+    fn superseded_marker_write_is_not_reported_as_persisted() {
+        let temp = std::env::temp_dir().join(format!(
+            "prism-superseded-marker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        let database_path = temp.join("prism.db");
+        let target = RemoteMutationTarget::Unknown {
+            marker_id: "same".into(),
+        };
+        let marker = |version, job_id| RemoteMutationReconciliationMarker {
+            target: target.clone(),
+            ledger: None,
+            database_path: database_path.clone(),
+            job_id,
+            reason: "uncertain".into(),
+            recorded_unix_ms: version,
+        };
+        update_persisted_remote_mutation_markers(&database_path, |markers| {
+            markers.push(marker(2, 2));
+        })
+        .unwrap();
+
+        let persisted = persist_marker_once(
+            &MarkerPersistenceRequest {
+                marker: marker(1, 1),
+            },
+            &std::sync::atomic::AtomicUsize::new(0),
+        )
+        .unwrap();
+
+        assert!(!persisted);
+        let encoded = crate::persistence::database::load_metadata(
+            &database_path,
+            super::super::REMOTE_MUTATION_RECONCILIATION_KEY,
+        )
+        .unwrap()
+        .unwrap();
+        let markers =
+            serde_json::from_str::<Vec<RemoteMutationReconciliationMarker>>(&encoded).unwrap();
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].recorded_unix_ms, 2);
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn failed_reconciliation_job_releases_the_retry_key() {
+        let mut runtime = BackgroundRuntime::default();
+        let key = (PathBuf::from("repo"), 1, 2);
+
+        assert!(runtime.begin_reconciliation(key.clone()));
+        runtime.track_reconciliation_job(3, key.clone());
+        runtime.fail_reconciliation_job(3);
+
+        assert!(runtime.begin_reconciliation(key));
     }
 
     #[test]

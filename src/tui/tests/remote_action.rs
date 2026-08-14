@@ -34,6 +34,88 @@ fn wait_for_background(tui: &mut Tui) {
 }
 
 #[test]
+fn coordinated_mutations_are_blocked_until_startup_markers_are_loaded() {
+    let temp = unique_temp_dir("prism-tui-marker-startup-admission");
+    fs::create_dir_all(&temp).unwrap();
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let session = test_session(0, &temp.join("worktree").display().to_string(), "feature");
+    let mut tui = Tui::new_single(repo, test_config(), vec![session]);
+    let key = TuiJobKey::Worktree(tui.sessions[0].identity_key(&tui.repos[0].identity));
+    let target = unknown_marker_target("startup-admission");
+
+    assert!(tui.remote_action_reconciliation_blocked(&key, &target));
+    wait_for_background(&mut tui);
+    assert!(!tui.remote_action_reconciliation_blocked(&key, &target));
+
+    drop(tui);
+    fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
+fn corrupt_startup_marker_fails_closed_and_marks_sessions_untrusted() {
+    let temp = unique_temp_dir("prism-tui-corrupt-startup-marker");
+    fs::create_dir_all(&temp).unwrap();
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    crate::persistence::database::upsert_metadata(
+        &crate::observability::db_path(&repo),
+        super::super::REMOTE_MUTATION_RECONCILIATION_KEY,
+        "not valid marker json",
+    )
+    .unwrap();
+    let session = test_session(0, &temp.join("worktree").display().to_string(), "feature");
+    let mut tui = Tui::new_single(repo, test_config(), vec![session]);
+    let key = TuiJobKey::Worktree(tui.sessions[0].identity_key(&tui.repos[0].identity));
+    let target = unknown_marker_target("after-load-error");
+
+    wait_for_background(&mut tui);
+
+    assert_eq!(tui.background.marker_count(&temp), 1);
+    assert!(tui.remote_action_reconciliation_blocked(&key, &target));
+    assert!(tui.sessions[0].pr.trusted_summary().is_err());
+    assert_eq!(tui.background.take_shutdown_errors().len(), 1);
+
+    drop(tui);
+    fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
+fn stale_marker_load_error_does_not_block_a_new_repository_incarnation() {
+    let temp = unique_temp_dir("prism-tui-stale-marker-load-error");
+    fs::create_dir_all(&temp).unwrap();
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let session = test_session(0, &temp.join("worktree").display().to_string(), "feature");
+    let mut tui = Tui::new_single(repo.clone(), test_config(), vec![session]);
+    wait_for_background(&mut tui);
+    let stale_repository = tui.repos[0].identity.clone();
+    let current_repository = crate::session::WorktreeRepositoryKey::new(temp.clone());
+    tui.repos[0].identity = current_repository.clone();
+    let key = TuiJobKey::Worktree(tui.sessions[0].identity_key(&current_repository));
+    let target = unknown_marker_target("new-incarnation");
+
+    tui.apply_loaded_remote_mutation_markers(
+        super::super::remote_action::LoadedRemoteMutationMarkers {
+            repositories: std::collections::BTreeSet::from([stale_repository.clone()]),
+            markers: BTreeMap::new(),
+            errors: vec![super::super::remote_action::RemoteMutationMarkerLoadError {
+                repository: stale_repository,
+                database_path: crate::observability::db_path(&repo),
+                message: "stale load error".to_string(),
+            }],
+        },
+    );
+
+    assert!(tui.remote_action_reconciliation_blocked(&key, &target));
+    wait_for_background(&mut tui);
+    assert_eq!(tui.background.marker_count(&temp), 0);
+    assert!(!tui.remote_action_reconciliation_blocked(&key, &target));
+    assert!(tui.sessions[0].pr.trusted_summary().is_ok());
+    assert!(tui.background.take_shutdown_errors().is_empty());
+
+    drop(tui);
+    fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
 fn startup_marker_load_survives_session_generation_change() {
     let temp = unique_temp_dir("prism-tui-marker-generation-race");
     fs::create_dir_all(&temp).unwrap();
@@ -248,6 +330,61 @@ fn empty_list_retains_persisted_create_marker_until_matching_summary_is_observed
     .unwrap();
     assert!(marker.is_some());
 
+    fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
+fn failed_reconciliation_releases_the_marker_for_retry() {
+    let temp = unique_temp_dir("prism-tui-reconciliation-retry");
+    fs::create_dir_all(&temp).unwrap();
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let session = test_session(0, &temp.join("worktree").display().to_string(), "feature");
+    let mut tui = Tui::new_single(repo, test_config(), vec![session]);
+    wait_for_background(&mut tui);
+    let repository = tui.repos[0].identity.clone();
+    let key = TuiJobKey::Worktree(tui.sessions[0].identity_key(&repository));
+    let identity = test_change_request_identity(crate::remote::ProviderKind::GitHub);
+    let target = RemoteMutationTarget::Review {
+        change_request: identity.clone(),
+        expected_state: "APPROVED".to_string(),
+        expected_body: "looks good".to_string(),
+        prior_review_ids: Vec::new(),
+    };
+    tui.record_remote_mutation_reconciliation(&key, 77, "uncertain", &target, None)
+        .unwrap();
+    wait_for_background(&mut tui);
+    let marker = tui.background.markers(&repository.root).unwrap()[0].clone();
+    let marker_key = (
+        repository.root.clone(),
+        marker.recorded_unix_ms,
+        marker.job_id,
+    );
+    let mut summary = test_pr_summary(false);
+    summary.change_request_identity = Some(identity);
+    let details = PrDetails {
+        reviews: vec![PrReview {
+            id: "review-1".to_string(),
+            state: "APPROVED".to_string(),
+            body: "looks good".to_string(),
+            ..PrReview::default()
+        }],
+        ..PrDetails::default()
+    };
+
+    tui.enqueue_details_reconciliation(&repository, &PrCache::observed(summary, Some(details)));
+    wait_for_background(&mut tui);
+
+    assert_eq!(tui.background.marker_count(&repository.root), 1);
+    assert!(tui.background.begin_reconciliation(marker_key));
+    tui.background.finish_reconciliation(
+        &repository.root,
+        marker.recorded_unix_ms,
+        marker.job_id,
+        &target,
+        false,
+    );
+
+    drop(tui);
     fs::remove_dir_all(temp).unwrap();
 }
 

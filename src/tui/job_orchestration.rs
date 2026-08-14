@@ -187,23 +187,29 @@ impl Tui {
             .spawn(kind, key, generation, timeout, name, job)
     }
 
-    pub(super) fn repository_root_for_job_key(&self, key: &TuiJobKey) -> Option<PathBuf> {
+    pub(super) fn repository_key_for_job_key<'a>(
+        &self,
+        key: &'a TuiJobKey,
+    ) -> Option<&'a WorktreeRepositoryKey> {
         match key {
-            TuiJobKey::Repository(repository) => Some(repository.root.clone()),
-            TuiJobKey::WorktrunkHookLogs(repository) => Some(repository.root.clone()),
+            TuiJobKey::Repository(repository)
+            | TuiJobKey::WorktrunkHookLogs(repository)
+            | TuiJobKey::WorkflowRepository(repository) => Some(repository),
             TuiJobKey::Worktree(worktree) | TuiJobKey::AgentStatePersistence(worktree) => {
-                Some(worktree.repository.root.clone())
+                Some(&worktree.repository)
             }
-            TuiJobKey::Pr(key) | TuiJobKey::PrPersistence(key) => {
-                Some(key.worktree.repository.root.clone())
-            }
-            TuiJobKey::Delete(key) => Some(key.worktree.repository.root.clone()),
-            TuiJobKey::Tmux(key) => Some(key.slot.worktree.repository.root.clone()),
-            TuiJobKey::Opencode(key) => Some(key.worktree.repository.root.clone()),
-            TuiJobKey::OpencodeListener(key) => Some(key.worktree.repository.root.clone()),
-            TuiJobKey::WorkflowRepository(repository) => Some(repository.root.clone()),
+            TuiJobKey::Pr(key) | TuiJobKey::PrPersistence(key) => Some(&key.worktree.repository),
+            TuiJobKey::Delete(key) => Some(&key.worktree.repository),
+            TuiJobKey::Tmux(key) => Some(&key.slot.worktree.repository),
+            TuiJobKey::Opencode(key) => Some(&key.worktree.repository),
+            TuiJobKey::OpencodeListener(key) => Some(&key.worktree.repository),
             TuiJobKey::None | TuiJobKey::System => None,
         }
+    }
+
+    pub(super) fn repository_root_for_job_key(&self, key: &TuiJobKey) -> Option<PathBuf> {
+        self.repository_key_for_job_key(key)
+            .map(|repository| repository.root.clone())
     }
     pub(crate) fn route_tui_job_messages(&mut self) -> usize {
         if !self.background.begin_routing() {
@@ -862,6 +868,19 @@ impl Tui {
     pub(super) fn recover_failed_tui_job(&mut self, metadata: &JobMetadata<TuiJobKind, TuiJobKey>) {
         if metadata.kind == TuiJobKind::SessionRefresh {
             self.session_refresh_pending = true;
+        }
+        if metadata.kind == TuiJobKind::RemoteReconciliation {
+            self.background.fail_reconciliation_job(metadata.id);
+            if metadata.key == TuiJobKey::System {
+                self.background.fail_marker_loads();
+                let error =
+                    "remote mutation marker loading failed; coordinated mutations remain blocked"
+                        .to_string();
+                for session in &mut self.sessions {
+                    session.pr.require_reconciliation(&error);
+                }
+                self.background.push_shutdown_error(error);
+            }
         }
         if let (TuiJobKind::WorktreeColumns, TuiJobKey::Repository(repository)) =
             (&metadata.kind, &metadata.key)

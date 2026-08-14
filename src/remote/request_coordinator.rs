@@ -862,14 +862,6 @@ impl RemoteRequestCoordinator {
         if existing.request_fingerprint != fingerprint {
             return Err(mutation_identity_reused(&request.request_id));
         }
-        if !matches!(
-            existing.state,
-            PersistedRemoteMutationState::Uncertain { .. }
-        ) {
-            return Err(RemoteCoordinatorError::Invalid(
-                "only an uncertain remote mutation can be reconciled".into(),
-            ));
-        }
         let state = match reconciliation {
             RemoteMutationReconciliation::Applied(value) => {
                 PersistedRemoteMutationState::Applied { value }
@@ -880,6 +872,26 @@ impl RemoteRequestCoordinator {
                 }
             }
         };
+        if matches!(
+            (&existing.state, &state),
+            (
+                PersistedRemoteMutationState::Applied { .. },
+                PersistedRemoteMutationState::Applied { .. }
+            ) | (
+                PersistedRemoteMutationState::Failed { .. },
+                PersistedRemoteMutationState::Failed { .. }
+            )
+        ) {
+            return Ok(());
+        }
+        if !matches!(
+            existing.state,
+            PersistedRemoteMutationState::Uncertain { .. }
+        ) {
+            return Err(RemoteCoordinatorError::Invalid(
+                "remote mutation was already reconciled to a different outcome".into(),
+            ));
+        }
         self.store
             .save_mutation(&PersistedRemoteMutation {
                 state,
@@ -2299,13 +2311,33 @@ mod tests {
         )
         .await
         .unwrap();
+        let applied = RemoteMutationReconciliation::Applied(serde_json::json!({"merged": true}));
+        restarted
+            .reconcile_mutation(&request, applied)
+            .await
+            .unwrap();
         restarted
             .reconcile_mutation(
                 &request,
-                RemoteMutationReconciliation::Applied(serde_json::json!({"merged": true})),
+                RemoteMutationReconciliation::Applied(serde_json::json!({
+                    "merged": true,
+                    "last_refreshed": 101
+                })),
             )
             .await
             .unwrap();
+        let error = restarted
+            .reconcile_mutation(
+                &request,
+                RemoteMutationReconciliation::Rejected("not merged".to_string()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("already reconciled to a different outcome")
+        );
         assert!(matches!(
             restarted.mutate::<serde_json::Value>(request).await.unwrap(),
             RemoteMutationResult::Applied(value) if value == serde_json::json!({"merged": true})

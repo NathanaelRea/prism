@@ -45,6 +45,29 @@ pub(super) fn unresolved_review_thread_ids(details: &crate::remote::PrDetails) -
     ids
 }
 
+pub(super) fn resolve_review_request_id(
+    operation: &remote_operation::RemoteMutationOperation,
+    subject: &str,
+) -> Result<String, String> {
+    let mut canonical_operation = operation.clone();
+    let remote_operation::RemoteMutationOperation::TuiResolveReviewThreads(payload) =
+        &mut canonical_operation
+    else {
+        return Err("review resolution request ID requires a resolve operation".to_string());
+    };
+    payload.thread_ids.sort();
+    payload.thread_ids.dedup();
+    let number = payload.summary.number;
+    let head_sha = payload.summary.head_sha.clone();
+    let bytes = serde_json::to_vec(&(&canonical_operation, subject))
+        .map_err(|error| format!("encode review resolution request identity: {error}"))?;
+    use sha2::Digest as _;
+    Ok(format!(
+        "resolve:{number}:{head_sha}:{:x}",
+        sha2::Sha256::digest(bytes)
+    ))
+}
+
 pub(super) fn remote_pr_choice_keys() -> Vec<String> {
     ('1'..='9')
         .chain('a'..='z')
@@ -435,7 +458,6 @@ impl Tui {
             .get(&worktree)
             .copied()
             .unwrap_or_default();
-        let resolve_request_id = format!("resolve:{}:{}", summary.number, summary.head_sha);
         let resolve_subject = format!("{}#{}", path.display(), summary.number);
         let resolve_operation = remote_operation::RemoteMutationOperation::TuiResolveReviewThreads(
             remote_operation::TuiRemoteResolvePayload {
@@ -445,6 +467,7 @@ impl Tui {
                 thread_ids: thread_ids.clone(),
             },
         );
+        let resolve_request_id = resolve_review_request_id(&resolve_operation, &resolve_subject)?;
         let RemoteActionValue::Resolved { cache, count } = self.run_remote_action(
             raw,
             crate::tui::RemoteActionRequest {

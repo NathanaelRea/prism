@@ -15,8 +15,9 @@ use crate::tui::{
 use super::worktrees::development_url_opened_message;
 use super::{
     apply_bulk_review_resolution, archived_picker_overflow_message, discover_wt_columns,
-    open_http_url_in_browser, remote_pr_choice_keys, remote_pr_worktree_branch, run_browser_opener,
-    status_label_with_behind, unresolved_review_thread_ids, worktree_column_choices,
+    open_http_url_in_browser, remote_pr_choice_keys, remote_pr_worktree_branch,
+    resolve_review_request_id, run_browser_opener, status_label_with_behind,
+    unresolved_review_thread_ids, worktree_column_choices,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -92,6 +93,58 @@ fn review_resolution_uses_only_unresolved_threads_in_the_observed_details() {
         unresolved_review_thread_ids(&details),
         vec!["thread-1", "thread-2"]
     );
+}
+
+#[test]
+fn review_resolution_request_identity_covers_the_complete_canonical_operation() {
+    let operation = |repository: &str, thread_ids: Vec<String>| {
+        let summary = phase_1_pr_summary("head");
+        crate::workflow::remote_operation::RemoteMutationOperation::TuiResolveReviewThreads(
+            crate::workflow::remote_operation::TuiRemoteResolvePayload {
+                repository: repository.into(),
+                worktree: format!("{repository}/worktree").into(),
+                summary,
+                thread_ids,
+            },
+        )
+    };
+    let first = resolve_review_request_id(
+        &operation(
+            "/repo",
+            vec!["thread-2".to_string(), "thread-1".to_string()],
+        ),
+        "/repo#42",
+    )
+    .unwrap();
+    let reordered = resolve_review_request_id(
+        &operation(
+            "/repo",
+            vec![
+                "thread-1".to_string(),
+                "thread-2".to_string(),
+                "thread-1".to_string(),
+            ],
+        ),
+        "/repo#42",
+    )
+    .unwrap();
+    let different_threads = resolve_review_request_id(
+        &operation("/repo", vec!["thread-3".to_string()]),
+        "/repo#42",
+    )
+    .unwrap();
+    let different_repository = resolve_review_request_id(
+        &operation(
+            "/other",
+            vec!["thread-1".to_string(), "thread-2".to_string()],
+        ),
+        "/other#42",
+    )
+    .unwrap();
+
+    assert_eq!(first, reordered);
+    assert_ne!(first, different_threads);
+    assert_ne!(first, different_repository);
 }
 
 #[test]
