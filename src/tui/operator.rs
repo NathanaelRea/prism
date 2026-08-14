@@ -286,11 +286,7 @@ impl Tui {
             return Ok(());
         };
         let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-        let worktree = self
-            .selected_worktree_index()
-            .and_then(|index| self.sessions.get(index))
-            .map(|session| session.path.clone())
-            .unwrap_or_else(|| self.repo.root.clone());
+        let (worktree, change_request) = self.selected_workflow_subject();
         let input_values = if action == "run" {
             let workflow = catalog
                 .get(&name)
@@ -311,7 +307,7 @@ impl Tui {
                 .arg(&self.repo.root)
                 .args(["workflow", &action, &name]);
             if action == "run" {
-                command.arg("--worktree").arg(&worktree);
+                append_workflow_subject_arguments(&mut command, &worktree, change_request.as_ref());
                 for (input_name, value) in &input_values {
                     command.arg("--input").arg(format!("{input_name}={value}"));
                 }
@@ -326,11 +322,7 @@ impl Tui {
         self.show_message(&format!("{action} {name}"))
     }
 
-    pub(super) fn launch_stabilization_workflow(
-        &mut self,
-        runtime: &mut TerminalRuntime,
-    ) -> Result<(), String> {
-        let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    fn selected_workflow_subject(&self) -> (std::path::PathBuf, Option<(String, String)>) {
         let session = self
             .selected_worktree_index()
             .and_then(|index| self.sessions.get(index));
@@ -340,18 +332,22 @@ impl Tui {
         let change_request = session
             .and_then(|session| session.pr.summary())
             .and_then(workflow_change_request_arguments);
+        (worktree, change_request)
+    }
+
+    pub(super) fn launch_stabilization_workflow(
+        &mut self,
+        runtime: &mut TerminalRuntime,
+    ) -> Result<(), String> {
+        let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+        let (worktree, change_request) = self.selected_workflow_subject();
         let status = runtime.suspend_for(|| {
             let mut command = Command::new(executable);
             command
                 .arg("--repo")
                 .arg(&self.repo.root)
-                .args(["workflow", "run", "stabilize", "--worktree"])
-                .arg(worktree);
-            if let Some((identity, head)) = change_request {
-                command
-                    .args(["--change-request", &identity])
-                    .args(["--change-request-head", &head]);
-            }
+                .args(["workflow", "run", "stabilize"]);
+            append_workflow_subject_arguments(&mut command, &worktree, change_request.as_ref());
             command
                 .status()
                 .map_err(|error| format!("launch stabilization Workflow: {error}"))
@@ -512,6 +508,19 @@ fn select_prompt_workflow(
     )))
 }
 
+fn append_workflow_subject_arguments(
+    command: &mut Command,
+    worktree: &std::path::Path,
+    change_request: Option<&(String, String)>,
+) {
+    command.arg("--worktree").arg(worktree);
+    if let Some((identity, head)) = change_request {
+        command
+            .args(["--change-request", identity])
+            .args(["--change-request-head", head]);
+    }
+}
+
 fn workflow_change_request_arguments(
     summary: &crate::remote::PrSummary,
 ) -> Option<(String, String)> {
@@ -586,12 +595,35 @@ mod tests {
             draft: false,
         };
 
-        let (identity, head) = workflow_change_request_arguments(&summary).unwrap();
-        assert_eq!(
-            identity,
-            "github:github.com:example/repo:change_request:PR_test"
+        let change_request = (
+            "github:github.com:example/repo:change_request:PR_test".to_string(),
+            "abc123".to_string(),
         );
-        assert_eq!(head, "abc123");
+        assert_eq!(
+            workflow_change_request_arguments(&summary),
+            Some(change_request.clone())
+        );
+
+        let mut command = Command::new("prism");
+        append_workflow_subject_arguments(
+            &mut command,
+            std::path::Path::new("/repo/worktree"),
+            Some(&change_request),
+        );
+        assert_eq!(
+            command
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            [
+                "--worktree",
+                "/repo/worktree",
+                "--change-request",
+                "github:github.com:example/repo:change_request:PR_test",
+                "--change-request-head",
+                "abc123",
+            ]
+        );
     }
 
     #[test]
