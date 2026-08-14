@@ -47,6 +47,56 @@ fn open_pr_action_requires_an_observed_change_request() {
 
 #[cfg(unix)]
 #[test]
+fn merge_action_requires_fresh_summary_and_supported_guarded_merge() {
+    let repo = Repository {
+        root: PathBuf::from("/tmp/repo"),
+    };
+    let mut tui = Tui::new_single(
+        repo,
+        test_config(),
+        vec![test_session(0, "/tmp/repo", "feature")],
+    );
+    tui.focused_panel = PanelFocus::Worktrees;
+
+    let mut summary = test_pr_summary(false);
+    summary.change_request_identity = Some(test_change_request_identity(
+        crate::remote::ProviderKind::GitHub,
+    ));
+    tui.sessions[0].pr = PrCache::observed(summary.clone(), None);
+    assert!(tui.git_action_enabled(GitAction::Merge));
+
+    tui.sessions[0].pr.mark_preserved_stale();
+    assert!(!tui.git_action_enabled(GitAction::Merge));
+
+    summary.change_request_identity = Some(test_change_request_identity(
+        crate::remote::ProviderKind::GitLab,
+    ));
+    tui.sessions[0].pr = PrCache::observed(summary, None);
+    assert!(!tui.git_action_enabled(GitAction::Merge));
+
+    let mut capabilities =
+        crate::remote::Capabilities::for_provider(crate::remote::ProviderKind::GitLab);
+    capabilities.guarded_merge = crate::remote::SupportLevel::Unknown;
+    tui.repos[0].remote_capabilities = Some(capabilities.clone());
+    assert!(!tui.git_action_enabled(GitAction::Merge));
+
+    capabilities.guarded_merge = crate::remote::SupportLevel::Unsupported;
+    capabilities.guarded_merge_reason =
+        Some("GitLab adapter does not support rebase merges".to_string());
+    tui.repos[0].remote_capabilities = Some(capabilities.clone());
+    assert!(!tui.git_action_enabled(GitAction::Merge));
+    assert_eq!(
+        tui.remote_action_reason(GitAction::Merge).as_deref(),
+        Some("GitLab adapter does not support rebase merges")
+    );
+
+    capabilities.guarded_merge = crate::remote::SupportLevel::Supported;
+    capabilities.guarded_merge_reason = None;
+    tui.repos[0].remote_capabilities = Some(capabilities);
+    assert!(tui.git_action_enabled(GitAction::Merge));
+}
+
+#[test]
 fn submit_review_requires_the_configured_gh_executable() {
     let temp = unique_temp_dir("prism-tui-submit-review-test");
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));

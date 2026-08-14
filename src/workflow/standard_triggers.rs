@@ -79,6 +79,8 @@ pub struct ChangeRequestObservation {
     pub required_checks: Vec<RequiredCheck>,
     pub draft: bool,
     pub lifecycle_open: bool,
+    /// Authoritative provider policy says merge must be requested through its native queue.
+    pub merge_queue_required: bool,
     pub policy_blockers: Vec<String>,
     /// An explicit provider capability gap. It is never interpreted as satisfied.
     pub unsupported: Option<String>,
@@ -473,7 +475,7 @@ impl StepTrigger for ReadyToMergeTrigger {
                     .iter()
                     .any(|check| check.state != RequiredCheckState::Passed)
                 || observation.merge_relation != MergeRelation::Current
-                || observation.mergeability != Mergeability::Mergeable
+                || !mergeability_ready(&observation)
             {
                 return Ok(TriggerDecision::Wait {
                     summary: readiness_wait_summary(&observation),
@@ -515,6 +517,13 @@ async fn observe_exact(
             ExactObservation::Decision(TriggerDecision::Fail { reason })
         }
     })
+}
+
+fn mergeability_ready(observation: &ChangeRequestObservation) -> bool {
+    observation.mergeability == Mergeability::Mergeable
+        || (observation.merge_queue_required
+            && observation.provider == StandardProvider::GitHub
+            && observation.mergeability == Mergeability::Blocked)
 }
 
 fn readiness_wait_summary(observation: &ChangeRequestObservation) -> String {
@@ -728,6 +737,7 @@ mod tests {
             }],
             draft: false,
             lifecycle_open: true,
+            merge_queue_required: false,
             policy_blockers: Vec::new(),
             unsupported: None,
         }
@@ -1063,6 +1073,36 @@ mod tests {
         assert_eq!(sessions.len(), 4);
         // ready_to_merge is check-only: no merge or cleanup lifecycle exists.
         assert_eq!(complete.steps[3].attempts.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn github_queue_required_blocked_state_is_ready_for_provider_merge() {
+        let mut queued = observation();
+        queued.merge_queue_required = true;
+        queued.mergeability = Mergeability::Blocked;
+        let trigger = ReadyToMergeTrigger::new(Arc::new(FakeRemote::with([queued])));
+        assert!(matches!(
+            trigger.should_run_step(&context()).await.unwrap(),
+            TriggerDecision::Satisfied { .. }
+        ));
+
+        let mut unknown_queue = observation();
+        unknown_queue.mergeability = Mergeability::Blocked;
+        let trigger = ReadyToMergeTrigger::new(Arc::new(FakeRemote::with([unknown_queue])));
+        assert!(matches!(
+            trigger.should_run_step(&context()).await.unwrap(),
+            TriggerDecision::Wait { .. }
+        ));
+
+        let mut non_github = observation();
+        non_github.provider = StandardProvider::GitLab;
+        non_github.merge_queue_required = true;
+        non_github.mergeability = Mergeability::Blocked;
+        let trigger = ReadyToMergeTrigger::new(Arc::new(FakeRemote::with([non_github])));
+        assert!(matches!(
+            trigger.should_run_step(&context()).await.unwrap(),
+            TriggerDecision::Wait { .. }
+        ));
     }
 
     #[tokio::test]

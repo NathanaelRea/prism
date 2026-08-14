@@ -551,12 +551,15 @@ impl Tui {
             .as_ref()
             .map_err(|error| format!("remote mutation result requires reconciliation: {error}"))?;
         match value {
-            RemoteActionValue::Cache(cache) => self.persist_shutdown_remote_cache(key, cache),
-            RemoteActionValue::Resolved { cache, .. } => {
+            RemoteActionValue::Cache(cache)
+            | RemoteActionValue::Push { cache, .. }
+            | RemoteActionValue::Resolved { cache, .. }
+            | RemoteActionValue::Merge { cache, .. } => {
                 self.persist_shutdown_remote_cache(key, cache)
             }
             RemoteActionValue::WorktrunkUserConfig(_)
             | RemoteActionValue::ChangeRequests(_)
+            | RemoteActionValue::MergeRejected(_)
             | RemoteActionValue::Complete => Ok(()),
         }?;
         uncertain_remote_mutation_error(result).map_or(Ok(()), |error| {

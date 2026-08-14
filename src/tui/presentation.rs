@@ -629,7 +629,7 @@ impl Tui {
                     self.git_choice(GitAction::LazyGit, "g", "lazygit"),
                     self.git_choice(GitAction::Push, "P", "push branch"),
                     self.git_choice(GitAction::OpenPr, "o", "open PR"),
-                    self.git_choice(GitAction::Merge, "M", "stabilize and merge"),
+                    self.git_choice(GitAction::Merge, "M", "merge via provider"),
                     self.git_choice(GitAction::CiFix, "c", "CI repair"),
                     self.git_choice(GitAction::ReviewFix, "f", "review repair"),
                     self.git_choice(GitAction::ResolveAllComments, "R", "resolve all comments"),

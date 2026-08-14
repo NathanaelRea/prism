@@ -1134,17 +1134,31 @@ impl MergeMutationResult {
     }
 }
 
-fn native_queue_evidence_is_positive(state: &str) -> bool {
+pub(crate) fn native_queue_evidence_is_positive(state: &str) -> bool {
     let state = state.trim().to_ascii_lowercase();
-    if let Some((_, value)) = state.split_once('=') {
+    if let Some((key, value)) = state.split_once('=') {
         return matches!(
-            value.trim(),
-            "true" | "queued" | "pending" | "running" | "active" | "blocked"
+            (key.trim(), value.trim()),
+            (
+                "merge_when_pipeline_succeeds" | "auto_merge_enabled",
+                "true"
+            )
         );
     }
-    !matches!(
+    matches!(
         state.as_str(),
-        "" | "false" | "null" | "none" | "not_queued" | "not queued" | "unsupported" | "unknown"
+        "queued"
+            | "pending"
+            | "running"
+            | "active"
+            | "blocked"
+            | "awaiting_checks"
+            | "awaiting_merge"
+            | "preparing"
+            | "merge_train"
+            | "locked"
+            | "mergeable"
+            | "unmergeable"
     )
 }
 

@@ -568,8 +568,81 @@ async fn guarded_merge_requires_exact_identity_head_target_and_open_lifecycle() 
     assert!(request.validate_observation(&summary).is_err());
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn parser_accepts_https_ssh_and_scp_forms_and_normalizes_default_ports() {
+#[test]
+fn merge_result_preserves_immediate_merge_and_native_queue_acceptance() {
+    let source = repository(ProviderKind::GitHub, "github.com", "contributor/widget");
+    let target = repository(ProviderKind::GitHub, "github.com", "acme/widget");
+    let id = ChangeRequestId::new(
+        target.clone(),
+        NativeChangeRequestId::new("PR_42").unwrap(),
+        Some(42),
+    );
+    let summary = ChangeRequestSummary {
+        change_request: ChangeRequest {
+            id,
+            source_repository: source,
+            target_repository: target,
+            source_branch: "topic".into(),
+            target_branch: "main".into(),
+            head_sha: "abc123".into(),
+        },
+        title: String::new(),
+        author: String::new(),
+        body: String::new(),
+        web_url: None,
+        lifecycle: LifecycleState::Open,
+        review_decision: ReviewDecision::Approved,
+        requested_reviewers: Vec::new(),
+        mergeability: MergeabilityState::Blocked,
+        check_state: CheckState::Passed,
+        queue_state: QueueState::Queued,
+        native_state_evidence: NativeStateEvidence::default(),
+        comment_count: 0,
+        draft: false,
+        updated_at: None,
+    };
+    let pending = MergeMutationResult::from_summary(summary.clone(), "open");
+    assert_eq!(pending.outcome, MergeMutationOutcome::Pending);
+    assert_eq!(pending.summary.change_request.head_sha, "abc123");
+
+    let mut unknown_native_queue = summary.clone();
+    unknown_native_queue.queue_state = QueueState::Unknown("future_state".into());
+    unknown_native_queue.native_state_evidence.queue = vec!["FUTURE_STATE".into()];
+    assert_eq!(
+        MergeMutationResult::from_summary(unknown_native_queue, "open").outcome,
+        MergeMutationOutcome::Uncertain
+    );
+
+    for evidence in ["future_flag=true", "future_state=queued"] {
+        let mut unknown_keyed_queue = summary.clone();
+        unknown_keyed_queue.queue_state = QueueState::Unknown(evidence.into());
+        unknown_keyed_queue.native_state_evidence.queue = vec![evidence.into()];
+        assert_eq!(
+            MergeMutationResult::from_summary(unknown_keyed_queue, "open").outcome,
+            MergeMutationOutcome::Uncertain
+        );
+    }
+
+    for evidence in ["LOCKED", "MERGEABLE", "UNMERGEABLE"] {
+        let mut native_queue_entry = summary.clone();
+        native_queue_entry.queue_state = QueueState::Unknown(evidence.into());
+        native_queue_entry.native_state_evidence.queue = vec![evidence.into()];
+        assert_eq!(
+            MergeMutationResult::from_summary(native_queue_entry, "open").outcome,
+            MergeMutationOutcome::Pending
+        );
+    }
+
+    let mut merged = summary;
+    merged.lifecycle = LifecycleState::Merged;
+    merged.queue_state = QueueState::NotQueued;
+    let merged = MergeMutationResult::from_summary(merged, "merged");
+    assert_eq!(merged.outcome, MergeMutationOutcome::Merged);
+    assert_eq!(merged.summary.change_request.head_sha, "abc123");
+}
+
+#[test]
+fn parser_accepts_https_ssh_and_scp_forms_and_normalizes_default_ports() {
     let parser = GitRemoteParser::default();
     let cases = [
         (

@@ -7,7 +7,8 @@ use std::os::fd::AsRawFd as _;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -16,8 +17,11 @@ use sha2::{Digest as _, Sha256};
 use crate::platform::SupportedOs;
 use crate::workflow::worker_ipc::{self, WorkerEndpoint, WorkerStream};
 
-const PROTOCOL_VERSION: u32 = 4;
+const PROTOCOL_VERSION: u32 = 5;
 const TRANSITION_TIMEOUT: Duration = Duration::from_secs(3);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(6);
+const MAX_CONNECTION_HANDLERS: usize = 32;
+const AUTHENTICATION_FAILED_RESPONSE: &str = "error authentication-failed";
 #[cfg(not(test))]
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(test)]
@@ -67,10 +71,8 @@ pub fn probe_health() -> Result<DaemonHealth, String> {
         }
         Err(error) => return Err(format!("connect to Prism worker: {error}")),
     };
-    let secret = worker_ipc::read_secret(&endpoint)?;
-    parse_health(&request_stream(
-        stream,
-        &authenticated_command(&secret, "health"),
+    parse_health(&request_with_authentication_fallback(
+        &endpoint, stream, "health",
     )?)
 }
 
@@ -173,6 +175,17 @@ fn spawn_detached_worker(command: crate::process::Command) -> Result<u32, String
     }
 }
 
+fn ensure_compatible_running() -> Result<(), String> {
+    let health = probe_health()?;
+    if health.state == DaemonState::Running && health.protocol_version == Some(PROTOCOL_VERSION) {
+        return Ok(());
+    }
+    if health.state == DaemonState::Draining {
+        wait_stopped(TRANSITION_TIMEOUT)?;
+    }
+    ensure_running()
+}
+
 pub fn health_response() -> Result<String, String> {
     request("health")
 }
@@ -186,7 +199,7 @@ pub fn shutdown() -> Result<(), String> {
     if health.state != DaemonState::Draining {
         return Err(format!("Prism worker rejected shutdown: {response}"));
     }
-    wait_stopped(TRANSITION_TIMEOUT)
+    wait_stopped(SHUTDOWN_TIMEOUT)
 }
 
 fn wait_stopped(timeout: Duration) -> Result<(), String> {
@@ -240,6 +253,13 @@ pub async fn serve() -> Result<(), String> {
     result
 }
 
+#[derive(Default)]
+struct DaemonControl {
+    draining: AtomicBool,
+    handlers: AtomicUsize,
+    requests: AtomicUsize,
+}
+
 async fn serve_socket(
     service: &crate::PromptWorkflowService,
     generation: &str,
@@ -272,20 +292,49 @@ async fn serve_socket(
         std::process::id(),
         crate::workflow::prompt_worker::now_unix_ms()
     );
-    let mut draining = false;
+    let control = Arc::new(DaemonControl::default());
     loop {
         match worker_ipc::accept(&listener) {
-            Ok(stream) => {
-                draining |=
-                    respond(service, stream, &secret, &instance, generation, draining).await;
+            Ok(mut stream) => {
+                if control.handlers.load(Ordering::Acquire) >= MAX_CONNECTION_HANDLERS {
+                    tokio::task::spawn_blocking(move || {
+                        write_with_deadline(
+                            &mut stream,
+                            b"error worker-busy\n",
+                            RESPONSE_WRITE_TIMEOUT,
+                        )
+                    });
+                    continue;
+                }
+                control.handlers.fetch_add(1, Ordering::AcqRel);
+                let service = service.clone();
+                let secret = secret.clone();
+                let instance = instance.clone();
+                let generation = generation.to_string();
+                let handler_control = Arc::clone(&control);
+                tokio::spawn(async move {
+                    respond(
+                        &service,
+                        stream,
+                        &secret,
+                        &instance,
+                        &generation,
+                        &handler_control,
+                    )
+                    .await;
+                    handler_control.handlers.fetch_sub(1, Ordering::AcqRel);
+                });
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(error) => return Err(format!("accept Prism worker connection: {error}")),
         }
-        if draining {
+        if control.draining.load(Ordering::Acquire)
+            && control.handlers.load(Ordering::Acquire) == 0
+            && control.requests.load(Ordering::Acquire) == 0
+        {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     drop(listener);
     endpoint
@@ -299,11 +348,10 @@ async fn respond(
     secret: &str,
     instance: &str,
     generation: &str,
-    draining: bool,
-) -> bool {
-    // Local-socket streams expose synchronous I/O. Keep the one accepted
-    // connection's bounded read/write deadlines off Tokio worker threads; the
-    // sequential accept loop bounds this to one blocking task at a time.
+    control: &DaemonControl,
+) {
+    // Local-socket streams expose synchronous I/O. Keep each accepted
+    // connection's bounded read/write deadlines off Tokio worker threads.
     let read = tokio::task::spawn_blocking(move || {
         let mut stream = stream;
         let request = read_request_line(&mut stream);
@@ -311,7 +359,7 @@ async fn respond(
     })
     .await;
     let Ok((mut stream, request)) = read else {
-        return false;
+        return;
     };
     let Ok(request) = request else {
         let _ = tokio::task::spawn_blocking(move || {
@@ -322,7 +370,7 @@ async fn respond(
             )
         })
         .await;
-        return false;
+        return;
     };
     let request = request.trim();
     let Some(request) = authenticate_command(secret, request) else {
@@ -334,7 +382,7 @@ async fn respond(
             )
         })
         .await;
-        return false;
+        return;
     };
     let active = service
         .list(None, 10_000)
@@ -346,17 +394,32 @@ async fn respond(
         })
         .unwrap_or(0);
     let response = match request {
-        "health" | "wake" => health_line(instance, generation, draining, active),
-        "shutdown" => health_line(instance, generation, true, active),
-        request if request.starts_with('{') => prompt_response(service, request).await,
+        "health" | "wake" => health_line(
+            instance,
+            generation,
+            control.draining.load(Ordering::Acquire),
+            active,
+        ),
+        "shutdown" => {
+            control.draining.store(true, Ordering::Release);
+            health_line(instance, generation, true, active)
+        }
+        request if request.starts_with('{') => {
+            if control.draining.load(Ordering::Acquire) {
+                json_error("Prism worker is draining".to_string())
+            } else {
+                control.requests.fetch_add(1, Ordering::AcqRel);
+                let response = prompt_response(service, request).await;
+                control.requests.fetch_sub(1, Ordering::AcqRel);
+                response
+            }
+        }
         _ => "error unknown-command\n".into(),
     };
-    let shutdown = request == "shutdown";
     let _ = tokio::task::spawn_blocking(move || {
         write_with_deadline(&mut stream, response.as_bytes(), RESPONSE_WRITE_TIMEOUT)
     })
     .await;
-    shutdown
 }
 
 fn read_request_line(stream: &mut WorkerStream) -> io::Result<String> {
@@ -722,7 +785,7 @@ where
     F: FnMut(crate::remote::request_coordinator::RemoteWait),
     C: Fn() -> bool,
 {
-    ensure_running()?;
+    ensure_compatible_running()?;
     let payload = serde_json::to_value(payload)
         .map_err(|error| format!("encode remote observation: {error}"))?;
     coordinated_remote_request(
@@ -768,7 +831,7 @@ where
     F: FnMut(crate::remote::request_coordinator::RemoteWait),
     C: Fn() -> bool,
 {
-    ensure_running()?;
+    ensure_compatible_running()?;
     let payload = serde_json::to_value(payload)
         .map_err(|error| format!("encode remote mutation: {error}"))?;
     coordinated_remote_request(
@@ -828,7 +891,23 @@ fn request(command: &str) -> Result<String, String> {
     let stream = endpoint
         .connect()
         .map_err(|error| format!("connect to Prism worker: {error}"))?;
-    let secret = worker_ipc::read_secret(&endpoint)?;
+    request_with_authentication_fallback(&endpoint, stream, command)
+}
+
+fn request_with_authentication_fallback(
+    endpoint: &WorkerEndpoint,
+    stream: WorkerStream,
+    command: &str,
+) -> Result<String, String> {
+    let response = request_stream(stream, command)?;
+    if response != AUTHENTICATION_FAILED_RESPONSE {
+        return Ok(response);
+    }
+
+    let secret = worker_ipc::read_secret(endpoint)?;
+    let stream = endpoint
+        .connect()
+        .map_err(|error| format!("reconnect to authenticated Prism worker: {error}"))?;
     request_stream(stream, &authenticated_command(&secret, command))
 }
 
@@ -1020,6 +1099,108 @@ pub(crate) fn subscribe_notifications() -> Result<NotificationSubscription, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_connection_handler_keeps_health_responsive() {
+        let temporary = crate::compact_runtime::CompactTempDir::new("worker-concurrency");
+        let database = temporary.path().join("workflow.db");
+        let state_root = temporary.path().join("state");
+        let service = crate::PromptWorkflowService::open(&database, &state_root)
+            .await
+            .expect("open test service");
+        let runtime = temporary.path().join("runtime");
+        worker_ipc::prepare_runtime(&runtime).expect("prepare worker runtime");
+        let endpoint = WorkerEndpoint::for_runtime(&runtime).expect("create worker endpoint");
+        endpoint
+            .remove_stale_address()
+            .expect("remove stale worker endpoint");
+        let secret = worker_ipc::create_secret(&endpoint).expect("create worker secret");
+        let listener = endpoint.bind().expect("bind worker endpoint");
+        let client = endpoint.connect().expect("connect health client");
+        let server = worker_ipc::accept(&listener).expect("accept health client");
+
+        let control = Arc::new(DaemonControl::default());
+        control.handlers.fetch_add(1, Ordering::AcqRel);
+        let health_control = Arc::clone(&control);
+        let health_service = service.clone();
+        let health_secret = secret.clone();
+        let health = tokio::spawn(async move {
+            respond(
+                &health_service,
+                server,
+                &health_secret,
+                "test-instance",
+                "test-generation",
+                &health_control,
+            )
+            .await;
+        });
+        let command = authenticated_command(&secret, "health");
+        let response = tokio::task::spawn_blocking(move || request_stream(client, &command))
+            .await
+            .expect("join health client")
+            .expect("read health response");
+
+        assert!(response.starts_with("ok 5 test-instance"), "{response}");
+        assert_eq!(control.handlers.load(Ordering::Acquire), 1);
+
+        control.handlers.fetch_sub(1, Ordering::AcqRel);
+        health.await.expect("join health handler");
+        drop(listener);
+        endpoint
+            .remove_stale_address()
+            .expect("remove worker endpoint");
+    }
+
+    #[test]
+    fn authenticated_daemon_response_is_retried_with_runtime_secret() {
+        let temporary = crate::compact_runtime::CompactTempDir::new("worker-auth-fallback");
+        let runtime = temporary.path().join("runtime");
+        worker_ipc::prepare_runtime(&runtime).expect("prepare worker runtime");
+        let endpoint = WorkerEndpoint::for_runtime(&runtime).expect("create worker endpoint");
+        endpoint
+            .remove_stale_address()
+            .expect("remove stale worker endpoint");
+        let secret = worker_ipc::create_secret(&endpoint).expect("create worker secret");
+        let listener = endpoint.bind().expect("bind worker endpoint");
+        let client = endpoint.connect().expect("connect unauthenticated client");
+        let server_secret = secret.clone();
+        let server = thread::spawn(move || {
+            let mut first = worker_ipc::accept(&listener).expect("accept first request");
+            assert_eq!(
+                read_request_line(&mut first).expect("read first request"),
+                "health\n"
+            );
+            write_with_deadline(
+                &mut first,
+                b"error authentication-failed\n",
+                RESPONSE_WRITE_TIMEOUT,
+            )
+            .expect("reject unauthenticated request");
+            drop(first);
+
+            let mut retry = worker_ipc::accept(&listener).expect("accept authenticated retry");
+            assert_eq!(
+                read_request_line(&mut retry).expect("read authenticated retry"),
+                format!("auth {server_secret} health\n")
+            );
+            write_with_deadline(
+                &mut retry,
+                b"ok 5 test-instance pid=1 generation=test state=running active=0 notifications=0\n",
+                RESPONSE_WRITE_TIMEOUT,
+            )
+            .expect("write authenticated response");
+        });
+
+        let response = request_with_authentication_fallback(&endpoint, client, "health")
+            .expect("retry authenticated request");
+
+        assert!(response.starts_with("ok 5 test-instance"), "{response}");
+        server.join().expect("join authentication server");
+        endpoint
+            .remove_stale_address()
+            .expect("remove worker endpoint");
+    }
 
     #[test]
     fn runtime_paths_cover_supported_platforms() {

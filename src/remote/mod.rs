@@ -40,6 +40,7 @@ pub(crate) use model::{
     ProviderItemKind, ProviderItemObservation, ProviderKind, QueueState, RemoteBase,
     RemoteRepository, RemoteRepositoryId, RepositoryPolicy, ResolveReviewThread, Review,
     ReviewDecision, ReviewSubmissionKind, ReviewThread, SubmitReview, WebScheme,
+    native_queue_evidence_is_positive,
 };
 #[cfg(test)]
 pub(crate) use model::{HeadAssociation, NativeMergeGuard};
