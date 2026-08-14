@@ -1,8 +1,3 @@
-#![allow(
-    dead_code,
-    reason = "platform process policy is shared by optional adapters"
-)]
-
 use std::cell::RefCell;
 use std::env;
 use std::error::Error;
@@ -710,7 +705,7 @@ struct PolicySettings {
 
 pub struct SupervisedChild {
     child: Child,
-    stdin_writer: Option<JoinHandle<io::Result<()>>>,
+    stdin_writer: Option<StdinWriter>,
     started: Instant,
     deadline: Option<Duration>,
     termination_grace: Duration,
@@ -779,7 +774,7 @@ impl SupervisedChild {
         let stdout_counted = child.stdout.is_some();
         let stderr_counted = child.stderr.is_some();
         let stdin_writer = if let Some(bytes) = input {
-            let Some(mut stdin) = child.stdin.take() else {
+            let Some(stdin) = child.stdin.take() else {
                 let _ = terminate_active_child(&mut child, Duration::from_secs(1));
                 trace.finish(
                     ExternalCallOutcome::Failed,
@@ -787,7 +782,7 @@ impl SupervisedChild {
                 );
                 return Err(ProcessError::MissingPipe("stdin"));
             };
-            Some(std::thread::spawn(move || stdin.write_all(&bytes)))
+            Some(spawn_stdin_writer(stdin, bytes))
         } else {
             None
         };
@@ -821,7 +816,7 @@ impl SupervisedChild {
     }
 
     pub fn finish_stdin(&mut self) -> Result<(), ProcessError> {
-        join_stdin(self.stdin_writer.take())
+        finish_stdin_writer(self.stdin_writer.take(), self.termination_grace)
     }
 
     pub fn take_stdout(&mut self) -> Option<CountingReader<std::process::ChildStdout>> {
@@ -1548,11 +1543,10 @@ fn supervise_with_settings(
         spawn_capture_reader(stderr, settings.capture_bytes, Arc::clone(&stop_readers));
     let stdin_writer = match input {
         ProcessInput::Null => None,
-        ProcessInput::Bytes(bytes) => {
-            let mut stdin = stdin.expect("checked stdin pipe");
-            let bytes = bytes.to_vec();
-            Some(std::thread::spawn(move || stdin.write_all(&bytes)))
-        }
+        ProcessInput::Bytes(bytes) => Some(spawn_stdin_writer(
+            stdin.expect("checked stdin pipe"),
+            bytes.to_vec(),
+        )),
     };
 
     let mut status = None;
@@ -1653,18 +1647,37 @@ fn supervise_with_settings(
     }
 
     let reap_error = if status.is_none() {
-        match child.wait() {
-            Ok(child_status) => {
-                status = Some(child_status);
-                None
+        let reap_deadline = Instant::now() + settings.termination_grace;
+        loop {
+            match child.try_wait() {
+                Ok(Some(child_status)) => {
+                    status = Some(child_status);
+                    break None;
+                }
+                Ok(None) if Instant::now() < reap_deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => {
+                    break Some(ProcessError::Reap(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "child did not become reapable within the termination bound",
+                    )));
+                }
+                Err(error) => break Some(ProcessError::Reap(error)),
             }
-            Err(error) => Some(ProcessError::Reap(error)),
         }
     } else {
         None
     };
     stop_readers.store(true, Ordering::Release);
-    let stdin_result = join_stdin(stdin_writer);
+    if matches!(
+        completion,
+        ProcessCompletion::DeadlineExceeded | ProcessCompletion::Canceled
+    ) && let Some(writer) = &stdin_writer
+    {
+        writer.cancel();
+    }
+    let stdin_result = finish_stdin_writer(stdin_writer, settings.termination_grace);
     let stdout = join_capture_reader(stdout_reader, "stdout");
     let stderr = join_capture_reader(stderr_reader, "stderr");
 
@@ -1821,11 +1834,84 @@ fn join_capture_reader(
         .map_err(|source| ProcessError::Read { stream, source })
 }
 
-fn join_stdin(writer: Option<JoinHandle<io::Result<()>>>) -> Result<(), ProcessError> {
+struct StdinWriter {
+    handle: JoinHandle<io::Result<()>>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl StdinWriter {
+    fn cancel(&self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+
+    fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+}
+
+fn spawn_stdin_writer(mut stdin: std::process::ChildStdin, bytes: Vec<u8>) -> StdinWriter {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let writer_cancel = cancel.clone();
+    let handle = std::thread::spawn(move || {
+        let fd = stdin.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let mut written = 0;
+        while written < bytes.len() {
+            if writer_cancel.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            match stdin.write(&bytes[written..]) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "write subprocess stdin",
+                    ));
+                }
+                Ok(count) => written += count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    let mut descriptor = libc::pollfd {
+                        fd,
+                        events: libc::POLLOUT | libc::POLLHUP,
+                        revents: 0,
+                    };
+                    let result = unsafe { libc::poll(&mut descriptor, 1, 25) };
+                    if result < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    });
+    StdinWriter { handle, cancel }
+}
+
+fn finish_stdin_writer(
+    writer: Option<StdinWriter>,
+    hard_wait: Duration,
+) -> Result<(), ProcessError> {
     let Some(writer) = writer else {
         return Ok(());
     };
+    let deadline = Instant::now() + hard_wait;
+    while !writer.handle.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    if !writer.handle.is_finished() {
+        writer.cancel();
+        // The writer owns a nonblocking descriptor and polls cancellation every 25ms. Detach only
+        // as a final safety net rather than violating the process supervision hard bound.
+        return Ok(());
+    }
     writer
+        .handle
         .join()
         .map_err(|_| ProcessError::ThreadPanicked("stdin writer"))?
         .map_err(ProcessError::Stdin)
@@ -1897,10 +1983,24 @@ pub fn terminate_active_child(
             let _ = child.kill();
         }
     }
-    if status.is_none()
-        && let Err(error) = child.wait()
-    {
-        first_error.get_or_insert(ProcessError::Reap(error));
+    let reap_deadline = Instant::now() + grace;
+    while status.is_none() && Instant::now() < reap_deadline {
+        match child.try_wait() {
+            Ok(child_status) => status = child_status,
+            Err(error) => {
+                first_error.get_or_insert(ProcessError::Reap(error));
+                break;
+            }
+        }
+        if status.is_none() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    if status.is_none() {
+        first_error.get_or_insert(ProcessError::Reap(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "child did not become reapable within the termination bound",
+        )));
     }
     if let Some(error) = first_error {
         Err(error)
@@ -1918,7 +2018,14 @@ struct InteractiveProcessOutput {
 
 enum InteractiveIo<'a> {
     Inherited,
-    CaptureStdout { input: &'a [u8], max_bytes: usize },
+    #[allow(
+        dead_code,
+        reason = "reserved for optional interactive capture adapters"
+    )]
+    CaptureStdout {
+        input: &'a [u8],
+        max_bytes: usize,
+    },
 }
 
 // This is the explicit interactive exception: normal execution is unbounded, while
@@ -1946,6 +2053,7 @@ pub fn run_status_inherited_named(
         .ok_or_else(|| format!("{command_display}: exited with {}", output.status))
 }
 
+#[allow(dead_code, reason = "optional interactive process adapter")]
 pub fn run_capture_interactive(
     command: &mut Command,
     input: &[u8],
@@ -1955,6 +2063,7 @@ pub fn run_capture_interactive(
     run_capture_interactive_named(command, input, max_bytes, descriptor)
 }
 
+#[allow(dead_code, reason = "optional named interactive process adapter")]
 pub fn run_capture_interactive_named(
     command: &mut Command,
     input: &[u8],
@@ -2109,7 +2218,7 @@ fn run_interactive_inner(
     let (stdin_writer, stdout_reader) = match io_mode {
         InteractiveIo::Inherited => (None, None),
         InteractiveIo::CaptureStdout { input, max_bytes } => {
-            let mut stdin = child
+            let stdin = child
                 .stdin
                 .take()
                 .expect("configured interactive stdin pipe");
@@ -2119,7 +2228,7 @@ fn run_interactive_inner(
                 .expect("configured interactive stdout pipe");
             let input = input.to_vec();
             (
-                Some(std::thread::spawn(move || stdin.write_all(&input))),
+                Some(spawn_stdin_writer(stdin, input)),
                 Some(spawn_capture_reader(
                     stdout,
                     max_bytes,
@@ -2172,7 +2281,7 @@ fn run_interactive_inner(
         }
     }
     stop_reader.store(true, Ordering::Release);
-    let stdin_result = join_stdin(stdin_writer);
+    let stdin_result = finish_stdin_writer(stdin_writer, Duration::from_secs(1));
     if !was_canceled {
         stdin_result.map_err(|error| format!("{command_display}: {error}"))?;
     }
@@ -2450,6 +2559,7 @@ pub fn parse_command_words(command: &str) -> Result<Vec<String>, String> {
     }
 }
 
+#[allow(dead_code, reason = "optional configured command sequence adapter")]
 pub fn run_configured_commands(commands: &[String], cwd: &Path, label: &str) -> Result<(), String> {
     for command in commands {
         let argv = split_command_words(command);
@@ -2901,6 +3011,27 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn supervisor_bounds_blocked_stdin_when_descendant_escapes_group() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("setsid sh -c 'sleep 5' & exit 0");
+        let input = vec![b'x'; 1024 * 1024];
+        let started = Instant::now();
+        let result = supervise_with_settings(
+            &mut command,
+            ProcessPolicy::Test,
+            PolicySettings {
+                deadline: Duration::from_millis(100),
+                termination_grace: Duration::from_millis(100),
+                capture_bytes: 1024,
+            },
+            ProcessInput::Bytes(&input),
+            None,
+        );
+        assert!(result.is_ok() || matches!(result, Err(ProcessError::Stdin(_))));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
     fn supervisor_reports_requested_cancellation() {
         let canceled = AtomicBool::new(true);
         let outcome = supervise(

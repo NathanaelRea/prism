@@ -154,7 +154,10 @@ pub enum RemoteObservationResult<T> {
 pub enum RemoteMutationResult<T> {
     Applied(T),
     Pending(RemoteWait),
-    Failed(String),
+    Failed {
+        reason: String,
+        disposition: RemoteMutationFailureDisposition,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -194,10 +197,20 @@ pub struct RemoteOperationOutput {
     pub rate_limit_reset_unix_ms: Option<i64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteMutationFailureDisposition {
+    /// The adapter proved no mutation effect was attempted.
+    RejectedBeforeEffect,
+    /// Dispatch or a multi-effect operation may have changed provider state.
+    OutcomeUncertain,
+}
+
 #[derive(Clone, Debug)]
 pub struct RemoteOperationFailure {
     pub reason: String,
     pub retryable: bool,
+    pub mutation_disposition: RemoteMutationFailureDisposition,
     pub retry_after_unix_ms: Option<i64>,
     pub rate_limit_reset_unix_ms: Option<i64>,
 }
@@ -259,14 +272,51 @@ pub struct PersistedRemoteLane {
     pub updated_unix_ms: i64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistedRemoteMutationState {
+    Claimed,
+    Uncertain { reason: String },
+    Applied { value: serde_json::Value },
+    Failed { reason: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PersistedRemoteMutation {
+    pub lane: RemoteLaneKey,
+    pub request_id: String,
+    pub request_fingerprint: String,
+    pub state: PersistedRemoteMutationState,
+    pub updated_unix_ms: i64,
+}
+
 pub trait RemoteCoordinatorStore: Send + Sync + 'static {
     fn load_lanes<'a>(&'a self) -> RemoteFuture<'a, Vec<PersistedRemoteLane>>;
     fn save_lane<'a>(&'a self, lane: &'a PersistedRemoteLane) -> RemoteFuture<'a, ()>;
+    fn load_mutation<'a>(
+        &'a self,
+        lane: &'a RemoteLaneKey,
+        request_id: &'a str,
+    ) -> RemoteFuture<'a, Option<PersistedRemoteMutation>>;
+    /// Inserts a pre-dispatch claim and returns any record that already owned the identity.
+    fn claim_mutation<'a>(
+        &'a self,
+        mutation: &'a PersistedRemoteMutation,
+    ) -> RemoteFuture<'a, Option<PersistedRemoteMutation>>;
+    fn save_mutation<'a>(&'a self, mutation: &'a PersistedRemoteMutation) -> RemoteFuture<'a, ()>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "result", content = "value")]
+pub enum RemoteMutationReconciliation {
+    Applied(serde_json::Value),
+    Rejected(String),
 }
 
 #[derive(Default)]
 pub struct MemoryRemoteCoordinatorStore {
     lanes: std::sync::Mutex<BTreeMap<RemoteLaneKey, PersistedRemoteLane>>,
+    mutations: std::sync::Mutex<BTreeMap<RemoteMutationKey, PersistedRemoteMutation>>,
 }
 
 impl RemoteCoordinatorStore for MemoryRemoteCoordinatorStore {
@@ -280,6 +330,74 @@ impl RemoteCoordinatorStore for MemoryRemoteCoordinatorStore {
                 .lock()
                 .unwrap()
                 .insert(lane.key.clone(), lane.clone());
+            Ok(())
+        })
+    }
+
+    fn load_mutation<'a>(
+        &'a self,
+        lane: &'a RemoteLaneKey,
+        request_id: &'a str,
+    ) -> RemoteFuture<'a, Option<PersistedRemoteMutation>> {
+        Box::pin(async move {
+            Ok(self
+                .mutations
+                .lock()
+                .unwrap()
+                .get(&RemoteMutationKey {
+                    lane: lane.clone(),
+                    request_id: request_id.to_string(),
+                })
+                .cloned())
+        })
+    }
+
+    fn claim_mutation<'a>(
+        &'a self,
+        mutation: &'a PersistedRemoteMutation,
+    ) -> RemoteFuture<'a, Option<PersistedRemoteMutation>> {
+        Box::pin(async move {
+            let key = RemoteMutationKey {
+                lane: mutation.lane.clone(),
+                request_id: mutation.request_id.clone(),
+            };
+            let mut mutations = self.mutations.lock().unwrap();
+            if let Some(existing) = mutations.get(&key) {
+                return Ok(Some(existing.clone()));
+            }
+            mutations.insert(key, mutation.clone());
+            Ok(None)
+        })
+    }
+
+    fn save_mutation<'a>(&'a self, mutation: &'a PersistedRemoteMutation) -> RemoteFuture<'a, ()> {
+        Box::pin(async move {
+            let key = RemoteMutationKey {
+                lane: mutation.lane.clone(),
+                request_id: mutation.request_id.clone(),
+            };
+            let mut mutations = self.mutations.lock().unwrap();
+            let existing = mutations.get(&key).ok_or_else(|| {
+                RemoteCoordinatorError::Persistence("remote mutation has no durable claim".into())
+            })?;
+            let valid_transition = matches!(
+                (&existing.state, &mutation.state),
+                (
+                    PersistedRemoteMutationState::Claimed
+                        | PersistedRemoteMutationState::Uncertain { .. },
+                    PersistedRemoteMutationState::Uncertain { .. }
+                ) | (
+                    PersistedRemoteMutationState::Uncertain { .. },
+                    PersistedRemoteMutationState::Applied { .. }
+                        | PersistedRemoteMutationState::Failed { .. }
+                )
+            );
+            if !valid_transition || existing.request_fingerprint != mutation.request_fingerprint {
+                return Err(RemoteCoordinatorError::Persistence(
+                    "invalid remote mutation ledger transition".into(),
+                ));
+            }
+            mutations.insert(key, mutation.clone());
             Ok(())
         })
     }
@@ -539,10 +657,38 @@ impl RemoteRequestCoordinator {
             ));
         }
         let now = self.clock.now_unix_ms();
+        let fingerprint = mutation_fingerprint(&request)?;
+        let encoded_request_bytes = serde_json::to_vec(&request.payload)
+            .map_err(|error| RemoteCoordinatorError::Invalid(error.to_string()))?
+            .len()
+            .saturating_add(request.operation.len())
+            .saturating_add(request.subject.len());
+        if encoded_request_bytes > self.config.maximum_response_bytes {
+            return Err(RemoteCoordinatorError::Invalid(format!(
+                "remote mutation request exceeded {} bytes",
+                self.config.maximum_response_bytes
+            )));
+        }
         let mutation_key = RemoteMutationKey {
             lane: request.lane.clone(),
             request_id: request.request_id.clone(),
         };
+        if let Some(existing) = self
+            .store
+            .load_mutation(&request.lane, &request.request_id)
+            .await?
+        {
+            if existing.request_fingerprint != fingerprint {
+                return Err(mutation_identity_reused(&request.request_id));
+            }
+            if matches!(existing.state, PersistedRemoteMutationState::Claimed) {
+                // Claimed is strictly pre-dispatch: the executor is invoked only after the
+                // following Uncertain write succeeds. A failed boundary write is therefore safe
+                // to retry with the same fingerprint and identity.
+            } else {
+                return decode_persisted_mutation(&existing, &fingerprint, &request.request_id);
+            }
+        }
         let (persisted, queued, previous_lane) = {
             let mut state = self.state.lock().await;
             purge_expired_queue_entries(&mut state, now, self.config.queue_lease_ms);
@@ -633,33 +779,114 @@ impl RemoteRequestCoordinator {
                 state.lanes.insert(task_lane.clone(), previous_lane);
                 return Err(error);
             }
+            let claim = PersistedRemoteMutation {
+                lane: task_lane.clone(),
+                request_id: task_key.request_id.clone(),
+                request_fingerprint: fingerprint.clone(),
+                state: PersistedRemoteMutationState::Claimed,
+                updated_unix_ms: now,
+            };
+            if let Some(existing) = coordinator.store.claim_mutation(&claim).await? {
+                if existing.request_fingerprint != fingerprint {
+                    let mut state = coordinator.state.lock().await;
+                    state.in_flight_mutations.remove(&task_key);
+                    state.lanes.entry(task_lane.clone()).or_default().in_flight = false;
+                    return Err(mutation_identity_reused(&task_key.request_id));
+                }
+                if !matches!(existing.state, PersistedRemoteMutationState::Claimed) {
+                    let mut state = coordinator.state.lock().await;
+                    state.in_flight_mutations.remove(&task_key);
+                    state.lanes.entry(task_lane.clone()).or_default().in_flight = false;
+                    return persisted_mutation_result(
+                        &existing,
+                        &fingerprint,
+                        &task_key.request_id,
+                    );
+                }
+            }
+            // Persist the dispatch boundary before invoking the executor. A crash after this write
+            // can no longer replay the effect, even if it occurs before the adapter starts.
+            coordinator
+                .store
+                .save_mutation(&PersistedRemoteMutation {
+                    lane: task_lane.clone(),
+                    request_id: task_key.request_id.clone(),
+                    request_fingerprint: fingerprint.clone(),
+                    state: PersistedRemoteMutationState::Uncertain {
+                        reason: "remote mutation crossed its durable dispatch boundary; outcome requires authoritative reconciliation after Worker interruption".into(),
+                    },
+                    updated_unix_ms: coordinator.clock.now_unix_ms().max(now),
+                })
+                .await?;
             let result = coordinator
                 .executor
                 .execute(CoordinatedRemoteOperation::Mutate(request))
                 .await;
-            let finished = coordinator.finish_mutation(&task_lane, result, now).await;
             coordinator
-                .state
-                .lock()
+                .finish_mutation(&task_lane, &task_key.request_id, &fingerprint, result, now)
                 .await
-                .in_flight_mutations
-                .remove(&task_key);
-            finished
         });
-        match task.await {
-            Ok(result) => decode_mutation_result(result?),
-            Err(error) => {
-                self.state
-                    .lock()
-                    .await
-                    .in_flight_mutations
-                    .remove(&mutation_key);
-                self.abandon_lane(&lane_key).await;
-                Err(RemoteCoordinatorError::Execution(format!(
-                    "remote mutation task failed: {error}"
-                )))
-            }
+        let result = match task.await {
+            Ok(result) => result,
+            Err(error) => Err(RemoteCoordinatorError::Execution(format!(
+                "remote mutation task failed: {error}"
+            ))),
+        };
+        // This is the common finally path for every post-admission exit, including ordinary
+        // persistence errors returned from the spawned task.
+        self.state
+            .lock()
+            .await
+            .in_flight_mutations
+            .remove(&mutation_key);
+        self.abandon_lane(&lane_key).await;
+        decode_mutation_result(result?)
+    }
+
+    /// Record authoritative provider evidence for a previously uncertain mutation.
+    pub async fn reconcile_mutation(
+        &self,
+        request: &RemoteMutationRequest,
+        reconciliation: RemoteMutationReconciliation,
+    ) -> Result<(), RemoteCoordinatorError> {
+        let fingerprint = mutation_fingerprint(request)?;
+        let existing = self
+            .store
+            .load_mutation(&request.lane, &request.request_id)
+            .await?
+            .ok_or_else(|| {
+                RemoteCoordinatorError::Invalid(
+                    "remote mutation has no durable ledger entry".into(),
+                )
+            })?;
+        if existing.request_fingerprint != fingerprint {
+            return Err(mutation_identity_reused(&request.request_id));
         }
+        if !matches!(
+            existing.state,
+            PersistedRemoteMutationState::Uncertain { .. }
+        ) {
+            return Err(RemoteCoordinatorError::Invalid(
+                "only an uncertain remote mutation can be reconciled".into(),
+            ));
+        }
+        let state = match reconciliation {
+            RemoteMutationReconciliation::Applied(value) => {
+                PersistedRemoteMutationState::Applied { value }
+            }
+            RemoteMutationReconciliation::Rejected(reason) => {
+                PersistedRemoteMutationState::Failed {
+                    reason: bounded_reason(&reason),
+                }
+            }
+        };
+        self.store
+            .save_mutation(&PersistedRemoteMutation {
+                state,
+                updated_unix_ms: self.clock.now_unix_ms(),
+                ..existing
+            })
+            .await
     }
 
     pub async fn subscribe(&self, key: &RemoteObservationKey) -> tokio::sync::watch::Receiver<u64> {
@@ -774,53 +1001,80 @@ impl RemoteRequestCoordinator {
     async fn finish_mutation(
         &self,
         lane: &RemoteLaneKey,
+        request_id: &str,
+        fingerprint: &str,
         result: Result<RemoteOperationOutput, RemoteOperationFailure>,
         started_unix_ms: i64,
     ) -> Result<RemoteMutationResult<serde_json::Value>, RemoteCoordinatorError> {
         let now = self.clock.now_unix_ms().max(started_unix_ms);
-        match result {
-            Ok(output) => {
-                if output.response_bytes > self.config.maximum_response_bytes {
-                    self.release_lane(lane, now, None, false).await?;
-                    return Ok(RemoteMutationResult::Failed(format!(
-                        "provider response exceeded {} bytes",
-                        self.config.maximum_response_bytes
-                    )));
-                }
-                self.release_lane(
-                    lane,
-                    now,
+        let (result, persisted, cooldown, succeeded) = match result {
+            Ok(output) if output.response_bytes > self.config.maximum_response_bytes => {
+                let reason = format!(
+                    "remote mutation may have applied but its response exceeded {} bytes; authoritative reconciliation is required",
+                    self.config.maximum_response_bytes
+                );
+                (
+                    RemoteMutationResult::Failed {
+                        reason: reason.clone(),
+                        disposition: RemoteMutationFailureDisposition::OutcomeUncertain,
+                    },
+                    PersistedRemoteMutationState::Uncertain { reason },
                     maximum_time([output.retry_after_unix_ms, output.rate_limit_reset_unix_ms]),
-                    true,
+                    false,
                 )
-                .await?;
-                Ok(RemoteMutationResult::Applied(output.value))
             }
-            Err(failure) if failure.retryable => Ok(
-                match self
-                    .retry_lane(
-                        lane,
-                        now,
+            Ok(output) => (
+                RemoteMutationResult::Applied(output.value.clone()),
+                PersistedRemoteMutationState::Applied {
+                    value: output.value,
+                },
+                maximum_time([output.retry_after_unix_ms, output.rate_limit_reset_unix_ms]),
+                true,
+            ),
+            Err(failure)
+                if failure.mutation_disposition
+                    == RemoteMutationFailureDisposition::OutcomeUncertain =>
+            {
+                let reason = format!(
+                    "remote mutation outcome is uncertain and requires authoritative reconciliation: {}",
+                    bounded_reason(&failure.reason)
+                );
+                (
+                    RemoteMutationResult::Failed {
+                        reason: reason.clone(),
+                        disposition: RemoteMutationFailureDisposition::OutcomeUncertain,
+                    },
+                    PersistedRemoteMutationState::Uncertain { reason },
+                    maximum_time([
                         failure.retry_after_unix_ms,
                         failure.rate_limit_reset_unix_ms,
-                        &failure.reason,
-                    )
-                    .await?
-                {
-                    Some(wait) => RemoteMutationResult::Pending(wait),
-                    None => RemoteMutationResult::Failed(format!(
-                        "provider retry limit exhausted: {}",
-                        bounded_reason(&failure.reason)
-                    )),
-                },
-            ),
-            Err(failure) => {
-                self.release_lane(lane, now, None, false).await?;
-                Ok(RemoteMutationResult::Failed(bounded_reason(
-                    &failure.reason,
-                )))
+                    ]),
+                    false,
+                )
             }
-        }
+            Err(failure) => {
+                let reason = bounded_reason(&failure.reason);
+                (
+                    RemoteMutationResult::Failed {
+                        reason: reason.clone(),
+                        disposition: RemoteMutationFailureDisposition::RejectedBeforeEffect,
+                    },
+                    PersistedRemoteMutationState::Failed { reason },
+                    None,
+                    false,
+                )
+            }
+        };
+        let mutation = PersistedRemoteMutation {
+            lane: lane.clone(),
+            request_id: request_id.to_string(),
+            request_fingerprint: fingerprint.to_string(),
+            state: persisted,
+            updated_unix_ms: now,
+        };
+        self.store.save_mutation(&mutation).await?;
+        self.release_lane(lane, now, cooldown, succeeded).await?;
+        Ok(result)
     }
 
     async fn complete_observation(
@@ -992,6 +1246,52 @@ fn mutation_identity_reused(request_id: &str) -> RemoteCoordinatorError {
     ))
 }
 
+fn mutation_fingerprint(request: &RemoteMutationRequest) -> Result<String, RemoteCoordinatorError> {
+    let bytes = serde_json::to_vec(&(&request.operation, &request.subject, &request.payload))
+        .map_err(|error| RemoteCoordinatorError::Invalid(error.to_string()))?;
+    use sha2::Digest as _;
+    Ok(format!("sha256:{:x}", sha2::Sha256::digest(bytes)))
+}
+
+fn persisted_mutation_result(
+    mutation: &PersistedRemoteMutation,
+    fingerprint: &str,
+    request_id: &str,
+) -> Result<RemoteMutationResult<serde_json::Value>, RemoteCoordinatorError> {
+    if mutation.request_fingerprint != fingerprint {
+        return Err(mutation_identity_reused(request_id));
+    }
+    Ok(match &mutation.state {
+        PersistedRemoteMutationState::Applied { value } => {
+            RemoteMutationResult::Applied(value.clone())
+        }
+        PersistedRemoteMutationState::Failed { reason } => RemoteMutationResult::Failed {
+            reason: reason.clone(),
+            disposition: RemoteMutationFailureDisposition::RejectedBeforeEffect,
+        },
+        PersistedRemoteMutationState::Claimed => RemoteMutationResult::Failed {
+            reason: "remote mutation was claimed before Worker interruption; outcome is uncertain and requires authoritative reconciliation".into(),
+            disposition: RemoteMutationFailureDisposition::OutcomeUncertain,
+        },
+        PersistedRemoteMutationState::Uncertain { reason } => RemoteMutationResult::Failed {
+            reason: reason.clone(),
+            disposition: RemoteMutationFailureDisposition::OutcomeUncertain,
+        },
+    })
+}
+
+fn decode_persisted_mutation<T: DeserializeOwned>(
+    mutation: &PersistedRemoteMutation,
+    fingerprint: &str,
+    request_id: &str,
+) -> Result<RemoteMutationResult<T>, RemoteCoordinatorError> {
+    decode_mutation_result(persisted_mutation_result(
+        mutation,
+        fingerprint,
+        request_id,
+    )?)
+}
+
 fn ensure_queue_capacity(
     state: &CoordinatorState,
     config: &RemoteCoordinatorConfig,
@@ -1061,7 +1361,13 @@ fn decode_mutation_result<T: DeserializeOwned>(
             .map(RemoteMutationResult::Applied)
             .map_err(|error| RemoteCoordinatorError::Decode(error.to_string())),
         RemoteMutationResult::Pending(wait) => Ok(RemoteMutationResult::Pending(wait)),
-        RemoteMutationResult::Failed(reason) => Ok(RemoteMutationResult::Failed(reason)),
+        RemoteMutationResult::Failed {
+            reason,
+            disposition,
+        } => Ok(RemoteMutationResult::Failed {
+            reason,
+            disposition,
+        }),
     }
 }
 
@@ -1253,6 +1559,7 @@ mod tests {
                     return Err(RemoteOperationFailure {
                         reason: "rate limited".into(),
                         retryable: true,
+                        mutation_disposition: RemoteMutationFailureDisposition::OutcomeUncertain,
                         retry_after_unix_ms: Some(retry_after),
                         rate_limit_reset_unix_ms: None,
                     });
@@ -1269,19 +1576,86 @@ mod tests {
     }
 
     struct FailOnceStore {
-        lanes: std::sync::Mutex<BTreeMap<RemoteLaneKey, PersistedRemoteLane>>,
+        inner: MemoryRemoteCoordinatorStore,
         failures: AtomicUsize,
     }
 
     struct FailNthStore {
-        lanes: std::sync::Mutex<BTreeMap<RemoteLaneKey, PersistedRemoteLane>>,
+        inner: MemoryRemoteCoordinatorStore,
         calls: AtomicUsize,
         fail_at: usize,
     }
 
+    struct FailMutationStore {
+        inner: MemoryRemoteCoordinatorStore,
+        fail_claim_once: AtomicUsize,
+        fail_uncertain_once: AtomicUsize,
+    }
+
+    impl RemoteCoordinatorStore for FailMutationStore {
+        fn load_lanes<'a>(&'a self) -> RemoteFuture<'a, Vec<PersistedRemoteLane>> {
+            self.inner.load_lanes()
+        }
+
+        fn save_lane<'a>(&'a self, lane: &'a PersistedRemoteLane) -> RemoteFuture<'a, ()> {
+            self.inner.save_lane(lane)
+        }
+
+        fn load_mutation<'a>(
+            &'a self,
+            lane: &'a RemoteLaneKey,
+            request_id: &'a str,
+        ) -> RemoteFuture<'a, Option<PersistedRemoteMutation>> {
+            self.inner.load_mutation(lane, request_id)
+        }
+
+        fn claim_mutation<'a>(
+            &'a self,
+            mutation: &'a PersistedRemoteMutation,
+        ) -> RemoteFuture<'a, Option<PersistedRemoteMutation>> {
+            Box::pin(async move {
+                if self
+                    .fail_claim_once
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+                {
+                    return Err(RemoteCoordinatorError::Persistence(
+                        "injected mutation claim failure".into(),
+                    ));
+                }
+                self.inner.claim_mutation(mutation).await
+            })
+        }
+
+        fn save_mutation<'a>(
+            &'a self,
+            mutation: &'a PersistedRemoteMutation,
+        ) -> RemoteFuture<'a, ()> {
+            Box::pin(async move {
+                if matches!(
+                    mutation.state,
+                    PersistedRemoteMutationState::Uncertain { .. }
+                ) && self
+                    .fail_uncertain_once
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+                {
+                    return Err(RemoteCoordinatorError::Persistence(
+                        "injected dispatch-boundary persistence failure".into(),
+                    ));
+                }
+                self.inner.save_mutation(mutation).await
+            })
+        }
+    }
+
     impl RemoteCoordinatorStore for FailNthStore {
         fn load_lanes<'a>(&'a self) -> RemoteFuture<'a, Vec<PersistedRemoteLane>> {
-            Box::pin(async move { Ok(self.lanes.lock().unwrap().values().cloned().collect()) })
+            self.inner.load_lanes()
         }
 
         fn save_lane<'a>(&'a self, lane: &'a PersistedRemoteLane) -> RemoteFuture<'a, ()> {
@@ -1291,18 +1665,36 @@ mod tests {
                         "injected lane persistence failure".into(),
                     ));
                 }
-                self.lanes
-                    .lock()
-                    .unwrap()
-                    .insert(lane.key.clone(), lane.clone());
-                Ok(())
+                self.inner.save_lane(lane).await
             })
+        }
+
+        fn load_mutation<'a>(
+            &'a self,
+            lane: &'a RemoteLaneKey,
+            request_id: &'a str,
+        ) -> RemoteFuture<'a, Option<PersistedRemoteMutation>> {
+            self.inner.load_mutation(lane, request_id)
+        }
+
+        fn claim_mutation<'a>(
+            &'a self,
+            mutation: &'a PersistedRemoteMutation,
+        ) -> RemoteFuture<'a, Option<PersistedRemoteMutation>> {
+            self.inner.claim_mutation(mutation)
+        }
+
+        fn save_mutation<'a>(
+            &'a self,
+            mutation: &'a PersistedRemoteMutation,
+        ) -> RemoteFuture<'a, ()> {
+            self.inner.save_mutation(mutation)
         }
     }
 
     impl RemoteCoordinatorStore for FailOnceStore {
         fn load_lanes<'a>(&'a self) -> RemoteFuture<'a, Vec<PersistedRemoteLane>> {
-            Box::pin(async move { Ok(self.lanes.lock().unwrap().values().cloned().collect()) })
+            self.inner.load_lanes()
         }
 
         fn save_lane<'a>(&'a self, lane: &'a PersistedRemoteLane) -> RemoteFuture<'a, ()> {
@@ -1312,12 +1704,30 @@ mod tests {
                         "injected lane persistence failure".into(),
                     ));
                 }
-                self.lanes
-                    .lock()
-                    .unwrap()
-                    .insert(lane.key.clone(), lane.clone());
-                Ok(())
+                self.inner.save_lane(lane).await
             })
+        }
+
+        fn load_mutation<'a>(
+            &'a self,
+            lane: &'a RemoteLaneKey,
+            request_id: &'a str,
+        ) -> RemoteFuture<'a, Option<PersistedRemoteMutation>> {
+            self.inner.load_mutation(lane, request_id)
+        }
+
+        fn claim_mutation<'a>(
+            &'a self,
+            mutation: &'a PersistedRemoteMutation,
+        ) -> RemoteFuture<'a, Option<PersistedRemoteMutation>> {
+            self.inner.claim_mutation(mutation)
+        }
+
+        fn save_mutation<'a>(
+            &'a self,
+            mutation: &'a PersistedRemoteMutation,
+        ) -> RemoteFuture<'a, ()> {
+            self.inner.save_mutation(mutation)
         }
     }
 
@@ -1467,7 +1877,7 @@ mod tests {
             executor.clone(),
             clock.clone(),
             Arc::new(FailOnceStore {
-                lanes: std::sync::Mutex::new(BTreeMap::new()),
+                inner: MemoryRemoteCoordinatorStore::default(),
                 failures: AtomicUsize::new(0),
             }),
             RemoteCoordinatorConfig {
@@ -1515,7 +1925,7 @@ mod tests {
             mutation_executor.clone(),
             clock,
             Arc::new(FailOnceStore {
-                lanes: std::sync::Mutex::new(BTreeMap::new()),
+                inner: MemoryRemoteCoordinatorStore::default(),
                 failures: AtomicUsize::new(0),
             }),
             RemoteCoordinatorConfig {
@@ -1542,6 +1952,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mutation_persistence_failures_release_the_lane_and_marker() {
+        for (claim_failures, uncertain_failures) in [(1, 0), (0, 1)] {
+            let executor = Arc::new(RecordingExecutor::default());
+            let clock = Arc::new(FakeRemoteClock::new(100));
+            let store = Arc::new(FailMutationStore {
+                inner: MemoryRemoteCoordinatorStore::default(),
+                fail_claim_once: AtomicUsize::new(claim_failures),
+                fail_uncertain_once: AtomicUsize::new(uncertain_failures),
+            });
+            let coordinator = RemoteRequestCoordinator::new(
+                executor.clone(),
+                clock,
+                store,
+                RemoteCoordinatorConfig {
+                    minimum_start_delay_ms: 0,
+                    ..RemoteCoordinatorConfig::default()
+                },
+            )
+            .await
+            .unwrap();
+            let first = RemoteMutationRequest {
+                lane: lane(),
+                request_id: format!("fault-{claim_failures}-{uncertain_failures}"),
+                operation: "resolve".into(),
+                subject: "repo:1".into(),
+                priority: RemotePriority::WorkflowHook,
+                payload: serde_json::json!({"thread": 1}),
+            };
+            assert!(
+                coordinator
+                    .mutate::<serde_json::Value>(first.clone())
+                    .await
+                    .is_err()
+            );
+            {
+                let state = coordinator.state.lock().await;
+                assert!(state.in_flight_mutations.is_empty());
+                assert!(!state.lanes.get(&lane()).is_some_and(|lane| lane.in_flight));
+            }
+            if uncertain_failures == 1 {
+                assert!(matches!(
+                    coordinator
+                        .mutate::<serde_json::Value>(first)
+                        .await
+                        .unwrap(),
+                    RemoteMutationResult::Applied(_)
+                ));
+                assert_eq!(executor.calls.load(Ordering::Acquire), 1);
+            }
+            let later = RemoteMutationRequest {
+                lane: lane(),
+                request_id: format!("later-{claim_failures}-{uncertain_failures}"),
+                operation: "resolve".into(),
+                subject: "repo:2".into(),
+                priority: RemotePriority::WorkflowHook,
+                payload: serde_json::json!({"thread": 2}),
+            };
+            assert!(matches!(
+                coordinator
+                    .mutate::<serde_json::Value>(later)
+                    .await
+                    .unwrap(),
+                RemoteMutationResult::Applied(_)
+            ));
+        }
+    }
+
+    #[tokio::test]
     async fn completion_persistence_failure_still_clears_the_observation_marker() {
         let executor = Arc::new(RecordingExecutor::default());
         let clock = Arc::new(FakeRemoteClock::new(100));
@@ -1549,7 +2027,7 @@ mod tests {
             executor.clone(),
             clock.clone(),
             Arc::new(FailNthStore {
-                lanes: std::sync::Mutex::new(BTreeMap::new()),
+                inner: MemoryRemoteCoordinatorStore::default(),
                 calls: AtomicUsize::new(0),
                 fail_at: 2,
             }),
@@ -1693,6 +2171,144 @@ mod tests {
                 .await
                 .unwrap(),
             RemoteMutationResult::Applied(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn durable_mutation_result_replays_without_executor_and_rejects_reuse() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let clock = Arc::new(FakeRemoteClock::new(100));
+        let store = Arc::new(MemoryRemoteCoordinatorStore::default());
+        let first = coordinator(executor.clone(), clock.clone(), store.clone()).await;
+        let request = RemoteMutationRequest {
+            lane: lane(),
+            request_id: "durable".into(),
+            operation: "resolve".into(),
+            subject: "repo:1".into(),
+            priority: RemotePriority::WorkflowHook,
+            payload: serde_json::json!({"thread": 1}),
+        };
+        let applied = first
+            .mutate::<serde_json::Value>(request.clone())
+            .await
+            .unwrap();
+        assert!(matches!(applied, RemoteMutationResult::Applied(_)));
+        assert_eq!(executor.calls.load(Ordering::Acquire), 1);
+
+        let restarted = coordinator(executor.clone(), clock, store).await;
+        let replayed = restarted
+            .mutate::<serde_json::Value>(request.clone())
+            .await
+            .unwrap();
+        assert_eq!(applied, replayed);
+        assert_eq!(executor.calls.load(Ordering::Acquire), 1);
+        let error = restarted
+            .mutate::<serde_json::Value>(RemoteMutationRequest {
+                payload: serde_json::json!({"thread": 2}),
+                ..request
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("reused for a different request"));
+    }
+
+    #[tokio::test]
+    async fn durable_pre_dispatch_claim_is_safely_resumed_after_restart() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let clock = Arc::new(FakeRemoteClock::new(100));
+        let store = Arc::new(MemoryRemoteCoordinatorStore::default());
+        let request = RemoteMutationRequest {
+            lane: lane(),
+            request_id: "interrupted".into(),
+            operation: "merge".into(),
+            subject: "repo:1".into(),
+            priority: RemotePriority::WorkflowHook,
+            payload: serde_json::json!({"head": "abc"}),
+        };
+        let fingerprint = mutation_fingerprint(&request).unwrap();
+        store
+            .claim_mutation(&PersistedRemoteMutation {
+                lane: request.lane.clone(),
+                request_id: request.request_id.clone(),
+                request_fingerprint: fingerprint,
+                state: PersistedRemoteMutationState::Claimed,
+                updated_unix_ms: 99,
+            })
+            .await
+            .unwrap();
+        let restarted = coordinator(executor.clone(), clock, store).await;
+        let result = restarted
+            .mutate::<serde_json::Value>(request)
+            .await
+            .unwrap();
+        assert!(matches!(result, RemoteMutationResult::Applied(_)));
+        assert_eq!(executor.calls.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn uncertain_mutation_requires_authoritative_reconciliation() {
+        let executor = Arc::new(RecordingExecutor::default());
+        executor.response_bytes.store(65, Ordering::Release);
+        let clock = Arc::new(FakeRemoteClock::new(100));
+        let store = Arc::new(MemoryRemoteCoordinatorStore::default());
+        let coordinator = RemoteRequestCoordinator::new(
+            executor,
+            clock,
+            store.clone(),
+            RemoteCoordinatorConfig {
+                minimum_start_delay_ms: 0,
+                maximum_response_bytes: 64,
+                ..RemoteCoordinatorConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let request = RemoteMutationRequest {
+            lane: lane(),
+            request_id: "oversized-mutation".into(),
+            operation: "merge".into(),
+            subject: "repo:1".into(),
+            priority: RemotePriority::WorkflowHook,
+            payload: serde_json::json!({"head": "abc"}),
+        };
+        assert!(matches!(
+            coordinator.mutate::<serde_json::Value>(request.clone()).await.unwrap(),
+            RemoteMutationResult::Failed {
+                reason,
+                disposition: RemoteMutationFailureDisposition::OutcomeUncertain,
+            } if reason.contains("reconciliation")
+        ));
+        let durable = store
+            .load_mutation(&request.lane, &request.request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            durable.state,
+            PersistedRemoteMutationState::Uncertain { .. }
+        ));
+        let restarted = RemoteRequestCoordinator::new(
+            Arc::new(RecordingExecutor::default()),
+            Arc::new(FakeRemoteClock::new(101)),
+            store,
+            RemoteCoordinatorConfig {
+                minimum_start_delay_ms: 0,
+                maximum_response_bytes: 64,
+                ..RemoteCoordinatorConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        restarted
+            .reconcile_mutation(
+                &request,
+                RemoteMutationReconciliation::Applied(serde_json::json!({"merged": true})),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            restarted.mutate::<serde_json::Value>(request).await.unwrap(),
+            RemoteMutationResult::Applied(value) if value == serde_json::json!({"merged": true})
         ));
     }
 

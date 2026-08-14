@@ -1,9 +1,16 @@
 //! Prompt-first Workflow source parsing, graph compilation, discovery, and immutable snapshots.
 
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(unix)]
+use std::ffi::{CStr, CString, OsString};
 use std::fmt;
 use std::fs;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd as _, FromRawFd as _};
+#[cfg(unix)]
+use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
@@ -521,6 +528,10 @@ pub struct TriggerRevision {
     pub check_only: bool,
     pub repeatable_prepare: bool,
     pub repeatable_finalize: bool,
+    /// Captured repository bytes cross the CLI/Worker boundary with the compiled Workflow.
+    /// They are cleared after being retained in the immutable executable store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captured_bytes: Option<Vec<u8>>,
 }
 
 impl TriggerRevision {
@@ -533,8 +544,104 @@ impl TriggerRevision {
             check_only,
             repeatable_prepare: true,
             repeatable_finalize: true,
+            captured_bytes: None,
         }
     }
+}
+
+/// One immutable read of every executable repository resource. Paths are relative to `.prism`,
+/// normalized by `strip_prefix`, and symbolic links are rejected while capturing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RepositoryResourceSnapshot {
+    root: PathBuf,
+    files: BTreeMap<PathBuf, Vec<u8>>,
+    revision: Option<crate::resource::ContentRevision>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TrustedRepositoryResources(pub(crate) RepositoryResourceSnapshot);
+
+impl RepositoryResourceSnapshot {
+    pub fn capture(root: &Path) -> Result<Self, WorkflowSourceError> {
+        let mut captured = Vec::new();
+        #[cfg(unix)]
+        if let Some(root_directory) = open_directory_path_nofollow(root)? {
+            for directory in ["workflows", "triggers", "skills", "templates", "packages"] {
+                collect_resource_files_at(&root_directory, Path::new(directory), &mut captured)?;
+            }
+        }
+        #[cfg(not(unix))]
+        for directory in ["workflows", "triggers", "skills", "templates", "packages"] {
+            collect_resource_files(root, &root.join(directory), &mut captured)?;
+        }
+        captured.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut revision_bytes = b"prism-repository-resource-snapshot\0v2".to_vec();
+        revision_bytes.extend_from_slice(&(captured.len() as u64).to_be_bytes());
+        let mut files = BTreeMap::new();
+        for (relative, contents) in captured {
+            append_snapshot_field(&mut revision_bytes, relative_path_bytes(&relative));
+            append_snapshot_field(&mut revision_bytes, &contents);
+            files.insert(relative, contents);
+        }
+        let revision =
+            (!files.is_empty()).then(|| crate::resource::ContentRevision::digest(&revision_bytes));
+        Ok(Self {
+            root: root.to_path_buf(),
+            files,
+            revision,
+        })
+    }
+
+    pub fn revision(&self) -> Option<&crate::resource::ContentRevision> {
+        self.revision.as_ref()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
+    fn absolute_path(&self, relative: &Path) -> PathBuf {
+        self.root.join(relative)
+    }
+
+    pub(crate) fn path_for(&self, relative: &Path) -> PathBuf {
+        self.absolute_path(relative)
+    }
+
+    pub(crate) fn resource_files(&self) -> impl Iterator<Item = (&Path, &[u8])> {
+        self.files()
+    }
+
+    fn files(&self) -> impl Iterator<Item = (&Path, &[u8])> {
+        self.files
+            .iter()
+            .map(|(path, bytes)| (path.as_path(), bytes.as_slice()))
+    }
+}
+
+impl TrustedRepositoryResources {
+    pub fn snapshot(&self) -> &RepositoryResourceSnapshot {
+        &self.0
+    }
+}
+
+pub fn trusted_repository_resources(
+    global_root: &Path,
+    repository_root: &Path,
+    snapshot: RepositoryResourceSnapshot,
+) -> Result<Option<TrustedRepositoryResources>, WorkflowSourceError> {
+    let Some(revision) = snapshot.revision() else {
+        return Ok(None);
+    };
+    let trusted =
+        crate::resource::TrustStore::new(global_root.join("state/repository-resource-trust.json"))
+            .is_trusted(
+                crate::resource::ResourceScope::Repository,
+                Some(repository_root),
+                revision,
+            )
+            .map_err(|error| WorkflowSourceError::Io(error.to_string()))?;
+    Ok(trusted.then_some(TrustedRepositoryResources(snapshot)))
 }
 
 #[derive(Clone, Debug, Default)]
@@ -566,19 +673,15 @@ impl TriggerCatalog {
 
     pub fn discover(
         global_root: &Path,
-        repository_root: Option<&Path>,
-        repository_trusted: bool,
+        repository: Option<&TrustedRepositoryResources>,
     ) -> Result<Self, WorkflowSourceError> {
         let mut catalog = Self::builtins();
         for root in package_roots(global_root) {
             discover_trigger_directory(&root.join("triggers"), &mut catalog)?;
         }
         discover_trigger_directory(&global_root.join("triggers"), &mut catalog)?;
-        if repository_trusted && let Some(repository) = repository_root {
-            for root in package_roots(repository) {
-                discover_trigger_directory(&root.join("triggers"), &mut catalog)?;
-            }
-            discover_trigger_directory(&repository.join("triggers"), &mut catalog)?;
+        if let Some(repository) = repository {
+            discover_snapshot_triggers(repository, &mut catalog)?;
         }
         Ok(catalog)
     }
@@ -1616,10 +1719,9 @@ pub struct WorkflowCatalog {
 impl WorkflowCatalog {
     pub fn discover(
         global_root: &Path,
-        repository_root: Option<&Path>,
-        repository_trusted: bool,
+        repository: Option<&TrustedRepositoryResources>,
     ) -> Result<Self, Vec<WorkflowDiagnostic>> {
-        let triggers = TriggerCatalog::discover(global_root, repository_root, repository_trusted)
+        let triggers = TriggerCatalog::discover(global_root, repository)
             .map_err(|error| vec![diagnostic(global_root, "", error)])?;
         let mut candidates = Vec::<(WorkflowScope, PathBuf)>::new();
         for package in package_roots(global_root) {
@@ -1636,22 +1738,6 @@ impl WorkflowCatalog {
             &mut candidates,
         )
         .map_err(|error| vec![diagnostic(global_root, "", error)])?;
-        if repository_trusted && let Some(repository) = repository_root {
-            for package in package_roots(repository) {
-                workflow_files(
-                    &package.join("workflows"),
-                    WorkflowScope::Repository,
-                    &mut candidates,
-                )
-                .map_err(|error| vec![diagnostic(&package, "", error)])?;
-            }
-            workflow_files(
-                &repository.join("workflows"),
-                WorkflowScope::Repository,
-                &mut candidates,
-            )
-            .map_err(|error| vec![diagnostic(repository, "", error)])?;
-        }
         candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
         let mut entries = BTreeMap::new();
         let mut diagnostics = Vec::new();
@@ -1676,6 +1762,39 @@ impl WorkflowCatalog {
                     entries.insert(workflow.name.clone(), (discovered, workflow));
                 }
                 Err(mut errors) => diagnostics.append(&mut errors),
+            }
+        }
+        if let Some(repository) = repository {
+            for (relative, bytes) in repository.snapshot().files() {
+                if !is_repository_workflow_path(relative) {
+                    continue;
+                }
+                let path = repository.snapshot().absolute_path(relative);
+                let source = match String::from_utf8(bytes.to_vec()) {
+                    Ok(source) => source,
+                    Err(error) => {
+                        diagnostics.push(diagnostic(
+                            &path,
+                            "",
+                            WorkflowSourceError::Io(format!(
+                                "workflow source is not UTF-8: {error}"
+                            )),
+                        ));
+                        continue;
+                    }
+                };
+                match compile_workflow(&path, &source, &triggers) {
+                    Ok(workflow) => {
+                        let discovered = DiscoveredWorkflow {
+                            name: workflow.name.clone(),
+                            path: path.clone(),
+                            scope: WorkflowScope::Repository,
+                            revision: workflow.source_revision.clone(),
+                        };
+                        entries.insert(workflow.name.clone(), (discovered, workflow));
+                    }
+                    Err(mut errors) => diagnostics.append(&mut errors),
+                }
             }
         }
         if diagnostics.is_empty() {
@@ -1774,6 +1893,58 @@ fn workflow_files(
     Ok(())
 }
 
+fn is_repository_workflow_path(path: &Path) -> bool {
+    let components = path
+        .components()
+        .map(|part| part.as_os_str())
+        .collect::<Vec<_>>();
+    ((components.len() == 2 && components[0] == "workflows")
+        || (components.len() == 4 && components[0] == "packages" && components[2] == "workflows"))
+        && path.extension().and_then(|value| value.to_str()) == Some("toml")
+}
+
+fn is_repository_trigger_path(path: &Path) -> bool {
+    let components = path
+        .components()
+        .map(|part| part.as_os_str())
+        .collect::<Vec<_>>();
+    (components.len() == 2 && components[0] == "triggers")
+        || (components.len() == 4 && components[0] == "packages" && components[2] == "triggers")
+}
+
+fn discover_snapshot_triggers(
+    repository: &TrustedRepositoryResources,
+    catalog: &mut TriggerCatalog,
+) -> Result<(), WorkflowSourceError> {
+    for (relative, bytes) in repository.snapshot().files() {
+        if !is_repository_trigger_path(relative) {
+            continue;
+        }
+        let name = relative
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| WorkflowSourceError::Io("trigger filename is not UTF-8".into()))?
+            .to_string();
+        if !bytes.starts_with(b"#!") {
+            return Err(WorkflowSourceError::Io(format!(
+                "external trigger {} must begin with a shebang",
+                repository.snapshot().absolute_path(relative).display()
+            )));
+        }
+        let directives = trigger_directives(bytes);
+        catalog.insert(TriggerRevision {
+            name,
+            executable: Some(repository.snapshot().absolute_path(relative)),
+            digest: sha256(bytes),
+            check_only: directives.contains("check-only"),
+            repeatable_prepare: directives.contains("repeatable-prepare"),
+            repeatable_finalize: directives.contains("repeatable-finalize"),
+            captured_bytes: Some(bytes.to_vec()),
+        });
+    }
+    Ok(())
+}
+
 fn discover_trigger_directory(
     directory: &Path,
     catalog: &mut TriggerCatalog,
@@ -1809,6 +1980,7 @@ fn discover_trigger_directory(
             check_only: directives.contains("check-only"),
             repeatable_prepare: directives.contains("repeatable-prepare"),
             repeatable_finalize: directives.contains("repeatable-finalize"),
+            captured_bytes: None,
         });
     }
     Ok(())
@@ -1832,26 +2004,7 @@ fn trigger_directives(bytes: &[u8]) -> BTreeSet<String> {
 pub fn repository_resource_revision(
     repository_resources: &Path,
 ) -> Result<Option<crate::resource::ContentRevision>, WorkflowSourceError> {
-    let mut files = Vec::new();
-    for directory in ["workflows", "triggers", "packages"] {
-        collect_resource_files(
-            repository_resources,
-            &repository_resources.join(directory),
-            &mut files,
-        )?;
-    }
-    if files.is_empty() {
-        return Ok(None);
-    }
-    files.sort_by(|left, right| left.0.cmp(&right.0));
-    let mut bytes = Vec::new();
-    for (relative, contents) in files {
-        bytes.extend_from_slice(relative.to_string_lossy().as_bytes());
-        bytes.push(0);
-        bytes.extend_from_slice(&contents);
-        bytes.push(0xff);
-    }
-    Ok(Some(crate::resource::ContentRevision::digest(&bytes)))
+    Ok(RepositoryResourceSnapshot::capture(repository_resources)?.revision)
 }
 
 pub fn repository_resources_are_trusted(
@@ -1859,16 +2012,8 @@ pub fn repository_resources_are_trusted(
     repository_root: &Path,
     repository_resources: &Path,
 ) -> Result<bool, WorkflowSourceError> {
-    let Some(revision) = repository_resource_revision(repository_resources)? else {
-        return Ok(false);
-    };
-    crate::resource::TrustStore::new(global_root.join("state/repository-resource-trust.json"))
-        .is_trusted(
-            crate::resource::ResourceScope::Repository,
-            Some(repository_root),
-            &revision,
-        )
-        .map_err(|error| WorkflowSourceError::Io(error.to_string()))
+    let snapshot = RepositoryResourceSnapshot::capture(repository_resources)?;
+    Ok(trusted_repository_resources(global_root, repository_root, snapshot)?.is_some())
 }
 
 pub fn trust_repository_resources(
@@ -1876,24 +2021,232 @@ pub fn trust_repository_resources(
     repository_root: &Path,
     repository_resources: &Path,
 ) -> Result<crate::resource::TrustRecord, WorkflowSourceError> {
-    let revision = repository_resource_revision(repository_resources)?.ok_or_else(|| {
-        WorkflowSourceError::Invalid {
+    let snapshot = RepositoryResourceSnapshot::capture(repository_resources)?;
+    trust_repository_resource_snapshot(global_root, repository_root, &snapshot)
+}
+
+pub fn trust_repository_resource_snapshot(
+    global_root: &Path,
+    repository_root: &Path,
+    snapshot: &RepositoryResourceSnapshot,
+) -> Result<crate::resource::TrustRecord, WorkflowSourceError> {
+    let revision = snapshot
+        .revision()
+        .cloned()
+        .ok_or_else(|| WorkflowSourceError::Invalid {
             message: "repository has no Workflow or Trigger resources to trust".into(),
             step: None,
-        }
-    })?;
+        })?;
     crate::resource::TrustStore::new(global_root.join("state/repository-resource-trust.json"))
         .trust(repository_root, &revision, std::time::SystemTime::now())
         .map_err(|error| WorkflowSourceError::Io(error.to_string()))
 }
 
+fn append_snapshot_field(encoded: &mut Vec<u8>, bytes: &[u8]) {
+    encoded.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+    encoded.extend_from_slice(bytes);
+}
+
+#[cfg(unix)]
+fn relative_path_bytes(path: &Path) -> &[u8] {
+    use std::os::unix::ffi::OsStrExt as _;
+    path.as_os_str().as_bytes()
+}
+
+#[cfg(unix)]
+fn open_directory_path_nofollow(path: &Path) -> Result<Option<fs::File>, WorkflowSourceError> {
+    use std::path::Component;
+
+    let start = if path.is_absolute() {
+        Path::new("/")
+    } else {
+        Path::new(".")
+    };
+    let mut directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(start)?;
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            if matches!(component, Component::RootDir | Component::CurDir) {
+                continue;
+            }
+            return Err(WorkflowSourceError::Io(format!(
+                "repository resource root {} contains an unsupported path component",
+                path.display()
+            )));
+        };
+        match openat_file(&directory, name, libc::O_DIRECTORY) {
+            Ok(next) => directory = next,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                let message = if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) {
+                    format!(
+                        "repository resource root {} must not contain a symbolic link",
+                        path.display()
+                    )
+                } else {
+                    format!(
+                        "open repository resource directory {} without following links: {error}",
+                        path.display()
+                    )
+                };
+                return Err(WorkflowSourceError::Io(message));
+            }
+        }
+    }
+    Ok(Some(directory))
+}
+
+#[cfg(unix)]
+fn openat_file(
+    directory: &fs::File,
+    name: &std::ffi::OsStr,
+    extra_flags: libc::c_int,
+) -> std::io::Result<fs::File> {
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | extra_flags,
+        )
+    };
+    if fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { fs::File::from_raw_fd(fd) })
+    }
+}
+
+#[cfg(unix)]
+fn directory_entry_names(directory: &fs::File) -> std::io::Result<Vec<OsString>> {
+    let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
+    if duplicate < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let stream = unsafe { libc::fdopendir(duplicate) };
+    if stream.is_null() {
+        unsafe { libc::close(duplicate) };
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut names = Vec::new();
+    loop {
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break;
+        }
+        let bytes = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if bytes != b"." && bytes != b".." {
+            names.push(OsString::from_vec(bytes.to_vec()));
+        }
+    }
+    unsafe { libc::closedir(stream) };
+    names.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    Ok(names)
+}
+
+#[cfg(unix)]
+fn entry_stat(directory: &fs::File, name: &std::ffi::OsStr) -> std::io::Result<libc::stat> {
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let mut stat = unsafe { std::mem::zeroed() };
+    if unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            &mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(stat)
+    }
+}
+
+#[cfg(unix)]
+fn collect_resource_files_at(
+    parent: &fs::File,
+    relative: &Path,
+    files: &mut Vec<(PathBuf, Vec<u8>)>,
+) -> Result<(), WorkflowSourceError> {
+    let name = relative.file_name().expect("resource directory has a name");
+    let checked = match entry_stat(parent, name) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if checked.st_mode & libc::S_IFMT == libc::S_IFLNK {
+        return Err(WorkflowSourceError::Io(format!(
+            "repository resource {} must not be a symbolic link",
+            relative.display()
+        )));
+    }
+    if checked.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        return Ok(());
+    }
+    let directory = openat_file(parent, name, libc::O_DIRECTORY).map_err(|error| {
+        WorkflowSourceError::Io(format!(
+            "open repository resource {} without following links: {error}",
+            relative.display()
+        ))
+    })?;
+    let opened = directory.metadata()?;
+    use std::os::unix::fs::MetadataExt as _;
+    if checked.st_dev != opened.dev() || checked.st_ino != opened.ino() {
+        return Err(WorkflowSourceError::Io(format!(
+            "repository resource {} changed while it was captured",
+            relative.display()
+        )));
+    }
+    for child_name in directory_entry_names(&directory)? {
+        let child_relative = relative.join(&child_name);
+        let checked = entry_stat(&directory, &child_name)?;
+        match checked.st_mode & libc::S_IFMT {
+            libc::S_IFLNK => {
+                return Err(WorkflowSourceError::Io(format!(
+                    "repository resource {} must not be a symbolic link",
+                    child_relative.display()
+                )));
+            }
+            libc::S_IFDIR => collect_resource_files_at(&directory, &child_relative, files)?,
+            libc::S_IFREG => {
+                let mut file = openat_file(&directory, &child_name, 0).map_err(|error| {
+                    WorkflowSourceError::Io(format!(
+                        "open repository resource {} without following links: {error}",
+                        child_relative.display()
+                    ))
+                })?;
+                let opened = file.metadata()?;
+                if checked.st_dev != opened.dev() || checked.st_ino != opened.ino() {
+                    return Err(WorkflowSourceError::Io(format!(
+                        "repository resource {} changed while it was captured",
+                        child_relative.display()
+                    )));
+                }
+                let mut contents = Vec::new();
+                file.read_to_end(&mut contents)?;
+                files.push((child_relative, contents));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
 fn collect_resource_files(
     root: &Path,
     directory: &Path,
     files: &mut Vec<(PathBuf, Vec<u8>)>,
 ) -> Result<(), WorkflowSourceError> {
-    let Ok(entries) = fs::read_dir(directory) else {
-        return Ok(());
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
     };
     let mut entries = entries.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(fs::DirEntry::file_name);
@@ -1908,12 +2261,10 @@ fn collect_resource_files(
         if file_type.is_dir() {
             collect_resource_files(root, &entry.path(), files)?;
         } else if file_type.is_file() {
-            let relative = entry
-                .path()
-                .strip_prefix(root)
-                .map_err(|error| WorkflowSourceError::Io(error.to_string()))?
-                .to_path_buf();
-            files.push((relative, fs::read(entry.path())?));
+            files.push((
+                entry.path().strip_prefix(root).unwrap().to_path_buf(),
+                fs::read(entry.path())?,
+            ));
         }
     }
     Ok(())
@@ -2441,7 +2792,7 @@ prompt = "{{title}} publish={{publish}} count={{count}} mode={{mode}}"
             "#!/bin/sh\n# prism-trigger: check-only, repeatable-prepare\n",
         )
         .unwrap();
-        let catalog = TriggerCatalog::discover(&root, None, false).unwrap();
+        let catalog = TriggerCatalog::discover(&root, None).unwrap();
         let revision = catalog.get("check-clean").unwrap();
         assert!(revision.check_only);
         assert!(revision.repeatable_prepare);
@@ -2472,6 +2823,110 @@ prompt = "{{title}} publish={{publish}} count={{count}} mode={{mode}}"
         )
         .unwrap();
         assert!(!repository_resources_are_trusted(&global, &repository, &resources).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn snapshot_revision_encoding_is_injective_and_rejects_symlink_roots() {
+        let root = std::env::temp_dir().join(format!(
+            "prism-workflow-snapshot-encoding-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let one = root.join("one");
+        let two = root.join("two");
+        fs::create_dir_all(one.join("workflows")).unwrap();
+        fs::create_dir_all(two.join("workflows")).unwrap();
+        // The legacy delimiter encoding made these byte streams identical:
+        // `a + NUL + (x FF b NUL y) + FF` versus two records split at `FF b NUL`.
+        fs::write(one.join("workflows/a"), b"x\xffworkflows/b\0y").unwrap();
+        fs::write(two.join("workflows/a"), b"x").unwrap();
+        fs::write(two.join("workflows/b"), b"y").unwrap();
+        let one_revision = RepositoryResourceSnapshot::capture(&one)
+            .unwrap()
+            .revision()
+            .unwrap()
+            .clone();
+        let two_revision = RepositoryResourceSnapshot::capture(&two)
+            .unwrap()
+            .revision()
+            .unwrap()
+            .clone();
+        assert_ne!(one_revision, two_revision);
+
+        let actual = root.join("actual");
+        fs::create_dir_all(actual.join("workflows")).unwrap();
+        let linked = root.join("linked");
+        std::os::unix::fs::symlink(&actual, &linked).unwrap();
+        assert!(
+            RepositoryResourceSnapshot::capture(&linked)
+                .unwrap_err()
+                .to_string()
+                .contains("symbolic link")
+        );
+        let top_level_link = root.join("top-level-link");
+        fs::create_dir_all(&top_level_link).unwrap();
+        std::os::unix::fs::symlink(actual.join("workflows"), top_level_link.join("workflows"))
+            .unwrap();
+        assert!(
+            RepositoryResourceSnapshot::capture(&top_level_link)
+                .unwrap_err()
+                .to_string()
+                .contains("symbolic link")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn trusted_snapshot_discovery_never_rereads_workflow_trigger_or_package_bytes() {
+        let root = std::env::temp_dir().join(format!(
+            "prism-workflow-snapshot-toctou-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let global = root.join("global");
+        let repository = root.join("repo");
+        let resources = repository.join(".prism");
+        fs::create_dir_all(resources.join("packages/pkg/workflows")).unwrap();
+        fs::create_dir_all(resources.join("packages/pkg/triggers")).unwrap();
+        let workflow_path = resources.join("packages/pkg/workflows/review.toml");
+        let trigger_path = resources.join("packages/pkg/triggers/captured");
+        let original_trigger = b"#!/bin/sh\n# prism-trigger: repeatable-prepare\n";
+        fs::write(
+            &workflow_path,
+            "[[step]]\ntrigger='captured'\nprompt='trusted prompt'\n",
+        )
+        .unwrap();
+        fs::write(&trigger_path, original_trigger).unwrap();
+        let snapshot = RepositoryResourceSnapshot::capture(&resources).unwrap();
+        let revision = snapshot.revision().unwrap().clone();
+        crate::resource::TrustStore::new(global.join("state/repository-resource-trust.json"))
+            .trust(&repository, &revision, std::time::SystemTime::now())
+            .unwrap();
+        let trusted = trusted_repository_resources(&global, &repository, snapshot)
+            .unwrap()
+            .unwrap();
+
+        fs::write(&workflow_path, "[[step]]\nprompt='attacker prompt'\n").unwrap();
+        fs::write(&trigger_path, b"#!/bin/sh\nexit 99\n").unwrap();
+        let catalog = WorkflowCatalog::discover(&global, Some(&trusted)).unwrap();
+        let workflow = catalog.get("review").unwrap();
+        assert_eq!(workflow.steps[0].prompt.as_deref(), Some("trusted prompt"));
+        let trigger = workflow.steps[0].trigger.as_ref().unwrap();
+        assert_eq!(
+            trigger.captured_bytes.as_deref(),
+            Some(original_trigger.as_slice())
+        );
+        assert_eq!(trigger.digest, sha256(original_trigger));
+
+        let symlink = resources.join("packages/pkg/workflows/link.toml");
+        std::os::unix::fs::symlink(&workflow_path, &symlink).unwrap();
+        assert!(
+            RepositoryResourceSnapshot::capture(&resources)
+                .unwrap_err()
+                .to_string()
+                .contains("symbolic link")
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

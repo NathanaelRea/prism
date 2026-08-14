@@ -260,20 +260,18 @@ impl Tui {
     pub(super) fn launch_workflow(&mut self, runtime: &mut TerminalRuntime) -> Result<(), String> {
         let global = crate::util::prism_config_dir();
         let local = self.repo.root.join(".prism");
-        let repository_trusted =
-            crate::repository_resources_are_trusted(&global, &self.repo.root, &local)
-                .map_err(|error| error.to_string())?;
+        let snapshot = crate::RepositoryResourceSnapshot::capture(&local)
+            .map_err(|error| error.to_string())?;
+        let repository_has_resources = !snapshot.is_empty();
+        let repository = crate::trusted_repository_resources(&global, &self.repo.root, snapshot)
+            .map_err(|error| error.to_string())?;
         let catalog = runtime.suspend_for(|| {
-            crate::PromptWorkflowCatalog::discover(&global, Some(&local), repository_trusted)
+            crate::PromptWorkflowCatalog::discover(&global, repository.as_ref())
                 .map_err(format_diagnostics)
         })?;
         let candidates = catalog.list();
         if candidates.is_empty() {
-            if !repository_trusted
-                && crate::repository_resource_revision(&local)
-                    .map_err(|error| error.to_string())?
-                    .is_some()
-            {
+            if repository.is_none() && repository_has_resources {
                 return self.show_message(
                     "repository Workflow resources are untrusted; preview `prism workflow trust-repository` before applying trust",
                 );

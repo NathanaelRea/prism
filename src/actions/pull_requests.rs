@@ -1,4 +1,5 @@
 use super::*;
+use crate::workflow::remote_operation;
 
 type RemoteJobContext = crate::tui_jobs::JobContext<TuiJobKind, TuiJobKey, TuiJobPayload>;
 
@@ -228,6 +229,17 @@ impl Tui {
             change_request: change_request.clone(),
             expected_head_sha: expected_head_sha.clone(),
         };
+        let merge_request_id = format!("merge:{}:{}", summary.number, expected_head_sha);
+        let merge_subject = format!("{}#{}", path.display(), summary.number);
+        let merge_operation = remote_operation::RemoteMutationOperation::TuiMergeChangeRequest(
+            remote_operation::TuiRemoteMergePayload {
+                repository: repo.root.clone(),
+                worktree: path.clone(),
+                change_request,
+                display_number: summary.number,
+                expected_head_sha: expected_head_sha.clone(),
+            },
+        );
         let result = self.run_remote_action(
             raw,
             crate::tui::RemoteActionRequest {
@@ -237,38 +249,40 @@ impl Tui {
                 title: "Merge Pull Request",
                 message: "Requesting guarded merge from the provider",
                 abandon_cancelable: false,
-                mutation: Some(mutation),
+                effect: crate::tui::RemoteActionEffect::CoordinatedMutation {
+                    target: Box::new(mutation),
+                    ledger: Box::new(crate::tui::RemoteMutationLedgerContext {
+                        repository: repo.root.clone(),
+                        worktree: path.clone(),
+                        request_id: merge_request_id.clone(),
+                        operation: merge_operation.clone(),
+                        subject: merge_subject.clone(),
+                    }),
+                },
             },
             move |context| {
                 let progress = context.clone();
                 let cancellation = context;
-                let result: crate::workflow::standard_remote::TuiRemoteMergeResult =
+                let result: remote_operation::TuiRemoteMergeResult =
                     crate::worker::mutate_remote_with_progress(
                         &repo.root,
                         &path,
-                        &format!("merge:{}:{}", summary.number, expected_head_sha),
-                        "tui.merge_change_request",
-                        &format!("{}#{}", path.display(), summary.number),
-                        crate::workflow::standard_remote::TuiRemoteMergePayload {
-                            repository: repo.root.clone(),
-                            worktree: path.clone(),
-                            change_request,
-                            display_number: summary.number,
-                            expected_head_sha,
-                        },
+                        &merge_request_id,
+                        merge_operation,
+                        &merge_subject,
                         crate::worker::RemoteRequestProgress::new(
                             move |wait| report_remote_wait(&progress, wait),
                             move || cancellation.is_canceled(),
                         ),
                     )?;
                 match result {
-                    crate::workflow::standard_remote::TuiRemoteMergeResult::Accepted {
+                    remote_operation::TuiRemoteMergeResult::Accepted {
                         outcome,
                         summary,
                     } => {
                         cache.apply_worker_summary(*summary);
                         if outcome
-                            == crate::workflow::standard_remote::TuiRemoteMergeOutcome::Uncertain
+                            == remote_operation::TuiRemoteMergeOutcome::Uncertain
                         {
                             cache.require_reconciliation(
                                 "provider merge outcome is uncertain; authoritative re-observation required",
@@ -279,7 +293,7 @@ impl Tui {
                             outcome,
                         })
                     }
-                    crate::workflow::standard_remote::TuiRemoteMergeResult::Rejected { reason } => {
+                    remote_operation::TuiRemoteMergeResult::Rejected { reason } => {
                         Ok(RemoteActionValue::MergeRejected(reason))
                     }
                 }
@@ -292,13 +306,13 @@ impl Tui {
         };
         self.apply_remote_cache_result(selected, *cache);
         match outcome {
-            crate::workflow::standard_remote::TuiRemoteMergeOutcome::Merged => {
+            remote_operation::TuiRemoteMergeOutcome::Merged => {
                 self.show_message("pull request merged")
             }
-            crate::workflow::standard_remote::TuiRemoteMergeOutcome::Pending => {
+            remote_operation::TuiRemoteMergeOutcome::Pending => {
                 self.show_message("pull request accepted by the provider and is pending merge")
             }
-            crate::workflow::standard_remote::TuiRemoteMergeOutcome::Uncertain => Err(
+            remote_operation::TuiRemoteMergeOutcome::Uncertain => Err(
                 "provider merge outcome is uncertain; authoritative re-observation required"
                     .to_string(),
             ),
@@ -334,6 +348,16 @@ impl Tui {
             .unwrap_or_default();
         let expected = crate::remote::dispatcher::prepare_push(&path, &config, &branch)?;
         let mutation = remote_push_mutation_target(&expected);
+        let push_request_id = format!("push:{}:{}", branch, expected.expected_head_sha);
+        let push_subject = format!("{}:{}", path.display(), branch);
+        let push_operation = remote_operation::RemoteMutationOperation::TuiPushBranch(
+            remote_operation::TuiRemotePushPayload {
+                repository: repo.root.clone(),
+                worktree: path.clone(),
+                branch: branch.clone(),
+                expected,
+            },
+        );
         let RemoteActionValue::Cache(cache) = self.run_remote_action(
             raw,
             crate::tui::RemoteActionRequest {
@@ -343,7 +367,16 @@ impl Tui {
                 title: "Push Branch",
                 message: "Verifying and pushing selected branch",
                 abandon_cancelable: false,
-                mutation: Some(mutation),
+                effect: crate::tui::RemoteActionEffect::CoordinatedMutation {
+                    target: Box::new(mutation),
+                    ledger: Box::new(crate::tui::RemoteMutationLedgerContext {
+                        repository: repo.root.clone(),
+                        worktree: path.clone(),
+                        request_id: push_request_id.clone(),
+                        operation: push_operation.clone(),
+                        subject: push_subject.clone(),
+                    }),
+                },
             },
             move |context| {
                 let progress = context.clone();
@@ -351,15 +384,9 @@ impl Tui {
                 let snapshot = crate::worker::mutate_remote_with_progress(
                     &repo.root,
                     &path,
-                    &format!("push:{}:{}", branch, expected.expected_head_sha),
-                    "tui.push_branch",
-                    &format!("{}:{}", path.display(), branch),
-                    crate::workflow::standard_remote::TuiRemotePushPayload {
-                        repository: repo.root.clone(),
-                        worktree: path.clone(),
-                        branch,
-                        expected,
-                    },
+                    &push_request_id,
+                    push_operation,
+                    &push_subject,
                     crate::worker::RemoteRequestProgress::new(
                         move |wait| report_remote_wait(&progress, wait),
                         move || cancellation.is_canceled(),
@@ -408,6 +435,16 @@ impl Tui {
             .get(&worktree)
             .copied()
             .unwrap_or_default();
+        let resolve_request_id = format!("resolve:{}:{}", summary.number, summary.head_sha);
+        let resolve_subject = format!("{}#{}", path.display(), summary.number);
+        let resolve_operation = remote_operation::RemoteMutationOperation::TuiResolveReviewThreads(
+            remote_operation::TuiRemoteResolvePayload {
+                repository: repo.root.clone(),
+                worktree: path.clone(),
+                summary: summary.clone(),
+                thread_ids: thread_ids.clone(),
+            },
+        );
         let RemoteActionValue::Resolved { cache, count } = self.run_remote_action(
             raw,
             crate::tui::RemoteActionRequest {
@@ -417,13 +454,22 @@ impl Tui {
                 title: "Resolve Review Conversations",
                 message: "Resolving observed review conversations",
                 abandon_cancelable: false,
-                mutation: Some(crate::tui::RemoteMutationTarget::Resolve {
-                    change_request: summary
-                        .change_request_identity
-                        .clone()
-                        .ok_or_else(|| "pull request identity is unavailable".to_string())?,
-                    thread_ids: thread_ids.clone(),
-                }),
+                effect: crate::tui::RemoteActionEffect::CoordinatedMutation {
+                    target: Box::new(crate::tui::RemoteMutationTarget::Resolve {
+                        change_request: summary
+                            .change_request_identity
+                            .clone()
+                            .ok_or_else(|| "pull request identity is unavailable".to_string())?,
+                        thread_ids: thread_ids.clone(),
+                    }),
+                    ledger: Box::new(crate::tui::RemoteMutationLedgerContext {
+                        repository: repo.root.clone(),
+                        worktree: path.clone(),
+                        request_id: resolve_request_id.clone(),
+                        operation: resolve_operation.clone(),
+                        subject: resolve_subject.clone(),
+                    }),
+                },
             },
             move |context| {
                 let mutation_progress = context.clone();
@@ -431,15 +477,9 @@ impl Tui {
                 let count = crate::worker::mutate_remote_with_progress(
                     &repo.root,
                     &path,
-                    &format!("resolve:{}:{}", summary.number, summary.head_sha),
-                    "tui.resolve_review_threads",
-                    &format!("{}#{}", path.display(), summary.number),
-                    crate::workflow::standard_remote::TuiRemoteResolvePayload {
-                        repository: repo.root.clone(),
-                        worktree: path.clone(),
-                        summary,
-                        thread_ids,
-                    },
+                    &resolve_request_id,
+                    resolve_operation,
+                    &resolve_subject,
                     crate::worker::RemoteRequestProgress::new(
                         move |wait| report_remote_wait(&mutation_progress, wait),
                         move || mutation_cancellation.is_canceled(),
@@ -450,14 +490,15 @@ impl Tui {
                 let snapshot = crate::worker::observe_remote_with_progress(
                     &repo.root,
                     &path,
-                    "tui.change_request_cache",
+                    remote_operation::RemoteObservationOperation::TuiChangeRequestCache(
+                        remote_operation::TuiRemoteCachePayload {
+                            repository: repo.root.clone(),
+                            worktree: path.clone(),
+                            branch: branch.clone(),
+                            force_details: true,
+                        },
+                    ),
                     &format!("{}:{}:details", path.display(), branch),
-                    crate::workflow::standard_remote::TuiRemoteCachePayload {
-                        repository: repo.root.clone(),
-                        worktree: path.clone(),
-                        branch,
-                        force_details: true,
-                    },
                     move |wait| report_remote_wait(&observation_progress, wait),
                     move || observation_cancellation.is_canceled(),
                 )?;
@@ -495,7 +536,7 @@ impl Tui {
                 title: "Remote Pull Requests",
                 message: "Loading open pull requests",
                 abandon_cancelable: true,
-                mutation: None,
+                effect: crate::tui::RemoteActionEffect::ReadOnly,
             },
             move |context| {
                 let progress = context.clone();
@@ -503,12 +544,13 @@ impl Tui {
                 crate::worker::observe_remote_with_progress(
                     &path,
                     &path,
-                    "tui.change_requests",
+                    remote_operation::RemoteObservationOperation::TuiChangeRequests(
+                        remote_operation::TuiRemoteListPayload {
+                            repository: path.clone(),
+                            worktree: path.clone(),
+                        },
+                    ),
                     &path.to_string_lossy(),
-                    crate::workflow::standard_remote::TuiRemoteListPayload {
-                        repository: path.clone(),
-                        worktree: path.clone(),
-                    },
                     move |wait| report_remote_wait(&progress, wait),
                     move || cancellation.is_canceled(),
                 )
@@ -595,6 +637,16 @@ impl Tui {
         let path = context.repo.root.clone();
         let job_summary = summary.clone();
         let job_branch = branch.clone();
+        let fetch_request_id = format!("fetch:{}:{}", summary.number, summary.head_sha);
+        let fetch_subject = format!("{}#{}", path.display(), summary.number);
+        let fetch_operation = remote_operation::RemoteMutationOperation::TuiFetchChangeRequest(
+            remote_operation::TuiRemoteFetchPayload {
+                repository: path.clone(),
+                worktree: path.clone(),
+                branch: job_branch.clone(),
+                summary: job_summary.clone(),
+            },
+        );
         let RemoteActionValue::Complete = self.run_remote_action(
             raw,
             crate::tui::RemoteActionRequest {
@@ -604,7 +656,23 @@ impl Tui {
                 title: "Remote Pull Requests",
                 message: &format!("Fetching PR #{}", summary.number),
                 abandon_cancelable: true,
-                mutation: None,
+                effect: crate::tui::RemoteActionEffect::CoordinatedMutation {
+                    target: Box::new(crate::tui::RemoteMutationTarget::Fetch {
+                        change_request: summary
+                            .change_request_identity
+                            .clone()
+                            .ok_or_else(|| "pull request identity is unavailable".to_string())?,
+                        branch: branch.clone(),
+                        expected_head_sha: summary.head_sha.clone(),
+                    }),
+                    ledger: Box::new(crate::tui::RemoteMutationLedgerContext {
+                        repository: path.clone(),
+                        worktree: path.clone(),
+                        request_id: fetch_request_id.clone(),
+                        operation: fetch_operation.clone(),
+                        subject: fetch_subject.clone(),
+                    }),
+                },
             },
             move |context| {
                 let progress = context.clone();
@@ -612,15 +680,9 @@ impl Tui {
                 crate::worker::mutate_remote_with_progress::<bool, _, _>(
                     &path,
                     &path,
-                    &format!("fetch:{}:{}", job_summary.number, job_summary.head_sha),
-                    "tui.fetch_change_request",
-                    &format!("{}#{}", path.display(), job_summary.number),
-                    crate::workflow::standard_remote::TuiRemoteFetchPayload {
-                        repository: path.clone(),
-                        worktree: path.clone(),
-                        branch: job_branch,
-                        summary: job_summary,
-                    },
+                    &fetch_request_id,
+                    fetch_operation,
+                    &fetch_subject,
                     crate::worker::RemoteRequestProgress::new(
                         move |wait| report_remote_wait(&progress, wait),
                         move || cancellation.is_canceled(),
@@ -817,6 +879,37 @@ impl Tui {
             .filter_map(|session| session.pr.trusted_details().ok().flatten())
             .flat_map(|details| details.reviews.iter().map(|review| review.id.clone()))
             .collect();
+        let expected_state = match kind {
+            crate::remote::ReviewSubmissionKind::Approve => "APPROVED",
+            crate::remote::ReviewSubmissionKind::Comment => "COMMENTED",
+            crate::remote::ReviewSubmissionKind::RequestChanges => "CHANGES_REQUESTED",
+        }
+        .to_string();
+        let review_request_id = format!(
+            "review:{}:{}:{kind:?}:{:016x}",
+            summary.number,
+            summary.head_sha,
+            crate::util::stable_hash(std::path::Path::new(&body))
+        );
+        let review_subject = format!("{}#{}", path.display(), summary.number);
+        let review_operation = remote_operation::RemoteMutationOperation::TuiSubmitReview(
+            remote_operation::TuiRemoteReviewPayload {
+                repository: path.clone(),
+                worktree: path.clone(),
+                summary: selected_summary.clone(),
+                kind,
+                body: body.clone(),
+            },
+        );
+        let review_target = crate::tui::RemoteMutationTarget::Review {
+            change_request: summary
+                .change_request_identity
+                .clone()
+                .ok_or_else(|| "pull request identity is unavailable".to_string())?,
+            expected_state,
+            expected_body: body,
+            prior_review_ids,
+        };
         let RemoteActionValue::Complete = self.run_remote_action(
             raw,
             crate::tui::RemoteActionRequest {
@@ -826,20 +919,16 @@ impl Tui {
                 title: "Submit Review",
                 message: &format!("Submitting review for PR #{}", summary.number),
                 abandon_cancelable: false,
-                mutation: Some(crate::tui::RemoteMutationTarget::Review {
-                    change_request: summary
-                        .change_request_identity
-                        .clone()
-                        .ok_or_else(|| "pull request identity is unavailable".to_string())?,
-                    expected_state: match kind {
-                        crate::remote::ReviewSubmissionKind::Approve => "APPROVED",
-                        crate::remote::ReviewSubmissionKind::Comment => "COMMENTED",
-                        crate::remote::ReviewSubmissionKind::RequestChanges => "CHANGES_REQUESTED",
-                    }
-                    .to_string(),
-                    expected_body: body.clone(),
-                    prior_review_ids,
-                }),
+                effect: crate::tui::RemoteActionEffect::CoordinatedMutation {
+                    target: Box::new(review_target),
+                    ledger: Box::new(crate::tui::RemoteMutationLedgerContext {
+                        repository: path.clone(),
+                        worktree: path.clone(),
+                        request_id: review_request_id.clone(),
+                        operation: review_operation.clone(),
+                        subject: review_subject.clone(),
+                    }),
+                },
             },
             move |context| {
                 let progress = context.clone();
@@ -847,21 +936,9 @@ impl Tui {
                 crate::worker::mutate_remote_with_progress::<serde_json::Value, _, _>(
                     &path,
                     &path,
-                    &format!(
-                        "review:{}:{}:{}",
-                        selected_summary.number,
-                        selected_summary.head_sha,
-                        crate::workflow::prompt_worker::now_unix_ms()
-                    ),
-                    "tui.submit_review",
-                    &format!("{}#{}", path.display(), selected_summary.number),
-                    crate::workflow::standard_remote::TuiRemoteReviewPayload {
-                        repository: path.clone(),
-                        worktree: path.clone(),
-                        summary: selected_summary,
-                        kind,
-                        body,
-                    },
+                    &review_request_id,
+                    review_operation,
+                    &review_subject,
                     crate::worker::RemoteRequestProgress::new(
                         move |wait| report_remote_wait(&progress, wait),
                         move || cancellation.is_canceled(),
@@ -913,7 +990,7 @@ impl Tui {
                     title: "Open Pull Request",
                     message: "Refreshing pull request",
                     abandon_cancelable: true,
-                    mutation: None,
+                    effect: crate::tui::RemoteActionEffect::ReadOnly,
                 },
                 move |context| {
                     let progress = context.clone();
@@ -921,14 +998,15 @@ impl Tui {
                     let snapshot = crate::worker::observe_remote_with_progress(
                         &repo.root,
                         &path,
-                        "tui.change_request_cache",
+                        remote_operation::RemoteObservationOperation::TuiChangeRequestCache(
+                            remote_operation::TuiRemoteCachePayload {
+                                repository: repo.root.clone(),
+                                worktree: path.clone(),
+                                branch: branch.clone(),
+                                force_details: false,
+                            },
+                        ),
                         &format!("{}:{}:summary", path.display(), branch),
-                        crate::workflow::standard_remote::TuiRemoteCachePayload {
-                            repository: repo.root.clone(),
-                            worktree: path.clone(),
-                            branch,
-                            force_details: false,
-                        },
                         move |wait| report_remote_wait(&progress, wait),
                         move || cancellation.is_canceled(),
                     )?;

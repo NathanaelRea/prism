@@ -349,7 +349,7 @@ impl Tui {
                     title: "Worktrunk Configuration",
                     message: "Creating Worktrunk user config",
                     abandon_cancelable: false,
-                    mutation: None,
+                    effect: crate::tui::RemoteActionEffect::LocalMutation,
                 },
                 move |_| {
                     crate::worktrunk::create_user_config(&repo, &config)
@@ -393,7 +393,7 @@ impl Tui {
                 title: "Worktrunk Configuration",
                 message: "Locating Worktrunk user config",
                 abandon_cancelable: true,
-                mutation: None,
+                effect: crate::tui::RemoteActionEffect::ReadOnly,
             },
             move |_| {
                 crate::worktrunk::discover_user_config(&repo, &config)

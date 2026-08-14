@@ -32,10 +32,11 @@ pub(crate) enum TuiJobKind {
     OpencodePoll,
     OpencodeListener,
     RemoteAction,
+    RemoteReconciliation,
 }
 
 impl TuiJobKind {
-    const fn label(&self) -> &'static str {
+    pub(super) const fn label(&self) -> &'static str {
         match self {
             Self::SessionRefresh => "session_refresh",
             Self::AgentStatePersistence => "agent_state_persistence",
@@ -52,6 +53,7 @@ impl TuiJobKind {
             Self::OpencodePoll => "opencode_poll",
             Self::OpencodeListener => "opencode_listener",
             Self::RemoteAction => "remote_action",
+            Self::RemoteReconciliation => "remote_reconciliation",
         }
     }
 }
@@ -59,6 +61,8 @@ impl TuiJobKind {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum TuiJobKey {
     None,
+    /// Process-lifetime work whose result must not be invalidated by session generations.
+    System,
     Repository(WorktreeRepositoryKey),
     WorktrunkHookLogs(WorktreeRepositoryKey),
     WorkflowRepository(WorktreeRepositoryKey),
@@ -106,6 +110,8 @@ pub(crate) enum TuiJobPayload {
     OpencodePoll(OpencodePollResult),
     OpencodeEvent(OpencodeEventResult),
     RemoteAction(Box<RemoteActionDelivery>),
+    RemoteReconciliation(super::remote_reconciliation::RemoteReconciliationResult),
+    RemoteMarkersLoaded(super::remote_action::LoadedRemoteMutationMarkers),
     RemoteActionProgress { id: JobId, message: String },
 }
 
@@ -177,33 +183,8 @@ impl Tui {
             + Send
             + 'static,
     {
-        if matches!(kind, TuiJobKind::DeleteSession | TuiJobKind::RemoteAction) {
-            let label = kind.label();
-            self.jobs.spawn_reliable_diagnostic(
-                kind,
-                key,
-                generation,
-                name,
-                crate::tui_jobs::JobDiagnostic {
-                    timeout,
-                    kind: label,
-                },
-                job,
-            )
-        } else {
-            let label = kind.label();
-            self.jobs.spawn_diagnostic(
-                kind,
-                key,
-                generation,
-                name,
-                crate::tui_jobs::JobDiagnostic {
-                    timeout,
-                    kind: label,
-                },
-                job,
-            )
-        }
+        self.background
+            .spawn(kind, key, generation, timeout, name, job)
     }
 
     pub(super) fn repository_root_for_job_key(&self, key: &TuiJobKey) -> Option<PathBuf> {
@@ -221,17 +202,21 @@ impl Tui {
             TuiJobKey::Opencode(key) => Some(key.worktree.repository.root.clone()),
             TuiJobKey::OpencodeListener(key) => Some(key.worktree.repository.root.clone()),
             TuiJobKey::WorkflowRepository(repository) => Some(repository.root.clone()),
-            TuiJobKey::None => None,
+            TuiJobKey::None | TuiJobKey::System => None,
         }
     }
     pub(crate) fn route_tui_job_messages(&mut self) -> usize {
-        if self.routing_tui_jobs {
+        if !self.background.begin_routing() {
             return 0;
         }
-        self.routing_tui_jobs = true;
         let deadline = Instant::now() + TUI_TICK_TIME_BUDGET;
+        for result in self.background.drain_marker_persistence_results() {
+            if let Err(error) = result.result {
+                self.background.record_remote_failure(result.key.2, error);
+            }
+        }
         let processed = self.route_tui_job_messages_with_budget(TUI_TICK_ITEM_BUDGET, deadline);
-        self.routing_tui_jobs = false;
+        self.background.finish_routing();
         processed
     }
 
@@ -240,19 +225,17 @@ impl Tui {
         limit: usize,
         deadline: Instant,
     ) -> usize {
-        for metadata in self.jobs.active_metadata() {
+        for metadata in self.background.active_metadata() {
             if !self.job_generation_is_current(&metadata)
-                && !self
-                    .remote_actions_requiring_reconciliation
-                    .contains(&metadata.id)
+                && !self.background.remote_action_is_tracked(metadata.id)
             {
-                self.jobs.cancel(metadata.id);
+                self.background.cancel(metadata.id);
             }
         }
         let mut processed = 0;
         let mut restart_session_refresh = false;
         while processed < limit && (processed == 0 || Instant::now() < deadline) {
-            let Some(message) = self.jobs.drain_terminals(1).into_iter().next() else {
+            let Some(message) = self.background.drain_terminals(1).into_iter().next() else {
                 break;
             };
             let JobMessage::Terminal { metadata, outcome } = message else {
@@ -283,31 +266,24 @@ impl Tui {
                         "remote action failed".to_string()
                     }
                 });
-                self.remote_action_failures
-                    .insert(metadata.id, error.clone());
-                if self
-                    .remote_actions_requiring_reconciliation
-                    .contains(&metadata.id)
+                self.background
+                    .record_remote_failure(metadata.id, error.clone());
+                if self.background.remote_action_is_tracked(metadata.id)
                     && !matches!(outcome, JobOutcome::SpawnFailed(_))
-                    && let Some(reconciliation) = self
-                        .remote_action_reconciliation_contexts
-                        .get(&metadata.id)
-                        .cloned()
+                    && let Some(reconciliation) = self.background.remote_context(metadata.id)
                     && let Err(marker_error) = self.record_remote_mutation_reconciliation(
                         &reconciliation.key,
                         metadata.id,
                         &error,
                         &reconciliation.target,
+                        Some(&reconciliation.ledger),
                     )
                 {
-                    self.remote_action_failures
-                        .insert(metadata.id, format!("{error}; {marker_error}"));
-                    self.shutdown_remote_action_errors.push(marker_error);
+                    self.background
+                        .record_remote_failure(metadata.id, format!("{error}; {marker_error}"));
+                    self.background.push_shutdown_error(marker_error);
                 }
-                self.remote_actions_requiring_reconciliation
-                    .remove(&metadata.id);
-                self.remote_action_reconciliation_contexts
-                    .remove(&metadata.id);
+                self.background.finish_remote_action(metadata.id);
             }
             match outcome {
                 JobOutcome::Completed | JobOutcome::Canceled => {}
@@ -357,6 +333,7 @@ impl Tui {
                     TuiJobKey::Opencode(key) => &key.worktree == selected,
                     TuiJobKey::OpencodeListener(stream) => &stream.worktree == selected,
                     TuiJobKey::None
+                    | TuiJobKey::System
                     | TuiJobKey::Repository(_)
                     | TuiJobKey::WorktrunkHookLogs(_)
                     | TuiJobKey::WorkflowRepository(_)
@@ -368,20 +345,18 @@ impl Tui {
         while processed < limit
             && Instant::now() < deadline
             && self
-                .jobs
+                .background
                 .latest_min_priority(priority)
                 .is_some_and(|value| value <= 1)
         {
             let Some(JobMessage::Payload { metadata, payload }) =
-                self.jobs.take_latest_by(priority)
+                self.background.take_latest_by(priority)
             else {
                 break;
             };
             processed += 1;
             if self.job_generation_is_current(&metadata)
-                || self
-                    .remote_actions_requiring_reconciliation
-                    .contains(&metadata.id)
+                || self.background.remote_action_is_tracked(metadata.id)
             {
                 self.route_tui_job_payload_for_metadata(&metadata, payload);
             } else {
@@ -390,7 +365,7 @@ impl Tui {
         }
 
         while processed < limit && Instant::now() < deadline {
-            let Some(message) = self.jobs.take_stream_event() else {
+            let Some(message) = self.background.take_stream_event() else {
                 break;
             };
             let JobMessage::Payload { metadata, payload } = message else {
@@ -406,15 +381,13 @@ impl Tui {
 
         while processed < limit && Instant::now() < deadline {
             let Some(JobMessage::Payload { metadata, payload }) =
-                self.jobs.take_latest_by(priority)
+                self.background.take_latest_by(priority)
             else {
                 break;
             };
             processed += 1;
             if self.job_generation_is_current(&metadata)
-                || self
-                    .remote_actions_requiring_reconciliation
-                    .contains(&metadata.id)
+                || self.background.remote_action_is_tracked(metadata.id)
             {
                 self.route_tui_job_payload_for_metadata(&metadata, payload);
             } else {
@@ -422,14 +395,14 @@ impl Tui {
             }
         }
 
-        for metadata in self.jobs.take_dirty_jobs() {
+        for metadata in self.background.take_dirty_jobs() {
             if self.job_generation_is_current(&metadata)
                 && let TuiJobKey::OpencodeListener(stream) = metadata.key
             {
                 self.request_opencode_reconciliation_for(stream.worktree);
             }
         }
-        let stats = self.jobs.queue_stats();
+        let stats = self.background.queue_stats();
         let idle = crate::flight_recorder::idle_for();
         crate::flight_recorder::record(
             "queue",
@@ -463,7 +436,7 @@ impl Tui {
         if stats.overflow_delta > 0 || stats.coalesced_delta > 0 {
             self.record_tui_queue_stats(stats);
         }
-        if restart_session_refresh && !self.scheduling_stopped {
+        if restart_session_refresh && !self.background.is_draining() {
             let _ = self.refresh_sessions_after_tmux();
         }
         processed
@@ -528,18 +501,11 @@ impl Tui {
 
     pub(super) fn apply_routed_remote_actions_for_shutdown(&mut self) -> Vec<String> {
         let mut errors = Vec::new();
-        while let Ok(delivery) = self.remote_action_rx.try_recv() {
-            if !self
-                .remote_actions_requiring_reconciliation
-                .contains(&delivery.id)
-            {
+        while let Some(delivery) = self.background.receive_remote_action() {
+            if !self.background.remote_action_is_tracked(delivery.id) {
                 continue;
             }
-            let Some(reconciliation) = self
-                .remote_action_reconciliation_contexts
-                .get(&delivery.id)
-                .cloned()
-            else {
+            let Some(reconciliation) = self.background.remote_context(delivery.id) else {
                 errors.push(format!(
                     "remote mutation {} was routed without its reconciliation key",
                     delivery.id
@@ -553,14 +519,12 @@ impl Tui {
                     delivery.id,
                     &error,
                     &reconciliation.target,
+                    Some(&reconciliation.ledger),
                 )
             {
                 errors.push(format!("{error}; {marker_error}"));
             }
-            self.remote_actions_requiring_reconciliation
-                .remove(&delivery.id);
-            self.remote_action_reconciliation_contexts
-                .remove(&delivery.id);
+            self.background.finish_remote_action(delivery.id);
         }
         errors
     }
@@ -570,19 +534,16 @@ impl Tui {
         metadata: &JobMetadata<TuiJobKind, TuiJobKey>,
         payload: TuiJobPayload,
     ) {
-        if self.scheduling_stopped
-            && self
-                .remote_actions_requiring_reconciliation
-                .contains(&metadata.id)
+        if self.background.is_draining()
+            && self.background.remote_action_is_tracked(metadata.id)
             && let TuiJobPayload::RemoteAction(delivery) = &payload
         {
             if let Err(error) =
                 self.apply_shutdown_remote_action_result(&metadata.key, &delivery.result)
             {
                 let marker = self
-                    .remote_action_reconciliation_contexts
-                    .get(&metadata.id)
-                    .cloned()
+                    .background
+                    .remote_context(metadata.id)
                     .ok_or_else(|| {
                         "remote mutation is missing its reconciliation target".to_string()
                     })
@@ -592,22 +553,19 @@ impl Tui {
                             metadata.id,
                             &error,
                             &reconciliation.target,
+                            Some(&reconciliation.ledger),
                         )
                     });
                 let error = match marker {
                     Ok(()) => error,
                     Err(marker_error) => {
-                        self.shutdown_remote_action_errors
-                            .push(marker_error.clone());
+                        self.background.push_shutdown_error(marker_error.clone());
                         format!("{error}; {marker_error}")
                     }
                 };
-                self.remote_action_failures.insert(metadata.id, error);
+                self.background.record_remote_failure(metadata.id, error);
             }
-            self.remote_actions_requiring_reconciliation
-                .remove(&metadata.id);
-            self.remote_action_reconciliation_contexts
-                .remove(&metadata.id);
+            self.background.finish_remote_action(metadata.id);
         }
         self.route_tui_job_payload(payload);
     }
@@ -651,7 +609,13 @@ impl Tui {
                 let _ = result;
             }
             TuiJobPayload::RemoteAction(result) => {
-                let _ = self.remote_action_tx.send(*result);
+                self.background.deliver_remote_action(*result);
+            }
+            TuiJobPayload::RemoteReconciliation(result) => {
+                self.apply_remote_reconciliation_result(result);
+            }
+            TuiJobPayload::RemoteMarkersLoaded(result) => {
+                self.apply_loaded_remote_mutation_markers(result);
             }
             TuiJobPayload::RemoteActionProgress { id, message } => {
                 let _active_job = id;
@@ -744,7 +708,12 @@ impl Tui {
     ) -> bool {
         match &metadata.key {
             TuiJobKey::None => metadata.generation == self.session_inventory_generation,
-            TuiJobKey::Repository(_) => metadata.generation == self.session_inventory_generation,
+            TuiJobKey::System => true,
+            TuiJobKey::Repository(repository) => {
+                metadata.kind == TuiJobKind::RemoteReconciliation
+                    || (metadata.generation == self.session_inventory_generation
+                        && self.repos.iter().any(|repo| &repo.identity == repository))
+            }
             TuiJobKey::WorktrunkHookLogs(repository) => {
                 self.repos.iter().any(|repo| &repo.identity == repository)
             }
@@ -932,29 +901,26 @@ impl Tui {
     pub(super) fn cleanup_tui_jobs(&mut self, reason: ShutdownReason) -> Result<(), String> {
         let mut errors = Vec::new();
         let started = Instant::now();
-        let active_jobs = self.jobs.active_metadata().len();
-        self.scheduling_stopped = true;
+        let active_jobs = self.background.begin_shutdown();
         errors.extend(self.apply_routed_remote_actions_for_shutdown());
-        self.jobs.stop_accepting();
-        let protected = self.remote_actions_requiring_reconciliation.clone();
-        self.jobs.cancel_all_except(&protected);
+        self.background.stop_admission_for_shutdown();
         if let Err(error) = self.shutdown_owned_opencode_servers() {
             errors.push(error);
         }
 
         let mutation_wait_started = Instant::now();
-        while !self.remote_actions_requiring_reconciliation.is_empty()
+        while !self.background.tracked_remote_action_ids().is_empty()
             && mutation_wait_started.elapsed() < TUI_MUTATION_SHUTDOWN_BOUND
         {
             self.route_tui_job_messages();
-            if !self.remote_actions_requiring_reconciliation.is_empty() {
+            if !self.background.tracked_remote_action_ids().is_empty() {
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
 
-        if !self.remote_actions_requiring_reconciliation.is_empty() {
-            let unfinished_mutations = self.remote_actions_requiring_reconciliation.clone();
-            for metadata in self.jobs.active_metadata() {
+        if !self.background.tracked_remote_action_ids().is_empty() {
+            let unfinished_mutations = self.background.tracked_remote_action_ids();
+            for metadata in self.background.active_metadata() {
                 if !unfinished_mutations.contains(&metadata.id) {
                     continue;
                 }
@@ -963,9 +929,8 @@ impl Tui {
                     TUI_MUTATION_SHUTDOWN_BOUND
                 );
                 let marker = self
-                    .remote_action_reconciliation_contexts
-                    .get(&metadata.id)
-                    .cloned()
+                    .background
+                    .remote_context(metadata.id)
                     .ok_or_else(|| {
                         "remote mutation is missing its reconciliation target".to_string()
                     })
@@ -975,27 +940,34 @@ impl Tui {
                             metadata.id,
                             &reason,
                             &reconciliation.target,
+                            Some(&reconciliation.ledger),
                         )
                     });
                 if let Err(error) = marker {
                     errors.push(error);
                 }
-                self.jobs.cancel(metadata.id);
+                self.background.cancel(metadata.id);
             }
         }
 
         let cancellation_started = Instant::now();
-        while self.jobs.has_jobs() && cancellation_started.elapsed() < TUI_JOB_SHUTDOWN_GRACE {
+        while self.background.has_jobs() && cancellation_started.elapsed() < TUI_JOB_SHUTDOWN_GRACE
+        {
             self.route_tui_job_messages();
-            if self.jobs.has_jobs() {
+            if self.background.has_jobs() {
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
         while self.route_tui_job_messages() > 0 {}
-        errors.append(&mut self.shutdown_remote_action_errors);
-        let unfinished = self.jobs.abandon_unfinished();
-        self.remote_actions_requiring_reconciliation.clear();
-        self.remote_action_reconciliation_contexts.clear();
+        errors.extend(self.background.take_shutdown_errors());
+        let unresolved_markers = self.background.unresolved_marker_persistence();
+        if unresolved_markers > 0 {
+            errors.push(format!(
+                "shutdown durability failure: {unresolved_markers} remote mutation marker write(s) remain unacknowledged after {:?}",
+                TUI_JOB_SHUTDOWN_GRACE
+            ));
+        }
+        let unfinished = self.background.abandon_unfinished();
         if unfinished > 0 {
             errors.push(format!(
                 "detached {unfinished} uncooperative job(s) after shutdown grace period"

@@ -594,8 +594,16 @@ impl WorkspaceState {
         let command = match request.action {
             ControlAction::Pause => worker::PromptWorkflowControl::Pause,
             ControlAction::Resume => worker::PromptWorkflowControl::Resume,
-            ControlAction::Stop => worker::PromptWorkflowControl::Cancel,
-            ControlAction::Recover => worker::PromptWorkflowControl::Retry,
+            ControlAction::Stop => {
+                if target.lifecycle == WorkflowLifecycle::RecoveryRequired {
+                    worker::PromptWorkflowControl::Discard
+                } else {
+                    worker::PromptWorkflowControl::Cancel
+                }
+            }
+            ControlAction::Recover => worker::PromptWorkflowControl::Recover {
+                evidence: "operator confirmed authoritative reconciliation".to_string(),
+            },
         };
         worker::command_prompt_workflow(&target.identity.run_id, command)?;
         Ok(ControlReceipt {
@@ -619,12 +627,16 @@ impl WorkspaceState {
             if decision.restart {
                 worker::command_prompt_workflow(
                     &decision.workflow.run_id,
-                    worker::PromptWorkflowControl::Retry,
+                    worker::PromptWorkflowControl::Recover {
+                        evidence:
+                            "operator confirmed authoritative reconciliation during batch recovery"
+                                .to_string(),
+                    },
                 )?;
             } else {
                 worker::command_prompt_workflow(
                     &decision.workflow.run_id,
-                    worker::PromptWorkflowControl::Cancel,
+                    worker::PromptWorkflowControl::Discard,
                 )?;
             }
         }

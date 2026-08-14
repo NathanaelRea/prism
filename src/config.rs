@@ -1443,9 +1443,14 @@ pub fn doctor(repo: &Repository, config: &mut Config) -> Result<(), String> {
 fn print_workflow_doctor(repo: &Repository) {
     let global = crate::util::prism_config_dir();
     let repository = repo.root.join(".prism");
-    let trusted =
-        crate::repository_resources_are_trusted(&global, &repo.root, &repository).unwrap_or(false);
-    match crate::PromptWorkflowCatalog::discover(&global, Some(&repository), trusted) {
+    let trusted = crate::RepositoryResourceSnapshot::capture(&repository)
+        .ok()
+        .and_then(|snapshot| {
+            crate::trusted_repository_resources(&global, &repo.root, snapshot)
+                .ok()
+                .flatten()
+        });
+    match crate::PromptWorkflowCatalog::discover(&global, trusted.as_ref()) {
         Ok(catalog) => {
             let workflows = catalog.list();
             println!("workflow definitions: {}", workflows.len());

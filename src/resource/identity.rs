@@ -78,6 +78,8 @@ pub struct DiscoveredResource {
     pub kind: ResourceKind,
     pub scope: ResourceScope,
     pub path: PathBuf,
+    /// Repository resources carry their captured content so consumers never reopen a mutable path.
+    pub captured_bytes: Option<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -159,12 +161,12 @@ pub fn ensure_global_drop_in_directories(global_root: &Path) -> Result<(), Resou
 
 pub fn discover(
     global_root: &Path,
-    repository_root: Option<&Path>,
+    repository: Option<&crate::TrustedRepositoryResources>,
 ) -> Result<Vec<DiscoveredResource>, ResourceError> {
     let mut resources = Vec::new();
     discover_scope(global_root, ResourceScope::Global, &mut resources)?;
-    if let Some(root) = repository_root {
-        discover_scope(root, ResourceScope::Repository, &mut resources)?;
+    if let Some(repository) = repository {
+        discover_repository_snapshot(repository, &mut resources)?;
     }
     let mut identities = BTreeMap::<QualifiedIdentity, PathBuf>::new();
     for resource in &resources {
@@ -178,6 +180,43 @@ pub fn discover(
     }
     resources.sort_by(|left, right| left.identity.cmp(&right.identity));
     Ok(resources)
+}
+
+fn discover_repository_snapshot(
+    repository: &crate::TrustedRepositoryResources,
+    output: &mut Vec<DiscoveredResource>,
+) -> Result<(), ResourceError> {
+    for (path, bytes) in repository.snapshot().resource_files() {
+        let kind = match path.components().next().map(|part| part.as_os_str()) {
+            Some(value) if value == "skills" => ResourceKind::Skill,
+            Some(value) if value == "templates" => ResourceKind::Template,
+            _ => continue,
+        };
+        let source = std::str::from_utf8(bytes).map_err(|error| ResourceError::InvalidSource {
+            path: repository.snapshot().path_for(path),
+            message: error.to_string(),
+        })?;
+        let value: toml::Value =
+            toml::from_str(source).map_err(|error| ResourceError::InvalidSource {
+                path: repository.snapshot().path_for(path),
+                message: error.to_string(),
+            })?;
+        let header: IdentityHeader =
+            value
+                .try_into()
+                .map_err(|error| ResourceError::InvalidSource {
+                    path: repository.snapshot().path_for(path),
+                    message: error.to_string(),
+                })?;
+        output.push(DiscoveredResource {
+            identity: QualifiedIdentity::new(header.id)?,
+            kind,
+            scope: ResourceScope::Repository,
+            path: repository.snapshot().path_for(path),
+            captured_bytes: Some(bytes.to_vec()),
+        });
+    }
+    Ok(())
 }
 
 fn discover_scope(
@@ -209,6 +248,7 @@ fn discover_scope(
                 kind,
                 scope,
                 path: path.to_owned(),
+                captured_bytes: None,
             });
             Ok(())
         })?;
@@ -275,8 +315,10 @@ mod tests {
             "id='acme.release/publish'",
         )
         .unwrap();
+        let snapshot = crate::RepositoryResourceSnapshot::capture(&repository).unwrap();
+        let trusted = crate::workflow::source::TrustedRepositoryResources(snapshot);
         assert!(matches!(
-            discover(&global, Some(&repository)),
+            discover(&global, Some(&trusted)),
             Err(ResourceError::IdentityConflict { .. })
         ));
         fs::remove_dir_all(global).unwrap();

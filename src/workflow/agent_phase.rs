@@ -223,17 +223,27 @@ async fn execute_invocation(
             Err(_) => continue,
         }
     };
-    if let Some(task) = stdin_task {
-        task.await.map_err(|error| {
-            AgentExecutionError::Protocol(format!("join harness stdin: {error}"))
-        })??;
-    }
-    // Reaping the leader does not reap same-group descendants. Kill them before draining output so
-    // inherited pipe descriptors cannot turn a successful invocation into a drain timeout.
+    // Reaping the leader does not reap same-group descendants. Kill them before awaiting stdin or
+    // draining output so inherited pipe descriptors cannot outlive the invocation deadline.
     if let Some(process_id) = process_id {
         let _ = crate::system::process::send_process_group_signal(process_id, libc::SIGKILL);
     }
     let drain_timeout = timeout.min(Duration::from_secs(5));
+    if let Some(mut task) = stdin_task {
+        match tokio::time::timeout(drain_timeout, &mut task).await {
+            Ok(joined) => joined.map_err(|error| {
+                AgentExecutionError::Protocol(format!("join harness stdin: {error}"))
+            })??,
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                invocation.cleanup();
+                return Err(AgentExecutionError::Protocol(
+                    "Agent stdin did not close after process exit".into(),
+                ));
+            }
+        }
+    }
     let (stdout, stderr) = match tokio::time::timeout(drain_timeout, async {
         let stdout = stdout_task.await.map_err(|error| {
             AgentExecutionError::Protocol(format!("join harness stdout: {error}"))

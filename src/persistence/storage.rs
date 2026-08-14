@@ -1,8 +1,3 @@
-#![allow(
-    dead_code,
-    reason = "storage diagnostics are available to optional debug surfaces"
-)]
-
 use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
 use std::ffi::OsString;
@@ -35,6 +30,9 @@ struct DatabaseIdentity {
     path: PathBuf,
     device: u64,
     inode: u64,
+    ctime_seconds: i64,
+    ctime_nanoseconds: i64,
+    size: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -402,6 +400,9 @@ fn database_identity(path: &Path) -> Result<Option<DatabaseIdentity>, StorageErr
         path: path.to_path_buf(),
         device: metadata.dev(),
         inode: metadata.ino(),
+        ctime_seconds: metadata.ctime(),
+        ctime_nanoseconds: metadata.ctime_nsec(),
+        size: metadata.len(),
     }))
 }
 
@@ -748,6 +749,29 @@ mod tests {
         assert_eq!(integer_pragma(&mut reader, "busy_timeout"), 0);
         assert_eq!(integer_pragma(&mut reader, "query_only"), 1);
         drop(reader);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn database_replacement_at_same_path_is_revalidated() {
+        let path = test_path("replacement");
+        drop(open_writable(&path).unwrap());
+        remove_database(&path);
+
+        // A valid but unknown old schema must be rejected after inode replacement rather than
+        // inheriting validation from the database that previously occupied this pathname.
+        let options = crate::persistence::pools::options(&path, true, false).unwrap();
+        let mut replacement = run_sqlx(SqliteConnection::connect_with(&options)).unwrap();
+        run_sqlx(sqlx::query("create table legacy_only(value text)").execute(&mut replacement))
+            .unwrap();
+        run_sqlx(replacement.close()).unwrap();
+        let error = open_writable(&path).unwrap_err();
+        assert!(error.to_string().contains("unknown historical schema"));
+
+        remove_database(&path);
+        fs::write(&path, b"not a sqlite database").unwrap();
+        let error = open_writable(&path).unwrap_err();
+        assert_eq!(error.kind(), StorageErrorKind::Corruption);
         remove_database(&path);
     }
 

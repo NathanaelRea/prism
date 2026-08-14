@@ -1,20 +1,11 @@
-#![allow(
-    dead_code,
-    reason = "test database helpers support focused persistence suites"
-)]
-
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::str::FromStr;
-use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Connection, Row, SqliteConnection, TypeInfo, ValueRef};
 
 use super::error::DatabaseError;
-
-static INITIALIZED_DATABASES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 
 type TransactionQuery =
     sqlx::query::Query<'static, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'static>>;
@@ -32,24 +23,10 @@ pub(crate) fn rollback_query() -> TransactionQuery {
 }
 
 pub(crate) fn initialize(path: &Path) -> Result<(), DatabaseError> {
-    let key = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map(|cwd| cwd.join(path))
-            .unwrap_or_else(|_| path.to_path_buf())
-    };
-    let initialized = INITIALIZED_DATABASES.get_or_init(|| Mutex::new(HashSet::new()));
-    let mut initialized = initialized.lock().map_err(|_| {
-        DatabaseError::Runtime(std::io::Error::other(
-            "repository database initialization state is poisoned",
-        ))
-    })?;
-    if initialized.contains(&key) && path.exists() {
-        return Ok(());
-    }
+    // Identity-aware validation and caching live in `storage`. This lower-level initializer always
+    // performs migrations and integrity checks so replacing a database at the same path can never
+    // inherit validation from its predecessor.
     crate::async_runtime::block_on(initialize_async(path)).map_err(DatabaseError::Runtime)??;
-    initialized.insert(key);
     Ok(())
 }
 
@@ -98,6 +75,19 @@ fn connect(path: &Path, options: SqliteConnectOptions) -> Result<SqliteConnectio
 
 pub(crate) fn load_metadata(path: &Path, key: &str) -> Result<Option<String>, DatabaseError> {
     let mut connection = open_writable(path)?;
+    let result = block_on(async {
+        sqlx::query_file_scalar!("sql/metadata/load.sql", key)
+            .fetch_optional(&mut connection)
+            .await
+    });
+    finish_connection(connection, result)
+}
+
+pub(crate) fn load_metadata_readonly(
+    path: &Path,
+    key: &str,
+) -> Result<Option<String>, DatabaseError> {
+    let mut connection = open_readonly(path)?;
     let result = block_on(async {
         sqlx::query_file_scalar!("sql/metadata/load.sql", key)
             .fetch_optional(&mut connection)
@@ -305,6 +295,10 @@ impl TestDatabase {
         Ok(Self { path: path.into() })
     }
 
+    #[allow(
+        dead_code,
+        reason = "focused persistence tests inspect transaction paths"
+    )]
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
