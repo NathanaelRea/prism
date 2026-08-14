@@ -210,7 +210,7 @@ pub(super) fn block_on<T>(
         .map_err(DatabaseError::Query)
 }
 
-fn finish_connection<T>(
+pub(super) fn finish_connection<T>(
     connection: SqliteConnection,
     result: Result<T, DatabaseError>,
 ) -> Result<T, DatabaseError> {

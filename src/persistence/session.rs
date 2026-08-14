@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use sqlx::{Connection, FromRow, SqliteConnection};
 
-use super::database::{block_on, writable_options};
+use super::database::{block_on, finish_connection, open_writable, writable_options};
 use super::error::DatabaseError;
 use crate::opencode::OpencodeRuntime;
 
@@ -813,6 +813,15 @@ where
     })
 }
 
+fn with_runtime_connection<T>(
+    path: &Path,
+    operation: impl FnOnce(&mut SqliteConnection) -> Result<T, DatabaseError>,
+) -> Result<T, DatabaseError> {
+    let mut connection = open_writable(path)?;
+    let result = operation(&mut connection);
+    finish_connection(connection, result)
+}
+
 pub(crate) fn load_runtime(
     path: &Path,
     repo_root: &str,
@@ -820,20 +829,19 @@ pub(crate) fn load_runtime(
     branch: &str,
     worktree_path: &str,
 ) -> Result<Option<OpencodeRuntime>, DatabaseError> {
-    super::database::initialize(path)?;
-    let options = writable_options(path, false)?;
-    let row = block_on(async {
-        let mut connection = SqliteConnection::connect_with(&options).await?;
-        sqlx::query_file_as!(
-            RuntimeRow,
-            "sql/session/load_opencode_runtime.sql",
-            repo_root,
-            harness_id,
-            branch,
-            worktree_path,
-        )
-        .fetch_optional(&mut connection)
-        .await
+    let row = with_runtime_connection(path, |connection| {
+        block_on(async {
+            sqlx::query_file_as!(
+                RuntimeRow,
+                "sql/session/load_opencode_runtime.sql",
+                repo_root,
+                harness_id,
+                branch,
+                worktree_path,
+            )
+            .fetch_optional(&mut *connection)
+            .await
+        })
     })?;
     row.map(TryInto::try_into).transpose()
 }
@@ -843,18 +851,17 @@ pub(crate) fn list_runtimes_for_harness(
     repo_root: &str,
     harness_id: &str,
 ) -> Result<Vec<OpencodeRuntime>, DatabaseError> {
-    super::database::initialize(path)?;
-    let options = writable_options(path, false)?;
-    let rows = block_on(async {
-        let mut connection = SqliteConnection::connect_with(&options).await?;
-        sqlx::query_file_as!(
-            RuntimeRow,
-            "sql/session/list_opencode_runtimes_for_harness.sql",
-            repo_root,
-            harness_id,
-        )
-        .fetch_all(&mut connection)
-        .await
+    let rows = with_runtime_connection(path, |connection| {
+        block_on(async {
+            sqlx::query_file_as!(
+                RuntimeRow,
+                "sql/session/list_opencode_runtimes_for_harness.sql",
+                repo_root,
+                harness_id,
+            )
+            .fetch_all(&mut *connection)
+            .await
+        })
     })?;
     rows.into_iter().map(TryInto::try_into).collect()
 }
@@ -865,19 +872,18 @@ pub(crate) fn list_runtimes_for_worktree(
     branch: &str,
     worktree_path: &str,
 ) -> Result<Vec<OpencodeRuntime>, DatabaseError> {
-    super::database::initialize(path)?;
-    let options = writable_options(path, false)?;
-    let rows = block_on(async {
-        let mut connection = SqliteConnection::connect_with(&options).await?;
-        sqlx::query_file_as!(
-            RuntimeRow,
-            "sql/session/list_opencode_runtimes_for_worktree.sql",
-            repo_root,
-            branch,
-            worktree_path,
-        )
-        .fetch_all(&mut connection)
-        .await
+    let rows = with_runtime_connection(path, |connection| {
+        block_on(async {
+            sqlx::query_file_as!(
+                RuntimeRow,
+                "sql/session/list_opencode_runtimes_for_worktree.sql",
+                repo_root,
+                branch,
+                worktree_path,
+            )
+            .fetch_all(&mut *connection)
+            .await
+        })
     })?;
     rows.into_iter().map(TryInto::try_into).collect()
 }
@@ -904,7 +910,6 @@ fn require_one_row(
 }
 
 pub(crate) fn save_runtime(path: &Path, runtime: &OpencodeRuntime) -> Result<(), DatabaseError> {
-    super::database::initialize(path)?;
     let generation = to_i64("opencode_runtime.generation", runtime.generation)?;
     let updated = to_i64("opencode_runtime.updated_unix_ms", runtime.updated_unix_ms)?;
     let server_port = i64::from(runtime.server_port);
@@ -913,26 +918,26 @@ pub(crate) fn save_runtime(path: &Path, runtime: &OpencodeRuntime) -> Result<(),
         .server_process_identity
         .map(|value| to_i64("opencode_runtime.server_start_time_ticks", value))
         .transpose()?;
-    let options = writable_options(path, false)?;
-    block_on(async {
-        let mut connection = SqliteConnection::connect_with(&options).await?;
-        sqlx::query_file!(
-            "sql/session/upsert_opencode_runtime.sql",
-            runtime.repo_root,
-            runtime.harness_id,
-            runtime.branch,
-            runtime.worktree_path,
-            server_port,
-            runtime.server_url,
-            server_pid,
-            runtime.opencode_session_id,
-            generation,
-            updated,
-            process_identity,
-        )
-        .execute(&mut connection)
-        .await?;
-        Ok(())
+    with_runtime_connection(path, |connection| {
+        block_on(async {
+            sqlx::query_file!(
+                "sql/session/upsert_opencode_runtime.sql",
+                runtime.repo_root,
+                runtime.harness_id,
+                runtime.branch,
+                runtime.worktree_path,
+                server_port,
+                runtime.server_url,
+                server_pid,
+                runtime.opencode_session_id,
+                generation,
+                updated,
+                process_identity,
+            )
+            .execute(&mut *connection)
+            .await?;
+            Ok(())
+        })
     })
 }
 
@@ -941,39 +946,37 @@ pub(crate) fn count_server_references(
     repo_root: &str,
     server_url: &str,
 ) -> Result<i64, DatabaseError> {
-    super::database::initialize(path)?;
-    let options = writable_options(path, false)?;
-    block_on(async {
-        let mut connection = SqliteConnection::connect_with(&options).await?;
-        sqlx::query_file_as!(
-            CountRow,
-            "sql/session/count_opencode_server_references.sql",
-            repo_root,
-            server_url,
-        )
-        .fetch_one(&mut connection)
-        .await
-        .map(|row| row.count)
+    with_runtime_connection(path, |connection| {
+        block_on(async {
+            sqlx::query_file_as!(
+                CountRow,
+                "sql/session/count_opencode_server_references.sql",
+                repo_root,
+                server_url,
+            )
+            .fetch_one(&mut *connection)
+            .await
+            .map(|row| row.count)
+        })
     })
 }
 
 pub(crate) fn delete_runtime(path: &Path, runtime: &OpencodeRuntime) -> Result<(), DatabaseError> {
     let generation = to_i64("opencode_runtime.generation", runtime.generation)?;
-    super::database::initialize(path)?;
-    let options = writable_options(path, false)?;
-    block_on(async {
-        let mut connection = SqliteConnection::connect_with(&options).await?;
-        sqlx::query_file!(
-            "sql/session/delete_opencode_runtime.sql",
-            runtime.repo_root,
-            runtime.harness_id,
-            runtime.branch,
-            runtime.worktree_path,
-            generation,
-        )
-        .execute(&mut connection)
-        .await?;
-        Ok(())
+    with_runtime_connection(path, |connection| {
+        block_on(async {
+            sqlx::query_file!(
+                "sql/session/delete_opencode_runtime.sql",
+                runtime.repo_root,
+                runtime.harness_id,
+                runtime.branch,
+                runtime.worktree_path,
+                generation,
+            )
+            .execute(&mut *connection)
+            .await?;
+            Ok(())
+        })
     })
 }
 
@@ -989,58 +992,57 @@ pub(crate) fn save_shared_server_runtime(
         .server_process_identity
         .map(|value| to_i64("opencode_runtime.server_start_time_ticks", value))
         .transpose()?;
-    super::database::initialize(path)?;
-    let options = writable_options(path, false)?;
-    block_on(async {
-        let mut connection = SqliteConnection::connect_with(&options).await?;
-        super::database::begin_immediate_query()
-            .execute(&mut connection)
-            .await?;
-        let result = async {
-            sqlx::query_file!(
-                "sql/session/update_shared_opencode_server.sql",
-                server_port,
-                runtime.server_url,
-                server_pid,
-                process_identity,
-                updated,
-                runtime.repo_root,
-                runtime.harness_id,
-                server_port,
-                runtime.server_url,
-                server_pid,
-                process_identity,
-            )
-            .execute(&mut connection)
-            .await?;
-            sqlx::query_file!(
-                "sql/session/upsert_opencode_runtime.sql",
-                runtime.repo_root,
-                runtime.harness_id,
-                runtime.branch,
-                runtime.worktree_path,
-                server_port,
-                runtime.server_url,
-                server_pid,
-                runtime.opencode_session_id,
-                generation,
-                updated,
-                process_identity,
-            )
-            .execute(&mut connection)
-            .await?;
-            super::database::commit_query()
-                .execute(&mut connection)
+    with_runtime_connection(path, |connection| {
+        block_on(async {
+            super::database::begin_immediate_query()
+                .execute(&mut *connection)
                 .await?;
-            Ok(())
-        }
-        .await;
-        if result.is_err() {
-            let _ = super::database::rollback_query()
-                .execute(&mut connection)
-                .await;
-        }
-        result
+            let result = async {
+                sqlx::query_file!(
+                    "sql/session/update_shared_opencode_server.sql",
+                    server_port,
+                    runtime.server_url,
+                    server_pid,
+                    process_identity,
+                    updated,
+                    runtime.repo_root,
+                    runtime.harness_id,
+                    server_port,
+                    runtime.server_url,
+                    server_pid,
+                    process_identity,
+                )
+                .execute(&mut *connection)
+                .await?;
+                sqlx::query_file!(
+                    "sql/session/upsert_opencode_runtime.sql",
+                    runtime.repo_root,
+                    runtime.harness_id,
+                    runtime.branch,
+                    runtime.worktree_path,
+                    server_port,
+                    runtime.server_url,
+                    server_pid,
+                    runtime.opencode_session_id,
+                    generation,
+                    updated,
+                    process_identity,
+                )
+                .execute(&mut *connection)
+                .await?;
+                super::database::commit_query()
+                    .execute(&mut *connection)
+                    .await?;
+                Ok(())
+            }
+            .await;
+            if result.is_err() {
+                let _ = super::database::rollback_query()
+                    .execute(&mut *connection)
+                    .await;
+            }
+            result
+        })
     })
 }
 
@@ -1048,12 +1050,13 @@ pub(crate) fn save_shared_server_runtime(
 pub(crate) fn test_install_shared_server_runtime_upsert_failure(
     path: &Path,
 ) -> Result<(), DatabaseError> {
-    let mut connection = super::database::open_writable(path)?;
-    block_on(async {
-        sqlx::query_file!("sql/session/test_fail_shared_server_runtime_upsert.sql")
-            .execute(&mut connection)
-            .await?;
-        Ok(())
+    with_runtime_connection(path, |connection| {
+        block_on(async {
+            sqlx::query_file!("sql/session/test_fail_shared_server_runtime_upsert.sql")
+                .execute(&mut *connection)
+                .await?;
+            Ok(())
+        })
     })
 }
 
