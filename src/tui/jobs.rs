@@ -1354,6 +1354,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn selective_shutdown_cancels_ordinary_jobs_but_keeps_protected_jobs_running() {
+        let (ordinary_started_tx, ordinary_started_rx) = std::sync::mpsc::channel();
         let (ordinary_stopped_tx, ordinary_stopped_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let mut jobs = JobRegistry::<&'static str, &'static str, &'static str>::default();
@@ -1364,6 +1365,7 @@ mod tests {
             None,
             "ordinary-job".to_string(),
             move |context| async move {
+                ordinary_started_tx.send(()).unwrap();
                 while !context.wait(Duration::from_secs(60)).await {}
                 ordinary_stopped_tx.send(()).unwrap();
                 Ok(None)
@@ -1382,6 +1384,9 @@ mod tests {
             },
         );
 
+        ordinary_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("ordinary job should start before shutdown");
         jobs.stop_accepting();
         jobs.cancel_all_except(&std::collections::BTreeSet::from([protected]));
 

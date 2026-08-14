@@ -26,6 +26,15 @@ pub(super) fn append_line_paste(input: &mut String, pasted: &str) {
     input.extend(pasted.chars().filter(|character| !character.is_control()));
 }
 
+pub(super) fn create_session_submit_key(
+    event: KeyEvent,
+    selected: usize,
+    field_count: usize,
+) -> bool {
+    event.code == KeyCode::Enter
+        && ((plain_key(event) && selected == field_count) || (ctrl_key(event) && selected == 0))
+}
+
 pub(super) fn confirmation_result(input: &str, default: bool) -> Option<bool> {
     match input.trim().to_ascii_lowercase().as_str() {
         "" => Some(default),
@@ -141,7 +150,10 @@ pub(super) fn create_session_fields(
         view::FormField {
             name: "Initial prompt".into(),
             value: String::new(),
-            description: Some("Optional. Enter adds a line; Tab moves to model.".into()),
+            description: Some(
+                "Optional. Enter adds a line; Ctrl+Enter creates the session; Tab moves to model."
+                    .into(),
+            ),
             constraint: None,
             required: false,
             kind: view::FormFieldKind::TextArea { height: 6 },
@@ -649,7 +661,7 @@ impl Tui {
                 KeyCode::BackTab | KeyCode::Up if plain_key(event) => {
                     selected = selected.saturating_sub(1);
                 }
-                KeyCode::Enter if plain_key(event) && selected == fields.len() => {
+                KeyCode::Enter if create_session_submit_key(event, selected, fields.len()) => {
                     let model = optional_selection(&fields[1].value);
                     let variant = optional_selection(&fields[2].value);
                     if fields[0].value.trim().is_empty() && (model.is_some() || variant.is_some()) {

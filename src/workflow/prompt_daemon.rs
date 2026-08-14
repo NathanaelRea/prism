@@ -79,10 +79,7 @@ pub fn probe_health() -> Result<DaemonHealth, String> {
 pub fn ensure_running() -> Result<(), String> {
     let generation = binary_generation()?;
     let health = probe_health()?;
-    if health.state == DaemonState::Running
-        && health.protocol_version == Some(PROTOCOL_VERSION)
-        && health.binary_generation.as_deref() == Some(generation.as_str())
-    {
+    if worker_matches_generation(&health, &generation) {
         return Ok(());
     }
     if health.state != DaemonState::Stopped {
@@ -99,13 +96,7 @@ pub fn ensure_running() -> Result<(), String> {
     let mut last = "worker did not become ready".to_string();
     while Instant::now() < deadline {
         match probe_health() {
-            Ok(health)
-                if health.state == DaemonState::Running
-                    && health.protocol_version == Some(PROTOCOL_VERSION)
-                    && health.binary_generation.as_deref() == Some(generation.as_str()) =>
-            {
-                return Ok(());
-            }
+            Ok(health) if worker_matches_generation(&health, &generation) => return Ok(()),
             Ok(health) => last = format!("worker state is {:?}", health.state),
             Err(error) => last = error,
         }
@@ -173,6 +164,12 @@ fn spawn_detached_worker(command: crate::process::Command) -> Result<u32, String
             Err(format!("start Prism worker daemon: {error}"))
         }
     }
+}
+
+fn worker_matches_generation(health: &DaemonHealth, generation: &str) -> bool {
+    health.state == DaemonState::Running
+        && health.protocol_version == Some(PROTOCOL_VERSION)
+        && health.binary_generation.as_deref() == Some(generation)
 }
 
 fn ensure_compatible_running() -> Result<(), String> {
@@ -831,7 +828,7 @@ where
     F: FnMut(crate::remote::request_coordinator::RemoteWait),
     C: Fn() -> bool,
 {
-    ensure_compatible_running()?;
+    ensure_running()?;
     let payload = serde_json::to_value(payload)
         .map_err(|error| format!("encode remote mutation: {error}"))?;
     coordinated_remote_request(
@@ -1099,6 +1096,21 @@ pub(crate) fn subscribe_notifications() -> Result<NotificationSubscription, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_protocol_stale_worker_is_not_compatible() {
+        let health = DaemonHealth {
+            state: DaemonState::Running,
+            protocol_version: Some(PROTOCOL_VERSION),
+            instance_id: Some("stale-worker".into()),
+            pid: Some(42),
+            binary_generation: Some("stale-generation".into()),
+            active: 0,
+            notifications: true,
+        };
+
+        assert!(!worker_matches_generation(&health, "current-generation"));
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_connection_handler_keeps_health_responsive() {

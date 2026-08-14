@@ -45,8 +45,8 @@ mod tests;
 use agent_state::AgentStatePersistenceRequest;
 #[cfg(test)]
 use dialog::{
-    append_line_paste, confirmation_result, create_session_fields, move_enabled_ordered_item,
-    selectable_choice_key, toggle_item_in_place, toggle_ordered_item,
+    append_line_paste, confirmation_result, create_session_fields, create_session_submit_key,
+    move_enabled_ordered_item, selectable_choice_key, toggle_item_in_place, toggle_ordered_item,
     update_create_session_variant_field,
 };
 use dialog::{choice_list, ctrl_key};

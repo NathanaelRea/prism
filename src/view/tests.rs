@@ -892,6 +892,7 @@ fn create_session_form_renders_multiline_prompt_model_and_variant() {
     assert!(rendered.contains("provider/model"));
     assert!(rendered.contains("Variant / thinking [default]"));
     assert!(rendered.contains("Create Session"));
+    assert!(rendered.contains("Ctrl+Enter create"));
     assert!(rendered.contains("Enter newline"));
 }
 
