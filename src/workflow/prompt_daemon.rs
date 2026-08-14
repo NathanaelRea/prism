@@ -8,7 +8,8 @@ use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -16,8 +17,9 @@ use sha2::{Digest as _, Sha256};
 
 use crate::platform::SupportedOs;
 
-const PROTOCOL_VERSION: u32 = 4;
+const PROTOCOL_VERSION: u32 = 6;
 const TRANSITION_TIMEOUT: Duration = Duration::from_secs(3);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(6);
 const SOCKET_PATH_BUDGET: usize = 103;
 const SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_CONNECTIONS: usize = 16;
@@ -82,10 +84,7 @@ pub fn probe_health() -> Result<DaemonHealth, String> {
 pub fn ensure_running() -> Result<(), String> {
     let generation = binary_generation()?;
     let health = probe_health()?;
-    if health.state == DaemonState::Running
-        && health.protocol_version == Some(PROTOCOL_VERSION)
-        && health.binary_generation.as_deref() == Some(generation.as_str())
-    {
+    if worker_matches_generation(&health, &generation) {
         return Ok(());
     }
     if health.state != DaemonState::Stopped {
@@ -106,19 +105,30 @@ pub fn ensure_running() -> Result<(), String> {
     let mut last = "worker did not become ready".to_string();
     while Instant::now() < deadline {
         match probe_health() {
-            Ok(health)
-                if health.state == DaemonState::Running
-                    && health.protocol_version == Some(PROTOCOL_VERSION)
-                    && health.binary_generation.as_deref() == Some(generation.as_str()) =>
-            {
-                return Ok(());
-            }
+            Ok(health) if worker_matches_generation(&health, &generation) => return Ok(()),
             Ok(health) => last = format!("worker state is {:?}", health.state),
             Err(error) => last = error,
         }
         thread::sleep(Duration::from_millis(25));
     }
     Err(last)
+}
+
+fn worker_matches_generation(health: &DaemonHealth, generation: &str) -> bool {
+    health.state == DaemonState::Running
+        && health.protocol_version == Some(PROTOCOL_VERSION)
+        && health.binary_generation.as_deref() == Some(generation)
+}
+
+fn ensure_compatible_running() -> Result<(), String> {
+    let health = probe_health()?;
+    if health.state == DaemonState::Running && health.protocol_version == Some(PROTOCOL_VERSION) {
+        return Ok(());
+    }
+    if health.state == DaemonState::Draining {
+        wait_stopped(TRANSITION_TIMEOUT)?;
+    }
+    ensure_running()
 }
 
 pub fn health_response() -> Result<String, String> {
@@ -134,7 +144,7 @@ pub fn shutdown() -> Result<(), String> {
     if health.state != DaemonState::Draining {
         return Err(format!("Prism worker rejected shutdown: {response}"));
     }
-    wait_stopped(TRANSITION_TIMEOUT)
+    wait_stopped(SHUTDOWN_TIMEOUT)
 }
 
 fn wait_stopped(timeout: Duration) -> Result<(), String> {
@@ -232,7 +242,7 @@ pub fn serve() -> Result<(), String> {
             }
         }
     });
-    let result = serve_socket(&runtime, &service, &generation, lock);
+    let result = serve_socket(&runtime, &service, &generation, &lock);
     let _ = shutdown.send(true);
     runtime
         .block_on(scheduler)
@@ -240,11 +250,17 @@ pub fn serve() -> Result<(), String> {
     result
 }
 
+#[derive(Default)]
+struct DaemonControl {
+    draining: AtomicBool,
+    handlers: AtomicUsize,
+}
+
 fn serve_socket(
     runtime: &tokio::runtime::Runtime,
     service: &crate::PromptWorkflowService,
     generation: &str,
-    _lock: File,
+    _lock: &File,
 ) -> Result<(), String> {
     let socket = validated_socket_path()?;
     let listener = UnixListener::bind(&socket)
@@ -259,39 +275,46 @@ fn serve_socket(
         std::process::id(),
         crate::workflow::prompt_worker::now_unix_ms()
     );
-    let (response_sender, response_receiver) = std::sync::mpsc::channel();
-    let active_connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let control = Arc::new(DaemonControl::default());
     let mut handlers = Vec::new();
-    let mut draining = false;
     let mut serve_error = None;
     loop {
         reap_finished_handlers(&mut handlers);
-        while let Ok(requested_shutdown) = response_receiver.try_recv() {
-            draining |= requested_shutdown;
-        }
-        if draining {
+        if control.draining.load(Ordering::Acquire) {
             break;
         }
         match listener.accept() {
-            Ok((stream, _)) => {
-                if active_connections.load(std::sync::atomic::Ordering::Acquire) >= MAX_CONNECTIONS
-                {
-                    let mut stream = stream;
+            Ok((mut stream, _)) => {
+                if control.handlers.load(Ordering::Acquire) >= MAX_CONNECTIONS {
                     let _ = stream.write_all(b"error worker-busy\n");
-                } else {
-                    let service = service.clone();
-                    let handle = runtime.handle().clone();
-                    let instance = instance.clone();
-                    let generation = generation.to_string();
-                    let response_sender = response_sender.clone();
-                    let active_connections = active_connections.clone();
-                    active_connections.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                    handlers.push(thread::spawn(move || {
-                        let _active = ActiveConnection(active_connections);
-                        let requested_shutdown =
-                            respond(&handle, &service, stream, &instance, &generation, draining);
-                        let _ = response_sender.send(requested_shutdown);
-                    }));
+                    continue;
+                }
+                control.handlers.fetch_add(1, Ordering::AcqRel);
+                let handle = runtime.handle().clone();
+                let service = service.clone();
+                let instance = instance.clone();
+                let generation = generation.to_string();
+                let handler_control = Arc::clone(&control);
+                match thread::Builder::new()
+                    .name("prism-worker-connection".to_string())
+                    .spawn(move || {
+                        let _active = ActiveConnection(Arc::clone(&handler_control));
+                        respond(
+                            &handle,
+                            &service,
+                            stream,
+                            &instance,
+                            &generation,
+                            &handler_control,
+                        );
+                    }) {
+                    Ok(handler) => handlers.push(handler),
+                    Err(error) => {
+                        control.handlers.fetch_sub(1, Ordering::AcqRel);
+                        serve_error =
+                            Some(format!("spawn Prism worker connection handler: {error}"));
+                        break;
+                    }
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -300,7 +323,7 @@ fn serve_socket(
                 break;
             }
         }
-        thread::sleep(Duration::from_millis(25));
+        thread::sleep(Duration::from_millis(10));
     }
     drop(listener);
     // The ownership lock remains in this stack frame until every request handler has stopped.
@@ -341,11 +364,11 @@ fn reap_finished_handlers(handlers: &mut Vec<thread::JoinHandle<()>>) {
     }
 }
 
-struct ActiveConnection(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+struct ActiveConnection(Arc<DaemonControl>);
 
 impl Drop for ActiveConnection {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.0.handlers.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -355,8 +378,8 @@ fn respond(
     mut stream: UnixStream,
     instance: &str,
     generation: &str,
-    draining: bool,
-) -> bool {
+    control: &DaemonControl,
+) {
     let _ = stream.set_read_timeout(Some(SOCKET_IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(SOCKET_IO_TIMEOUT));
     let mut request = String::new();
@@ -367,30 +390,37 @@ fn respond(
         || request.len() > 1024 * 1024
     {
         let _ = stream.write_all(b"error invalid-request\n");
-        return false;
+        return;
     }
     let request = request.trim();
     let response = match request {
         "health" | "wake" => health_line(
             instance,
             generation,
-            draining,
+            control.draining.load(Ordering::Acquire),
             active_run_count(runtime, service),
         ),
-        "shutdown" => health_line(
-            instance,
-            generation,
-            true,
-            active_run_count(runtime, service),
-        ),
-        request if request.starts_with('{') => prompt_response(runtime, service, request),
+        "shutdown" => {
+            control.draining.store(true, Ordering::Release);
+            health_line(
+                instance,
+                generation,
+                true,
+                active_run_count(runtime, service),
+            )
+        }
+        request if request.starts_with('{') => {
+            if control.draining.load(Ordering::Acquire) {
+                json_error("Prism worker is draining".to_string())
+            } else {
+                prompt_response(runtime, service, request)
+            }
+        }
         _ => "error unknown-command\n".into(),
     };
-    let requested_shutdown = request == "shutdown";
     if stream.write_all(response.as_bytes()).is_ok() {
         let _ = stream.shutdown(std::net::Shutdown::Write);
     }
-    requested_shutdown
 }
 
 fn active_run_count(
@@ -600,10 +630,13 @@ fn json_error(error: String) -> String {
     format!("{}\n", serde_json::json!({"ok": false, "error": error}))
 }
 
+const WORKER_CHANNEL_ERROR_PREFIX: &str = "worker channel error: ";
+
 fn worker_request(value: serde_json::Value) -> Result<serde_json::Value, String> {
-    let response = request(&value.to_string())?;
+    let response = request(&value.to_string())
+        .map_err(|error| format!("{WORKER_CHANNEL_ERROR_PREFIX}{error}"))?;
     let response: serde_json::Value = serde_json::from_str(&response)
-        .map_err(|error| format!("decode Worker response: {error}"))?;
+        .map_err(|error| format!("{WORKER_CHANNEL_ERROR_PREFIX}decode Worker response: {error}"))?;
     if response["ok"] == true {
         Ok(response)
     } else {
@@ -700,7 +733,7 @@ where
     F: FnMut(crate::remote::request_coordinator::RemoteWait),
     C: Fn() -> bool,
 {
-    ensure_running()?;
+    ensure_compatible_running()?;
     let mut request = serde_json::to_value(operation)
         .map_err(|error| format!("encode remote observation: {error}"))?;
     let object = request
@@ -827,35 +860,74 @@ where
     C: Fn() -> bool,
 {
     let deadline = Instant::now() + Duration::from_secs(90);
+    let mutation = completed_state == "applied";
+    let uncertain = |reason: String| format!("{UNCERTAIN_REMOTE_MUTATION_PREFIX}{reason}");
+    let mut pending = false;
     loop {
         if is_cancelled() {
-            return Err("remote request cancelled while queued".into());
+            let reason = "remote request cancelled while queued".to_string();
+            return Err(if mutation && pending {
+                uncertain(reason)
+            } else {
+                reason
+            });
         }
-        let response = worker_request(request_value.clone())?;
-        let response: CoordinatedRemoteResponse = serde_json::from_value(response)
-            .map_err(|error| format!("decode coordinated remote response: {error}"))?;
+        let response = match worker_request(request_value.clone()) {
+            Ok(response) => response,
+            Err(error) if mutation && error.starts_with(WORKER_CHANNEL_ERROR_PREFIX) => {
+                return Err(uncertain(
+                    error
+                        .strip_prefix(WORKER_CHANNEL_ERROR_PREFIX)
+                        .unwrap_or(&error)
+                        .to_string(),
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        let response: CoordinatedRemoteResponse = match serde_json::from_value(response) {
+            Ok(response) => response,
+            Err(error) if mutation => {
+                return Err(uncertain(format!(
+                    "decode coordinated remote response: {error}"
+                )));
+            }
+            Err(error) => {
+                return Err(format!("decode coordinated remote response: {error}"));
+            }
+        };
         let wait = match response {
             CoordinatedRemoteResponse::Fresh { value } if completed_state == "fresh" => {
                 return serde_json::from_value(value)
                     .map_err(|error| format!("decode coordinated remote response: {error}"));
             }
             CoordinatedRemoteResponse::Applied { value } if completed_state == "applied" => {
-                return serde_json::from_value(value)
-                    .map_err(|error| format!("decode coordinated remote response: {error}"));
+                return serde_json::from_value(value).map_err(|error| {
+                    uncertain(format!("decode coordinated remote response: {error}"))
+                });
             }
             CoordinatedRemoteResponse::Failed {
                 reason,
                 disposition: crate::remote::request_coordinator::RemoteMutationFailureDisposition::OutcomeUncertain,
-            } => return Err(format!("{UNCERTAIN_REMOTE_MUTATION_PREFIX}{reason}")),
+            } => return Err(uncertain(reason)),
             CoordinatedRemoteResponse::Failed { reason, .. } => return Err(reason),
             CoordinatedRemoteResponse::Pending { wait } => {
+                pending = true;
                 on_wait(wait.clone());
                 wait
+            }
+            _ if mutation => {
+                return Err(uncertain(
+                    "Worker returned the wrong coordinated remote response state".into(),
+                ));
             }
             _ => return Err("Worker returned the wrong coordinated remote response state".into()),
         };
         if Instant::now() >= deadline {
-            return Err(wait.summary);
+            return Err(if mutation {
+                uncertain(wait.summary)
+            } else {
+                wait.summary
+            });
         }
         let wake = wait.wake_at_unix_ms;
         let delay = wake
@@ -1067,6 +1139,112 @@ mod tests {
                 ..
             } if evidence == "authoritative provider observation"
         ));
+    }
+
+    #[test]
+    fn same_protocol_stale_worker_is_not_current_generation() {
+        let health = DaemonHealth {
+            state: DaemonState::Running,
+            protocol_version: Some(PROTOCOL_VERSION),
+            instance_id: Some("stale-worker".into()),
+            pid: Some(42),
+            binary_generation: Some("stale-generation".into()),
+            active: 0,
+            notifications: true,
+        };
+
+        assert!(!worker_matches_generation(&health, "current-generation"));
+    }
+
+    #[test]
+    fn concurrent_connection_handler_keeps_health_responsive() {
+        let temporary = crate::compact_runtime::CompactTempDir::new("worker-concurrency");
+        let database = temporary.path().join("workflow.db");
+        let state_root = temporary.path().join("state");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("create test runtime");
+        let service = runtime
+            .block_on(crate::PromptWorkflowService::open(&database, &state_root))
+            .expect("open test service");
+        let control = Arc::new(DaemonControl::default());
+        let (slow_server, _slow_client) = UnixStream::pair().expect("create slow socket pair");
+        let (health_server, mut health_client) =
+            UnixStream::pair().expect("create health socket pair");
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let slow_control = Arc::clone(&control);
+        slow_control.handlers.fetch_add(1, Ordering::AcqRel);
+        let slow = thread::spawn(move || {
+            release_rx.recv().expect("release slow handler");
+            drop(slow_server);
+            slow_control.handlers.fetch_sub(1, Ordering::AcqRel);
+        });
+        let health_control = Arc::clone(&control);
+        let handle = runtime.handle().clone();
+        let health_service = service.clone();
+        let health = thread::spawn(move || {
+            respond(
+                &handle,
+                &health_service,
+                health_server,
+                "test-instance",
+                "test-generation",
+                &health_control,
+            );
+        });
+
+        health_client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("configure health timeout");
+        health_client
+            .write_all(b"health\n")
+            .expect("write health request");
+        let mut response = String::new();
+        health_client
+            .read_to_string(&mut response)
+            .expect("read health response");
+        assert!(response.starts_with("ok 6 test-instance"), "{response}");
+        assert_eq!(control.handlers.load(Ordering::Acquire), 1);
+
+        release_tx.send(()).expect("release slow handler");
+        slow.join().expect("join slow handler");
+        health.join().expect("join health handler");
+    }
+
+    #[test]
+    fn draining_worker_rejects_new_json_requests() {
+        let temporary = crate::compact_runtime::CompactTempDir::new("worker-draining");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("create test runtime");
+        let service = runtime
+            .block_on(crate::PromptWorkflowService::open(
+                &temporary.path().join("workflow.db"),
+                &temporary.path().join("state"),
+            ))
+            .expect("open test service");
+        let control = DaemonControl::default();
+        control.draining.store(true, Ordering::Release);
+        let (server, mut client) = UnixStream::pair().expect("create socket pair");
+        client
+            .write_all(b"{\"type\":\"prompt_workflow_list\",\"repository\":null,\"limit\":1}\n")
+            .expect("write request");
+        respond(
+            runtime.handle(),
+            &service,
+            server,
+            "test-instance",
+            "test-generation",
+            &control,
+        );
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("read draining response");
+        assert!(response.contains("Prism worker is draining"), "{response}");
     }
 
     #[test]

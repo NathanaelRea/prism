@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -765,6 +765,9 @@ impl RemoteRequestCoordinator {
         };
 
         let lane_key = request.lane.clone();
+        let result_fingerprint = fingerprint.clone();
+        let dispatch_boundary_crossed = Arc::new(AtomicBool::new(false));
+        let task_dispatch_boundary = Arc::clone(&dispatch_boundary_crossed);
         let coordinator = self.clone();
         let task_lane = lane_key.clone();
         let task_key = mutation_key.clone();
@@ -818,6 +821,7 @@ impl RemoteRequestCoordinator {
                     updated_unix_ms: coordinator.clock.now_unix_ms().max(now),
                 })
                 .await?;
+            task_dispatch_boundary.store(true, Ordering::Release);
             let result = coordinator
                 .executor
                 .execute(CoordinatedRemoteOperation::Mutate(request))
@@ -831,6 +835,34 @@ impl RemoteRequestCoordinator {
             Err(error) => Err(RemoteCoordinatorError::Execution(format!(
                 "remote mutation task failed: {error}"
             ))),
+        };
+        let result = match result {
+            Err(error) => match self
+                .store
+                .load_mutation(&lane_key, &mutation_key.request_id)
+                .await
+            {
+                Ok(Some(persisted))
+                    if !matches!(persisted.state, PersistedRemoteMutationState::Claimed) =>
+                {
+                    persisted_mutation_result(
+                        &persisted,
+                        &result_fingerprint,
+                        &mutation_key.request_id,
+                    )
+                }
+                _ if dispatch_boundary_crossed.load(Ordering::Acquire) => {
+                    Ok(RemoteMutationResult::Failed {
+                        reason: format!(
+                            "remote mutation crossed its durable dispatch boundary but completion failed: {}",
+                            bounded_reason(&error.to_string())
+                        ),
+                        disposition: RemoteMutationFailureDisposition::OutcomeUncertain,
+                    })
+                }
+                _ => Err(error),
+            },
+            result => result,
         };
         // This is the common finally path for every post-admission exit, including ordinary
         // persistence errors returned from the spawned task.
@@ -1602,6 +1634,7 @@ mod tests {
         inner: MemoryRemoteCoordinatorStore,
         fail_claim_once: AtomicUsize,
         fail_uncertain_once: AtomicUsize,
+        fail_completion_once: AtomicUsize,
     }
 
     impl RemoteCoordinatorStore for FailMutationStore {
@@ -1658,6 +1691,21 @@ mod tests {
                 {
                     return Err(RemoteCoordinatorError::Persistence(
                         "injected dispatch-boundary persistence failure".into(),
+                    ));
+                }
+                if matches!(
+                    mutation.state,
+                    PersistedRemoteMutationState::Applied { .. }
+                        | PersistedRemoteMutationState::Failed { .. }
+                ) && self
+                    .fail_completion_once
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+                {
+                    return Err(RemoteCoordinatorError::Persistence(
+                        "injected mutation completion persistence failure".into(),
                     ));
                 }
                 self.inner.save_mutation(mutation).await
@@ -1972,6 +2020,7 @@ mod tests {
                 inner: MemoryRemoteCoordinatorStore::default(),
                 fail_claim_once: AtomicUsize::new(claim_failures),
                 fail_uncertain_once: AtomicUsize::new(uncertain_failures),
+                fail_completion_once: AtomicUsize::new(0),
             });
             let coordinator = RemoteRequestCoordinator::new(
                 executor.clone(),
@@ -2029,6 +2078,56 @@ mod tests {
                 RemoteMutationResult::Applied(_)
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn mutation_completion_persistence_failure_returns_durable_uncertainty() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let clock = Arc::new(FakeRemoteClock::new(100));
+        let coordinator = RemoteRequestCoordinator::new(
+            executor.clone(),
+            clock,
+            Arc::new(FailMutationStore {
+                inner: MemoryRemoteCoordinatorStore::default(),
+                fail_claim_once: AtomicUsize::new(0),
+                fail_uncertain_once: AtomicUsize::new(0),
+                fail_completion_once: AtomicUsize::new(1),
+            }),
+            RemoteCoordinatorConfig {
+                minimum_start_delay_ms: 0,
+                ..RemoteCoordinatorConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let request = RemoteMutationRequest {
+            lane: lane(),
+            request_id: "completion-persistence-failure".into(),
+            operation: "resolve".into(),
+            subject: "repo:1".into(),
+            priority: RemotePriority::WorkflowHook,
+            payload: serde_json::json!({"thread": 1}),
+        };
+
+        for result in [
+            coordinator
+                .mutate::<serde_json::Value>(request.clone())
+                .await
+                .unwrap(),
+            coordinator
+                .mutate::<serde_json::Value>(request)
+                .await
+                .unwrap(),
+        ] {
+            assert!(matches!(
+                result,
+                RemoteMutationResult::Failed {
+                    disposition: RemoteMutationFailureDisposition::OutcomeUncertain,
+                    ..
+                }
+            ));
+        }
+        assert_eq!(executor.calls.load(Ordering::Acquire), 1);
     }
 
     #[tokio::test]

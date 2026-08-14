@@ -13,7 +13,8 @@ use crate::remote::request_coordinator::{
 };
 
 pub(crate) use super::remote_operation::{
-    ResolveThreadsPayload, TuiRemoteMergeOutcome, TuiRemoteMergeResult,
+    ResolveThreadsPayload, TuiRemoteCreatePreparation, TuiRemoteMergeOutcome, TuiRemoteMergeResult,
+    TuiRemotePushResult,
 };
 use super::standard_triggers::{
     ChangeRequestObservation, MergeRelation, Mergeability, RequiredCheck, RequiredCheckState,
@@ -342,6 +343,10 @@ fn execute_typed(
             .map_err(classify_failure)?;
             output(head, "remote-branch-head")
         }
+        TypedCoordinatedRemoteOperation::Observe(Observation::TuiPushBranchResult(payload)) => {
+            let result = tui_push_reconciliation_result(&payload).map_err(classify_failure)?;
+            output(result, "push-result")
+        }
         TypedCoordinatedRemoteOperation::Observe(Observation::TuiLocalBranchHead(payload)) => {
             let repository = crate::repo::Repository {
                 root: payload.repository,
@@ -431,6 +436,14 @@ fn execute_typed(
                     current.set_upstream,
                 )
                 .map_err(classify_failure)?;
+                let result = tui_push_result(&payload).map_err(uncertain)?;
+                output(result, "mutation")
+            }
+            Mutation::TuiCreateChangeRequest(payload) => {
+                let repository = crate::repo::Repository {
+                    root: payload.repository,
+                };
+                let config = crate::config::Config::load(&repository);
                 let mut cache = crate::remote::load_pr_cache(&repository, &payload.branch);
                 crate::remote::dispatcher::refresh_change_request_cache(
                     &repository,
@@ -438,7 +451,30 @@ fn execute_typed(
                     &mut cache,
                     &payload.worktree,
                     &config,
-                    true,
+                    false,
+                )
+                .map_err(classify_failure)?;
+                if cache.has_summary() {
+                    return output(
+                        crate::remote::WorkerPrCacheSnapshot::capture(&cache),
+                        "mutation",
+                    );
+                }
+                let guard = crate::remote::dispatcher::prepare_create_change_request(
+                    &payload.worktree,
+                    &config,
+                    &payload.branch,
+                    &payload.target_repository,
+                    &payload.source_push,
+                )
+                .map_err(classify_failure)?;
+                crate::remote::dispatcher::create_change_request(
+                    &repository,
+                    &config,
+                    &payload.worktree,
+                    &payload.body,
+                    &guard,
+                    &mut cache,
                 )
                 .map_err(classify_failure)?;
                 output(
@@ -524,6 +560,96 @@ fn execute_typed(
             }
         },
     }
+}
+
+fn tui_push_result(
+    payload: &super::remote_operation::TuiRemotePushPayload,
+) -> Result<TuiRemotePushResult, String> {
+    let repository = crate::repo::Repository {
+        root: payload.repository.clone(),
+    };
+    let config = crate::config::Config::load(&repository);
+    let pushed =
+        crate::remote::dispatcher::prepare_push(&payload.worktree, &config, &payload.branch)?;
+    if !crate::remote::dispatcher::same_push_target(&payload.expected, &pushed) {
+        return Err("push destination changed while pushing".into());
+    }
+    let mut cache = crate::remote::load_pr_cache(&repository, &payload.branch);
+    crate::remote::dispatcher::refresh_change_request_cache(
+        &repository,
+        &payload.branch,
+        &mut cache,
+        &payload.worktree,
+        &config,
+        false,
+    )?;
+    let create = if cache.has_summary() {
+        None
+    } else {
+        let (origin_repository, upstream_repository) =
+            crate::remote::dispatcher::create_change_request_targets(&payload.worktree, &config)?;
+        Some(TuiRemoteCreatePreparation {
+            source_push: pushed,
+            origin_repository,
+            upstream_repository,
+        })
+    };
+    Ok(TuiRemotePushResult {
+        cache: crate::remote::WorkerPrCacheSnapshot::capture(&cache),
+        create,
+    })
+}
+
+fn tui_push_reconciliation_result(
+    payload: &super::remote_operation::TuiRemotePushPayload,
+) -> Result<TuiRemotePushResult, String> {
+    let repository = crate::repo::Repository {
+        root: payload.repository.clone(),
+    };
+    let config = crate::config::Config::load(&repository);
+    let current =
+        crate::remote::dispatcher::prepare_push(&payload.worktree, &config, &payload.branch)?;
+    let expected = &payload.expected;
+    if current.repository != expected.repository
+        || current.remote != expected.remote
+        || current.remote_branch != expected.remote_branch
+        || current.local_branch != expected.local_branch
+    {
+        return Err("push destination changed before reconciliation".into());
+    }
+    let remote_head = crate::git::push_remote_branch_head_sha(
+        &payload.worktree,
+        &expected.remote,
+        &expected.remote_branch,
+        &config,
+    )?;
+    if remote_head.as_deref() != Some(expected.expected_head_sha.as_str()) {
+        return Err("pushed branch no longer has the expected authoritative head".into());
+    }
+    let mut cache = crate::remote::load_pr_cache(&repository, &payload.branch);
+    crate::remote::dispatcher::refresh_change_request_cache(
+        &repository,
+        &payload.branch,
+        &mut cache,
+        &payload.worktree,
+        &config,
+        false,
+    )?;
+    let create = if cache.has_summary() || current.expected_head_sha != expected.expected_head_sha {
+        None
+    } else {
+        let (origin_repository, upstream_repository) =
+            crate::remote::dispatcher::create_change_request_targets(&payload.worktree, &config)?;
+        Some(TuiRemoteCreatePreparation {
+            source_push: current,
+            origin_repository,
+            upstream_repository,
+        })
+    };
+    Ok(TuiRemotePushResult {
+        cache: crate::remote::WorkerPrCacheSnapshot::capture(&cache),
+        create,
+    })
 }
 
 fn observe_change_request(subject: &TriggerSubject) -> Result<ChangeRequestObservation, String> {
@@ -916,6 +1042,47 @@ mod tests {
         assert_eq!(decoded.change_request, identity);
         assert_eq!(decoded.display_number, 42);
         assert_eq!(decoded.expected_head_sha, "abc123");
+    }
+
+    #[test]
+    fn tui_push_result_round_trip_preserves_create_preparation() {
+        let repository = crate::remote::RemoteRepositoryId::new(
+            crate::remote::ProviderKind::GitHub,
+            crate::remote::HostIdentity::new("github.com", None).unwrap(),
+            "example/repo",
+        )
+        .unwrap();
+        let source_push = crate::remote::dispatcher::PushGuard {
+            repository: repository.clone(),
+            remote: "origin".into(),
+            remote_branch: "feature".into(),
+            local_branch: "feature".into(),
+            expected_head_sha: "abc123".into(),
+            set_upstream: true,
+        };
+        let result = TuiRemotePushResult {
+            cache: crate::remote::WorkerPrCacheSnapshot::capture(&crate::remote::PrCache::default()),
+            create: Some(TuiRemoteCreatePreparation {
+                source_push,
+                origin_repository: repository,
+                upstream_repository: None,
+            }),
+        };
+
+        let encoded = serde_json::to_value(&result).unwrap();
+        let decoded: TuiRemotePushResult = serde_json::from_value(encoded).unwrap();
+        let create = decoded.create.unwrap();
+        assert_eq!(create.source_push.remote_branch, "feature");
+        assert_eq!(create.origin_repository.project_path(), "example/repo");
+    }
+
+    #[test]
+    fn post_effect_failures_are_classified_uncertain() {
+        let failure = uncertain("push destination changed while pushing".into());
+        assert_eq!(
+            failure.mutation_disposition,
+            RemoteMutationFailureDisposition::OutcomeUncertain
+        );
     }
 
     #[test]

@@ -99,6 +99,76 @@ fn remote_push_mutation_target(
     }
 }
 
+pub(super) fn remote_create_mutation_target(
+    preparation: &remote_operation::TuiRemoteCreatePreparation,
+    target: &crate::remote::RemoteRepositoryId,
+    target_branch: &str,
+) -> crate::tui::RemoteMutationTarget {
+    crate::tui::RemoteMutationTarget::Create {
+        source_provider: preparation.source_push.repository.provider(),
+        source_host: preparation.source_push.repository.host().to_string(),
+        source_project: preparation
+            .source_push
+            .repository
+            .project_path()
+            .to_string(),
+        source_branch: preparation.source_push.remote_branch.clone(),
+        expected_head_sha: preparation.source_push.expected_head_sha.clone(),
+        target_provider: Some(target.provider()),
+        target_host: target.host().to_string(),
+        target_project: target.project_path().to_string(),
+        target_branch: target_branch.to_string(),
+        expected_base_sha: String::new(),
+    }
+}
+
+fn mutation_request_id(
+    prefix: &str,
+    operation: &remote_operation::RemoteMutationOperation,
+    subject: &str,
+) -> Result<String, String> {
+    let bytes = serde_json::to_vec(&(operation, subject))
+        .map_err(|error| format!("encode {prefix} request identity: {error}"))?;
+    use sha2::Digest as _;
+    Ok(format!("{prefix}:{:x}", sha2::Sha256::digest(bytes)))
+}
+
+pub(super) fn push_request_id(
+    operation: &remote_operation::RemoteMutationOperation,
+    subject: &str,
+) -> Result<String, String> {
+    if !matches!(
+        operation,
+        remote_operation::RemoteMutationOperation::TuiPushBranch(_)
+    ) {
+        return Err("push request ID requires a push operation".to_string());
+    }
+    mutation_request_id("push", operation, subject)
+}
+
+pub(super) fn create_change_request_id(
+    operation: &remote_operation::RemoteMutationOperation,
+    subject: &str,
+) -> Result<String, String> {
+    if !matches!(
+        operation,
+        remote_operation::RemoteMutationOperation::TuiCreateChangeRequest(_)
+    ) {
+        return Err("create request ID requires a create operation".to_string());
+    }
+    mutation_request_id("create", operation, subject)
+}
+
+pub(super) fn pr_target_choice_list(origin: &str, upstream: &str) -> crate::view::ChoiceList {
+    crate::view::ChoiceList {
+        title: "Create Pull Request Target".to_string(),
+        choices: vec![
+            crate::view::KeyChoice::new("u", format!("upstream ({upstream})")),
+            crate::view::KeyChoice::new("o", format!("origin ({origin})")),
+        ],
+    }
+}
+
 pub(super) fn open_url_in_browser(url: &str) -> Result<(), String> {
     run_browser_opener(
         crate::platform::browser_candidates(crate::platform::current_os()),
@@ -359,7 +429,7 @@ impl Tui {
             return self.show_message("cannot push a detached worktree");
         }
 
-        let repo = context.repo;
+        let repo = context.repo.clone();
         let config = context.config;
         let mut cache = self.sessions[selected].pr.clone();
         let worktree = self.sessions[selected]
@@ -371,7 +441,6 @@ impl Tui {
             .unwrap_or_default();
         let expected = crate::remote::dispatcher::prepare_push(&path, &config, &branch)?;
         let mutation = remote_push_mutation_target(&expected);
-        let push_request_id = format!("push:{}:{}", branch, expected.expected_head_sha);
         let push_subject = format!("{}:{}", path.display(), branch);
         let push_operation = remote_operation::RemoteMutationOperation::TuiPushBranch(
             remote_operation::TuiRemotePushPayload {
@@ -381,10 +450,11 @@ impl Tui {
                 expected,
             },
         );
-        let RemoteActionValue::Cache(cache) = self.run_remote_action(
+        let push_request_id = push_request_id(&push_operation, &push_subject)?;
+        let RemoteActionValue::Push { cache, create } = self.run_remote_action(
             raw,
             crate::tui::RemoteActionRequest {
-                key: TuiJobKey::Worktree(worktree),
+                key: TuiJobKey::Worktree(worktree.clone()),
                 generation,
                 name: "prism-push-branch",
                 title: "Push Branch",
@@ -404,12 +474,110 @@ impl Tui {
             move |context| {
                 let progress = context.clone();
                 let cancellation = context.clone();
+                let result: remote_operation::TuiRemotePushResult =
+                    crate::worker::mutate_remote_with_progress(
+                        &repo.root,
+                        &path,
+                        &push_request_id,
+                        push_operation,
+                        &push_subject,
+                        crate::worker::RemoteRequestProgress::new(
+                            move |wait| report_remote_wait(&progress, wait),
+                            move || cancellation.is_canceled(),
+                        ),
+                    )?;
+                cache.apply_worker_snapshot(result.cache);
+                Ok(RemoteActionValue::Push {
+                    cache: Box::new(cache),
+                    create: result.create.map(Box::new),
+                })
+            },
+        )?
+        else {
+            return Err("push returned an unexpected result".to_string());
+        };
+        self.apply_remote_cache_result(selected, *cache);
+        let Some(preparation) = create else {
+            return self.show_message("push complete");
+        };
+
+        let target = if let Some(upstream) = &preparation.upstream_repository {
+            let Some(choice) = self.prompt_choice_dialog(
+                raw,
+                pr_target_choice_list(
+                    preparation.origin_repository.project_path(),
+                    upstream.project_path(),
+                ),
+            )?
+            else {
+                return Ok(());
+            };
+            match choice.as_str() {
+                "u" => upstream.clone(),
+                "o" => preparation.origin_repository.clone(),
+                _ => return Ok(()),
+            }
+        } else {
+            preparation.origin_repository.clone()
+        };
+        let Some(body) =
+            self.prompt_line_dialog(raw, "Create Pull Request", "Description: ", "")?
+        else {
+            return Ok(());
+        };
+        let target_branch = config
+            .default_base
+            .as_deref()
+            .map(str::trim)
+            .filter(|branch| !branch.is_empty())
+            .unwrap_or("main")
+            .to_string();
+        let create_mutation = remote_create_mutation_target(&preparation, &target, &target_branch);
+        let repo = context.repo;
+        let branch = self.sessions[selected].branch.clone();
+        let path = self.sessions[selected].path.clone();
+        let mut cache = self.sessions[selected].pr.clone();
+        let create_subject = format!("{}:{}", path.display(), branch);
+        let create_operation = remote_operation::RemoteMutationOperation::TuiCreateChangeRequest(
+            remote_operation::TuiRemoteCreatePayload {
+                repository: repo.root.clone(),
+                worktree: path.clone(),
+                branch,
+                body,
+                target_repository: target,
+                source_push: preparation.source_push.clone(),
+            },
+        );
+        let create_request_id = create_change_request_id(&create_operation, &create_subject)?;
+        let RemoteActionValue::Cache(cache) = self.run_remote_action(
+            raw,
+            crate::tui::RemoteActionRequest {
+                key: TuiJobKey::Worktree(worktree),
+                generation,
+                name: "prism-create-change-request",
+                title: "Create Pull Request",
+                message: "Creating pull request",
+                abandon_cancelable: false,
+                effect: crate::tui::RemoteActionEffect::CoordinatedMutation {
+                    target: Box::new(create_mutation),
+                    ledger: Box::new(crate::tui::RemoteMutationLedgerContext {
+                        repository: repo.root.clone(),
+                        worktree: path.clone(),
+                        request_id: create_request_id.clone(),
+                        operation: create_operation.clone(),
+                        subject: create_subject.clone(),
+                    }),
+                },
+            },
+            move |context| {
+                let progress = context.clone();
+                let cancellation = context.clone();
                 let snapshot = crate::worker::mutate_remote_with_progress(
                     &repo.root,
                     &path,
-                    &push_request_id,
-                    push_operation,
-                    &push_subject,
+                    &create_request_id,
+                    create_operation,
+                    &create_subject,
                     crate::worker::RemoteRequestProgress::new(
                         move |wait| report_remote_wait(&progress, wait),
                         move || cancellation.is_canceled(),
@@ -420,10 +588,10 @@ impl Tui {
             },
         )?
         else {
-            return Err("push returned an unexpected result".to_string());
+            return Err("pull request creation returned an unexpected result".to_string());
         };
         self.apply_remote_cache_result(selected, *cache);
-        self.show_message("push complete")
+        self.show_message("push complete; pull request created")
     }
 
     pub(crate) fn resolve_review_comments(

@@ -334,6 +334,112 @@ fn empty_list_retains_persisted_create_marker_until_matching_summary_is_observed
 }
 
 #[test]
+fn typed_push_and_create_markers_select_authoritative_result_observations() {
+    let provider = crate::remote::ProviderKind::GitHub;
+    let repository_id = crate::remote::RemoteRepositoryId::new(
+        provider,
+        crate::remote::HostIdentity::new("github.com", None).unwrap(),
+        "example/repo",
+    )
+    .unwrap();
+    let push = crate::remote::dispatcher::PushGuard {
+        repository: repository_id.clone(),
+        remote: "origin".into(),
+        remote_branch: "feature".into(),
+        local_branch: "feature".into(),
+        expected_head_sha: "abc123".into(),
+        set_upstream: false,
+    };
+    let repository = crate::session::WorktreeRepositoryKey::new("/repo".into());
+    let push_operation = crate::workflow::remote_operation::RemoteMutationOperation::TuiPushBranch(
+        crate::workflow::remote_operation::TuiRemotePushPayload {
+            repository: "/repo".into(),
+            worktree: "/repo/worktree".into(),
+            branch: "feature".into(),
+            expected: push.clone(),
+        },
+    );
+    let create_operation =
+        crate::workflow::remote_operation::RemoteMutationOperation::TuiCreateChangeRequest(
+            crate::workflow::remote_operation::TuiRemoteCreatePayload {
+                repository: "/repo".into(),
+                worktree: "/repo/worktree".into(),
+                branch: "feature".into(),
+                body: "description".into(),
+                target_repository: repository_id,
+                source_push: push,
+            },
+        );
+    let marker = |job_id, target, operation| {
+        super::super::remote_action::RemoteMutationReconciliationMarker {
+            target,
+            ledger: Some(crate::tui::RemoteMutationLedgerContext {
+                repository: "/repo".into(),
+                worktree: "/repo/worktree".into(),
+                request_id: format!("request-{job_id}"),
+                operation,
+                subject: "/repo:feature".into(),
+            }),
+            database_path: std::path::PathBuf::new(),
+            job_id,
+            reason: "uncertain".into(),
+            recorded_unix_ms: job_id,
+        }
+    };
+    let markers = vec![
+        marker(
+            1,
+            RemoteMutationTarget::Push {
+                remote: "origin".into(),
+                branch: "feature".into(),
+                expected_head_sha: "abc123".into(),
+                repository_provider: Some(provider),
+                repository_host: "github.com".into(),
+                repository_project: "example/repo".into(),
+            },
+            push_operation,
+        ),
+        marker(
+            2,
+            RemoteMutationTarget::Create {
+                source_provider: provider,
+                source_host: "github.com".into(),
+                source_project: "example/repo".into(),
+                source_branch: "feature".into(),
+                expected_head_sha: "abc123".into(),
+                target_provider: Some(provider),
+                target_host: "github.com".into(),
+                target_project: "example/repo".into(),
+                target_branch: "main".into(),
+                expected_base_sha: "base123".into(),
+            },
+            create_operation,
+        ),
+    ];
+    let mut summary = test_pr_summary(false);
+    summary.change_request_identity = Some(test_change_request_identity(provider));
+    let commands = super::super::remote_reconciliation::classify_summary_evidence(
+        &repository,
+        &markers,
+        &[summary],
+        &BTreeMap::from([(
+            ("origin".to_string(), "feature".to_string()),
+            "abc123".to_string(),
+        )]),
+    );
+
+    assert_eq!(commands.len(), 2);
+    assert!(matches!(
+        commands[0].observation,
+        Some(super::super::remote_reconciliation::ReconciliationObservation::PushResult(_))
+    ));
+    assert!(matches!(
+        commands[1].observation,
+        Some(super::super::remote_reconciliation::ReconciliationObservation::Cache(_))
+    ));
+}
+
+#[test]
 fn failed_reconciliation_releases_the_marker_for_retry() {
     let temp = unique_temp_dir("prism-tui-reconciliation-retry");
     fs::create_dir_all(&temp).unwrap();

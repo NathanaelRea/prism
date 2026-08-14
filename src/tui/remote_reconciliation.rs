@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 #[derive(Clone, Debug)]
 pub(crate) enum ReconciliationObservation {
     Cache(crate::workflow::remote_operation::TuiRemoteCachePayload),
+    PushResult(crate::workflow::remote_operation::TuiRemotePushPayload),
     LocalBranch(crate::workflow::remote_operation::TuiLocalBranchHeadPayload),
 }
 
@@ -56,11 +57,65 @@ pub(crate) fn classify_summary_evidence(
                     };
                     (
                         serde_json::Value::Null,
+                        Some(ReconciliationObservation::PushResult(operation.clone())),
+                    )
+                }
+                RemoteMutationTarget::Create {
+                    source_provider,
+                    source_host,
+                    source_project,
+                    source_branch,
+                    expected_head_sha,
+                    target_provider: Some(target_provider),
+                    target_host,
+                    target_project,
+                    target_branch,
+                    ..
+                } => {
+                    let operation = match &ledger.operation {
+                        crate::workflow::remote_operation::RemoteMutationOperation::TuiCreateChangeRequest(payload) => payload,
+                        _ => return None,
+                    };
+                    let source_repository = crate::remote::RemoteRepositoryId::new(
+                        *source_provider,
+                        crate::remote::HostIdentity::parse(source_host).ok()?,
+                        source_project,
+                    )
+                    .ok()?;
+                    let target_repository = crate::remote::RemoteRepositoryId::new(
+                        *target_provider,
+                        crate::remote::HostIdentity::parse(target_host).ok()?,
+                        target_project,
+                    )
+                    .ok()?;
+                    if operation.source_push.repository != source_repository
+                        || operation.target_repository != target_repository
+                        || operation.source_push.remote_branch != *source_branch
+                        || operation.source_push.expected_head_sha != *expected_head_sha
+                    {
+                        return None;
+                    }
+                    summaries.iter().find(|summary| {
+                        let Some(identity) = summary.change_request_identity.as_ref() else {
+                            return false;
+                        };
+                        identity
+                            .source_repository()
+                            .is_ok_and(|repository| repository == source_repository)
+                            && identity
+                                .target_repository()
+                                .is_ok_and(|repository| repository == target_repository)
+                            && summary.head_ref == *source_branch
+                            && summary.base_ref == *target_branch
+                            && summary.head_sha == *expected_head_sha
+                    })?;
+                    (
+                        serde_json::Value::Null,
                         Some(ReconciliationObservation::Cache(
                             crate::workflow::remote_operation::TuiRemoteCachePayload {
-                            repository: operation.repository.clone(),
-                            worktree: operation.worktree.clone(),
-                            branch: operation.branch.clone(),
+                                repository: operation.repository.clone(),
+                                worktree: operation.worktree.clone(),
+                                branch: operation.branch.clone(),
                                 force_details: true,
                             },
                         )),
@@ -264,6 +319,17 @@ impl Tui {
                                     &format!("{}:{}:reconcile", payload.worktree.display(), payload.branch),
                                 )?)
                                 .map_err(|error| format!("encode authoritative cache snapshot: {error}"))?;
+                            }
+                            Some(ReconciliationObservation::PushResult(payload)) => {
+                                applied = serde_json::to_value(crate::worker::observe_remote::<
+                                    crate::workflow::remote_operation::TuiRemotePushResult,
+                                >(
+                                    &payload.repository,
+                                    &payload.worktree,
+                                    crate::workflow::remote_operation::RemoteObservationOperation::TuiPushBranchResult(Box::new(payload.clone())),
+                                    &format!("{}:{}:push-reconcile", payload.worktree.display(), payload.branch),
+                                )?)
+                                .map_err(|error| format!("encode authoritative push result: {error}"))?;
                             }
                             Some(ReconciliationObservation::LocalBranch(payload)) => {
                                 let expected = match &target {

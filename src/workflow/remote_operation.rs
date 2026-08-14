@@ -45,6 +45,29 @@ pub struct TuiRemotePushPayload {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TuiRemotePushResult {
+    pub cache: crate::remote::WorkerPrCacheSnapshot,
+    pub create: Option<TuiRemoteCreatePreparation>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TuiRemoteCreatePreparation {
+    pub source_push: crate::remote::dispatcher::PushGuard,
+    pub origin_repository: crate::remote::RemoteRepositoryId,
+    pub upstream_repository: Option<crate::remote::RemoteRepositoryId>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TuiRemoteCreatePayload {
+    pub repository: PathBuf,
+    pub worktree: PathBuf,
+    pub branch: String,
+    pub body: String,
+    pub target_repository: crate::remote::RemoteRepositoryId,
+    pub source_push: crate::remote::dispatcher::PushGuard,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TuiRemoteFetchPayload {
     pub repository: PathBuf,
     pub worktree: PathBuf,
@@ -98,6 +121,8 @@ pub enum RemoteObservationOperation {
     TuiRemoteBranchHead(TuiRemoteBranchHeadPayload),
     #[serde(rename = "tui.change_request_cache")]
     TuiChangeRequestCache(TuiRemoteCachePayload),
+    #[serde(rename = "tui.push_branch_result")]
+    TuiPushBranchResult(Box<TuiRemotePushPayload>),
     #[serde(rename = "tui.local_branch_head")]
     TuiLocalBranchHead(TuiLocalBranchHeadPayload),
 }
@@ -110,6 +135,7 @@ impl RemoteObservationOperation {
             Self::TuiRepositoryPolicy(_) => "tui.repository_policy",
             Self::TuiRemoteBranchHead(_) => "tui.remote_branch_head",
             Self::TuiChangeRequestCache(_) => "tui.change_request_cache",
+            Self::TuiPushBranchResult(_) => "tui.push_branch_result",
             Self::TuiLocalBranchHead(_) => "tui.local_branch_head",
         }
     }
@@ -122,6 +148,7 @@ impl RemoteObservationOperation {
             }
             Self::TuiRemoteBranchHead(payload) => (&payload.repository, &payload.worktree),
             Self::TuiChangeRequestCache(payload) => (&payload.repository, &payload.worktree),
+            Self::TuiPushBranchResult(payload) => (&payload.repository, &payload.worktree),
             Self::TuiLocalBranchHead(payload) => (&payload.repository, &payload.worktree),
         }
     }
@@ -136,6 +163,8 @@ pub enum RemoteMutationOperation {
     TuiResolveReviewThreads(TuiRemoteResolvePayload),
     #[serde(rename = "tui.push_branch")]
     TuiPushBranch(TuiRemotePushPayload),
+    #[serde(rename = "tui.create_change_request")]
+    TuiCreateChangeRequest(TuiRemoteCreatePayload),
     #[serde(rename = "tui.fetch_change_request")]
     TuiFetchChangeRequest(TuiRemoteFetchPayload),
     #[serde(rename = "tui.submit_review")]
@@ -150,6 +179,7 @@ impl RemoteMutationOperation {
             Self::ChangeRequestResolveReviewThreads(_) => "change_request.resolve_review_threads",
             Self::TuiResolveReviewThreads(_) => "tui.resolve_review_threads",
             Self::TuiPushBranch(_) => "tui.push_branch",
+            Self::TuiCreateChangeRequest(_) => "tui.create_change_request",
             Self::TuiFetchChangeRequest(_) => "tui.fetch_change_request",
             Self::TuiSubmitReview(_) => "tui.submit_review",
             Self::TuiMergeChangeRequest(_) => "tui.merge_change_request",
@@ -163,6 +193,7 @@ impl RemoteMutationOperation {
             }
             Self::TuiResolveReviewThreads(payload) => (&payload.repository, &payload.worktree),
             Self::TuiPushBranch(payload) => (&payload.repository, &payload.worktree),
+            Self::TuiCreateChangeRequest(payload) => (&payload.repository, &payload.worktree),
             Self::TuiFetchChangeRequest(payload) => (&payload.repository, &payload.worktree),
             Self::TuiSubmitReview(payload) => (&payload.repository, &payload.worktree),
             Self::TuiMergeChangeRequest(payload) => (&payload.repository, &payload.worktree),

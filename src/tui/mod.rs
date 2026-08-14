@@ -45,8 +45,9 @@ use background_runtime::BackgroundRuntime;
 use dialog::{choice_list, ctrl_key};
 #[cfg(test)]
 use dialog::{
-    confirmation_result, create_session_fields, move_enabled_ordered_item, selectable_choice_key,
-    toggle_item_in_place, toggle_ordered_item, update_create_session_variant_field,
+    confirmation_result, create_session_fields, create_session_submit_key,
+    move_enabled_ordered_item, selectable_choice_key, toggle_item_in_place, toggle_ordered_item,
+    update_create_session_variant_field,
 };
 pub(crate) use git_actions::GitAction;
 use git_actions::{
