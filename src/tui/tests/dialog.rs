@@ -1,8 +1,10 @@
 use crate::view::{ChoiceList, FormFieldKind, KeyChoice, OrderedToggleItem};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::super::{
-    confirmation_result, create_session_fields, move_enabled_ordered_item, selectable_choice_key,
-    toggle_item_in_place, toggle_ordered_item, update_create_session_variant_field,
+    confirmation_result, create_session_fields, create_session_submit_key,
+    move_enabled_ordered_item, selectable_choice_key, toggle_item_in_place, toggle_ordered_item,
+    update_create_session_variant_field,
 };
 
 #[test]
@@ -45,6 +47,17 @@ fn create_session_fields_include_multiline_prompt_and_harness_defaults() {
         panic!("variant field must be an enum");
     };
     assert_eq!(options, &["Harness default", "low", "high"]);
+}
+
+#[test]
+fn ctrl_enter_submits_create_session_from_initial_prompt() {
+    let plain_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    let ctrl_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
+
+    assert!(!create_session_submit_key(plain_enter, 0, 3));
+    assert!(create_session_submit_key(ctrl_enter, 0, 3));
+    assert!(!create_session_submit_key(ctrl_enter, 1, 3));
+    assert!(create_session_submit_key(plain_enter, 3, 3));
 }
 
 #[test]

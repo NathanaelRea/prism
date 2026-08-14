@@ -7,7 +7,8 @@ use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{
         self, DisableFocusChange, EnableFocusChange, EnableMouseCapture, Event, KeyEvent,
-        MouseEvent,
+        KeyboardEnhancementFlags, MouseEvent, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{
@@ -21,6 +22,8 @@ use crate::view;
 
 pub(crate) struct TerminalRuntime {
     active: bool,
+    keyboard_enhancement_active: bool,
+    raw_mode_active: bool,
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
 }
 
@@ -39,33 +42,16 @@ pub(crate) struct DrawTiming {
 
 impl TerminalRuntime {
     pub(crate) fn enter() -> Result<Self, String> {
-        enable_raw_mode().map_err(|error| error.to_string())?;
-        let mut stdout = io::stdout();
-        if let Err(error) = execute!(
-            stdout,
-            EnterAlternateScreen,
-            EnableMouseCapture,
-            EnableFocusChange,
-            Hide
-        )
-        .map_err(|error| error.to_string())
-        {
-            let _ = disable_raw_mode();
-            return Err(error);
-        }
-        let backend = CrosstermBackend::new(stdout);
-        let terminal = match Terminal::new(backend).map_err(|error| error.to_string()) {
-            Ok(terminal) => terminal,
-            Err(error) => {
-                let _ = execute!(io::stdout(), DisableFocusChange, LeaveAlternateScreen, Show);
-                let _ = disable_raw_mode();
-                return Err(error);
-            }
-        };
-        Ok(Self {
-            active: true,
+        let backend = CrosstermBackend::new(io::stdout());
+        let terminal = Terminal::new(backend).map_err(|error| error.to_string())?;
+        let mut runtime = Self {
+            active: false,
+            keyboard_enhancement_active: false,
+            raw_mode_active: false,
             terminal,
-        })
+        };
+        runtime.activate_terminal(false)?;
+        Ok(runtime)
     }
 
     pub(crate) fn draw(&mut self, model: &view::FrameModel<'_>) -> Result<DrawTiming, String> {
@@ -92,41 +78,26 @@ impl TerminalRuntime {
     }
 
     pub(crate) fn suspend(&mut self) -> Result<(), String> {
-        if !self.active {
+        if !self.active && !self.keyboard_enhancement_active && !self.raw_mode_active {
             return Ok(());
         }
         let started = Instant::now();
-        let result = self.leave_active_terminal();
+        let result = self.leave_active_terminal(true);
         crate::flight_recorder::record(
             "lifecycle",
             "terminal_suspend",
             Some(started.elapsed()),
             vec![crate::flight_recorder::boolean("success", result.is_ok())],
         );
-        result?;
-        self.active = false;
-        Ok(())
+        result
     }
 
     pub(crate) fn resume(&mut self) -> Result<(), String> {
-        if self.active {
+        if self.active && self.keyboard_enhancement_active && self.raw_mode_active {
             return Ok(());
         }
         let started = Instant::now();
-        let result = (|| {
-            enable_raw_mode().map_err(|error| error.to_string())?;
-            execute!(
-                io::stdout(),
-                EnterAlternateScreen,
-                EnableMouseCapture,
-                EnableFocusChange,
-                Hide
-            )
-            .map_err(|error| error.to_string())?;
-            self.active = true;
-            self.terminal.clear().map_err(|error| error.to_string())?;
-            Ok(())
-        })();
+        let result = self.activate_terminal(true);
         crate::flight_recorder::record(
             "lifecycle",
             "terminal_resume",
@@ -215,30 +186,91 @@ impl TerminalRuntime {
         result
     }
 
-    fn leave_active_terminal(&mut self) -> Result<(), String> {
-        execute!(
+    fn activate_terminal(&mut self, clear: bool) -> Result<(), String> {
+        if self.active || self.keyboard_enhancement_active || self.raw_mode_active {
+            self.leave_active_terminal(false)?;
+        }
+        enable_raw_mode().map_err(|error| error.to_string())?;
+        self.raw_mode_active = true;
+        self.active = true;
+        if let Err(error) = execute!(
             io::stdout(),
-            crossterm::event::DisableMouseCapture,
-            DisableFocusChange,
-            LeaveAlternateScreen,
-            Clear(ClearType::All),
-            MoveTo(0, 0),
-            Show
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableFocusChange,
+            Hide
         )
-        .map_err(|error| error.to_string())?;
-        disable_raw_mode().map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())
+        {
+            let _ = self.leave_active_terminal(false);
+            return Err(error);
+        }
+        if let Err(error) = execute!(
+            io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )
+        .map_err(|error| error.to_string())
+        {
+            let _ = self.leave_active_terminal(false);
+            return Err(error);
+        }
+        self.keyboard_enhancement_active = true;
+        if clear && let Err(error) = self.terminal.clear().map_err(|error| error.to_string()) {
+            let _ = self.leave_active_terminal(false);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn leave_active_terminal(&mut self, clear: bool) -> Result<(), String> {
+        let mut first_error = None;
+        if self.keyboard_enhancement_active {
+            // Pop is stack-based, so an attempted pop must not be retried after an
+            // ambiguous output error and remove an outer application's state.
+            self.keyboard_enhancement_active = false;
+            if let Err(error) = execute!(io::stdout(), PopKeyboardEnhancementFlags) {
+                first_error = Some(error.to_string());
+            }
+        }
+        if self.active {
+            let result = if clear {
+                execute!(
+                    io::stdout(),
+                    crossterm::event::DisableMouseCapture,
+                    DisableFocusChange,
+                    LeaveAlternateScreen,
+                    Clear(ClearType::All),
+                    MoveTo(0, 0),
+                    Show
+                )
+            } else {
+                execute!(
+                    io::stdout(),
+                    crossterm::event::DisableMouseCapture,
+                    DisableFocusChange,
+                    LeaveAlternateScreen,
+                    Show
+                )
+            };
+            match result {
+                Ok(()) => self.active = false,
+                Err(error) if first_error.is_none() => first_error = Some(error.to_string()),
+                Err(_) => {}
+            }
+        }
+        if self.raw_mode_active {
+            match disable_raw_mode() {
+                Ok(()) => self.raw_mode_active = false,
+                Err(error) if first_error.is_none() => first_error = Some(error.to_string()),
+                Err(_) => {}
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 }
 
 impl Drop for TerminalRuntime {
     fn drop(&mut self) {
-        let _ = execute!(
-            io::stdout(),
-            crossterm::event::DisableMouseCapture,
-            DisableFocusChange,
-            LeaveAlternateScreen,
-            Show
-        );
-        let _ = disable_raw_mode();
+        let _ = self.leave_active_terminal(false);
     }
 }
