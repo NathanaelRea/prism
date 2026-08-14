@@ -197,6 +197,7 @@ fn is_worker_transition_error(error: &str) -> bool {
         || error.contains("Broken pipe")
         || error.contains("connection refused")
         || error.contains("Connection refused")
+        || error.contains("closed connection without a response")
 }
 
 pub fn serve() -> Result<(), String> {
@@ -958,7 +959,11 @@ fn request_stream(mut stream: UnixStream, command: &str) -> Result<String, Strin
     stream
         .read_to_string(&mut response)
         .map_err(|error| format!("read Prism worker response: {error}"))?;
-    Ok(response.trim().to_string())
+    let response = response.trim();
+    if response.is_empty() {
+        return Err("Prism worker closed connection without a response".into());
+    }
+    Ok(response.to_string())
 }
 
 fn parse_health(response: &str) -> Result<DaemonHealth, String> {
@@ -1154,6 +1159,21 @@ mod tests {
         };
 
         assert!(!worker_matches_generation(&health, "current-generation"));
+    }
+
+    #[test]
+    fn connection_closed_without_response_is_a_worker_transition() {
+        let (server, client) = UnixStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            let mut request = String::new();
+            BufReader::new(server).read_line(&mut request).unwrap();
+            assert_eq!(request, "health\n");
+        });
+
+        let result = request_stream(client, "health");
+        server.join().unwrap();
+        let error = result.unwrap_err();
+        assert!(is_worker_transition_error(&error), "{error}");
     }
 
     #[test]
