@@ -284,8 +284,8 @@ mod tests {
     use super::*;
 
     fn temp(name: &str) -> PathBuf {
-        let path =
-            std::env::temp_dir().join(format!("prism-resource-{name}-{}", std::process::id()));
+        let root = std::env::temp_dir().canonicalize().unwrap();
+        let path = root.join(format!("prism-resource-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         path
