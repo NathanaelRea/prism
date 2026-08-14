@@ -5,9 +5,9 @@
 
 use std::path::{Path, PathBuf};
 
-use sqlx::{Connection, FromRow, SqliteConnection};
+use sqlx::{FromRow, SqliteConnection};
 
-use super::database::{block_on, finish_connection, open_writable, writable_options};
+use super::database::{block_on, connect_writable, finish_connection, open_writable};
 use super::error::DatabaseError;
 use crate::opencode::OpencodeRuntime;
 
@@ -179,35 +179,40 @@ impl SessionStore {
         Ok(Self { path: path.into() })
     }
 
-    fn options(&self) -> Result<sqlx::sqlite::SqliteConnectOptions, DatabaseError> {
-        writable_options(&self.path, false)
+    fn with_connection<T>(
+        &self,
+        operation: impl FnOnce(&mut SqliteConnection) -> Result<T, DatabaseError>,
+    ) -> Result<T, DatabaseError> {
+        let mut connection = connect_writable(&self.path)?;
+        let result = operation(&mut connection);
+        finish_connection(connection, result)
     }
 
     pub(crate) fn load_pending_deletion(
         &self,
         branch: &str,
     ) -> Result<Option<PendingDeletion>, DatabaseError> {
-        let options = self.options()?;
-        let row = block_on(async {
-            let mut connection = SqliteConnection::connect_with(&options).await?;
-            sqlx::query_file_as!(
-                PendingDeletionRow,
-                "sql/session/load_pending_deletion.sql",
-                branch
-            )
-            .fetch_optional(&mut connection)
-            .await
+        let row = self.with_connection(|connection| {
+            block_on(async {
+                sqlx::query_file_as!(
+                    PendingDeletionRow,
+                    "sql/session/load_pending_deletion.sql",
+                    branch
+                )
+                .fetch_optional(&mut *connection)
+                .await
+            })
         })?;
         Ok(row.map(Into::into))
     }
 
     pub(crate) fn list_pending_deletions(&self) -> Result<Vec<PendingDeletion>, DatabaseError> {
-        let options = self.options()?;
-        let rows = block_on(async {
-            let mut connection = SqliteConnection::connect_with(&options).await?;
-            sqlx::query_file_as!(PendingDeletionRow, "sql/session/list_pending_deletions.sql")
-                .fetch_all(&mut connection)
-                .await
+        let rows = self.with_connection(|connection| {
+            block_on(async {
+                sqlx::query_file_as!(PendingDeletionRow, "sql/session/list_pending_deletions.sql")
+                    .fetch_all(&mut *connection)
+                    .await
+            })
         })?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
@@ -220,21 +225,21 @@ impl SessionStore {
         branch_oid: Option<&str>,
         updated_unix_ms: i64,
     ) -> Result<(), DatabaseError> {
-        let options = self.options()?;
-        block_on(async {
-            let mut connection = SqliteConnection::connect_with(&options).await?;
-            let result = sqlx::query_file!(
-                "sql/session/save_pending_deletion.sql",
-                branch,
-                worktree_path,
-                worktree_incarnation,
-                branch_oid,
-                updated_unix_ms
-            )
-            .execute(&mut connection)
-            .await?;
-            require_one_row(result, "save pending worktree deletion")?;
-            Ok(())
+        self.with_connection(|connection| {
+            block_on(async {
+                let result = sqlx::query_file!(
+                    "sql/session/save_pending_deletion.sql",
+                    branch,
+                    worktree_path,
+                    worktree_incarnation,
+                    branch_oid,
+                    updated_unix_ms
+                )
+                .execute(&mut *connection)
+                .await?;
+                require_one_row(result, "save pending worktree deletion")?;
+                Ok(())
+            })
         })
     }
 
@@ -244,68 +249,70 @@ impl SessionStore {
         worktree_removed: bool,
         updated_unix_ms: i64,
     ) -> Result<(), DatabaseError> {
-        let options = self.options()?;
-        block_on(async {
-            let mut connection = SqliteConnection::connect_with(&options).await?;
-            if worktree_removed {
-                let result = sqlx::query_file!(
-                    "sql/session/mark_pending_worktree_removed.sql",
-                    updated_unix_ms,
-                    branch
-                )
-                .execute(&mut connection)
-                .await?;
-                require_one_row(result, "mark pending worktree removal")?;
-            } else {
-                let result = sqlx::query_file!(
-                    "sql/session/mark_pending_branch_deleted.sql",
-                    updated_unix_ms,
-                    branch
-                )
-                .execute(&mut connection)
-                .await?;
-                require_one_row(result, "mark pending branch deletion")?;
-            }
-            Ok(())
+        self.with_connection(|connection| {
+            block_on(async {
+                if worktree_removed {
+                    let result = sqlx::query_file!(
+                        "sql/session/mark_pending_worktree_removed.sql",
+                        updated_unix_ms,
+                        branch
+                    )
+                    .execute(&mut *connection)
+                    .await?;
+                    require_one_row(result, "mark pending worktree removal")?;
+                } else {
+                    let result = sqlx::query_file!(
+                        "sql/session/mark_pending_branch_deleted.sql",
+                        updated_unix_ms,
+                        branch
+                    )
+                    .execute(&mut *connection)
+                    .await?;
+                    require_one_row(result, "mark pending branch deletion")?;
+                }
+                Ok(())
+            })
         })
     }
 
     pub(crate) fn persisted_worktrees(&self) -> Result<Vec<(String, String)>, DatabaseError> {
-        let options = self.options()?;
-        block_on(async {
-            let mut connection = SqliteConnection::connect_with(&options).await?;
-            let rows = sqlx::query_file_as!(
-                PersistedWorktreeRow,
-                "sql/session/list_persisted_worktrees.sql"
-            )
-            .fetch_all(&mut connection)
-            .await?;
-            Ok(rows
-                .into_iter()
-                .map(|row| (row.branch, row.worktree))
-                .collect())
+        self.with_connection(|connection| {
+            block_on(async {
+                let rows = sqlx::query_file_as!(
+                    PersistedWorktreeRow,
+                    "sql/session/list_persisted_worktrees.sql"
+                )
+                .fetch_all(&mut *connection)
+                .await?;
+                Ok(rows
+                    .into_iter()
+                    .map(|row| (row.branch, row.worktree))
+                    .collect())
+            })
         })
     }
 
     pub(crate) fn unadopted_state(&self) -> Result<UnadoptedState, DatabaseError> {
-        let options = self.options()?;
-        block_on(async {
-            let mut connection = SqliteConnection::connect_with(&options).await?;
-            let runtimes =
-                sqlx::query_file_as!(BranchPathRow, "sql/session/list_unadopted_runtimes.sql")
-                    .fetch_all(&mut connection)
-                    .await?;
-            let branches =
-                sqlx::query_file_as!(BranchRow, "sql/session/list_unadopted_agent_branches.sql")
-                    .fetch_all(&mut connection)
-                    .await?;
-            Ok((
-                runtimes
-                    .into_iter()
-                    .map(|row| (row.branch, row.worktree_path))
-                    .collect(),
-                branches.into_iter().map(|row| row.branch).collect(),
-            ))
+        self.with_connection(|connection| {
+            block_on(async {
+                let runtimes =
+                    sqlx::query_file_as!(BranchPathRow, "sql/session/list_unadopted_runtimes.sql")
+                        .fetch_all(&mut *connection)
+                        .await?;
+                let branches = sqlx::query_file_as!(
+                    BranchRow,
+                    "sql/session/list_unadopted_agent_branches.sql"
+                )
+                .fetch_all(&mut *connection)
+                .await?;
+                Ok((
+                    runtimes
+                        .into_iter()
+                        .map(|row| (row.branch, row.worktree_path))
+                        .collect(),
+                    branches.into_iter().map(|row| row.branch).collect(),
+                ))
+            })
         })
     }
 
@@ -317,54 +324,54 @@ impl SessionStore {
         incarnation: &str,
         updated_unix_ms: i64,
     ) -> Result<(), DatabaseError> {
-        let options = self.options()?;
-        block_on(async {
-            let mut connection = SqliteConnection::connect_with(&options).await?;
-            super::database::begin_immediate_query()
-                .execute(&mut connection)
-                .await?;
-            let result = async {
-                sqlx::query_file!(
-                    "sql/session/repoint_task_metadata.sql",
-                    new_path,
-                    branch,
-                    old_path
-                )
-                .execute(&mut connection)
-                .await?;
-                sqlx::query_file!(
-                    "sql/session/repoint_worktree_harness.sql",
-                    new_path,
-                    incarnation,
-                    updated_unix_ms,
-                    branch,
-                    old_path
-                )
-                .execute(&mut connection)
-                .await?;
-                super::database::commit_query()
-                    .execute(&mut connection)
+        self.with_connection(|connection| {
+            block_on(async {
+                super::database::begin_immediate_query()
+                    .execute(&mut *connection)
                     .await?;
-                Ok(())
-            }
-            .await;
-            if result.is_err() {
-                let _ = super::database::rollback_query()
-                    .execute(&mut connection)
-                    .await;
-            }
-            result
+                let result = async {
+                    sqlx::query_file!(
+                        "sql/session/repoint_task_metadata.sql",
+                        new_path,
+                        branch,
+                        old_path
+                    )
+                    .execute(&mut *connection)
+                    .await?;
+                    sqlx::query_file!(
+                        "sql/session/repoint_worktree_harness.sql",
+                        new_path,
+                        incarnation,
+                        updated_unix_ms,
+                        branch,
+                        old_path
+                    )
+                    .execute(&mut *connection)
+                    .await?;
+                    super::database::commit_query()
+                        .execute(&mut *connection)
+                        .await?;
+                    Ok(())
+                }
+                .await;
+                if result.is_err() {
+                    let _ = super::database::rollback_query()
+                        .execute(&mut *connection)
+                        .await;
+                }
+                result
+            })
         })
     }
 
     pub(crate) fn cleanup_owner(&self, branch: &str) -> Result<Option<String>, DatabaseError> {
-        let options = self.options()?;
-        block_on(async {
-            let mut connection = SqliteConnection::connect_with(&options).await?;
-            sqlx::query_file_as!(CleanupOwnerRow, "sql/session/cleanup_owner.sql", branch)
-                .fetch_optional(&mut connection)
-                .await
-                .map(|row| row.map(|row| row.worktree))
+        self.with_connection(|connection| {
+            block_on(async {
+                sqlx::query_file_as!(CleanupOwnerRow, "sql/session/cleanup_owner.sql", branch)
+                    .fetch_optional(&mut *connection)
+                    .await
+                    .map(|row| row.map(|row| row.worktree))
+            })
         })
     }
 
@@ -383,87 +390,90 @@ impl SessionStore {
                 ))
             })
             .collect::<Result<Vec<_>, DatabaseError>>()?;
-        let options = self.options()?;
-        block_on(async {
-            let mut connection = SqliteConnection::connect_with(&options).await?;
-            super::database::begin_immediate_query()
-                .execute(&mut connection)
-                .await?;
-            let result = async {
-                let owner =
-                    sqlx::query_file_as!(CleanupOwnerRow, "sql/session/cleanup_owner.sql", branch)
-                        .fetch_optional(&mut connection)
-                        .await?
-                        .map(|row| row.worktree);
-                if owner.as_deref().is_some_and(|owner| owner != worktree_path) {
-                    return Err(sqlx::Error::Protocol(format!(
-                        "retained state for {branch}: it now belongs to worktree {owner:?}"
-                    )));
-                }
-                sqlx::query_file!("sql/session/delete_pr_details_cache.sql", branch)
-                    .execute(&mut connection)
+        self.with_connection(|connection| {
+            block_on(async {
+                super::database::begin_immediate_query()
+                    .execute(&mut *connection)
                     .await?;
-                sqlx::query_file!("sql/session/delete_pr_cache.sql", branch)
-                    .execute(&mut connection)
-                    .await?;
-                sqlx::query_file!("sql/session/delete_agent_state.sql", branch)
-                    .execute(&mut connection)
-                    .await?;
-                for (runtime, generation) in &generations {
-                    sqlx::query_file!(
-                        "sql/session/delete_opencode_runtime.sql",
-                        runtime.repo_root,
-                        runtime.harness_id,
-                        runtime.branch,
-                        runtime.worktree_path,
-                        generation
+                let result = async {
+                    let owner = sqlx::query_file_as!(
+                        CleanupOwnerRow,
+                        "sql/session/cleanup_owner.sql",
+                        branch
                     )
-                    .execute(&mut connection)
+                    .fetch_optional(&mut *connection)
+                    .await?
+                    .map(|row| row.worktree);
+                    if owner.as_deref().is_some_and(|owner| owner != worktree_path) {
+                        return Err(sqlx::Error::Protocol(format!(
+                            "retained state for {branch}: it now belongs to worktree {owner:?}"
+                        )));
+                    }
+                    sqlx::query_file!("sql/session/delete_pr_details_cache.sql", branch)
+                        .execute(&mut *connection)
+                        .await?;
+                    sqlx::query_file!("sql/session/delete_pr_cache.sql", branch)
+                        .execute(&mut *connection)
+                        .await?;
+                    sqlx::query_file!("sql/session/delete_agent_state.sql", branch)
+                        .execute(&mut *connection)
+                        .await?;
+                    for (runtime, generation) in &generations {
+                        sqlx::query_file!(
+                            "sql/session/delete_opencode_runtime.sql",
+                            runtime.repo_root,
+                            runtime.harness_id,
+                            runtime.branch,
+                            runtime.worktree_path,
+                            generation
+                        )
+                        .execute(&mut *connection)
+                        .await?;
+                    }
+                    sqlx::query_file!(
+                        "sql/session/delete_task_metadata.sql",
+                        branch,
+                        worktree_path
+                    )
+                    .execute(&mut *connection)
                     .await?;
+                    sqlx::query_file!(
+                        "sql/session/delete_worktree_harness.sql",
+                        branch,
+                        worktree_path
+                    )
+                    .execute(&mut *connection)
+                    .await?;
+                    sqlx::query_file!("sql/session/delete_hidden_session.sql", branch)
+                        .execute(&mut *connection)
+                        .await?;
+                    sqlx::query_file!(
+                        "sql/session/delete_archived_worktree_for_path.sql",
+                        branch,
+                        worktree_path
+                    )
+                    .execute(&mut *connection)
+                    .await?;
+                    sqlx::query_file!(
+                        "sql/session/delete_pending_deletion.sql",
+                        branch,
+                        worktree_path
+                    )
+                    .execute(&mut *connection)
+                    .await?;
+                    super::database::commit_query()
+                        .execute(&mut *connection)
+                        .await?;
+                    Ok(())
                 }
-                sqlx::query_file!(
-                    "sql/session/delete_task_metadata.sql",
-                    branch,
-                    worktree_path
-                )
-                .execute(&mut connection)
-                .await?;
-                sqlx::query_file!(
-                    "sql/session/delete_worktree_harness.sql",
-                    branch,
-                    worktree_path
-                )
-                .execute(&mut connection)
-                .await?;
-                sqlx::query_file!("sql/session/delete_hidden_session.sql", branch)
-                    .execute(&mut connection)
-                    .await?;
-                sqlx::query_file!(
-                    "sql/session/delete_archived_worktree_for_path.sql",
-                    branch,
-                    worktree_path
-                )
-                .execute(&mut connection)
-                .await?;
-                sqlx::query_file!(
-                    "sql/session/delete_pending_deletion.sql",
-                    branch,
-                    worktree_path
-                )
-                .execute(&mut connection)
-                .await?;
-                super::database::commit_query()
-                    .execute(&mut connection)
-                    .await?;
-                Ok(())
-            }
-            .await;
-            if result.is_err() {
-                let _ = super::database::rollback_query()
-                    .execute(&mut connection)
-                    .await;
-            }
-            result
+                .await;
+                if result.is_err() {
+                    let _ = super::database::rollback_query()
+                        .execute(&mut *connection)
+                        .await;
+                }
+                result
+            })
         })
     }
 
@@ -471,23 +481,23 @@ impl SessionStore {
         &self,
         input: &TaskMetadataInput<'_>,
     ) -> Result<(), DatabaseError> {
-        let options = self.options()?;
-        block_on(async {
-            let mut connection = SqliteConnection::connect_with(&options).await?;
-            let result = sqlx::query_file!(
-                "sql/session/write_task_metadata.sql",
-                input.branch,
-                input.prompt_summary,
-                input.initial_prompt,
-                input.worktree,
-                input.classification,
-                input.visibility,
-                input.updated_unix_ms
-            )
-            .execute(&mut connection)
-            .await?;
-            require_one_row(result, "write task metadata")?;
-            Ok(())
+        self.with_connection(|connection| {
+            block_on(async {
+                let result = sqlx::query_file!(
+                    "sql/session/write_task_metadata.sql",
+                    input.branch,
+                    input.prompt_summary,
+                    input.initial_prompt,
+                    input.worktree,
+                    input.classification,
+                    input.visibility,
+                    input.updated_unix_ms
+                )
+                .execute(&mut *connection)
+                .await?;
+                require_one_row(result, "write task metadata")?;
+                Ok(())
+            })
         })
     }
 
@@ -495,22 +505,22 @@ impl SessionStore {
         &self,
         input: &TaskMetadataInput<'_>,
     ) -> Result<(), DatabaseError> {
-        let options = self.options()?;
-        block_on(async {
-            let mut connection = SqliteConnection::connect_with(&options).await?;
-            let result = sqlx::query_file!(
-                "sql/session/set_worktree_visibility.sql",
-                input.branch,
-                input.prompt_summary,
-                input.worktree,
-                input.classification,
-                input.visibility,
-                input.updated_unix_ms
-            )
-            .execute(&mut connection)
-            .await?;
-            require_one_row(result, "set worktree visibility")?;
-            Ok(())
+        self.with_connection(|connection| {
+            block_on(async {
+                let result = sqlx::query_file!(
+                    "sql/session/set_worktree_visibility.sql",
+                    input.branch,
+                    input.prompt_summary,
+                    input.worktree,
+                    input.classification,
+                    input.visibility,
+                    input.updated_unix_ms
+                )
+                .execute(&mut *connection)
+                .await?;
+                require_one_row(result, "set worktree visibility")?;
+                Ok(())
+            })
         })
     }
 
@@ -518,16 +528,16 @@ impl SessionStore {
         &self,
         branch: &str,
     ) -> Result<Option<WorktreeHarnessRecord>, DatabaseError> {
-        let options = self.options()?;
-        let row = block_on(async {
-            let mut connection = SqliteConnection::connect_with(&options).await?;
-            sqlx::query_file_as!(
-                WorktreeHarnessRow,
-                "sql/session/load_worktree_harness.sql",
-                branch
-            )
-            .fetch_optional(&mut connection)
-            .await
+        let row = self.with_connection(|connection| {
+            block_on(async {
+                sqlx::query_file_as!(
+                    WorktreeHarnessRow,
+                    "sql/session/load_worktree_harness.sql",
+                    branch
+                )
+                .fetch_optional(&mut *connection)
+                .await
+            })
         })?;
         Ok(row.map(|row| WorktreeHarnessRecord {
             worktree_path: row.worktree_path,
@@ -541,104 +551,104 @@ impl SessionStore {
         &self,
         input: &WorktreeHarnessInput<'_>,
     ) -> Result<(), DatabaseError> {
-        let options = self.options()?;
-        block_on(async {
-            let mut connection = SqliteConnection::connect_with(&options).await?;
-            let result = sqlx::query_file!(
-                "sql/session/set_worktree_harness.sql",
-                input.branch,
-                input.worktree_path,
-                input.worktree_incarnation,
-                input.harness_id,
-                input.migration_policy,
-                input.updated_unix_ms
-            )
-            .execute(&mut connection)
-            .await?;
-            require_one_row(result, "set worktree harness")?;
-            Ok(())
+        self.with_connection(|connection| {
+            block_on(async {
+                let result = sqlx::query_file!(
+                    "sql/session/set_worktree_harness.sql",
+                    input.branch,
+                    input.worktree_path,
+                    input.worktree_incarnation,
+                    input.harness_id,
+                    input.migration_policy,
+                    input.updated_unix_ms
+                )
+                .execute(&mut *connection)
+                .await?;
+                require_one_row(result, "set worktree harness")?;
+                Ok(())
+            })
         })
     }
 
     pub(crate) fn archive(&self, input: &ArchiveInput<'_>) -> Result<(), DatabaseError> {
-        let options = self.options()?;
-        block_on(async {
-            let mut connection = SqliteConnection::connect_with(&options).await?;
-            super::database::begin_immediate_query()
-                .execute(&mut connection)
-                .await?;
-            let result = async {
-                sqlx::query_file!(
-                    "sql/session/upsert_hidden_session.sql",
-                    input.branch,
-                    input.archived_unix_ms
-                )
-                .execute(&mut connection)
-                .await?;
-                sqlx::query_file!(
-                    "sql/session/upsert_archived_worktree.sql",
-                    input.branch,
-                    input.repo_root,
-                    input.worktree_path,
-                    input.archived_unix_ms,
-                    input.classification
-                )
-                .execute(&mut connection)
-                .await?;
-                super::database::commit_query()
-                    .execute(&mut connection)
+        self.with_connection(|connection| {
+            block_on(async {
+                super::database::begin_immediate_query()
+                    .execute(&mut *connection)
                     .await?;
-                Ok(())
-            }
-            .await;
-            if result.is_err() {
-                let _ = super::database::rollback_query()
-                    .execute(&mut connection)
-                    .await;
-            }
-            result
+                let result = async {
+                    sqlx::query_file!(
+                        "sql/session/upsert_hidden_session.sql",
+                        input.branch,
+                        input.archived_unix_ms
+                    )
+                    .execute(&mut *connection)
+                    .await?;
+                    sqlx::query_file!(
+                        "sql/session/upsert_archived_worktree.sql",
+                        input.branch,
+                        input.repo_root,
+                        input.worktree_path,
+                        input.archived_unix_ms,
+                        input.classification
+                    )
+                    .execute(&mut *connection)
+                    .await?;
+                    super::database::commit_query()
+                        .execute(&mut *connection)
+                        .await?;
+                    Ok(())
+                }
+                .await;
+                if result.is_err() {
+                    let _ = super::database::rollback_query()
+                        .execute(&mut *connection)
+                        .await;
+                }
+                result
+            })
         })
     }
 
     pub(crate) fn unarchive(&self, branch: &str) -> Result<(), DatabaseError> {
-        let options = self.options()?;
-        block_on(async {
-            let mut connection = SqliteConnection::connect_with(&options).await?;
-            super::database::begin_immediate_query()
-                .execute(&mut connection)
-                .await?;
-            let result = async {
-                sqlx::query_file!("sql/session/delete_hidden_session.sql", branch)
-                    .execute(&mut connection)
+        self.with_connection(|connection| {
+            block_on(async {
+                super::database::begin_immediate_query()
+                    .execute(&mut *connection)
                     .await?;
-                sqlx::query_file!("sql/session/delete_archived_worktree.sql", branch)
-                    .execute(&mut connection)
-                    .await?;
-                super::database::commit_query()
-                    .execute(&mut connection)
-                    .await?;
-                Ok(())
-            }
-            .await;
-            if result.is_err() {
-                let _ = super::database::rollback_query()
-                    .execute(&mut connection)
-                    .await;
-            }
-            result
+                let result = async {
+                    sqlx::query_file!("sql/session/delete_hidden_session.sql", branch)
+                        .execute(&mut *connection)
+                        .await?;
+                    sqlx::query_file!("sql/session/delete_archived_worktree.sql", branch)
+                        .execute(&mut *connection)
+                        .await?;
+                    super::database::commit_query()
+                        .execute(&mut *connection)
+                        .await?;
+                    Ok(())
+                }
+                .await;
+                if result.is_err() {
+                    let _ = super::database::rollback_query()
+                        .execute(&mut *connection)
+                        .await;
+                }
+                result
+            })
         })
     }
 
     pub(crate) fn list_archived(&self) -> Result<Vec<ArchivedWorktreeRecord>, DatabaseError> {
-        let options = self.options()?;
-        let rows = block_on(async {
-            let mut connection = SqliteConnection::connect_with(&options).await?;
-            sqlx::query_file_as!(
-                ArchivedWorktreeRow,
-                "sql/session/list_archived_worktrees.sql"
-            )
-            .fetch_all(&mut connection)
-            .await
+        let rows = self.with_connection(|connection| {
+            block_on(async {
+                sqlx::query_file_as!(
+                    ArchivedWorktreeRow,
+                    "sql/session/list_archived_worktrees.sql"
+                )
+                .fetch_all(&mut *connection)
+                .await
+            })
         })?;
         Ok(rows
             .into_iter()
@@ -651,14 +661,17 @@ impl SessionStore {
     }
 
     pub(crate) fn hidden_exists(&self, branch: &str) -> Result<bool, DatabaseError> {
-        let options = self.options()?;
-        block_on(async {
-            let mut connection = SqliteConnection::connect_with(&options).await?;
-            let row =
-                sqlx::query_file_as!(ExistsRow, "sql/session/hidden_session_exists.sql", branch)
-                    .fetch_one(&mut connection)
-                    .await?;
-            Ok(row.exists != 0)
+        self.with_connection(|connection| {
+            block_on(async {
+                let row = sqlx::query_file_as!(
+                    ExistsRow,
+                    "sql/session/hidden_session_exists.sql",
+                    branch
+                )
+                .fetch_one(&mut *connection)
+                .await?;
+                Ok(row.exists != 0)
+            })
         })
     }
 
@@ -668,26 +681,26 @@ impl SessionStore {
         state: &str,
         updated: i64,
     ) -> Result<(), DatabaseError> {
-        let options = self.options()?;
-        block_on(async {
-            let mut connection = SqliteConnection::connect_with(&options).await?;
-            let result =
-                sqlx::query_file!("sql/session/save_agent_state.sql", branch, state, updated)
-                    .execute(&mut connection)
-                    .await?;
-            require_one_row(result, "save agent state")?;
-            Ok(())
+        self.with_connection(|connection| {
+            block_on(async {
+                let result =
+                    sqlx::query_file!("sql/session/save_agent_state.sql", branch, state, updated)
+                        .execute(&mut *connection)
+                        .await?;
+                require_one_row(result, "save agent state")?;
+                Ok(())
+            })
         })
     }
 
     pub(crate) fn load_agent_state(&self, branch: &str) -> Result<Option<String>, DatabaseError> {
-        let options = self.options()?;
-        block_on(async {
-            let mut connection = SqliteConnection::connect_with(&options).await?;
-            sqlx::query_file_as!(StateRow, "sql/session/load_agent_state.sql", branch)
-                .fetch_optional(&mut connection)
-                .await
-                .map(|row| row.map(|row| row.state))
+        self.with_connection(|connection| {
+            block_on(async {
+                sqlx::query_file_as!(StateRow, "sql/session/load_agent_state.sql", branch)
+                    .fetch_optional(&mut *connection)
+                    .await
+                    .map(|row| row.map(|row| row.state))
+            })
         })
     }
 
@@ -695,16 +708,16 @@ impl SessionStore {
         &self,
         branch: &str,
     ) -> Result<Option<TaskMetadataRecord>, DatabaseError> {
-        let options = self.options()?;
-        let row = block_on(async {
-            let mut connection = SqliteConnection::connect_with(&options).await?;
-            sqlx::query_file_as!(
-                TaskMetadataRow,
-                "sql/session/load_task_metadata.sql",
-                branch
-            )
-            .fetch_optional(&mut connection)
-            .await
+        let row = self.with_connection(|connection| {
+            block_on(async {
+                sqlx::query_file_as!(
+                    TaskMetadataRow,
+                    "sql/session/load_task_metadata.sql",
+                    branch
+                )
+                .fetch_optional(&mut *connection)
+                .await
+            })
         })?;
         Ok(row.map(|row| TaskMetadataRecord {
             prompt_summary: row.prompt_summary,
@@ -718,43 +731,43 @@ impl SessionStore {
         &self,
         branch: &str,
     ) -> Result<Option<String>, DatabaseError> {
-        let options = self.options()?;
-        block_on(async {
-            let mut connection = SqliteConnection::connect_with(&options).await?;
-            sqlx::query_file_as!(
-                InitialPromptRow,
-                "sql/session/load_task_initial_prompt.sql",
-                branch
-            )
-            .fetch_optional(&mut connection)
-            .await
-            .map(|row| row.map(|row| row.initial_prompt))
+        self.with_connection(|connection| {
+            block_on(async {
+                sqlx::query_file_as!(
+                    InitialPromptRow,
+                    "sql/session/load_task_initial_prompt.sql",
+                    branch
+                )
+                .fetch_optional(&mut *connection)
+                .await
+                .map(|row| row.map(|row| row.initial_prompt))
+            })
         })
     }
 
     pub(crate) fn hidden_sessions(&self) -> Result<Vec<(String, i64)>, DatabaseError> {
-        let options = self.options()?;
-        block_on(async {
-            let mut connection = SqliteConnection::connect_with(&options).await?;
-            let rows =
-                sqlx::query_file_as!(HiddenSessionRow, "sql/session/list_hidden_sessions.sql")
-                    .fetch_all(&mut connection)
-                    .await?;
-            Ok(rows
-                .into_iter()
-                .map(|row| (row.branch, row.hidden_unix_ms))
-                .collect())
+        self.with_connection(|connection| {
+            block_on(async {
+                let rows =
+                    sqlx::query_file_as!(HiddenSessionRow, "sql/session/list_hidden_sessions.sql")
+                        .fetch_all(&mut *connection)
+                        .await?;
+                Ok(rows
+                    .into_iter()
+                    .map(|row| (row.branch, row.hidden_unix_ms))
+                    .collect())
+            })
         })
     }
 
     pub(crate) fn remove_agent_state(&self, branch: &str) -> Result<(), DatabaseError> {
-        let options = self.options()?;
-        block_on(async {
-            let mut connection = SqliteConnection::connect_with(&options).await?;
-            sqlx::query_file!("sql/session/delete_agent_state.sql", branch)
-                .execute(&mut connection)
-                .await?;
-            Ok(())
+        self.with_connection(|connection| {
+            block_on(async {
+                sqlx::query_file!("sql/session/delete_agent_state.sql", branch)
+                    .execute(&mut *connection)
+                    .await?;
+                Ok(())
+            })
         })
     }
 }
