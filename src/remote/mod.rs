@@ -49,9 +49,9 @@ pub(crate) use model::{
 };
 #[cfg(test)]
 pub(crate) use model::{HeadAssociation, NativeMergeGuard};
-pub(crate) use store::{load_pr_cache, persist_pr_cache_snapshot};
 #[cfg(test)]
-pub(crate) use store::{save_pr_cache, save_pr_details_cache};
+pub(crate) use store::save_pr_cache;
+pub(crate) use store::{load_pr_cache, persist_pr_cache_snapshot};
 
 #[cfg(test)]
 pub(crate) fn test_change_request_identity() -> CanonicalChangeRequestIdentity {

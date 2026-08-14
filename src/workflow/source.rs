@@ -2168,6 +2168,16 @@ fn entry_stat(directory: &fs::File, name: &std::ffi::OsStr) -> std::io::Result<l
 }
 
 #[cfg(unix)]
+fn file_stat(file: &fs::File) -> std::io::Result<libc::stat> {
+    let mut stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(file.as_raw_fd(), &mut stat) } != 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(stat)
+    }
+}
+
+#[cfg(unix)]
 fn collect_resource_files_at(
     parent: &fs::File,
     relative: &Path,
@@ -2194,9 +2204,8 @@ fn collect_resource_files_at(
             relative.display()
         ))
     })?;
-    let opened = directory.metadata()?;
-    use std::os::unix::fs::MetadataExt as _;
-    if checked.st_dev != opened.dev() || checked.st_ino != opened.ino() {
+    let opened = file_stat(&directory)?;
+    if checked.st_dev != opened.st_dev || checked.st_ino != opened.st_ino {
         return Err(WorkflowSourceError::Io(format!(
             "repository resource {} changed while it was captured",
             relative.display()
@@ -2220,8 +2229,8 @@ fn collect_resource_files_at(
                         child_relative.display()
                     ))
                 })?;
-                let opened = file.metadata()?;
-                if checked.st_dev != opened.dev() || checked.st_ino != opened.ino() {
+                let opened = file_stat(&file)?;
+                if checked.st_dev != opened.st_dev || checked.st_ino != opened.st_ino {
                     return Err(WorkflowSourceError::Io(format!(
                         "repository resource {} changed while it was captured",
                         child_relative.display()

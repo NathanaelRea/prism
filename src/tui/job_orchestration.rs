@@ -248,13 +248,15 @@ impl Tui {
                 unreachable!();
             };
             processed += 1;
-            // A completed portal job's payload records the successful resize. Keep the poll slot
+            // Some completed jobs apply their state change from the payload. Keep their poll slot
             // owned until that payload is applied: under a spent routing budget the terminal can
             // be observed one tick before the coalesced payload.
-            let tmux_portal_payload_pending = metadata.kind == TuiJobKind::TmuxPortal
-                && matches!(&outcome, JobOutcome::Completed)
+            let state_payload_pending = matches!(
+                metadata.kind,
+                TuiJobKind::DeleteSession | TuiJobKind::TmuxPortal
+            ) && matches!(&outcome, JobOutcome::Completed)
                 && self.job_generation_is_current(&metadata);
-            if !tmux_portal_payload_pending {
+            if !state_payload_pending {
                 self.clear_tui_job_in_flight(&metadata);
             }
             self.record_tui_job_terminal(&metadata, &outcome);

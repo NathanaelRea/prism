@@ -8,7 +8,9 @@ use crate::repo::Repository;
 use crate::session::WorktreeRepositoryKey;
 use crate::tui_jobs::{CoalescedFacet, JobRegistry};
 
-use super::super::{PrPollKey, Tui, TuiJobKey, TuiJobKind};
+use super::super::{
+    DeleteSessionKey, DeleteSessionResult, PrPollKey, Tui, TuiJobKey, TuiJobKind, TuiJobPayload,
+};
 use super::support::{test_config, test_session, unique_temp_dir};
 
 #[test]
@@ -148,6 +150,65 @@ fn tui_tick_terminal_budget_retains_every_remaining_outcome() {
     let remaining = tui.background.queue_stats().terminal_depth;
     assert!(remaining >= 100 - super::super::TUI_TICK_ITEM_BUDGET);
     assert!(remaining < 100);
+}
+
+#[test]
+fn completed_delete_keeps_in_flight_state_until_its_payload_is_applied() {
+    let temp = unique_temp_dir("prism-delete-payload-order-test");
+    fs::create_dir_all(&temp).unwrap();
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let mut session = test_session(0, &temp.join("worktree").display().to_string(), "feature");
+    session.hidden = true;
+    let mut tui = Tui::new_single(repo, test_config(), vec![session]);
+    let key = DeleteSessionKey {
+        worktree: tui.sessions[0].identity_key(&tui.repos[0].identity),
+        generation: 0,
+    };
+    tui.delete_sessions_in_flight.insert(key.clone());
+    let result_key = key.clone();
+    tui.spawn_tui_job(
+        TuiJobKind::DeleteSession,
+        TuiJobKey::Delete(key.clone()),
+        key.generation,
+        Some(Duration::from_secs(1)),
+        "delete-payload-order".to_string(),
+        move |context| {
+            Ok(Some(TuiJobPayload::DeleteSession(DeleteSessionResult {
+                key: result_key,
+                delivery_id: context.id(),
+                result: Err("delete failed".to_string()),
+            })))
+        },
+    );
+
+    let started = Instant::now();
+    while tui.background.queue_stats().terminal_depth == 0
+        || tui.background.queue_stats().latest_depth == 0
+    {
+        tui.background.collect_finished();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        std::thread::yield_now();
+    }
+
+    assert_eq!(
+        tui.route_tui_job_messages_with_budget(1, Instant::now() + Duration::from_secs(1)),
+        1
+    );
+    assert!(tui.delete_sessions_in_flight.contains(&key));
+    assert!(tui.sessions[0].hidden);
+
+    let started = Instant::now();
+    let mut changed = false;
+    while tui.delete_sessions_in_flight.contains(&key) && started.elapsed() < Duration::from_secs(1)
+    {
+        changed |= tui.poll_delete_sessions();
+        std::thread::yield_now();
+    }
+    assert!(changed, "delete payload was not applied");
+    assert!(!tui.delete_sessions_in_flight.contains(&key));
+    assert!(!tui.sessions[0].hidden);
+
+    let _ = fs::remove_dir_all(temp);
 }
 
 #[test]

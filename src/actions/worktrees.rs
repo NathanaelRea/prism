@@ -786,6 +786,7 @@ impl Tui {
         }
         let mut changed = false;
         while let Ok(result) = self.delete_session_rx.try_recv() {
+            self.delete_sessions_in_flight.remove(&result.key);
             let Some(current_generation) =
                 self.worktree_generations.get(&result.key.worktree).copied()
             else {

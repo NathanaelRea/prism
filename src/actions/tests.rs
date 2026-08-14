@@ -1178,8 +1178,7 @@ fn unavailable_remote_preserves_stale_live_and_persisted_display_state() {
             ..PrDetails::default()
         }),
     );
-    crate::remote::save_pr_cache(&repo, "feature", &cache).unwrap();
-    crate::remote::save_pr_details_cache(&repo, "feature", cache.details().unwrap()).unwrap();
+    crate::remote::persist_pr_cache_snapshot(&repo, "feature", &cache).unwrap();
     let mut session = test_session(temp.join("worktree"), "feature");
     session.pr = cache;
     session.unseen_comments = true;
