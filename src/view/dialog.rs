@@ -722,7 +722,7 @@ pub(super) fn form_lines(
             .get(selected)
             .is_some_and(|field| matches!(field.kind, crate::view::FormFieldKind::TextArea { .. }))
         {
-            "Tab move  Enter newline  Type to edit  Esc cancel"
+            "Ctrl+Enter create  Tab move  Enter newline  Type to edit  Esc cancel"
         } else {
             "Tab/↑/↓ move  Type to edit  Space/Enter choose  Esc cancel"
         },
