@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use super::*;
 
-#[test]
-fn provider_implementations_stay_behind_remote_boundary() {
+#[tokio::test(flavor = "multi_thread")]
+async fn provider_implementations_stay_behind_remote_boundary() {
     fn scan(directory: &std::path::Path, excluded: &std::path::Path, violations: &mut Vec<String>) {
         if directory == excluded {
             return;
@@ -36,9 +36,10 @@ fn provider_implementations_stay_behind_remote_boundary() {
                 }
             }
 
-            let production = source
+            let normalized_source = source.replace("\r\n", "\n");
+            let production = normalized_source
                 .split_once("#[cfg(test)]\nmod tests")
-                .map_or(source.as_str(), |(production, _)| production);
+                .map_or(normalized_source.as_str(), |(production, _)| production);
             let compact_production: String = production
                 .chars()
                 .filter(|character| !character.is_whitespace())
@@ -80,8 +81,8 @@ fn provider_implementations_stay_behind_remote_boundary() {
     );
 }
 
-#[test]
-fn remote_domain_boundary_contains_no_database_driver_calls() {
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_domain_boundary_contains_no_database_driver_calls() {
     fn scan(path: &std::path::Path, violations: &mut Vec<String>) {
         for entry in std::fs::read_dir(path).expect("read remote source directory") {
             let path = entry.expect("read remote source entry").path();
@@ -116,8 +117,8 @@ fn remote_domain_boundary_contains_no_database_driver_calls() {
     );
 }
 
-#[test]
-fn temporary_file_cache_interface_rejects_malformed_json() {
+#[tokio::test(flavor = "multi_thread")]
+async fn temporary_file_cache_interface_rejects_malformed_json() {
     let root = std::env::temp_dir().join(format!(
         "prism-remote-strict-json-{}-{}",
         std::process::id(),
@@ -203,8 +204,8 @@ fn change_request(
     )
 }
 
-#[test]
-fn canonical_identity_normalizes_dns_but_preserves_project_path_case() {
+#[tokio::test(flavor = "multi_thread")]
+async fn canonical_identity_normalizes_dns_but_preserves_project_path_case() {
     let first = RemoteRepositoryId::new(
         ProviderKind::GitLab,
         HostIdentity::new("GITLAB.COM.", None).unwrap(),
@@ -218,8 +219,8 @@ fn canonical_identity_normalizes_dns_but_preserves_project_path_case() {
     assert_ne!(first, different_case);
 }
 
-#[test]
-fn github_repository_identity_compares_owner_and_repo_case_insensitively() {
+#[tokio::test(flavor = "multi_thread")]
+async fn github_repository_identity_compares_owner_and_repo_case_insensitively() {
     let displayed = repository(ProviderKind::GitHub, "github.com", "Acme/Widget");
     let differently_cased = repository(ProviderKind::GitHub, "github.com", "acme/WIDGET");
 
@@ -239,8 +240,8 @@ fn github_repository_identity_compares_owner_and_repo_case_insensitively() {
     );
 }
 
-#[test]
-fn github_change_request_identity_uses_case_insensitive_repository_paths() {
+#[tokio::test(flavor = "multi_thread")]
+async fn github_change_request_identity_uses_case_insensitive_repository_paths() {
     let first_target = repository(ProviderKind::GitHub, "github.com", "Acme/Widget");
     let first_source = repository(ProviderKind::GitHub, "github.com", "Contributor/Widget");
     let second_target = repository(ProviderKind::GitHub, "github.com", "acme/WIDGET");
@@ -260,8 +261,8 @@ fn github_change_request_identity_uses_case_insensitive_repository_paths() {
     assert_eq!(first.project_path(), "Acme/Widget");
 }
 
-#[test]
-fn change_request_identity_ignores_display_metadata_and_formats_provider_labels() {
+#[tokio::test(flavor = "multi_thread")]
+async fn change_request_identity_ignores_display_metadata_and_formats_provider_labels() {
     let github = change_request(
         ProviderKind::GitHub,
         "github.com",
@@ -290,8 +291,8 @@ fn change_request_identity_ignores_display_metadata_and_formats_provider_labels(
     assert_eq!(gitlab.display_label(), "!7");
 }
 
-#[test]
-fn unknown_native_states_are_retained_verbatim() {
+#[tokio::test(flavor = "multi_thread")]
+async fn unknown_native_states_are_retained_verbatim() {
     assert_eq!(
         LifecycleState::from_native("SUPERSEDED_BY_TRAIN"),
         LifecycleState::Unknown("SUPERSEDED_BY_TRAIN".to_string())
@@ -314,8 +315,8 @@ fn unknown_native_states_are_retained_verbatim() {
     );
 }
 
-#[test]
-fn issue_shaped_change_requests_are_not_issue_identities() {
+#[tokio::test(flavor = "multi_thread")]
+async fn issue_shaped_change_requests_are_not_issue_identities() {
     let repository = repository(ProviderKind::GitHub, "github.com", "owner/repo");
     let issue = ProviderItemId::new(repository.clone(), "1", ProviderItemKind::Issue).unwrap();
     let change_request =
@@ -324,8 +325,8 @@ fn issue_shaped_change_requests_are_not_issue_identities() {
     assert!(change_request.as_issue().is_none());
 }
 
-#[test]
-fn provider_item_revision_covers_all_consumed_external_fields() {
+#[tokio::test(flavor = "multi_thread")]
+async fn provider_item_revision_covers_all_consumed_external_fields() {
     let id = ProviderItemId::new(
         repository(ProviderKind::GitHub, "github.com", "owner/repo"),
         "1",
@@ -349,8 +350,8 @@ fn provider_item_revision_covers_all_consumed_external_fields() {
     assert_ne!(original, changed.revision());
 }
 
-#[test]
-fn provider_issue_capability_gaps_are_explicit() {
+#[tokio::test(flavor = "multi_thread")]
+async fn provider_issue_capability_gaps_are_explicit() {
     assert_eq!(
         Capabilities::for_provider(ProviderKind::GitHub).issue_discovery,
         SupportLevel::Supported
@@ -365,8 +366,8 @@ fn provider_issue_capability_gaps_are_explicit() {
     );
 }
 
-#[test]
-fn capability_support_is_independent_from_observation_quality() {
+#[tokio::test(flavor = "multi_thread")]
+async fn capability_support_is_independent_from_observation_quality() {
     let capabilities = Capabilities {
         ci_logs: SupportLevel::Supported,
         resolve_review_thread: SupportLevel::Unsupported,
@@ -399,8 +400,8 @@ fn capability_support_is_independent_from_observation_quality() {
     );
 }
 
-#[test]
-fn gitlab_and_forgejo_review_submission_is_explicitly_unsupported() {
+#[tokio::test(flavor = "multi_thread")]
+async fn gitlab_and_forgejo_review_submission_is_explicitly_unsupported() {
     let config = crate::test_support::test_config();
     let gitlab_repository = repository(ProviderKind::GitLab, "gitlab.com", "group/repo");
     let gitlab = super::gitlab::GitLabAdapter::new(&config, gitlab_repository.clone()).unwrap();
@@ -449,8 +450,8 @@ fn gitlab_and_forgejo_review_submission_is_explicitly_unsupported() {
     }
 }
 
-#[test]
-fn observation_absence_empty_stale_failed_and_unavailable_states_are_distinct() {
+#[tokio::test(flavor = "multi_thread")]
+async fn observation_absence_empty_stale_failed_and_unavailable_states_are_distinct() {
     let error = RemoteError::new(
         ProviderKind::Forgejo,
         RemoteOperation::ObserveChecks,
@@ -487,8 +488,8 @@ fn observation_absence_empty_stale_failed_and_unavailable_states_are_distinct() 
     assert!(states[8].known().is_none());
 }
 
-#[test]
-fn head_association_requires_canonical_identity_and_exact_sha() {
+#[tokio::test(flavor = "multi_thread")]
+async fn head_association_requires_canonical_identity_and_exact_sha() {
     let id = change_request(
         ProviderKind::GitHub,
         "github.com",
@@ -517,8 +518,8 @@ fn head_association_requires_canonical_identity_and_exact_sha() {
     assert!(!association.matches(&different, "abc123"));
 }
 
-#[test]
-fn guarded_merge_requires_exact_identity_head_target_and_open_lifecycle() {
+#[tokio::test(flavor = "multi_thread")]
+async fn guarded_merge_requires_exact_identity_head_target_and_open_lifecycle() {
     let source = repository(ProviderKind::GitLab, "gitlab.com", "contributor/widget");
     let target = repository(ProviderKind::GitLab, "gitlab.com", "acme/widget");
     let id = ChangeRequestId::new(
@@ -661,8 +662,8 @@ fn parser_accepts_https_ssh_and_scp_forms_and_normalizes_default_ports() {
     }
 }
 
-#[test]
-fn parser_preserves_non_default_ports_and_nested_project_paths() {
+#[tokio::test(flavor = "multi_thread")]
+async fn parser_preserves_non_default_ports_and_nested_project_paths() {
     let parsed = GitRemoteParser::default()
         .parse("ssh://git@Git.Example.COM.:2222/Division/Team/Project.git")
         .unwrap();
@@ -674,8 +675,8 @@ fn parser_preserves_non_default_ports_and_nested_project_paths() {
     assert_eq!(parsed.project_path, "Division/Team/Project");
 }
 
-#[test]
-fn http_requires_an_explicit_parser_or_host_profile_opt_in() {
+#[tokio::test(flavor = "multi_thread")]
+async fn http_requires_an_explicit_parser_or_host_profile_opt_in() {
     let remote = "http://git.example.com/Owner/Repo.git";
     assert!(matches!(
         GitRemoteParser::default().parse(remote),
@@ -694,8 +695,8 @@ fn http_requires_an_explicit_parser_or_host_profile_opt_in() {
     assert_eq!(discovered.repository.id.provider(), ProviderKind::Forgejo);
 }
 
-#[test]
-fn builtins_map_codeberg_to_forgejo_and_use_provider_bases() {
+#[tokio::test(flavor = "multi_thread")]
+async fn builtins_map_codeberg_to_forgejo_and_use_provider_bases() {
     let discovery = RemoteDiscovery::default();
     let codeberg = discovery
         .discover("https://codeberg.org/Team/Project.git")
@@ -716,8 +717,8 @@ fn builtins_map_codeberg_to_forgejo_and_use_provider_bases() {
     );
 }
 
-#[test]
-fn explicit_profiles_enable_known_self_hosted_instances_without_network_detection() {
+#[tokio::test(flavor = "multi_thread")]
+async fn explicit_profiles_enable_known_self_hosted_instances_without_network_detection() {
     let host = HostIdentity::new("git.internal.example", None).unwrap();
     let profile = HostProfile::new(host, ProviderKind::GitLab).unwrap();
     let discovery = RemoteDiscovery::new([profile]).unwrap();
@@ -734,8 +735,8 @@ fn explicit_profiles_enable_known_self_hosted_instances_without_network_detectio
     );
 }
 
-#[test]
-fn explicit_profile_ports_and_credential_names_remain_configuration_not_secrets() {
+#[tokio::test(flavor = "multi_thread")]
+async fn explicit_profile_ports_and_credential_names_remain_configuration_not_secrets() {
     let host = HostIdentity::new("forge.example", Some(8443)).unwrap();
     let profile = HostProfile::new(host, ProviderKind::Forgejo)
         .unwrap()
@@ -762,8 +763,8 @@ fn explicit_profile_ports_and_credential_names_remain_configuration_not_secrets(
     );
 }
 
-#[test]
-fn unknown_hosts_and_conflicting_profiles_are_rejected() {
+#[tokio::test(flavor = "multi_thread")]
+async fn unknown_hosts_and_conflicting_profiles_are_rejected() {
     assert!(matches!(
         RemoteDiscovery::default().discover("https://unknown.example/owner/repo.git"),
         Err(DiscoveryError::UnknownHost(_))
@@ -777,8 +778,8 @@ fn unknown_hosts_and_conflicting_profiles_are_rejected() {
     ));
 }
 
-#[test]
-fn malformed_remotes_fail_without_partial_identity() {
+#[tokio::test(flavor = "multi_thread")]
+async fn malformed_remotes_fail_without_partial_identity() {
     let parser = GitRemoteParser::default();
     for remote in [
         "",
@@ -799,10 +800,10 @@ fn malformed_remotes_fail_without_partial_identity() {
     }
 }
 
-#[test]
-fn remote_error_keeps_classification_and_only_exposes_bounded_single_line_message() {
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_error_keeps_classification_and_only_exposes_bounded_single_line_message() {
     let secrets = [
-        "glpat-direct-secret",
+        concat!("glpat-", "direct-secret"),
         "bearer-header-secret",
         "private-header-secret",
         "query-secret",

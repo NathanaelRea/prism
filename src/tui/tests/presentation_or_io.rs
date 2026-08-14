@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -8,6 +9,7 @@ use ratatui::text::Line;
 
 use crate::agent::AgentState;
 use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey, AgentSessionWarmupResult};
+#[cfg(unix)]
 use crate::config::Config;
 use crate::opencode::{OpencodeState, OpencodeStatus};
 use crate::remote::PrCache;
@@ -19,8 +21,8 @@ use super::super::{
 };
 use super::support::{test_config, test_pr_summary, test_session, unique_temp_dir};
 
-#[test]
-fn workflow_polling_does_not_access_database_on_tui_thread() {
+#[tokio::test(flavor = "multi_thread")]
+async fn workflow_polling_does_not_access_database_on_tui_thread() {
     let temp = unique_temp_dir("prism-tui-database-poll-test");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -37,8 +39,8 @@ fn workflow_polling_does_not_access_database_on_tui_thread() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn applying_pr_poll_result_does_no_io_on_tui_thread() {
+#[tokio::test(flavor = "multi_thread")]
+async fn applying_pr_poll_result_does_no_io_on_tui_thread() {
     let temp = unique_temp_dir("prism-tui-pr-result-test");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -112,8 +114,8 @@ fn applying_pr_poll_result_does_no_io_on_tui_thread() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn failed_pr_details_respect_retry_backoff_on_tui_tick() {
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_pr_details_respect_retry_backoff_on_tui_tick() {
     let temp = unique_temp_dir("prism-tui-pr-details-backoff-test");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -130,7 +132,8 @@ fn failed_pr_details_respect_retry_backoff_on_tui_tick() {
         &mut failed_poll,
         &tui.sessions[0].path,
         &tui.repos[0].config,
-    );
+    )
+    .await;
     let repository = tui.repos[0].identity.clone();
     let generation = tui.worktree_generations[&tui.sessions[0].identity_key(&repository)];
     let key =
@@ -157,8 +160,9 @@ fn failed_pr_details_respect_retry_backoff_on_tui_tick() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn returning_from_tmux_does_not_wait_for_worktree_refresh() {
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn returning_from_tmux_does_not_wait_for_worktree_refresh() {
     let temp = unique_temp_dir("prism-tmux-return-refresh-test");
     let worktree = temp.join("feature");
     fs::create_dir_all(&worktree).unwrap();
@@ -230,8 +234,8 @@ esac
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn tmux_portal_rejects_capture_from_previous_generation() {
+#[tokio::test(flavor = "multi_thread")]
+async fn tmux_portal_rejects_capture_from_previous_generation() {
     let repo = Repository {
         root: PathBuf::from("/tmp/repo"),
     };
@@ -271,8 +275,8 @@ fn tmux_portal_rejects_capture_from_previous_generation() {
     );
 }
 
-#[test]
-fn tmux_portal_starts_capture_immediately_after_selection() {
+#[tokio::test(flavor = "multi_thread")]
+async fn tmux_portal_starts_capture_immediately_after_selection() {
     let repo = Repository {
         root: PathBuf::from("/tmp/repo"),
     };
@@ -294,8 +298,9 @@ fn tmux_portal_starts_capture_immediately_after_selection() {
     );
 }
 
-#[test]
-fn workflow_database_writer_does_not_block_tmux_portal_polling() {
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn workflow_database_writer_does_not_block_tmux_portal_polling() {
     let temp = unique_temp_dir("prism-tmux-portal-database-test");
     fs::create_dir_all(&temp).unwrap();
     let tmux = temp.join("tmux");
@@ -337,8 +342,9 @@ fn workflow_database_writer_does_not_block_tmux_portal_polling() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn tmux_portal_resizes_once_for_unchanged_target_and_size() {
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn tmux_portal_resizes_once_for_unchanged_target_and_size() {
     let temp = unique_temp_dir("prism-tmux-portal-resize-test");
     fs::create_dir_all(&temp).unwrap();
     let log = temp.join("tmux.log");
@@ -397,6 +403,7 @@ fn tmux_portal_resizes_once_for_unchanged_target_and_size() {
     let _ = fs::remove_dir_all(temp);
 }
 
+#[cfg(unix)]
 fn wait_for_tmux_portal_job(tui: &mut Tui) {
     let started = Instant::now();
     while !tui.tmux_portal_polls_in_flight.is_empty() {
@@ -406,8 +413,8 @@ fn wait_for_tmux_portal_job(tui: &mut Tui) {
     }
 }
 
-#[test]
-fn tmux_portal_keeps_previous_capture_while_new_selection_loads() {
+#[tokio::test(flavor = "multi_thread")]
+async fn tmux_portal_keeps_previous_capture_while_new_selection_loads() {
     let repo = Repository {
         root: PathBuf::from("/tmp/repo"),
     };
@@ -462,8 +469,8 @@ fn tmux_portal_keeps_previous_capture_while_new_selection_loads() {
     );
 }
 
-#[test]
-fn tmux_portal_waits_for_running_capture_after_selection_changes() {
+#[tokio::test(flavor = "multi_thread")]
+async fn tmux_portal_waits_for_running_capture_after_selection_changes() {
     let repo = Repository {
         root: PathBuf::from("/tmp/repo"),
     };
@@ -496,8 +503,8 @@ fn tmux_portal_waits_for_running_capture_after_selection_changes() {
     assert!(!tui.tmux_portal_polls_in_flight.contains_key(&second_key));
 }
 
-#[test]
-fn tmux_portal_tracks_in_flight_capture_when_inactive() {
+#[tokio::test(flavor = "multi_thread")]
+async fn tmux_portal_tracks_in_flight_capture_when_inactive() {
     let repo = Repository {
         root: PathBuf::from("/tmp/repo"),
     };
@@ -515,8 +522,8 @@ fn tmux_portal_tracks_in_flight_capture_when_inactive() {
     assert!(tui.tmux_portal_polls_in_flight.contains_key(&key));
 }
 
-#[test]
-fn tmux_portal_ignores_superseded_capture_for_same_key() {
+#[tokio::test(flavor = "multi_thread")]
+async fn tmux_portal_ignores_superseded_capture_for_same_key() {
     let repo = Repository {
         root: PathBuf::from("/tmp/repo"),
     };

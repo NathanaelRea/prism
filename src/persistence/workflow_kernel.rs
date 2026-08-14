@@ -260,10 +260,13 @@ async fn prepare_epoch(path: &Path) -> Result<(), WorkflowKernelError> {
         connection.close().await.map_err(persistence)?;
         return Ok(());
     }
-    if crate::worker::socket_path().exists() {
+    let worker_may_be_live = crate::worker::probe_health()
+        .map(|health| health.state != crate::worker::DaemonState::Stopped)
+        .unwrap_or(true);
+    if worker_may_be_live {
         connection.close().await.map_err(persistence)?;
         return Err(WorkflowKernelError::Persistence(format!(
-            "cannot replace a pre-cutover Workflow database {} while a Prism worker socket exists",
+            "cannot replace a pre-cutover Workflow database {} while a Prism worker may be running",
             path.display()
         )));
     }

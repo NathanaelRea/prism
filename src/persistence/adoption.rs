@@ -244,10 +244,12 @@ async fn create_current_backup_and_lock(
     }
 
     set_owner_only(&temporary)?;
-    std::fs::rename(&temporary, &backup).map_err(|source| DatabaseError::Backup {
-        path: path.into(),
-        backup: backup.clone(),
-        source,
+    crate::system::file_persistence::commit_staging(&temporary, &backup).map_err(|source| {
+        DatabaseError::Backup {
+            path: path.into(),
+            backup: backup.clone(),
+            source,
+        }
     })?;
     Ok(())
 }

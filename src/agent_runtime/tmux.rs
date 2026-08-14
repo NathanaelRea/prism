@@ -3,15 +3,15 @@
     reason = "harness adapters expose optional resume capabilities"
 )]
 
+use crate::process::Command;
 use std::path::Path;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::opencode::{OpencodeRuntime, load_runtime};
 use crate::process::{
     ProcessDescriptor, ProcessPolicy, run_capture_named, run_output_allow_failure_named,
-    run_output_named, run_status_inherited_named, run_status_with_stdin_named, split_command_words,
+    run_output_named, run_status_attached_named, run_status_with_stdin_named, split_command_words,
 };
 use crate::repo::Repository;
 use crate::session::Session;
@@ -81,22 +81,22 @@ impl TmuxWindow {
     }
 }
 
-pub fn attach_or_create_agent(
+pub async fn attach_or_create_agent(
     repo: &Repository,
     config: &Config,
     session: &Session,
     generation: u64,
 ) -> Result<(), String> {
     let runtime = TmuxAgentSession::for_worktree_session(repo, &session.branch, generation);
-    ensure_tmux_agent_session_for_attach(repo, config, session, &runtime)?;
-    match attach_agent_session(config, &runtime) {
+    ensure_tmux_agent_session_for_attach(repo, config, session, &runtime).await?;
+    match attach_agent_session(config, &runtime).await {
         Ok(()) => Ok(()),
-        Err(_) if matches!(session_exists(config, runtime.name()), Ok(false)) => Ok(()),
+        Err(_) if matches!(session_exists(config, runtime.name()).await, Ok(false)) => Ok(()),
         Err(error) => Err(error),
     }
 }
 
-pub fn attach_or_create_window(
+pub async fn attach_or_create_window(
     repo: &Repository,
     config: &Config,
     session: &Session,
@@ -104,104 +104,109 @@ pub fn attach_or_create_window(
     window: TmuxWindow,
 ) -> Result<(), String> {
     let runtime = TmuxAgentSession::for_worktree_session(repo, &session.branch, generation);
-    ensure_tmux_agent_session_for_attach(repo, config, session, &runtime)?;
-    match attach(config, &runtime, window) {
+    ensure_tmux_agent_session_for_attach(repo, config, session, &runtime).await?;
+    match attach(config, &runtime, window).await {
         Ok(()) => Ok(()),
-        Err(_) if matches!(session_exists(config, runtime.name()), Ok(false)) => Ok(()),
+        Err(_) if matches!(session_exists(config, runtime.name()).await, Ok(false)) => Ok(()),
         Err(error) => Err(error),
     }
 }
 
-pub fn ensure_agent_session(
+pub async fn ensure_agent_session(
     repo: &Repository,
     config: &Config,
     session: &Session,
     generation: u64,
 ) -> Result<bool, String> {
     let runtime = TmuxAgentSession::for_worktree_session(repo, &session.branch, generation);
-    ensure_tmux_agent_session(repo, config, session, &runtime)
+    ensure_tmux_agent_session(repo, config, session, &runtime).await
 }
 
-fn ensure_tmux_agent_session_for_attach(
+async fn ensure_tmux_agent_session_for_attach(
     repo: &Repository,
     config: &Config,
     session: &Session,
     runtime: &TmuxAgentSession,
 ) -> Result<(), String> {
     let opencode_runtime = usable_opencode_runtime(repo, config, session);
-    if tmux_agent_session_running(config, runtime)
+    if tmux_agent_session_running(config, runtime).await
         && agent_session_runtime_matches(config, runtime.name(), session, opencode_runtime.as_ref())
-        && configure_agent_session(config, runtime.name(), opencode_runtime.as_ref())?
+            .await
+        && configure_agent_session(config, runtime.name(), opencode_runtime.as_ref()).await?
     {
-        ensure_companion_windows(config, session, runtime)?;
+        ensure_companion_windows(config, session, runtime).await?;
         return Ok(());
     }
-    ensure_tmux_agent_session(repo, config, session, runtime).map(|_| ())
+    ensure_tmux_agent_session(repo, config, session, runtime)
+        .await
+        .map(|_| ())
 }
 
-fn ensure_tmux_agent_session(
+async fn ensure_tmux_agent_session(
     repo: &Repository,
     config: &Config,
     session: &Session,
     runtime_session: &TmuxAgentSession,
 ) -> Result<bool, String> {
-    if session_exists(config, runtime_session.name())? {
+    if session_exists(config, runtime_session.name()).await? {
         let stored_runtime = usable_opencode_runtime(repo, config, session);
         if !agent_session_runtime_matches(
             config,
             runtime_session.name(),
             session,
             stored_runtime.as_ref(),
-        ) {
-            kill_session(config, runtime_session.name())?;
-        } else if !configure_agent_session(config, runtime_session.name(), stored_runtime.as_ref())?
+        )
+        .await
         {
-            let runtime = opencode_runtime_for_session(repo, config, session)?;
-            create_detached_agent_session(
+            kill_session(config, runtime_session.name()).await?;
+        } else if !configure_agent_session(config, runtime_session.name(), stored_runtime.as_ref())
+            .await?
+        {
+            let runtime = opencode_runtime_for_session(repo, config, session).await?;
+            create_configured_agent_session(
                 repo,
                 config,
                 session,
                 runtime_session,
                 runtime.as_ref(),
                 InteractiveAgentLaunch::default(),
-            )?;
-            configure_agent_session(config, runtime_session.name(), runtime.as_ref())?;
-            ensure_companion_windows(config, session, runtime_session)?;
+            )
+            .await?;
+            ensure_companion_windows(config, session, runtime_session).await?;
             return Ok(wait_for_agent_session_running(
                 config,
                 runtime_session,
                 CREATED_SESSION_READY_WAIT,
-            ));
+            )
+            .await);
         } else if wait_for_agent_session_running(
             config,
             runtime_session,
             EXISTING_SESSION_READY_WAIT,
-        ) {
-            ensure_companion_windows(config, session, runtime_session)?;
+        )
+        .await
+        {
+            ensure_companion_windows(config, session, runtime_session).await?;
             return Ok(true);
         } else {
-            kill_session(config, runtime_session.name())?;
+            kill_session(config, runtime_session.name()).await?;
         }
     }
-    let runtime = opencode_runtime_for_session(repo, config, session)?;
-    create_detached_agent_session(
+    let runtime = opencode_runtime_for_session(repo, config, session).await?;
+    create_configured_agent_session(
         repo,
         config,
         session,
         runtime_session,
         runtime.as_ref(),
         InteractiveAgentLaunch::default(),
-    )?;
-    configure_agent_session(config, runtime_session.name(), runtime.as_ref())?;
-    ensure_companion_windows(config, session, runtime_session)?;
-    Ok(wait_for_agent_session_running(
-        config,
-        runtime_session,
-        CREATED_SESSION_READY_WAIT,
-    ))
+    )
+    .await?;
+    ensure_companion_windows(config, session, runtime_session).await?;
+    Ok(wait_for_agent_session_running(config, runtime_session, CREATED_SESSION_READY_WAIT).await)
 }
 
-pub fn paste_agent_prompt(
+pub async fn paste_agent_prompt(
     repo: &Repository,
     config: &Config,
     session: &Session,
@@ -216,9 +221,10 @@ pub fn paste_agent_prompt(
         prompt,
         crate::harness::AgentSelection::default(),
     )
+    .await
 }
 
-pub fn paste_agent_prompt_with_selection(
+pub async fn paste_agent_prompt_with_selection(
     repo: &Repository,
     config: &Config,
     session: &Session,
@@ -230,13 +236,14 @@ pub fn paste_agent_prompt_with_selection(
     if selected_adapter_is(config, "opencode") && !config.is_default_branch(&session.branch) {
         let harness_config = config.harness_config(&config.default_harness)?;
         let runtime = crate::harness::Harness::new(&config.default_harness, &harness_config)
-            .prepare_session(repo, config, &session.branch, &session.path)?
+            .prepare_session(repo, config, &session.branch, &session.path)
+            .await?
             .ok_or_else(|| "selected harness has no native session protocol".to_string())?;
         let session_id = runtime
             .opencode_session_id
             .as_deref()
             .ok_or_else(|| "OpenCode session ID is not available".to_string())?;
-        ensure_agent_session(repo, config, session, generation)?;
+        ensure_agent_session(repo, config, session, generation).await?;
         return crate::opencode::submit_prompt_for_worktree_with_selection(
             &runtime.server_url,
             session_id,
@@ -255,20 +262,20 @@ pub fn paste_agent_prompt_with_selection(
                 config.default_harness
             ));
         }
-        if !ensure_agent_session(repo, config, session, generation)? {
+        if !ensure_agent_session(repo, config, session, generation).await? {
             return Err("agent session did not become ready".to_string());
         }
-        return paste_prompt_into_tmux(config, &runtime_session, prompt);
+        return paste_prompt_into_tmux(config, &runtime_session, prompt).await;
     }
-    if tmux_agent_session_running(config, &runtime_session) {
+    if tmux_agent_session_running(config, &runtime_session).await {
         return Err(format!(
             "harness '{}' does not support submitting a prompt to an existing interactive session",
             config.default_harness
         ));
     }
-    let runtime = opencode_runtime_for_session(repo, config, session)?;
-    if session_exists(config, runtime_session.name())? {
-        kill_session(config, runtime_session.name())?;
+    let runtime = opencode_runtime_for_session(repo, config, session).await?;
+    if session_exists(config, runtime_session.name()).await? {
+        kill_session(config, runtime_session.name()).await?;
     }
     create_detached_agent_session(
         repo,
@@ -281,17 +288,18 @@ pub fn paste_agent_prompt_with_selection(
             resume_session_id: None,
             selection,
         },
-    )?;
-    configure_agent_session(config, runtime_session.name(), runtime.as_ref())?;
-    ensure_companion_windows(config, session, &runtime_session)?;
-    if wait_for_agent_session_running(config, &runtime_session, CREATED_SESSION_READY_WAIT) {
+    )
+    .await?;
+    configure_agent_session(config, runtime_session.name(), runtime.as_ref()).await?;
+    ensure_companion_windows(config, session, &runtime_session).await?;
+    if wait_for_agent_session_running(config, &runtime_session, CREATED_SESSION_READY_WAIT).await {
         Ok(())
     } else {
         Err("agent session did not become ready".to_string())
     }
 }
 
-fn paste_prompt_into_tmux(
+async fn paste_prompt_into_tmux(
     config: &Config,
     runtime_session: &TmuxAgentSession,
     prompt: &str,
@@ -300,7 +308,9 @@ fn paste_prompt_into_tmux(
         config,
         &runtime_session.target(TmuxWindow::Agent),
         AGENT_INPUT_READY_WAIT,
-    ) {
+    )
+    .await
+    {
         return Err("agent prompt did not become ready".to_string());
     }
     let buffer_name = runtime_session.prompt_buffer_name();
@@ -312,7 +322,8 @@ fn paste_prompt_into_tmux(
             "-",
         ]),
         prompt,
-    )?;
+    )
+    .await?;
     run_tmux_status(Command::new(config.tool("tmux")).env_remove("TMUX").args([
         "paste-buffer",
         "-d",
@@ -321,41 +332,46 @@ fn paste_prompt_into_tmux(
         "-t",
         &runtime_session.target(TmuxWindow::Agent),
     ]))
+    .await
 }
 
-pub fn agent_session_running(
+pub async fn agent_session_running(
     repo: &Repository,
     config: &Config,
     session: &Session,
     generation: u64,
 ) -> bool {
-    agent_session_running_result(repo, config, session, generation).unwrap_or(false)
+    agent_session_running_result(repo, config, session, generation)
+        .await
+        .unwrap_or(false)
 }
 
-pub fn agent_session_running_result(
+pub async fn agent_session_running_result(
     repo: &Repository,
     config: &Config,
     session: &Session,
     generation: u64,
 ) -> Result<bool, String> {
     let runtime = TmuxAgentSession::for_worktree_session(repo, &session.branch, generation);
-    tmux_agent_session_running_result(config, &runtime)
+    tmux_agent_session_running_result(config, &runtime).await
 }
 
-fn tmux_agent_session_running(config: &Config, runtime: &TmuxAgentSession) -> bool {
-    tmux_agent_session_running_result(config, runtime).unwrap_or(false)
+async fn tmux_agent_session_running(config: &Config, runtime: &TmuxAgentSession) -> bool {
+    tmux_agent_session_running_result(config, runtime)
+        .await
+        .unwrap_or(false)
 }
 
-fn tmux_agent_session_running_result(
+async fn tmux_agent_session_running_result(
     config: &Config,
     runtime: &TmuxAgentSession,
 ) -> Result<bool, String> {
-    if !session_exists(config, runtime.name())? {
+    if !session_exists(config, runtime.name()).await? {
         return Ok(false);
     }
     let target = runtime.target(TmuxWindow::Agent);
-    let current_command = pane_current_command_result(config, &target)?;
-    let start_command = pane_start_command_result(config, &target)?;
+    let current_command = pane_current_command_result(config, &target).await?;
+    let start_command = pane_start_command_result(config, &target).await?;
     Ok(current_command
         .as_deref()
         .is_some_and(|command| pane_command_matches_agent(config, command))
@@ -364,46 +380,47 @@ fn tmux_agent_session_running_result(
             .is_some_and(|command| pane_start_command_matches_agent(config, command)))
 }
 
-pub fn kill_agent_session(
+pub async fn kill_agent_session(
     repo: &Repository,
     config: &Config,
     branch: &str,
     generation: u64,
 ) -> Result<(), String> {
     let runtime = TmuxAgentSession::for_worktree_session(repo, branch, generation);
-    kill_session(config, runtime.name())
+    kill_session(config, runtime.name()).await
 }
 
-pub fn kill_agent_sessions_for_branch(
+pub async fn kill_agent_sessions_for_branch(
     repo: &Repository,
     config: &Config,
     branch: &str,
 ) -> Result<(), String> {
     let prefix = agent_session_prefix(repo, branch);
-    for name in agent_session_names_with_prefix(config, &prefix)? {
-        kill_session(config, &name)?;
+    for name in agent_session_names_with_prefix(config, &prefix).await? {
+        kill_session(config, &name).await?;
     }
     Ok(())
 }
 
-pub fn latest_agent_session_generation(
+pub async fn latest_agent_session_generation(
     repo: &Repository,
     config: &Config,
     branch: &str,
 ) -> Option<u64> {
     latest_agent_session_generation_result(repo, config, branch)
+        .await
         .ok()
         .flatten()
 }
 
-pub fn latest_agent_session_generation_result(
+pub async fn latest_agent_session_generation_result(
     repo: &Repository,
     config: &Config,
     branch: &str,
 ) -> Result<Option<u64>, String> {
     let started = std::time::Instant::now();
     let prefix = agent_session_prefix(repo, branch);
-    let sessions = agent_session_names_with_prefix(config, &prefix);
+    let sessions = agent_session_names_with_prefix(config, &prefix).await;
     let generation = sessions.as_ref().ok().and_then(|sessions| {
         sessions
             .iter()
@@ -424,14 +441,18 @@ pub fn latest_agent_session_generation_result(
     sessions.map(|_| generation)
 }
 
-fn agent_session_names_with_prefix(config: &Config, prefix: &str) -> Result<Vec<String>, String> {
-    Ok(tmux_session_names(config)?
+async fn agent_session_names_with_prefix(
+    config: &Config,
+    prefix: &str,
+) -> Result<Vec<String>, String> {
+    Ok(tmux_session_names(config)
+        .await?
         .into_iter()
         .filter(|name| name.starts_with(prefix))
         .collect())
 }
 
-fn tmux_session_names(config: &Config) -> Result<Vec<String>, String> {
+async fn tmux_session_names(config: &Config) -> Result<Vec<String>, String> {
     let output = run_tmux_output_allow_failure(
         Command::new(config.tool("tmux")).env_remove("TMUX").args([
             "list-sessions",
@@ -439,9 +460,11 @@ fn tmux_session_names(config: &Config) -> Result<Vec<String>, String> {
             "#{session_name}",
         ]),
         ProcessPolicy::TmuxPoll,
-    )?;
+    )
+    .await?;
     if !output.status.success() {
-        let stderr = output.stderr.trim();
+        let stderr_text = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr_text.trim();
         if tmux_missing_session_error(stderr) || stderr.contains("error connecting to") {
             return Ok(Vec::new());
         }
@@ -451,7 +474,10 @@ fn tmux_session_names(config: &Config) -> Result<Vec<String>, String> {
             stderr.to_string()
         });
     }
-    Ok(output.stdout.lines().map(str::to_string).collect())
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect())
 }
 
 fn agent_session_prefix(repo: &Repository, branch: &str) -> String {
@@ -465,11 +491,11 @@ fn legacy_agent_session_repo_prefix(repo: &Repository) -> String {
     format!("prism-{hash:016x}-")
 }
 
-pub(crate) fn migrate_legacy_agent_sessions(
+pub(crate) async fn migrate_legacy_agent_sessions(
     repo: &Repository,
     config: &Config,
 ) -> Result<(), String> {
-    let sessions = tmux_session_names(config)?;
+    let sessions = tmux_session_names(config).await?;
     let hash = stable_hash(repo.root.as_path());
     let legacy_prefix = legacy_agent_session_repo_prefix(repo);
     for legacy_name in &sessions {
@@ -506,6 +532,7 @@ pub(crate) fn migrate_legacy_agent_sessions(
             legacy_name,
             &name,
         ]))
+        .await
         .map_err(|error| format!("migrate tmux session '{legacy_name}' to '{name}': {error}"))?;
     }
     Ok(())
@@ -515,20 +542,28 @@ fn is_repository_hash(value: &str) -> bool {
     value.len() == 16 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn attach(config: &Config, runtime: &TmuxAgentSession, window: TmuxWindow) -> Result<(), String> {
+async fn attach(
+    config: &Config,
+    runtime: &TmuxAgentSession,
+    window: TmuxWindow,
+) -> Result<(), String> {
     let target = runtime.target(window);
-    attach_target(config, &target, &target)
+    attach_target(config, &target, &target).await
 }
 
-fn attach_agent_session(config: &Config, runtime: &TmuxAgentSession) -> Result<(), String> {
-    attach_target(config, &runtime.target(TmuxWindow::Agent), runtime.name())
+async fn attach_agent_session(config: &Config, runtime: &TmuxAgentSession) -> Result<(), String> {
+    attach_target(config, &runtime.target(TmuxWindow::Agent), runtime.name()).await
 }
 
-fn attach_session(config: &Config, name: &str) -> Result<(), String> {
-    attach_target(config, name, name)
+async fn attach_session(config: &Config, name: &str) -> Result<(), String> {
+    attach_target(config, name, name).await
 }
 
-fn attach_target(config: &Config, size_target: &str, attach_target: &str) -> Result<(), String> {
+async fn attach_target(
+    config: &Config,
+    size_target: &str,
+    attach_target: &str,
+) -> Result<(), String> {
     run_tmux_status(Command::new(config.tool("tmux")).env_remove("TMUX").args([
         "set-option",
         "-w",
@@ -536,13 +571,15 @@ fn attach_target(config: &Config, size_target: &str, attach_target: &str) -> Res
         size_target,
         "window-size",
         "latest",
-    ]))?;
-    let mut command = Command::new(config.tool("tmux"));
-    command
-        .env_remove("TMUX")
-        .args(["attach-session", "-t", attach_target]);
+    ]))
+    .await?;
+    let command = Command::new(config.tool("tmux")).env_remove("TMUX").args([
+        "attach-session",
+        "-t",
+        attach_target,
+    ]);
     let descriptor = ProcessDescriptor::for_tmux(&command);
-    run_status_inherited_named(&mut command, descriptor)
+    run_status_attached_named(command, descriptor).await
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -552,7 +589,7 @@ struct InteractiveAgentLaunch<'a> {
     selection: crate::harness::AgentSelection<'a>,
 }
 
-fn create_detached_agent_session(
+async fn create_detached_agent_session(
     repo: &Repository,
     config: &Config,
     session: &Session,
@@ -569,7 +606,7 @@ fn create_detached_agent_session(
         launch.resume_session_id,
         launch.selection,
     )?;
-    run_tmux_status(
+    run_tmux_daemonizing_status(
         Command::new(config.tool("tmux"))
             .env_remove("TMUX")
             .args(["new-session", "-d", "-s"])
@@ -579,9 +616,10 @@ fn create_detached_agent_session(
             .arg(&session.path)
             .arg(command),
     )
+    .await
 }
 
-pub fn attach_resumable_harness_session(
+pub async fn attach_resumable_harness_session(
     repo: &Repository,
     config: &Config,
     session: &Session,
@@ -589,8 +627,8 @@ pub fn attach_resumable_harness_session(
     session_id: &str,
 ) -> Result<(), String> {
     let runtime_session = TmuxAgentSession::for_worktree_session(repo, &session.branch, generation);
-    if session_exists(config, runtime_session.name())? {
-        kill_session(config, runtime_session.name())?;
+    if session_exists(config, runtime_session.name()).await? {
+        kill_session(config, runtime_session.name()).await?;
     }
     create_detached_agent_session(
         repo,
@@ -603,21 +641,44 @@ pub fn attach_resumable_harness_session(
             resume_session_id: Some(session_id),
             selection: crate::harness::AgentSelection::default(),
         },
-    )?;
-    configure_agent_session(config, runtime_session.name(), None)?;
-    ensure_companion_windows(config, session, &runtime_session)?;
-    attach(config, &runtime_session, TmuxWindow::Agent)
+    )
+    .await?;
+    configure_agent_session(config, runtime_session.name(), None).await?;
+    ensure_companion_windows(config, session, &runtime_session).await?;
+    attach(config, &runtime_session, TmuxWindow::Agent).await
 }
 
-fn configure_agent_session(
+async fn create_configured_agent_session(
+    repo: &Repository,
+    config: &Config,
+    session: &Session,
+    runtime_session: &TmuxAgentSession,
+    runtime: Option<&OpencodeRuntime>,
+    launch: InteractiveAgentLaunch<'_>,
+) -> Result<(), String> {
+    for _ in 0..2 {
+        create_detached_agent_session(repo, config, session, runtime_session, runtime, launch)
+            .await?;
+        if configure_agent_session(config, runtime_session.name(), runtime).await? {
+            return Ok(());
+        }
+        tokio::time::sleep(SESSION_READY_POLL_INTERVAL).await;
+    }
+    Err(format!(
+        "tmux session '{}' exited before it could be configured",
+        runtime_session.name()
+    ))
+}
+
+async fn configure_agent_session(
     config: &Config,
     name: &str,
     runtime: Option<&OpencodeRuntime>,
 ) -> Result<bool, String> {
-    match configure_detach_on_destroy(config, name) {
+    match configure_detach_on_destroy(config, name).await {
         Ok(()) => {
             if let Some(runtime) = runtime {
-                match configure_opencode_runtime(config, name, runtime) {
+                match configure_opencode_runtime(config, name, runtime).await {
                     Ok(()) => {}
                     Err(error) if tmux_missing_session_error(&error) => return Ok(false),
                     Err(error) => return Err(error),
@@ -630,7 +691,7 @@ fn configure_agent_session(
     }
 }
 
-fn configure_opencode_runtime(
+async fn configure_opencode_runtime(
     config: &Config,
     name: &str,
     runtime: &OpencodeRuntime,
@@ -641,9 +702,10 @@ fn configure_opencode_runtime(
             .args(["set-option", "-t", name, OPENCODE_RUNTIME_OPTION])
             .arg(opencode_runtime_marker(runtime)),
     )
+    .await
 }
 
-fn configure_detach_on_destroy(config: &Config, name: &str) -> Result<(), String> {
+async fn configure_detach_on_destroy(config: &Config, name: &str) -> Result<(), String> {
     run_tmux_status(Command::new(config.tool("tmux")).env_remove("TMUX").args([
         "set-option",
         "-t",
@@ -651,29 +713,31 @@ fn configure_detach_on_destroy(config: &Config, name: &str) -> Result<(), String
         "detach-on-destroy",
         "on",
     ]))
+    .await
 }
 
-fn ensure_companion_windows(
+async fn ensure_companion_windows(
     config: &Config,
     session: &Session,
     runtime: &TmuxAgentSession,
 ) -> Result<(), String> {
-    configure_window_indexing(config, runtime.name())?;
-    move_initial_window_to_one(config, runtime)?;
-    rename_window(config, runtime, TmuxWindow::Agent)?;
-    ensure_window(config, session, runtime, TmuxWindow::LazyGit)?;
-    ensure_window(config, session, runtime, TmuxWindow::Terminal)?;
+    configure_window_indexing(config, runtime.name()).await?;
+    move_initial_window_to_one(config, runtime).await?;
+    rename_window(config, runtime, TmuxWindow::Agent).await?;
+    ensure_window(config, session, runtime, TmuxWindow::LazyGit).await?;
+    ensure_window(config, session, runtime, TmuxWindow::Terminal).await?;
     Ok(())
 }
 
-fn configure_window_indexing(config: &Config, name: &str) -> Result<(), String> {
+async fn configure_window_indexing(config: &Config, name: &str) -> Result<(), String> {
     run_tmux_status(Command::new(config.tool("tmux")).env_remove("TMUX").args([
         "set-option",
         "-t",
         name,
         "base-index",
         "1",
-    ]))?;
+    ]))
+    .await?;
     run_tmux_status(Command::new(config.tool("tmux")).env_remove("TMUX").args([
         "set-option",
         "-t",
@@ -681,23 +745,29 @@ fn configure_window_indexing(config: &Config, name: &str) -> Result<(), String> 
         "renumber-windows",
         "off",
     ]))
+    .await
 }
 
-fn move_initial_window_to_one(config: &Config, runtime: &TmuxAgentSession) -> Result<(), String> {
+async fn move_initial_window_to_one(
+    config: &Config,
+    runtime: &TmuxAgentSession,
+) -> Result<(), String> {
     match run_tmux_status(Command::new(config.tool("tmux")).env_remove("TMUX").args([
         "move-window",
         "-s",
         &format!("{}:0", runtime.name()),
         "-t",
         &runtime.target(TmuxWindow::Agent),
-    ])) {
+    ]))
+    .await
+    {
         Ok(()) => Ok(()),
         Err(error) if tmux_missing_session_error(&error) || error.contains("same index") => Ok(()),
         Err(error) => Err(error),
     }
 }
 
-fn rename_window(
+async fn rename_window(
     config: &Config,
     runtime: &TmuxAgentSession,
     window: TmuxWindow,
@@ -707,21 +777,23 @@ fn rename_window(
         "-t",
         &runtime.target(window),
         &window.name(config),
-    ])) {
+    ]))
+    .await
+    {
         Ok(()) => Ok(()),
         Err(error) if tmux_missing_session_error(&error) => Ok(()),
         Err(error) => Err(error),
     }
 }
 
-fn ensure_window(
+async fn ensure_window(
     config: &Config,
     session: &Session,
     runtime: &TmuxAgentSession,
     window: TmuxWindow,
 ) -> Result<(), String> {
-    if window_exists(config, runtime.name(), window)? {
-        rename_window(config, runtime, window)?;
+    if window_exists(config, runtime.name(), window).await? {
+        rename_window(config, runtime, window).await?;
         return Ok(());
     }
     let command = match window {
@@ -729,7 +801,12 @@ fn ensure_window(
         TmuxWindow::LazyGit => config.tool("lazygit"),
         TmuxWindow::Terminal => crate::terminal::shell_program_from_env(),
     };
-    let command = crate::terminal::posix_shell_quote(&command);
+    let command = crate::terminal::shell_command_for(
+        crate::platform::current_os(),
+        &[command],
+        &std::collections::BTreeMap::new(),
+        None,
+    )?;
     run_tmux_status(
         Command::new(config.tool("tmux"))
             .env_remove("TMUX")
@@ -739,9 +816,10 @@ fn ensure_window(
             .arg(&session.path)
             .arg(command),
     )
+    .await
 }
 
-fn window_exists(config: &Config, name: &str, window: TmuxWindow) -> Result<bool, String> {
+async fn window_exists(config: &Config, name: &str, window: TmuxWindow) -> Result<bool, String> {
     run_tmux_output_allow_failure(
         Command::new(config.tool("tmux")).env_remove("TMUX").args([
             "list-windows",
@@ -752,12 +830,13 @@ fn window_exists(config: &Config, name: &str, window: TmuxWindow) -> Result<bool
         ]),
         ProcessPolicy::TmuxPoll,
     )
+    .await
     .map(|output| {
         output.status.success()
             && output
                 .stdout
-                .lines()
-                .any(|line| line == window.index().to_string())
+                .split(|byte| *byte == b'\n')
+                .any(|line| line == window.index().to_string().as_bytes())
     })
 }
 
@@ -765,29 +844,33 @@ fn window_target(name: &str, window: TmuxWindow) -> String {
     format!("{name}:{}", window.index())
 }
 
-fn kill_session(config: &Config, name: &str) -> Result<(), String> {
+async fn kill_session(config: &Config, name: &str) -> Result<(), String> {
     match run_tmux_status(Command::new(config.tool("tmux")).env_remove("TMUX").args([
         "kill-session",
         "-t",
         name,
-    ])) {
+    ]))
+    .await
+    {
         Ok(()) => Ok(()),
         Err(error) if tmux_missing_session_error(&error) => Ok(()),
         Err(error) => Err(error),
     }
 }
 
-fn session_exists(config: &Config, name: &str) -> Result<bool, String> {
+async fn session_exists(config: &Config, name: &str) -> Result<bool, String> {
     let output = run_tmux_output_allow_failure(
         Command::new(config.tool("tmux"))
             .env_remove("TMUX")
             .args(["has-session", "-t", name]),
         ProcessPolicy::TmuxPoll,
-    )?;
+    )
+    .await?;
     if output.status.success() {
         return Ok(true);
     }
-    let error = output.stderr.trim();
+    let error_text = String::from_utf8_lossy(&output.stderr);
+    let error = error_text.trim();
     if tmux_missing_session_error(error) || (error.is_empty() && output.status.code() == Some(1)) {
         Ok(false)
     } else if error.is_empty() {
@@ -797,30 +880,31 @@ fn session_exists(config: &Config, name: &str) -> Result<bool, String> {
     }
 }
 
-fn wait_for_agent_session_running(
+async fn wait_for_agent_session_running(
     config: &Config,
     runtime: &TmuxAgentSession,
     timeout: Duration,
 ) -> bool {
     let started = Instant::now();
     loop {
-        if tmux_agent_session_running(config, runtime) {
+        if tmux_agent_session_running(config, runtime).await {
             return true;
         }
         if started.elapsed() >= timeout {
             return false;
         }
-        std::thread::sleep(SESSION_READY_POLL_INTERVAL);
+        tokio::time::sleep(SESSION_READY_POLL_INTERVAL).await;
     }
 }
 
-fn wait_for_agent_input_ready(config: &Config, name: &str, timeout: Duration) -> bool {
+async fn wait_for_agent_input_ready(config: &Config, name: &str, timeout: Duration) -> bool {
     if config.default_agent != "opencode" {
         return true;
     }
     let started = Instant::now();
     loop {
         if pane_capture(config, name)
+            .await
             .map(|output| opencode_input_ready(&output))
             .unwrap_or(false)
         {
@@ -829,7 +913,7 @@ fn wait_for_agent_input_ready(config: &Config, name: &str, timeout: Duration) ->
         if started.elapsed() >= timeout {
             return false;
         }
-        std::thread::sleep(SESSION_READY_POLL_INTERVAL);
+        tokio::time::sleep(SESSION_READY_POLL_INTERVAL).await;
     }
 }
 
@@ -837,17 +921,17 @@ fn opencode_input_ready(output: &str) -> bool {
     output.contains("Ask anything") || output.contains("ctrl+p commands")
 }
 
-pub(crate) fn capture_agent_pane(
+pub(crate) async fn capture_agent_pane(
     repo: &Repository,
     config: &Config,
     branch: &str,
     generation: u64,
 ) -> Result<String, String> {
     let runtime = TmuxAgentSession::for_worktree_session(repo, branch, generation);
-    capture_pane(config, &runtime.target(TmuxWindow::Agent), true)
+    capture_pane(config, &runtime.target(TmuxWindow::Agent), true).await
 }
 
-pub(crate) fn resize_agent_pane(
+pub(crate) async fn resize_agent_pane(
     repo: &Repository,
     config: &Config,
     branch: &str,
@@ -865,7 +949,8 @@ pub(crate) fn resize_agent_pane(
             .arg(height.to_string())
             .args(["-t", &runtime.target(TmuxWindow::Agent)]),
         ProcessPolicy::TmuxCapture,
-    )?;
+    )
+    .await?;
     match tmux_output_result(output) {
         Ok(_) => Ok(()),
         Err(error) if tmux_missing_session_error(&error) => Ok(()),
@@ -873,42 +958,71 @@ pub(crate) fn resize_agent_pane(
     }
 }
 
-fn pane_capture(config: &Config, name: &str) -> Option<String> {
-    capture_pane(config, name, false).ok()
+async fn pane_capture(config: &Config, name: &str) -> Option<String> {
+    capture_pane(config, name, false).await.ok()
 }
 
-fn capture_pane(config: &Config, target: &str, include_styles: bool) -> Result<String, String> {
-    let mut command = Command::new(config.tool("tmux"));
-    command.env_remove("TMUX").args(["capture-pane", "-p"]);
+async fn capture_pane(
+    config: &Config,
+    target: &str,
+    include_styles: bool,
+) -> Result<String, String> {
+    let mut command = Command::new(config.tool("tmux"))
+        .env_remove("TMUX")
+        .args(["capture-pane", "-p"]);
     if include_styles {
-        command.args(["-e", "-N"]);
+        command = command.args(["-e", "-N"]);
     }
-    command.args(["-t", target]);
-    let output = if include_styles {
-        run_tmux_output_allow_failure(&mut command, ProcessPolicy::TmuxCapture)?
+    command = command.args(["-t", target]);
+    let policy = if include_styles {
+        ProcessPolicy::TmuxCapture
     } else {
-        run_tmux_output_allow_failure(&mut command, ProcessPolicy::TmuxPoll)?
+        ProcessPolicy::TmuxPoll
     };
+    let output = run_tmux_output_allow_failure(command, policy).await?;
     tmux_output_result(output)
 }
 
 fn tmux_output_result(output: crate::process::ProcessOutput) -> Result<String, String> {
     if output.status.success() {
-        Ok(output.stdout)
-    } else if output.stderr.trim().is_empty() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else if String::from_utf8_lossy(&output.stderr).trim().is_empty() {
         Err(format!("tmux exited with {}", output.status))
     } else {
-        Err(output.stderr.trim().to_string())
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
     }
 }
 
-fn run_tmux_status(command: &mut Command) -> Result<(), String> {
-    let descriptor = ProcessDescriptor::for_tmux(command);
-    let output = run_output_named(command, ProcessPolicy::TmuxPoll, descriptor)?;
+#[cfg(not(windows))]
+async fn run_tmux_daemonizing_status(command: Command) -> Result<(), String> {
+    run_tmux_status(command).await
+}
+
+#[cfg(windows)]
+async fn run_tmux_daemonizing_status(command: Command) -> Result<(), String> {
+    use processkit::StdioMode;
+
+    // ProcessKit intentionally places descendants in a kill-on-drop Job Object.
+    // psmux's first `new-session` command launches its persistent server as a
+    // descendant, so this one daemonizing invocation must run outside that job.
+    let display = crate::observability::sanitize_command_text(&command.command_line());
+    let mut command = command
+        .stdout(StdioMode::Piped)
+        .stderr(StdioMode::Piped)
+        .to_tokio_command()
+        .map_err(|error| format!("{display}: {error}"))?;
+    command.kill_on_drop(true);
+    let output = tokio::time::timeout(
+        ProcessPolicy::TmuxPoll.settings().deadline,
+        command.output(),
+    )
+    .await
+    .map_err(|_| format!("{display}: deadline exceeded"))?
+    .map_err(|error| format!("{display}: {error}"))?;
     if output.status.success() {
         return Ok(());
     }
-    let stderr = output.stderr.trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if stderr.is_empty() {
         Err(format!("tmux exited with {}", output.status))
     } else {
@@ -916,22 +1030,36 @@ fn run_tmux_status(command: &mut Command) -> Result<(), String> {
     }
 }
 
-fn run_tmux_status_with_stdin(command: &mut Command, stdin: &str) -> Result<(), String> {
-    let descriptor = ProcessDescriptor::for_tmux(command);
-    run_status_with_stdin_named(command, stdin, ProcessPolicy::TmuxPoll, descriptor)
+async fn run_tmux_status(command: Command) -> Result<(), String> {
+    let descriptor = ProcessDescriptor::for_tmux(&command);
+    let output = run_output_named(command, ProcessPolicy::TmuxPoll, descriptor).await?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.is_empty() {
+        Err(format!("tmux exited with {}", output.status))
+    } else {
+        Err(stderr)
+    }
 }
 
-fn run_tmux_output_allow_failure(
-    command: &mut Command,
+async fn run_tmux_status_with_stdin(command: Command, stdin: &str) -> Result<(), String> {
+    let descriptor = ProcessDescriptor::for_tmux(&command);
+    run_status_with_stdin_named(command, stdin, ProcessPolicy::TmuxPoll, descriptor).await
+}
+
+async fn run_tmux_output_allow_failure(
+    command: Command,
     policy: ProcessPolicy,
 ) -> Result<crate::process::ProcessOutput, String> {
-    let descriptor = ProcessDescriptor::for_tmux(command);
-    run_output_allow_failure_named(command, policy, descriptor)
+    let descriptor = ProcessDescriptor::for_tmux(&command);
+    run_output_allow_failure_named(command, policy, descriptor).await
 }
 
-fn run_tmux_capture(command: &mut Command, policy: ProcessPolicy) -> Result<String, String> {
-    let descriptor = ProcessDescriptor::for_tmux(command);
-    run_capture_named(command, policy, descriptor)
+async fn run_tmux_capture(command: Command, policy: ProcessPolicy) -> Result<String, String> {
+    let descriptor = ProcessDescriptor::for_tmux(&command);
+    run_capture_named(command, policy, descriptor).await
 }
 
 fn tmux_missing_session_error(error: &str) -> bool {
@@ -973,30 +1101,12 @@ fn agent_shell_command(
             config.default_agent
         ));
     }
-    let command = argv
-        .iter()
-        .map(|arg| crate::terminal::posix_shell_quote(arg))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let command = if invocation.environment.is_empty() {
-        command
-    } else {
-        let assignments = invocation
-            .environment
-            .iter()
-            .map(|(key, value)| format!("{}={}", key, crate::terminal::posix_shell_quote(value)))
-            .collect::<Vec<_>>()
-            .join(" ");
-        format!("env {assignments} {command}")
-    };
-    if let Some(path) = invocation.prompt_file {
-        Ok(format!(
-            "{command}; prism_status=$?; rm -f {}; exit $prism_status",
-            crate::terminal::posix_shell_quote(&path.display().to_string())
-        ))
-    } else {
-        Ok(command)
-    }
+    crate::terminal::shell_command_for(
+        crate::platform::current_os(),
+        &argv,
+        &invocation.environment,
+        invocation.prompt_file.as_deref(),
+    )
 }
 
 fn interactive_agent_invocation(
@@ -1045,7 +1155,7 @@ fn interactive_agent_invocation(
         )
 }
 
-fn opencode_runtime_for_session(
+async fn opencode_runtime_for_session(
     repo: &Repository,
     config: &Config,
     session: &Session,
@@ -1056,10 +1166,14 @@ fn opencode_runtime_for_session(
     let harness_config = config.harness_config(&config.default_harness)?;
     crate::harness::Harness::new(&config.default_harness, &harness_config)
         .prepare_session(repo, config, &session.branch, &session.path)
+        .await
         .map_err(|error| format!("prepare harness runtime: {error}"))
 }
 
-fn pane_current_command_result(config: &Config, name: &str) -> Result<Option<String>, String> {
+async fn pane_current_command_result(
+    config: &Config,
+    name: &str,
+) -> Result<Option<String>, String> {
     let result = run_tmux_capture(
         Command::new(config.tool("tmux"))
             .env_remove("TMUX")
@@ -1067,7 +1181,8 @@ fn pane_current_command_result(config: &Config, name: &str) -> Result<Option<Str
             .arg(name)
             .arg("#{pane_current_command}"),
         ProcessPolicy::TmuxPoll,
-    );
+    )
+    .await;
     match result {
         Ok(output) => {
             let output = output.trim().to_string();
@@ -1078,11 +1193,11 @@ fn pane_current_command_result(config: &Config, name: &str) -> Result<Option<Str
     }
 }
 
-fn pane_start_command(config: &Config, name: &str) -> Option<String> {
-    pane_start_command_result(config, name).ok().flatten()
+async fn pane_start_command(config: &Config, name: &str) -> Option<String> {
+    pane_start_command_result(config, name).await.ok().flatten()
 }
 
-fn pane_start_command_result(config: &Config, name: &str) -> Result<Option<String>, String> {
+async fn pane_start_command_result(config: &Config, name: &str) -> Result<Option<String>, String> {
     let result = run_tmux_capture(
         Command::new(config.tool("tmux"))
             .env_remove("TMUX")
@@ -1090,7 +1205,8 @@ fn pane_start_command_result(config: &Config, name: &str) -> Result<Option<Strin
             .arg(name)
             .arg("#{pane_start_command}"),
         ProcessPolicy::TmuxPoll,
-    );
+    )
+    .await;
     match result {
         Ok(output) => {
             let output = output.trim().to_string();
@@ -1137,14 +1253,13 @@ fn pane_start_command_matches_agent(config: &Config, pane_start_command: &str) -
         .strip_prefix('"')
         .and_then(|command| command.strip_suffix('"'))
         .unwrap_or(pane_start_command);
-    let Some(executable) = split_command_words(command).into_iter().next() else {
-        return false;
-    };
-    let executable = Path::new(&executable)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(&executable);
-    pane_command_matches_agent(config, executable)
+    split_command_words(command).into_iter().any(|argument| {
+        let executable = Path::new(&argument)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&argument);
+        pane_command_matches_agent(config, executable)
+    })
 }
 
 fn usable_opencode_runtime(
@@ -1166,7 +1281,7 @@ fn usable_opencode_runtime(
     })
 }
 
-fn agent_session_runtime_matches(
+async fn agent_session_runtime_matches(
     config: &Config,
     name: &str,
     session: &Session,
@@ -1186,6 +1301,7 @@ fn agent_session_runtime_matches(
         ]),
         ProcessPolicy::TmuxPoll,
     )
+    .await
     .ok()
     .map(|value| value.trim().to_string())
     .filter(|value| !value.is_empty());
@@ -1193,7 +1309,7 @@ fn agent_session_runtime_matches(
         return recorded == expected;
     }
 
-    let Some(command) = pane_start_command(config, name) else {
+    let Some(command) = pane_start_command(config, name).await else {
         return false;
     };
     let argv = split_command_words(&command);
@@ -1230,13 +1346,16 @@ fn safe_tmux_name(value: &str) -> String {
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
+    #[cfg(windows)]
+    use crate::test_support::PermissionsExt;
     use std::collections::BTreeMap;
     use std::fs;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::io::{Error, ErrorKind};
     use std::net::{TcpListener, TcpStream};
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::thread;
@@ -1250,14 +1369,15 @@ mod tests {
     use crate::session::Session;
 
     use super::{
-        TmuxAgentSession, TmuxWindow, attach_or_create_agent, attach_or_create_window,
-        capture_agent_pane, ensure_agent_session, latest_agent_session_generation,
-        migrate_legacy_agent_sessions, pane_command_matches_agent,
-        pane_start_command_matches_agent, paste_agent_prompt, session_exists,
+        InteractiveAgentLaunch, TmuxAgentSession, TmuxWindow, attach_or_create_agent,
+        attach_or_create_window, capture_agent_pane, create_configured_agent_session,
+        ensure_agent_session, latest_agent_session_generation, migrate_legacy_agent_sessions,
+        pane_command_matches_agent, pane_start_command_matches_agent, paste_agent_prompt,
+        session_exists,
     };
 
-    #[test]
-    fn tmux_session_names_are_stable_and_safe() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tmux_session_names_are_stable_and_safe() {
         let repo = Repository {
             root: PathBuf::from("/repo/my project"),
         };
@@ -1276,8 +1396,8 @@ mod tests {
         assert!(!name.contains(':'));
     }
 
-    #[test]
-    fn tmux_agent_session_exposes_runtime_targets() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tmux_agent_session_exposes_runtime_targets() {
         let repo = Repository {
             root: PathBuf::from("/repo/my project"),
         };
@@ -1306,8 +1426,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rejects_prompt_placeholder_for_interactive_tmux_command() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rejects_prompt_placeholder_for_interactive_tmux_command() {
         let mut config = crate::test_support::test_config();
         config.default_agent = "custom".to_string();
         config.agent_commands.insert(
@@ -1334,8 +1454,8 @@ mod tests {
         assert!(error.contains("prompt placeholder"));
     }
 
-    #[test]
-    fn opencode_runtime_uses_attach_command_for_agent_window() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opencode_runtime_uses_attach_command_for_agent_window() {
         let temp = unique_temp_dir("prism-tmux-opencode-attach-test");
         fs::create_dir_all(&temp).unwrap();
         let log = temp.join("tmux.log");
@@ -1395,7 +1515,7 @@ exit 0
         )
         .unwrap();
 
-        let result = ensure_agent_session(&repo, &config, &session, 0);
+        let result = ensure_agent_session(&repo, &config, &session, 0).await;
 
         assert_eq!(result, Ok(false));
         let commands = fs::read_to_string(&log).unwrap_or_default();
@@ -1407,8 +1527,8 @@ exit 0
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn ensure_agent_session_resolves_opencode_session_before_tmux_attach() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ensure_agent_session_resolves_opencode_session_before_tmux_attach() {
         let temp = unique_temp_dir("prism-tmux-opencode-resolve-test");
         fs::create_dir_all(&temp).unwrap();
         let log = temp.join("tmux.log");
@@ -1474,7 +1594,7 @@ exit 0
         )
         .unwrap();
 
-        let result = ensure_agent_session(&repo, &config, &session, 0);
+        let result = ensure_agent_session(&repo, &config, &session, 0).await;
 
         assert_eq!(result, Ok(false));
         let runtime = crate::opencode::load_runtime(&repo, "opencode", "feature", &session.path)
@@ -1488,8 +1608,8 @@ exit 0
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn pane_command_only_counts_the_configured_agent_as_running() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pane_command_only_counts_the_configured_agent_as_running() {
         let mut config = crate::test_support::test_config();
         config.default_agent = "opencode".to_string();
         config
@@ -1504,11 +1624,15 @@ exit 0
             &config,
             r#""/usr/local/bin/opencode attach http://127.0.0.1:41000""#
         ));
+        assert!(pane_start_command_matches_agent(
+            &config,
+            r#"& '/usr/local/bin/opencode' 'attach' 'http://127.0.0.1:41000'"#
+        ));
         assert!(!pane_start_command_matches_agent(&config, r#""/bin/bash""#));
     }
 
-    #[test]
-    fn latest_agent_session_generation_reads_highest_existing_generation() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn latest_agent_session_generation_reads_highest_existing_generation() {
         let temp = unique_temp_dir("prism-tmux-latest-generation-test");
         fs::create_dir_all(&temp).unwrap();
         let tmux = temp.join("tmux");
@@ -1543,15 +1667,15 @@ exit 1
             .tools
             .insert("tmux".to_string(), tmux.display().to_string());
 
-        let generation = latest_agent_session_generation(&repo, &config, "feature");
+        let generation = latest_agent_session_generation(&repo, &config, "feature").await;
 
         assert_eq!(generation, Some(7));
 
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn startup_migration_renames_legacy_agent_sessions() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn startup_migration_renames_legacy_agent_sessions() {
         let temp = unique_temp_dir("prism-tmux-legacy-generation-test");
         fs::create_dir_all(&temp).unwrap();
         let log = temp.join("tmux.log");
@@ -1598,7 +1722,7 @@ exit 1
             .tools
             .insert("tmux".to_string(), tmux.display().to_string());
 
-        let result = migrate_legacy_agent_sessions(&repo, &config);
+        let result = migrate_legacy_agent_sessions(&repo, &config).await;
 
         assert_eq!(result, Ok(()));
         let commands = fs::read_to_string(&log).unwrap();
@@ -1611,8 +1735,8 @@ exit 1
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn startup_migration_accepts_an_existing_current_session() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn startup_migration_accepts_an_existing_current_session() {
         let temp = unique_temp_dir("prism-tmux-existing-current-session-test");
         fs::create_dir_all(&temp).unwrap();
         let log = temp.join("tmux.log");
@@ -1655,7 +1779,7 @@ exit 1
             .tools
             .insert("tmux".to_string(), tmux.display().to_string());
 
-        let result = migrate_legacy_agent_sessions(&repo, &config);
+        let result = migrate_legacy_agent_sessions(&repo, &config).await;
 
         assert_eq!(result, Ok(()));
         let commands = fs::read_to_string(&log).unwrap();
@@ -1664,8 +1788,8 @@ exit 1
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn startup_migration_propagates_rename_failures() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn startup_migration_propagates_rename_failures() {
         let temp = unique_temp_dir("prism-tmux-legacy-migration-failure-test");
         fs::create_dir_all(&temp).unwrap();
         let tmux = temp.join("tmux");
@@ -1700,7 +1824,9 @@ exit 1
             .tools
             .insert("tmux".to_string(), tmux.display().to_string());
 
-        let error = migrate_legacy_agent_sessions(&repo, &config).unwrap_err();
+        let error = migrate_legacy_agent_sessions(&repo, &config)
+            .await
+            .unwrap_err();
 
         assert!(error.contains("migrate tmux session"));
         assert!(error.contains("rename failed"));
@@ -1708,8 +1834,8 @@ exit 1
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn startup_migration_accepts_missing_tmux_socket() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn startup_migration_accepts_missing_tmux_socket() {
         let temp = unique_temp_dir("prism-tmux-missing-socket-migration-test");
         fs::create_dir_all(&temp).unwrap();
         let tmux = temp.join("tmux");
@@ -1728,15 +1854,15 @@ exit 1
             .tools
             .insert("tmux".to_string(), tmux.display().to_string());
 
-        let result = migrate_legacy_agent_sessions(&repo, &config);
+        let result = migrate_legacy_agent_sessions(&repo, &config).await;
 
         assert_eq!(result, Ok(()));
 
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn session_lookup_accepts_missing_tmux_socket() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_lookup_accepts_missing_tmux_socket() {
         let temp = unique_temp_dir("prism-tmux-missing-socket-session-test");
         fs::create_dir_all(&temp).unwrap();
         let tmux = temp.join("tmux");
@@ -1754,13 +1880,13 @@ exit 1
             .tools
             .insert("tmux".to_string(), tmux.display().to_string());
 
-        assert_eq!(session_exists(&config, "prism-test"), Ok(false));
+        assert_eq!(session_exists(&config, "prism-test").await, Ok(false));
 
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn capture_agent_pane_does_not_resize_agent_window() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn capture_agent_pane_does_not_resize_agent_window() {
         let temp = unique_temp_dir("prism-tmux-capture-pane-test");
         fs::create_dir_all(&temp).unwrap();
         let log = temp.join("tmux.log");
@@ -1788,7 +1914,7 @@ echo 'agent output'
         let runtime = TmuxAgentSession::for_worktree_session(&repo, "feature", 4);
 
         assert_eq!(
-            capture_agent_pane(&repo, &config, "feature", 4),
+            capture_agent_pane(&repo, &config, "feature", 4).await,
             Ok("agent output\n".to_string()),
         );
         assert_eq!(
@@ -1799,8 +1925,8 @@ echo 'agent output'
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn paste_agent_prompt_loads_and_pastes_tmux_buffer() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paste_agent_prompt_loads_and_pastes_tmux_buffer() {
         let temp = unique_temp_dir("prism-tmux-paste-test");
         fs::create_dir_all(&temp).unwrap();
         let log = temp.join("tmux.log");
@@ -1859,7 +1985,9 @@ exit 1
         let prompt =
             "  fix review comments\nquote: \"that's fine\"\n$PATH && rm -rf nope\n--leading-dash";
 
-        paste_agent_prompt(&repo, &config, &session, 0, prompt).unwrap();
+        paste_agent_prompt(&repo, &config, &session, 0, prompt)
+            .await
+            .unwrap();
 
         assert_eq!(fs::read_to_string(&prompt_file).unwrap(), prompt);
         let commands = fs::read_to_string(&log).unwrap();
@@ -1870,8 +1998,8 @@ exit 1
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn paste_agent_prompt_does_not_require_window_zero() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paste_agent_prompt_does_not_require_window_zero() {
         let temp = unique_temp_dir("prism-tmux-base-index-test");
         fs::create_dir_all(&temp).unwrap();
         let log = temp.join("tmux.log");
@@ -1935,7 +2063,9 @@ exit 1
         let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let session = test_session(temp.join("worktree"), "feature");
 
-        paste_agent_prompt(&repo, &config, &session, 0, "hello").unwrap();
+        paste_agent_prompt(&repo, &config, &session, 0, "hello")
+            .await
+            .unwrap();
 
         assert_eq!(fs::read_to_string(&prompt_file).unwrap(), "hello");
         let commands = fs::read_to_string(&log).unwrap();
@@ -1944,8 +2074,8 @@ exit 1
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn paste_agent_prompt_waits_for_opencode_input() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paste_agent_prompt_waits_for_opencode_input() {
         let temp = unique_temp_dir("prism-tmux-input-ready-test");
         fs::create_dir_all(&temp).unwrap();
         let log = temp.join("tmux.log");
@@ -2011,7 +2141,9 @@ exit 1
         let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let session = test_session(temp.join("worktree"), "feature");
 
-        paste_agent_prompt(&repo, &config, &session, 0, "hello").unwrap();
+        paste_agent_prompt(&repo, &config, &session, 0, "hello")
+            .await
+            .unwrap();
 
         assert_eq!(fs::read_to_string(&prompt_file).unwrap(), "hello");
         assert_eq!(fs::read_to_string(&capture_count).unwrap().trim(), "3");
@@ -2023,8 +2155,8 @@ exit 1
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn paste_agent_prompt_persists_prompt_in_target_opencode_session() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paste_agent_prompt_persists_prompt_in_target_opencode_session() {
         let temp = unique_temp_dir("prism-tmux-api-paste-test");
         fs::create_dir_all(&temp).unwrap();
         let log = temp.join("tmux.log");
@@ -2123,7 +2255,9 @@ exit 1
         let prompt =
             "  fix review comments\nquote: \"that's fine\"\n$PATH && rm -rf nope\n--leading-dash";
 
-        paste_agent_prompt(&repo, &config, &session, 0, prompt).unwrap();
+        paste_agent_prompt(&repo, &config, &session, 0, prompt)
+            .await
+            .unwrap();
 
         assert!(!prompt_file.exists());
         let api_requests = fs::read_to_string(&api_log).unwrap();
@@ -2141,8 +2275,8 @@ exit 1
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn ensure_agent_session_sets_detach_on_destroy() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ensure_agent_session_sets_detach_on_destroy() {
         let temp = unique_temp_dir("prism-tmux-detach-test");
         fs::create_dir_all(&temp).unwrap();
         let log = temp.join("tmux.log");
@@ -2184,7 +2318,7 @@ exit 0
         let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let session = test_session(temp.join("worktree"), "feature");
 
-        let result = ensure_agent_session(&repo, &config, &session, 0);
+        let result = ensure_agent_session(&repo, &config, &session, 0).await;
 
         assert_eq!(result, Ok(false));
         let commands = fs::read_to_string(&log).unwrap();
@@ -2200,8 +2334,8 @@ exit 0
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn ensure_agent_session_replaces_existing_session_without_agent() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ensure_agent_session_replaces_existing_session_without_agent() {
         let temp = unique_temp_dir("prism-tmux-stale-test");
         fs::create_dir_all(&temp).unwrap();
         let log = temp.join("tmux.log");
@@ -2240,7 +2374,7 @@ exit 0
         let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let session = test_session(temp.join("worktree"), "feature");
 
-        let result = ensure_agent_session(&repo, &config, &session, 0);
+        let result = ensure_agent_session(&repo, &config, &session, 0).await;
 
         assert_eq!(result, Ok(false));
         let commands = fs::read_to_string(&log).unwrap();
@@ -2251,8 +2385,8 @@ exit 0
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn ensure_agent_session_recovers_when_session_disappears_before_configure() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ensure_agent_session_recovers_when_session_disappears_before_configure() {
         let temp = unique_temp_dir("prism-tmux-vanished-test");
         fs::create_dir_all(&temp).unwrap();
         let log = temp.join("tmux.log");
@@ -2304,7 +2438,7 @@ exit 0
         let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let session = test_session(temp.join("worktree"), "feature");
 
-        let result = ensure_agent_session(&repo, &config, &session, 0);
+        let result = ensure_agent_session(&repo, &config, &session, 0).await;
 
         assert_eq!(result, Ok(true));
         let commands = fs::read_to_string(&log).unwrap();
@@ -2315,8 +2449,73 @@ exit 0
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn configure_agent_session_reports_session_disappearing_before_runtime_marker() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_configured_session_retries_when_initial_agent_exits() {
+        let temp = unique_temp_dir("prism-tmux-create-retry-test");
+        fs::create_dir_all(&temp).unwrap();
+        let log = temp.join("tmux.log");
+        let configure_count = temp.join("configure-count");
+        let tmux = temp.join("tmux");
+        fs::write(
+            &tmux,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$1" in
+  new-session)
+    exit 0
+    ;;
+  set-option)
+    count="$(cat '{}' 2>/dev/null || echo 0)"
+    count="$((count + 1))"
+    echo "$count" > '{}'
+    if [ "$count" -eq 1 ]; then
+      echo "can't find session: vanished" >&2
+      exit 1
+    fi
+    exit 0
+    ;;
+esac
+exit 0
+"#,
+                log.display(),
+                configure_count.display(),
+                configure_count.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux, permissions).unwrap();
+
+        let mut config = test_config();
+        config
+            .tools
+            .insert("tmux".to_string(), tmux.display().to_string());
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let session = test_session(temp.join("worktree"), "feature");
+        let runtime_session = TmuxAgentSession::for_worktree_session(&repo, "feature", 0);
+
+        let result = create_configured_agent_session(
+            &repo,
+            &config,
+            &session,
+            &runtime_session,
+            None,
+            InteractiveAgentLaunch::default(),
+        )
+        .await;
+
+        assert_eq!(result, Ok(()));
+        let commands = fs::read_to_string(&log).unwrap();
+        assert_eq!(commands.matches("new-session -d -s").count(), 2);
+        assert_eq!(commands.matches("set-option -t").count(), 2);
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn configure_agent_session_reports_session_disappearing_before_runtime_marker() {
         let temp = unique_temp_dir("prism-tmux-vanished-before-runtime-marker-test");
         fs::create_dir_all(&temp).unwrap();
         let configure_count = temp.join("configure-count");
@@ -2366,15 +2565,15 @@ exit 1
             updated_unix_ms: 42,
         };
 
-        let result = super::configure_agent_session(&config, "prism-test", Some(&runtime));
+        let result = super::configure_agent_session(&config, "prism-test", Some(&runtime)).await;
 
         assert_eq!(result, Ok(false));
 
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn attach_return_after_destroy_does_not_recreate_immediately() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn attach_return_after_destroy_does_not_recreate_immediately() {
         let temp = unique_temp_dir("prism-tmux-attach-destroy-test");
         fs::create_dir_all(&temp).unwrap();
         let log = temp.join("tmux.log");
@@ -2434,7 +2633,7 @@ exit 0
         let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let session = test_session(temp.join("worktree"), "feature");
 
-        let result = attach_or_create_agent(&repo, &config, &session, 0);
+        let result = attach_or_create_agent(&repo, &config, &session, 0).await;
 
         assert_eq!(result, Ok(()));
         let commands = fs::read_to_string(&log).unwrap();
@@ -2454,8 +2653,8 @@ exit 0
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn attach_existing_agent_does_not_require_opencode_server() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn attach_existing_agent_does_not_require_opencode_server() {
         let temp = unique_temp_dir("prism-tmux-existing-agent-attach-test");
         fs::create_dir_all(&temp).unwrap();
         let log = temp.join("tmux.log");
@@ -2510,7 +2709,9 @@ exit 1
         let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let session = test_session(temp.join("worktree"), "feature");
 
-        attach_or_create_agent(&repo, &config, &session, 0).unwrap();
+        attach_or_create_agent(&repo, &config, &session, 0)
+            .await
+            .unwrap();
 
         let commands = fs::read_to_string(&log).unwrap();
         assert!(commands.contains("attach-session -t"));
@@ -2524,8 +2725,8 @@ exit 1
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn attach_companion_windows_targets_named_indices() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn attach_companion_windows_targets_named_indices() {
         let temp = unique_temp_dir("prism-tmux-companion-attach-test");
         fs::create_dir_all(&temp).unwrap();
         let log = temp.join("tmux.log");
@@ -2570,7 +2771,9 @@ exit 0
         let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let session = test_session(temp.join("worktree"), "feature");
 
-        attach_or_create_window(&repo, &config, &session, 0, TmuxWindow::LazyGit).unwrap();
+        attach_or_create_window(&repo, &config, &session, 0, TmuxWindow::LazyGit)
+            .await
+            .unwrap();
 
         let commands = fs::read_to_string(&log).unwrap();
         assert!(commands.contains("new-window -d -t"));

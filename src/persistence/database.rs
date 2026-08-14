@@ -5,7 +5,6 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -72,11 +71,8 @@ pub(crate) fn open_readonly(path: &Path) -> Result<SqliteConnection, DatabaseErr
             ),
         });
     }
-    let options = SqliteConnectOptions::from_str(&path.to_string_lossy())
-        .map_err(|source| DatabaseError::Connect {
-            path: path.to_path_buf(),
-            source,
-        })?
+    let options = SqliteConnectOptions::new()
+        .filename(path)
         .read_only(true)
         .create_if_missing(false)
         .foreign_keys(true)

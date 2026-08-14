@@ -143,7 +143,7 @@ impl PromptWorkflowService {
         subject: String,
         payload: serde_json::Value,
     ) -> Result<RemoteObservationResult<serde_json::Value>, String> {
-        let lane = super::standard_remote::lane_for_remote_paths(repository, worktree)?;
+        let lane = super::standard_remote::lane_for_remote_paths(repository, worktree).await?;
         let key = RemoteObservationKey::new(lane, operation, subject)
             .map_err(|error| error.to_string())?;
         self.coordinator
@@ -166,7 +166,7 @@ impl PromptWorkflowService {
         subject: String,
         payload: serde_json::Value,
     ) -> Result<RemoteMutationResult<serde_json::Value>, String> {
-        let lane = super::standard_remote::lane_for_remote_paths(repository, worktree)?;
+        let lane = super::standard_remote::lane_for_remote_paths(repository, worktree).await?;
         self.coordinator
             .mutate(RemoteMutationRequest {
                 lane,
@@ -307,10 +307,11 @@ pub fn now_unix_ms() -> i64 {
         .unwrap_or(0)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn pinned_external_triggers_can_be_rehydrated_from_a_workflow_snapshot() {
         let root =

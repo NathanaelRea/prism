@@ -38,10 +38,12 @@ Run the exhaustive metadata gate before pushing:
 scripts/full-check.sh
 ```
 
-Prism supports Linux and macOS. Both gates run native tests and clippy plus the
-host-independent policy tests for both supported operating systems. The full
-gate additionally verifies SQLx metadata freshness. CI runs it natively on both
-Linux and macOS; cross-compilation does not replace native platform verification.
+Prism supports Linux, macOS, and native `x86_64-pc-windows-msvc`. On Linux and
+macOS, both gates run native tests and Clippy plus the host-independent platform
+policy tests. The full gate additionally verifies SQLx metadata freshness. CI
+runs those gates natively on Linux and macOS and runs `scripts/windows-check.ps1`
+natively on Windows; cross-compilation does not replace native platform
+verification.
 
 Run the focused native contracts on a prepared macOS host before the complete
 suite:

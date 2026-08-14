@@ -7,4 +7,5 @@ pub mod source;
 pub mod standard_remote;
 pub mod standard_triggers;
 pub mod step_trigger;
+mod worker_ipc;
 pub(crate) use prompt_daemon as worker;

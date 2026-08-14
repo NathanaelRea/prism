@@ -109,8 +109,8 @@ pub fn replace_entries(
     })
 }
 
-pub fn ensure_repo_entry(path: &Path) -> Result<(Repository, usize, Vec<RepoEntry>), String> {
-    let repo = Repository::discover(Some(path))?;
+pub async fn ensure_repo_entry(path: &Path) -> Result<(Repository, usize, Vec<RepoEntry>), String> {
+    let repo = Repository::discover(Some(path)).await?;
     let root = repo.root.clone();
     let (index, entries) = ensure_repo_root(&repos_path(), root)?;
     Ok((repo, index, entries))
@@ -127,9 +127,11 @@ fn ensure_repo_root(path: &Path, root: PathBuf) -> Result<(usize, Vec<RepoEntry>
     })
 }
 
-pub fn ensure_entries_for_tui(repo_arg: Option<&Path>) -> Result<(Vec<RepoEntry>, usize), String> {
+pub async fn ensure_entries_for_tui(
+    repo_arg: Option<&Path>,
+) -> Result<(Vec<RepoEntry>, usize), String> {
     if let Some(path) = repo_arg {
-        let (_, index, entries) = ensure_repo_entry(path)?;
+        let (_, index, entries) = ensure_repo_entry(path).await?;
         return Ok((entries, index));
     }
 
@@ -140,10 +142,10 @@ pub fn ensure_entries_for_tui(repo_arg: Option<&Path>) -> Result<(Vec<RepoEntry>
     Ok((entries, 0))
 }
 
-pub fn discover_valid_entries(entries: Vec<RepoEntry>) -> Vec<DiscoveredRepoEntry> {
+pub async fn discover_valid_entries(entries: Vec<RepoEntry>) -> Vec<DiscoveredRepoEntry> {
     let mut discovered = Vec::new();
     for (source_index, entry) in entries.into_iter().enumerate() {
-        match Repository::discover(Some(&entry.root)) {
+        match Repository::discover(Some(&entry.root)).await {
             Ok(repo) => discovered.push(DiscoveredRepoEntry {
                 repo,
                 key: entry.key,
@@ -332,8 +334,8 @@ mod tests {
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[test]
-    fn parses_repos_toml_in_order() {
+    #[tokio::test]
+    async fn parses_repos_toml_in_order() {
         let entries = parse_entries(
             r#"# comment
 [[repos]]
@@ -353,8 +355,8 @@ key = "1"
         assert_eq!(entries[1].key, Some('1'));
     }
 
-    #[test]
-    fn semantically_invalid_repos_are_rejected() {
+    #[tokio::test]
+    async fn semantically_invalid_repos_are_rejected() {
         let error = parse_entries(
             r#"[[repos]]
 path = "/tmp/repo \"quoted\""
@@ -373,8 +375,8 @@ key = "8"
         assert!(error.to_string().contains("missing path"));
     }
 
-    #[test]
-    fn picks_next_unused_digit_key() {
+    #[tokio::test]
+    async fn picks_next_unused_digit_key() {
         let entries = vec![RepoEntry {
             root: PathBuf::from("/one"),
             key: Some('1'),
@@ -383,8 +385,8 @@ key = "8"
         assert_eq!(next_key(&entries), Some('2'));
     }
 
-    #[test]
-    fn discover_valid_entries_skips_missing_repositories() {
+    #[tokio::test]
+    async fn discover_valid_entries_skips_missing_repositories() {
         let temp = unique_temp_dir("prism-workspace-discover-test");
         let repo_path = temp.join("repo");
         fs::create_dir_all(&repo_path).unwrap();
@@ -401,19 +403,22 @@ key = "8"
             },
         ];
 
-        let discovered = discover_valid_entries(entries);
+        let discovered = discover_valid_entries(entries).await;
         let expected_repo_path = fs::canonicalize(&repo_path).unwrap();
 
         assert_eq!(discovered.len(), 1);
-        assert_eq!(discovered[0].repo.root, expected_repo_path);
+        assert_eq!(
+            discovered[0].repo.root.canonicalize().unwrap(),
+            expected_repo_path
+        );
         assert_eq!(discovered[0].key, Some('1'));
         assert_eq!(discovered[0].source_index, 0);
 
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn removes_missing_entries_and_preserves_selected_repository() {
+    #[tokio::test]
+    async fn removes_missing_entries_and_preserves_selected_repository() {
         let temp = unique_temp_dir("prism-workspace-cleanup-test");
         let first = temp.join("first");
         let selected = temp.join("selected");
@@ -441,8 +446,8 @@ key = "8"
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn concurrent_repository_additions_retain_both_entries() {
+    #[tokio::test]
+    async fn concurrent_repository_additions_retain_both_entries() {
         let temp = unique_temp_dir("prism-workspace-concurrent-test");
         fs::create_dir_all(&temp).unwrap();
         let path = temp.join("repos.toml");
@@ -474,8 +479,8 @@ key = "8"
         fs::remove_dir_all(temp).unwrap();
     }
 
-    #[test]
-    fn invalid_repos_toml_is_not_overwritten_by_a_mutator() {
+    #[tokio::test]
+    async fn invalid_repos_toml_is_not_overwritten_by_a_mutator() {
         let temp = unique_temp_dir("prism-workspace-invalid-test");
         fs::create_dir_all(&temp).unwrap();
         let path = temp.join("repos.toml");
@@ -490,8 +495,8 @@ key = "8"
         fs::remove_dir_all(temp).unwrap();
     }
 
-    #[test]
-    fn semantically_invalid_repos_toml_is_not_overwritten_by_a_mutator() {
+    #[tokio::test]
+    async fn semantically_invalid_repos_toml_is_not_overwritten_by_a_mutator() {
         let temp = unique_temp_dir("prism-workspace-semantic-invalid-test");
         fs::create_dir_all(&temp).unwrap();
         let path = temp.join("repos.toml");
@@ -505,8 +510,8 @@ key = "8"
         fs::remove_dir_all(temp).unwrap();
     }
 
-    #[test]
-    fn unreadable_repos_path_is_reported_and_not_replaced() {
+    #[tokio::test]
+    async fn unreadable_repos_path_is_reported_and_not_replaced() {
         let temp = unique_temp_dir("prism-workspace-unreadable-test");
         fs::create_dir_all(&temp).unwrap();
         let path = temp.join("repos.toml");

@@ -1,7 +1,8 @@
 //! AI-authored, Worktree Session-scoped one-off Workflow drafts.
 
 use std::fs;
-use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -98,7 +99,9 @@ pub(crate) fn save_draft(path: &Path, draft: &OneOffWorkflowDraft) -> Result<(),
     let bytes = serde_json::to_vec_pretty(draft)
         .map_err(|error| format!("serialize one-off Workflow draft: {error}"))?;
     let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true).mode(0o600);
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
     use std::io::Write as _;
     let mut file = options
         .open(&temporary)
@@ -107,14 +110,15 @@ pub(crate) fn save_draft(path: &Path, draft: &OneOffWorkflowDraft) -> Result<(),
         .map_err(|error| format!("write one-off Workflow draft: {error}"))?;
     file.sync_all()
         .map_err(|error| format!("sync one-off Workflow draft: {error}"))?;
-    fs::rename(&temporary, path)
+    crate::system::file_persistence::commit_staging(&temporary, path)
         .map_err(|error| format!("commit one-off Workflow draft: {error}"))?;
-    let mut permissions = fs::metadata(path)
-        .map_err(|error| format!("inspect one-off Workflow draft: {error}"))?
-        .permissions();
-    permissions.set_mode(0o600);
-    fs::set_permissions(path, permissions)
-        .map_err(|error| format!("secure one-off Workflow draft: {error}"))
+    #[cfg(unix)]
+    fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .map_err(|error| format!("secure one-off Workflow draft: {error}"))?;
+    #[cfg(windows)]
+    crate::system::windows_security::secure_path(path, false)
+        .map_err(|error| format!("secure one-off Workflow draft: {error}"))?;
+    Ok(())
 }
 
 pub(crate) async fn generate_source(

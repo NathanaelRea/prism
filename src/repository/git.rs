@@ -1,4 +1,4 @@
-use std::process::Command;
+use crate::process::Command;
 
 use crate::config::Config;
 use crate::process::{
@@ -46,7 +46,7 @@ impl GitStatus {
     }
 }
 
-pub fn inspect_status(path: &std::path::Path, config: &Config) -> GitStatus {
+pub async fn inspect_status(path: &std::path::Path, config: &Config) -> GitStatus {
     let output = run_capture(
         Command::new(config.tool("git"))
             .env("GIT_OPTIONAL_LOCKS", "0")
@@ -54,7 +54,8 @@ pub fn inspect_status(path: &std::path::Path, config: &Config) -> GitStatus {
             .arg(path)
             .args(["status", "--porcelain=v1", "--branch"]),
         ProcessPolicy::Metadata,
-    );
+    )
+    .await;
     let mut status = match output {
         Ok(output) => parse_git_status(&output),
         Err(error) => GitStatus {
@@ -68,7 +69,7 @@ pub fn inspect_status(path: &std::path::Path, config: &Config) -> GitStatus {
         ("rebase", "rebase-apply"),
         ("cherry_pick", "CHERRY_PICK_HEAD"),
     ] {
-        if git_path_exists(path, config, marker) {
+        if git_path_exists(path, config, marker).await {
             status.operation = Some(name.to_string());
             break;
         }
@@ -92,7 +93,7 @@ fn parse_git_status(output: &str) -> GitStatus {
     status
 }
 
-fn git_path_exists(path: &std::path::Path, config: &Config, marker: &str) -> bool {
+async fn git_path_exists(path: &std::path::Path, config: &Config, marker: &str) -> bool {
     run_capture(
         Command::new(config.tool("git"))
             .env("GIT_OPTIONAL_LOCKS", "0")
@@ -101,6 +102,7 @@ fn git_path_exists(path: &std::path::Path, config: &Config, marker: &str) -> boo
             .args(["rev-parse", "--git-path", marker]),
         ProcessPolicy::Metadata,
     )
+    .await
     .map(|value| {
         let value = std::path::PathBuf::from(value.trim());
         let value = if value.is_absolute() {
@@ -121,19 +123,19 @@ pub(crate) struct RepositoryCheckout {
     pub dirty: bool,
 }
 
-pub(crate) fn inspect_repository_checkout(
+pub(crate) async fn inspect_repository_checkout(
     repo: &Repository,
     config: &Config,
 ) -> Result<RepositoryCheckout, String> {
     Ok(RepositoryCheckout {
-        current_branch: current_branch(repo, config)?,
-        default_base: default_base(repo, config),
-        worktree_count: worktree_count(repo, config)?,
-        dirty: worktree_dirty(repo, config)?,
+        current_branch: current_branch(repo, config).await?,
+        default_base: default_base(repo, config).await,
+        worktree_count: worktree_count(repo, config).await?,
+        dirty: worktree_dirty(repo, config).await?,
     })
 }
 
-pub fn git_status_label(path: &std::path::Path, config: &Config) -> String {
+pub async fn git_status_label(path: &std::path::Path, config: &Config) -> String {
     match run_capture(
         Command::new(config.tool("git"))
             .env("GIT_OPTIONAL_LOCKS", "0")
@@ -141,7 +143,9 @@ pub fn git_status_label(path: &std::path::Path, config: &Config) -> String {
             .arg(path)
             .args(["status", "--short", "--branch"]),
         ProcessPolicy::Metadata,
-    ) {
+    )
+    .await
+    {
         Ok(output) => parse_git_status_label(&output),
         Err(_) => "status error".to_string(),
     }
@@ -187,7 +191,7 @@ fn parse_branch_count(branch: &str, key: &str) -> Option<usize> {
     digits.parse().ok()
 }
 
-pub fn worktree_dirty(repo: &Repository, config: &Config) -> Result<bool, String> {
+pub async fn worktree_dirty(repo: &Repository, config: &Config) -> Result<bool, String> {
     let status = run_capture(
         Command::new(config.tool("git"))
             .env("GIT_OPTIONAL_LOCKS", "0")
@@ -195,18 +199,20 @@ pub fn worktree_dirty(repo: &Repository, config: &Config) -> Result<bool, String
             .arg(&repo.root)
             .args(["status", "--short"]),
         ProcessPolicy::Metadata,
-    )?;
+    )
+    .await?;
     Ok(!status.trim().is_empty())
 }
 
-fn current_branch(repo: &Repository, config: &Config) -> Result<Option<String>, String> {
+async fn current_branch(repo: &Repository, config: &Config) -> Result<Option<String>, String> {
     let output = run_capture(
         Command::new(config.tool("git"))
             .arg("-C")
             .arg(&repo.root)
             .args(["branch", "--show-current"]),
         ProcessPolicy::Metadata,
-    )?;
+    )
+    .await?;
     let branch = output.trim();
     if branch.is_empty() {
         Ok(None)
@@ -215,15 +221,19 @@ fn current_branch(repo: &Repository, config: &Config) -> Result<Option<String>, 
     }
 }
 
-fn default_base(repo: &Repository, config: &Config) -> Option<String> {
-    config
-        .default_base
-        .clone()
-        .or_else(|| local_branch_exists(&repo.root, config, "main").then(|| "main".to_string()))
-        .or_else(|| local_branch_exists(&repo.root, config, "master").then(|| "master".to_string()))
+async fn default_base(repo: &Repository, config: &Config) -> Option<String> {
+    if let Some(base) = config.default_base.clone() {
+        Some(base)
+    } else if local_branch_exists(&repo.root, config, "main").await {
+        Some("main".to_string())
+    } else if local_branch_exists(&repo.root, config, "master").await {
+        Some("master".to_string())
+    } else {
+        None
+    }
 }
 
-fn local_branch_exists(path: &std::path::Path, config: &Config, branch: &str) -> bool {
+async fn local_branch_exists(path: &std::path::Path, config: &Config, branch: &str) -> bool {
     run_output_allow_failure(
         Command::new(config.tool("git")).arg("-C").arg(path).args([
             "show-ref",
@@ -233,30 +243,32 @@ fn local_branch_exists(path: &std::path::Path, config: &Config, branch: &str) ->
         ]),
         ProcessPolicy::Metadata,
     )
+    .await
     .map(|output| output.status.success())
     .unwrap_or(false)
 }
 
-fn worktree_count(repo: &Repository, config: &Config) -> Result<usize, String> {
+async fn worktree_count(repo: &Repository, config: &Config) -> Result<usize, String> {
     let output = run_capture(
         Command::new(config.tool("git"))
             .arg("-C")
             .arg(&repo.root)
             .args(["worktree", "list", "--porcelain"]),
         ProcessPolicy::Metadata,
-    )?;
+    )
+    .await?;
     Ok(output
         .lines()
         .filter(|line| line.starts_with("worktree "))
         .count())
 }
 
-pub fn branch_behind(
+pub async fn branch_behind(
     path: &std::path::Path,
     branch: &str,
     config: &Config,
 ) -> Result<usize, String> {
-    fetch_origin(path, config)?;
+    fetch_origin(path, config).await?;
     let upstream = format!("origin/{branch}");
     let count = run_capture(
         Command::new(config.tool("git"))
@@ -265,12 +277,17 @@ pub fn branch_behind(
             .args(["rev-list", "--count"])
             .arg(format!("{branch}..{upstream}")),
         ProcessPolicy::Metadata,
-    )?;
+    )
+    .await?;
     Ok(count.trim().parse().unwrap_or(0))
 }
 
-pub fn pull_branch(path: &std::path::Path, branch: &str, config: &Config) -> Result<(), String> {
-    fetch_origin(path, config)?;
+pub async fn pull_branch(
+    path: &std::path::Path,
+    branch: &str,
+    config: &Config,
+) -> Result<(), String> {
+    fetch_origin(path, config).await?;
     run_status_named(
         Command::new(config.tool("git"))
             .arg("-C")
@@ -278,7 +295,8 @@ pub fn pull_branch(path: &std::path::Path, branch: &str, config: &Config) -> Res
             .args(["switch", branch]),
         ProcessPolicy::LocalMutation,
         ProcessDescriptor::new("git.switch"),
-    )?;
+    )
+    .await?;
     run_status_named(
         Command::new(config.tool("git")).arg("-C").arg(path).args([
             "pull",
@@ -289,9 +307,10 @@ pub fn pull_branch(path: &std::path::Path, branch: &str, config: &Config) -> Res
         ProcessPolicy::NetworkQuery,
         ProcessDescriptor::new("git.pull"),
     )
+    .await
 }
 
-pub(crate) fn fetch_origin(path: &std::path::Path, config: &Config) -> Result<(), String> {
+pub(crate) async fn fetch_origin(path: &std::path::Path, config: &Config) -> Result<(), String> {
     run_status_named(
         Command::new(config.tool("git"))
             .arg("-C")
@@ -300,9 +319,10 @@ pub(crate) fn fetch_origin(path: &std::path::Path, config: &Config) -> Result<()
         ProcessPolicy::NetworkQuery,
         ProcessDescriptor::new("git.fetch"),
     )
+    .await
 }
 
-pub fn has_upstream(path: &std::path::Path, config: &Config) -> Result<bool, String> {
+pub async fn has_upstream(path: &std::path::Path, config: &Config) -> Result<bool, String> {
     let upstream = run_output_allow_failure(
         Command::new(config.tool("git")).arg("-C").arg(path).args([
             "rev-parse",
@@ -311,7 +331,8 @@ pub fn has_upstream(path: &std::path::Path, config: &Config) -> Result<bool, Str
             "@{u}",
         ]),
         ProcessPolicy::Metadata,
-    )?;
+    )
+    .await?;
     Ok(upstream.status.success())
 }
 
@@ -336,14 +357,18 @@ pub(crate) struct GitPushResult {
     pub set_upstream: bool,
 }
 
-pub(crate) fn inspect_dirty(path: &std::path::Path, config: &Config) -> Result<DirtyState, String> {
+pub(crate) async fn inspect_dirty(
+    path: &std::path::Path,
+    config: &Config,
+) -> Result<DirtyState, String> {
     let status = run_capture(
         Command::new(config.tool("git"))
             .arg("-C")
             .arg(path)
             .args(["status", "--short"]),
         ProcessPolicy::Metadata,
-    )?;
+    )
+    .await?;
     let entries = status
         .lines()
         .map(str::trim_end)
@@ -357,7 +382,7 @@ pub(crate) fn inspect_dirty(path: &std::path::Path, config: &Config) -> Result<D
 }
 
 #[allow(dead_code)]
-pub(crate) fn stage_all(path: &std::path::Path, config: &Config) -> Result<(), String> {
+pub(crate) async fn stage_all(path: &std::path::Path, config: &Config) -> Result<(), String> {
     run_status(
         Command::new(config.tool("git"))
             .arg("-C")
@@ -365,15 +390,16 @@ pub(crate) fn stage_all(path: &std::path::Path, config: &Config) -> Result<(), S
             .args(["add", "-A"]),
         ProcessPolicy::LocalMutation,
     )
+    .await
 }
 
 #[allow(dead_code)]
-pub(crate) fn commit_if_dirty(
+pub(crate) async fn commit_if_dirty(
     path: &std::path::Path,
     config: &Config,
     message: &str,
 ) -> Result<GitCommitResult, String> {
-    if !inspect_dirty(path, config)?.dirty {
+    if !inspect_dirty(path, config).await?.dirty {
         return Ok(GitCommitResult {
             committed: false,
             commit_sha: None,
@@ -381,15 +407,16 @@ pub(crate) fn commit_if_dirty(
         });
     }
 
-    stage_all(path, config)?;
+    stage_all(path, config).await?;
     run_status(
         Command::new(config.tool("git"))
             .arg("-C")
             .arg(path)
             .args(["commit", "-m", message]),
         ProcessPolicy::LocalMutation,
-    )?;
-    let commit_sha = current_head_sha(path, config)?;
+    )
+    .await?;
+    let commit_sha = current_head_sha(path, config).await?;
     Ok(GitCommitResult {
         committed: true,
         commit_sha: Some(commit_sha),
@@ -398,25 +425,30 @@ pub(crate) fn commit_if_dirty(
 }
 
 #[allow(dead_code)]
-pub(crate) fn current_head_sha(path: &std::path::Path, config: &Config) -> Result<String, String> {
+pub(crate) async fn current_head_sha(
+    path: &std::path::Path,
+    config: &Config,
+) -> Result<String, String> {
     let sha = run_capture(
         Command::new(config.tool("git"))
             .arg("-C")
             .arg(path)
             .args(["rev-parse", "HEAD"]),
         ProcessPolicy::Metadata,
-    )?;
+    )
+    .await?;
     Ok(sha.trim().to_string())
 }
 
 #[allow(dead_code)]
-pub(crate) fn push_current_branch(
+pub(crate) async fn push_current_branch(
     path: &std::path::Path,
     config: &Config,
 ) -> Result<GitPushResult, String> {
-    let branch = current_branch_name(path, config)?
+    let branch = current_branch_name(path, config)
+        .await?
         .ok_or_else(|| "cannot push detached HEAD".to_string())?;
-    let set_upstream = !has_upstream(path, config)?;
+    let set_upstream = !has_upstream(path, config).await?;
     let mut args = vec!["push".to_string()];
     if set_upstream {
         args.extend(["-u".to_string(), "origin".to_string(), branch.clone()]);
@@ -428,7 +460,8 @@ pub(crate) fn push_current_branch(
             .args(args),
         ProcessPolicy::NetworkQuery,
         ProcessDescriptor::new("git.push"),
-    )?;
+    )
+    .await?;
     Ok(GitPushResult {
         branch,
         set_upstream,
@@ -436,7 +469,7 @@ pub(crate) fn push_current_branch(
 }
 
 #[allow(dead_code)]
-pub(crate) fn current_branch_name(
+pub(crate) async fn current_branch_name(
     path: &std::path::Path,
     config: &Config,
 ) -> Result<Option<String>, String> {
@@ -446,7 +479,8 @@ pub(crate) fn current_branch_name(
             .arg(path)
             .args(["branch", "--show-current"]),
         ProcessPolicy::Metadata,
-    )?;
+    )
+    .await?;
     let branch = output.trim();
     if branch.is_empty() {
         Ok(None)
@@ -456,15 +490,15 @@ pub(crate) fn current_branch_name(
 }
 
 #[allow(dead_code)]
-pub(crate) fn remote_branch_head_sha(
+pub(crate) async fn remote_branch_head_sha(
     path: &std::path::Path,
     branch: &str,
     config: &Config,
 ) -> Result<Option<String>, String> {
-    remote_branch_head_sha_on(path, "origin", branch, config)
+    remote_branch_head_sha_on(path, "origin", branch, config).await
 }
 
-pub(crate) fn remote_branch_head_sha_on(
+pub(crate) async fn remote_branch_head_sha_on(
     path: &std::path::Path,
     remote: &str,
     branch: &str,
@@ -480,17 +514,19 @@ pub(crate) fn remote_branch_head_sha_on(
             .args(["rev-parse", "--verify", "--quiet"])
             .arg(format!("refs/remotes/{remote}/{branch}")),
         ProcessPolicy::Metadata,
-    )?;
+    )
+    .await?;
     if !output.status.success() {
         return match output.status.code() {
             Some(1) => Ok(None),
             _ => Err(format!(
                 "inspect remote branch {remote}/{branch}: {}",
-                output.stderr.trim()
+                String::from_utf8_lossy(&output.stderr).trim()
             )),
         };
     }
-    let sha = output.stdout.trim();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let sha = stdout.trim();
     if sha.is_empty() {
         Ok(None)
     } else {
@@ -498,7 +534,7 @@ pub(crate) fn remote_branch_head_sha_on(
     }
 }
 
-pub(crate) fn fetch_remote_branch(
+pub(crate) async fn fetch_remote_branch(
     path: &std::path::Path,
     remote: &str,
     branch: &str,
@@ -524,15 +560,16 @@ pub(crate) fn fetch_remote_branch(
         ProcessPolicy::NetworkQuery,
         ProcessDescriptor::new("git.fetch"),
     )
+    .await
 }
 
-pub(crate) fn push_remote_branch_head_sha(
+pub(crate) async fn push_remote_branch_head_sha(
     path: &std::path::Path,
     remote: &str,
     branch: &str,
     config: &Config,
 ) -> Result<Option<String>, String> {
-    let push_url = single_push_remote_url(path, remote, config)?;
+    let push_url = single_push_remote_url(path, remote, config).await?;
     let output = run_output_allow_failure(
         Command::new(config.tool("git"))
             .arg("-C")
@@ -541,18 +578,19 @@ pub(crate) fn push_remote_branch_head_sha(
             .arg(&push_url)
             .arg(format!("refs/heads/{branch}")),
         ProcessPolicy::NetworkQuery,
-    )?;
+    )
+    .await?;
     if !output.status.success() {
         return match output.status.code() {
             Some(2) => Ok(None),
             _ => Err(format!(
                 "inspect push branch {remote}/{branch}: {}",
-                output.stderr.trim()
+                String::from_utf8_lossy(&output.stderr).trim()
             )),
         };
     }
-    let sha = output
-        .stdout
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let sha = stdout
         .split_whitespace()
         .next()
         .filter(|sha| !sha.is_empty())
@@ -560,7 +598,7 @@ pub(crate) fn push_remote_branch_head_sha(
     Ok(Some(sha.to_string()))
 }
 
-pub(crate) fn single_push_remote_url(
+pub(crate) async fn single_push_remote_url(
     path: &std::path::Path,
     remote: &str,
     config: &Config,
@@ -571,7 +609,8 @@ pub(crate) fn single_push_remote_url(
             .arg(path)
             .args(["remote", "get-url", "--push", "--all", remote]),
         ProcessPolicy::Metadata,
-    )?;
+    )
+    .await?;
     let urls = push_urls
         .lines()
         .map(str::trim)
@@ -594,10 +633,11 @@ mod tests {
 
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::process::Command as StdCommand;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[test]
-    fn git_status_label_reports_clean_ahead_and_dirty() {
+    #[tokio::test]
+    async fn git_status_label_reports_clean_ahead_and_dirty() {
         assert_eq!(parse_git_status_label("## main...origin/main\n"), "clean");
         assert_eq!(
             parse_git_status_label("## main...origin/main [ahead 1]\n"),
@@ -615,40 +655,40 @@ mod tests {
         );
     }
 
-    #[test]
-    fn fetch_remote_branch_rejects_invalid_names_before_running_git() {
+    #[tokio::test]
+    async fn fetch_remote_branch_rejects_invalid_names_before_running_git() {
         let missing_path = Path::new("/path/that/does/not/exist");
         let config = test_config();
 
         for remote in ["", " \t"] {
             assert_eq!(
-                fetch_remote_branch(missing_path, remote, "main", &config),
+                fetch_remote_branch(missing_path, remote, "main", &config).await,
                 Err("cannot fetch from an empty remote name".to_string())
             );
         }
         for branch in ["", " \t", "(detached)", " (detached) "] {
             assert_eq!(
-                fetch_remote_branch(missing_path, "origin", branch, &config),
+                fetch_remote_branch(missing_path, "origin", branch, &config).await,
                 Err("cannot fetch an empty or detached branch name".to_string())
             );
         }
     }
 
-    #[test]
-    fn branch_behind_fetches_origin_even_when_worktree_is_dirty() {
+    #[tokio::test]
+    async fn branch_behind_fetches_origin_even_when_worktree_is_dirty() {
         let temp = unique_temp_dir("prism-dirty-behind-test");
         let origin = temp.join("origin.git");
         let work = temp.join("work");
         let remote = temp.join("remote");
         fs::create_dir_all(&temp).unwrap();
 
-        run(Command::new("git").args(["init", "--bare"]).arg(&origin));
-        run(Command::new("git").arg("--git-dir").arg(&origin).args([
+        run(StdCommand::new("git").args(["init", "--bare"]).arg(&origin));
+        run(StdCommand::new("git").arg("--git-dir").arg(&origin).args([
             "symbolic-ref",
             "HEAD",
             "refs/heads/main",
         ]));
-        run(Command::new("git").arg("clone").arg(&origin).arg(&work));
+        run(StdCommand::new("git").arg("clone").arg(&origin).arg(&work));
         configure_user(&work);
         fs::write(work.join("tracked.txt"), "base\n").unwrap();
         run_git(&work, &["add", "tracked.txt"]);
@@ -656,28 +696,31 @@ mod tests {
         run_git(&work, &["push", "-u", "origin", "main"]);
 
         let config = test_config();
-        assert_eq!(branch_behind(&work, "main", &config).unwrap(), 0);
+        assert_eq!(branch_behind(&work, "main", &config).await.unwrap(), 0);
 
         fs::write(work.join("tracked.txt"), "dirty\n").unwrap();
-        run(Command::new("git").arg("clone").arg(&origin).arg(&remote));
+        run(StdCommand::new("git")
+            .arg("clone")
+            .arg(&origin)
+            .arg(&remote));
         configure_user(&remote);
         fs::write(remote.join("remote.txt"), "remote\n").unwrap();
         run_git(&remote, &["add", "remote.txt"]);
         run_git(&remote, &["commit", "-m", "remote change"]);
         run_git(&remote, &["push", "origin", "main"]);
 
-        assert_eq!(branch_behind(&work, "main", &config).unwrap(), 1);
+        assert_eq!(branch_behind(&work, "main", &config).await.unwrap(), 1);
 
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn inspect_repository_checkout_reports_startup_facts() {
+    #[tokio::test]
+    async fn inspect_repository_checkout_reports_startup_facts() {
         let temp = unique_temp_dir("prism-startup-checkout-test");
         let work = temp.join("work");
         fs::create_dir_all(&temp).unwrap();
 
-        run(Command::new("git").args(["init"]).arg(&work));
+        run(StdCommand::new("git").args(["init"]).arg(&work));
         configure_user(&work);
         run_git(&work, &["branch", "-M", "main"]);
         fs::write(work.join("tracked.txt"), "base\n").unwrap();
@@ -688,7 +731,7 @@ mod tests {
         config.default_base = None;
         let repo = Repository { root: work.clone() };
 
-        let checkout = inspect_repository_checkout(&repo, &config).unwrap();
+        let checkout = inspect_repository_checkout(&repo, &config).await.unwrap();
         assert_eq!(checkout.current_branch.as_deref(), Some("main"));
         assert_eq!(checkout.default_base.as_deref(), Some("main"));
         assert_eq!(checkout.worktree_count, 1);
@@ -697,7 +740,7 @@ mod tests {
         run_git(&work, &["switch", "-c", "feature"]);
         fs::write(work.join("untracked.txt"), "dirty\n").unwrap();
 
-        let checkout = inspect_repository_checkout(&repo, &config).unwrap();
+        let checkout = inspect_repository_checkout(&repo, &config).await.unwrap();
         assert_eq!(checkout.current_branch.as_deref(), Some("feature"));
         assert_eq!(checkout.default_base.as_deref(), Some("main"));
         assert_eq!(checkout.worktree_count, 1);
@@ -706,8 +749,8 @@ mod tests {
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn inspect_dirty_reports_untracked_and_modified_entries() {
+    #[tokio::test]
+    async fn inspect_dirty_reports_untracked_and_modified_entries() {
         let temp = unique_temp_dir("prism-dirty-state-test");
         let work = temp.join("work");
         fs::create_dir_all(&work).unwrap();
@@ -720,7 +763,7 @@ mod tests {
         fs::write(work.join("tracked.txt"), "changed\n").unwrap();
         fs::write(work.join("untracked.txt"), "new\n").unwrap();
 
-        let state = inspect_dirty(&work, &test_config()).unwrap();
+        let state = inspect_dirty(&work, &test_config()).await.unwrap();
         assert!(state.dirty);
         assert!(
             state
@@ -738,8 +781,8 @@ mod tests {
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn commit_if_dirty_skips_clean_worktree() {
+    #[tokio::test]
+    async fn commit_if_dirty_skips_clean_worktree() {
         let temp = unique_temp_dir("prism-empty-commit-test");
         let work = temp.join("work");
         fs::create_dir_all(&work).unwrap();
@@ -749,15 +792,17 @@ mod tests {
         run_git(&work, &["add", "tracked.txt"]);
         run_git(&work, &["commit", "-m", "initial"]);
 
-        let result = commit_if_dirty(&work, &test_config(), "test commit").unwrap();
+        let result = commit_if_dirty(&work, &test_config(), "test commit")
+            .await
+            .unwrap();
         assert!(!result.committed);
         assert_eq!(result.commit_sha, None);
 
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn commit_if_dirty_stages_and_commits_changes() {
+    #[tokio::test]
+    async fn commit_if_dirty_stages_and_commits_changes() {
         let temp = unique_temp_dir("prism-normal-commit-test");
         let work = temp.join("work");
         fs::create_dir_all(&work).unwrap();
@@ -766,51 +811,56 @@ mod tests {
         fs::write(work.join("tracked.txt"), "base\n").unwrap();
         run_git(&work, &["add", "tracked.txt"]);
         run_git(&work, &["commit", "-m", "initial"]);
-        let before = current_head_sha(&work, &test_config()).unwrap();
+        let before = current_head_sha(&work, &test_config()).await.unwrap();
 
         fs::write(work.join("tracked.txt"), "changed\n").unwrap();
         fs::write(work.join("new.txt"), "new\n").unwrap();
-        let result = commit_if_dirty(&work, &test_config(), "test commit").unwrap();
+        let result = commit_if_dirty(&work, &test_config(), "test commit")
+            .await
+            .unwrap();
 
         assert!(result.committed);
         let after = result.commit_sha.unwrap();
         assert_ne!(after, before);
-        assert_eq!(after, current_head_sha(&work, &test_config()).unwrap());
-        assert!(!inspect_dirty(&work, &test_config()).unwrap().dirty);
+        assert_eq!(
+            after,
+            current_head_sha(&work, &test_config()).await.unwrap()
+        );
+        assert!(!inspect_dirty(&work, &test_config()).await.unwrap().dirty);
 
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn push_current_branch_sets_upstream_when_missing() {
+    #[tokio::test]
+    async fn push_current_branch_sets_upstream_when_missing() {
         let temp = unique_temp_dir("prism-push-upstream-test");
         let origin = temp.join("origin.git");
         let seed = temp.join("seed");
         let work = temp.join("work");
         fs::create_dir_all(&temp).unwrap();
-        run(Command::new("git").args(["init", "--bare"]).arg(&origin));
-        run(Command::new("git").arg("--git-dir").arg(&origin).args([
+        run(StdCommand::new("git").args(["init", "--bare"]).arg(&origin));
+        run(StdCommand::new("git").arg("--git-dir").arg(&origin).args([
             "symbolic-ref",
             "HEAD",
             "refs/heads/main",
         ]));
-        run(Command::new("git").arg("clone").arg(&origin).arg(&seed));
+        run(StdCommand::new("git").arg("clone").arg(&origin).arg(&seed));
         configure_user(&seed);
         fs::write(seed.join("tracked.txt"), "base\n").unwrap();
         run_git(&seed, &["add", "tracked.txt"]);
         run_git(&seed, &["commit", "-m", "initial"]);
         run_git(&seed, &["push", "-u", "origin", "main"]);
-        run(Command::new("git").arg("clone").arg(&origin).arg(&work));
+        run(StdCommand::new("git").arg("clone").arg(&origin).arg(&work));
         configure_user(&work);
         run_git(&work, &["switch", "-c", "feature"]);
         fs::write(work.join("feature.txt"), "feature\n").unwrap();
         run_git(&work, &["add", "feature.txt"]);
         run_git(&work, &["commit", "-m", "feature"]);
 
-        let result = push_current_branch(&work, &test_config()).unwrap();
+        let result = push_current_branch(&work, &test_config()).await.unwrap();
         assert_eq!(result.branch, "feature");
         assert!(result.set_upstream);
-        assert!(has_upstream(&work, &test_config()).unwrap());
+        assert!(has_upstream(&work, &test_config()).await.unwrap());
 
         let _ = fs::remove_dir_all(temp);
     }
@@ -821,10 +871,10 @@ mod tests {
     }
 
     fn run_git(path: &Path, args: &[&str]) {
-        run(Command::new("git").arg("-C").arg(path).args(args));
+        run(StdCommand::new("git").arg("-C").arg(path).args(args));
     }
 
-    fn run(command: &mut Command) {
+    fn run(command: &mut StdCommand) {
         let output = command.output().unwrap();
         assert!(
             output.status.success(),

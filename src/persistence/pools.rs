@@ -1,6 +1,6 @@
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::str::FromStr;
 use std::time::Duration;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
@@ -13,6 +13,7 @@ static REPOSITORY_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migratio
 
 pub(super) async fn initialize_repository_database(path: &Path) -> Result<(), DatabaseError> {
     prepare_parent(path)?;
+    secure_existing_database(path)?;
     super::adoption::adopt_historical_repository_database(path, &REPOSITORY_MIGRATOR).await?;
     migrate(path, &REPOSITORY_MIGRATOR).await?;
     set_owner_only(path)
@@ -55,29 +56,23 @@ pub(crate) fn options(
     create: bool,
     readonly: bool,
 ) -> Result<SqliteConnectOptions, DatabaseError> {
-    SqliteConnectOptions::from_str(&path.to_string_lossy())
-        .map_err(|source| DatabaseError::Connect {
-            path: path.into(),
-            source,
-        })
-        .map(|options| {
-            let options = options
-                .create_if_missing(create)
-                .read_only(readonly)
-                .foreign_keys(true)
-                .busy_timeout(if readonly {
-                    Duration::ZERO
-                } else {
-                    WRITER_BUSY_TIMEOUT
-                });
-            if readonly {
-                options
-            } else {
-                options
-                    .journal_mode(SqliteJournalMode::Wal)
-                    .synchronous(SqliteSynchronous::Full)
-            }
-        })
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(create)
+        .read_only(readonly)
+        .foreign_keys(true)
+        .busy_timeout(if readonly {
+            Duration::ZERO
+        } else {
+            WRITER_BUSY_TIMEOUT
+        });
+    Ok(if readonly {
+        options
+    } else {
+        options
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Full)
+    })
 }
 
 fn prepare_parent(path: &Path) -> Result<(), DatabaseError> {
@@ -86,17 +81,51 @@ fn prepare_parent(path: &Path) -> Result<(), DatabaseError> {
             path: parent.into(),
             source,
         })?;
+        #[cfg(windows)]
+        crate::system::windows_security::secure_path(parent, true).map_err(|source| {
+            DatabaseError::SetPermissions {
+                path: parent.into(),
+                source,
+            }
+        })?;
     }
     Ok(())
 }
 
+fn secure_existing_database(path: &Path) -> Result<(), DatabaseError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(DatabaseError::SetPermissions {
+            path: path.into(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "database path is a symbolic link",
+            ),
+        }),
+        Ok(_) => set_owner_only(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(DatabaseError::SetPermissions {
+            path: path.into(),
+            source,
+        }),
+    }
+}
+
 pub(super) fn set_owner_only(path: &Path) -> Result<(), DatabaseError> {
+    #[cfg(unix)]
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|source| {
         DatabaseError::SetPermissions {
             path: path.into(),
             source,
         }
-    })
+    })?;
+    #[cfg(windows)]
+    crate::system::windows_security::secure_path(path, false).map_err(|source| {
+        DatabaseError::SetPermissions {
+            path: path.into(),
+            source,
+        }
+    })?;
+    Ok(())
 }
 
 pub(super) async fn validate_integrity(
@@ -294,5 +323,31 @@ mod tests {
         .unwrap();
         let _ = std::fs::remove_file(path.with_extension("db.pre-sqlx-backup"));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_database_reparse_target_is_rejected_before_migration() {
+        use std::os::windows::fs::symlink_file;
+
+        let root = std::env::temp_dir().join(format!(
+            "prism-database-reparse-{}-{}",
+            std::process::id(),
+            crate::util::timestamp_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("target.sqlite");
+        let database = root.join("repository.sqlite");
+        std::fs::write(&target, b"sentinel").unwrap();
+        if let Err(error) = symlink_file(&target, &database) {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                std::fs::remove_dir_all(root).unwrap();
+                return;
+            }
+            panic!("create database symlink: {error}");
+        }
+        assert!(secure_existing_database(&database).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"sentinel");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

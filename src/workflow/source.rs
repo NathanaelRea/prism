@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io::Write as _;
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
@@ -1789,15 +1790,39 @@ fn discover_trigger_directory(
             continue;
         }
         let path = entry.path();
+        #[cfg(unix)]
         let name = path
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| WorkflowSourceError::Io("trigger filename is not UTF-8".into()))?
             .to_string();
+        #[cfg(windows)]
+        let name = path
+            .file_stem()
+            .filter(|_| {
+                path.extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+            })
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                WorkflowSourceError::Io(format!(
+                    "native Windows external trigger {} must use an .exe filename",
+                    path.display()
+                ))
+            })?
+            .to_string();
         let bytes = fs::read(&path)?;
+        #[cfg(unix)]
         if !bytes.starts_with(b"#!") {
             return Err(WorkflowSourceError::Io(format!(
                 "external trigger {} must begin with a shebang",
+                path.display()
+            )));
+        }
+        #[cfg(windows)]
+        if !bytes.starts_with(b"MZ") {
+            return Err(WorkflowSourceError::Io(format!(
+                "native Windows external trigger {} must be a PE executable",
                 path.display()
             )));
         }
@@ -2023,9 +2048,17 @@ pub fn copy_example(global_root: &Path, name: &str) -> Result<PathBuf, WorkflowS
 
 fn write_new_owner_only(path: &Path, bytes: &[u8]) -> Result<bool, WorkflowSourceError> {
     let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true).mode(0o600);
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
     match options.open(path) {
         Ok(mut file) => {
+            #[cfg(windows)]
+            if let Err(error) = crate::system::windows_security::secure_path(path, false) {
+                drop(file);
+                let _ = fs::remove_file(path);
+                return Err(error.into());
+            }
             file.write_all(bytes)?;
             file.sync_all()?;
             Ok(true)
@@ -2429,6 +2462,7 @@ prompt = "{{title}} publish={{publish}} count={{count}} mode={{mode}}"
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn external_trigger_directives_declare_check_only_and_recovery_policy() {
         let root =
@@ -2446,6 +2480,21 @@ prompt = "{{title}} publish={{publish}} count={{count}} mode={{mode}}"
         assert!(revision.check_only);
         assert!(revision.repeatable_prepare);
         assert!(!revision.repeatable_finalize);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_trigger_discovery_uses_native_executable_stem() {
+        let root =
+            std::env::temp_dir().join(format!("prism-trigger-native-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("triggers")).unwrap();
+        let executable = root.join("triggers/check-clean.exe");
+        fs::write(&executable, b"MZnative-trigger-fixture").unwrap();
+        let catalog = TriggerCatalog::discover(&root, None, false).unwrap();
+        let revision = catalog.get("check-clean").unwrap();
+        assert_eq!(revision.executable.as_deref(), Some(executable.as_path()));
         fs::remove_dir_all(root).unwrap();
     }
 

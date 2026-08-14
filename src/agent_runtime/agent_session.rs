@@ -112,28 +112,28 @@ pub(crate) fn warmup_jobs_for_sessions(
     generations: &mut BTreeMap<AgentSessionSlot, u64>,
     in_flight: &BTreeSet<AgentSessionWarmupKey>,
 ) -> Vec<AgentSessionWarmupJob> {
-    sessions
-        .iter()
-        .map(Session::background_job_snapshot)
-        .filter_map(|session| {
-            let use_ = session_use(repos, generations, &session);
-            (!in_flight.contains(&use_.warmup_key))
-                .then(|| {
-                    repos.get(session.repo_index).and_then(|repo| {
-                        let session_key = session.identity_key(&repo.identity);
-                        let config = harness_configs.get(&session_key)?.clone();
-                        Some(AgentSessionWarmupJob {
-                            key: use_.warmup_key,
-                            repo: repo.repo.clone(),
-                            config,
-                            session,
-                            delay: Duration::ZERO,
-                        })
-                    })
-                })
-                .flatten()
-        })
-        .collect()
+    let mut jobs = Vec::new();
+    for session in sessions.iter().map(Session::background_job_snapshot) {
+        let use_ = session_use(repos, generations, &session);
+        if in_flight.contains(&use_.warmup_key) {
+            continue;
+        }
+        let Some(repo) = repos.get(session.repo_index) else {
+            continue;
+        };
+        let session_key = session.identity_key(&repo.identity);
+        let Some(config) = harness_configs.get(&session_key).cloned() else {
+            continue;
+        };
+        jobs.push(AgentSessionWarmupJob {
+            key: use_.warmup_key,
+            repo: repo.repo.clone(),
+            config,
+            session,
+            delay: Duration::ZERO,
+        });
+    }
+    jobs
 }
 
 pub(crate) fn warmup_job_for_key(
@@ -168,7 +168,7 @@ pub(crate) fn warmup_job_for_key(
 }
 
 pub(crate) fn generation_for_slot(
-    repos: &[ManagedRepo],
+    _repos: &[ManagedRepo],
     generations: &mut BTreeMap<AgentSessionSlot, u64>,
     slot: &AgentSessionSlot,
 ) -> u64 {
@@ -185,42 +185,29 @@ pub(crate) fn generation_for_slot(
         );
         return generation;
     }
-    let started = std::time::Instant::now();
-    let generation = repos
-        .iter()
-        .find(|repo| repo.identity == slot.worktree.repository)
-        .and_then(|repo| {
-            tmux::latest_agent_session_generation(&repo.repo, &repo.config, &slot.worktree.branch)
-        })
-        .unwrap_or(0);
-    generations.insert(slot.clone(), generation);
-    crate::flight_recorder::record(
-        "tmux",
-        "generation",
-        Some(started.elapsed()),
-        vec![
-            crate::flight_recorder::text("target", &slot.worktree.branch),
-            crate::flight_recorder::unsigned("generation", generation),
-            crate::flight_recorder::boolean("cached", false),
-        ],
-    );
-    generation
+    // Session refresh discovers persisted tmux generations asynchronously and
+    // seeds this map. Before that snapshot arrives, generation zero is the
+    // stable initial namespace.
+    0
 }
 
-pub(crate) fn rotate_generation(
+pub(crate) async fn rotate_generation(
     repos: &[ManagedRepo],
     generations: &mut BTreeMap<AgentSessionSlot, u64>,
     slot: AgentSessionSlot,
 ) -> u64 {
     let started = std::time::Instant::now();
     let cached = generation_for_slot(repos, generations, &slot);
-    let observed = repos
+    let observed = if let Some(repo) = repos
         .iter()
         .find(|repo| repo.identity == slot.worktree.repository)
-        .and_then(|repo| {
-            tmux::latest_agent_session_generation(&repo.repo, &repo.config, &slot.worktree.branch)
-        })
-        .unwrap_or(cached);
+    {
+        tmux::latest_agent_session_generation(&repo.repo, &repo.config, &slot.worktree.branch)
+            .await
+            .unwrap_or(cached)
+    } else {
+        cached
+    };
     let generation = cached.max(observed).saturating_add(1);
     let target = slot.worktree.branch.clone();
     generations.insert(slot, generation);
@@ -289,23 +276,24 @@ pub(crate) fn reconcile_worktree_sessions(
     }
 }
 
-pub(crate) fn ensure_session(
+pub(crate) async fn ensure_session(
     repo: &Repository,
     config: &crate::config::Config,
     session: &Session,
     generation: u64,
 ) -> Result<bool, String> {
-    tmux::ensure_agent_session(repo, config, session, generation)
+    tmux::ensure_agent_session(repo, config, session, generation).await
 }
 
-pub(crate) fn ensure_latest_session(
+pub(crate) async fn ensure_latest_session(
     repo: &Repository,
     config: &Config,
     session: &Session,
 ) -> Result<EnsuredAgentSession, String> {
-    let generation =
-        tmux::latest_agent_session_generation(repo, config, &session.branch).unwrap_or(0);
-    let running = ensure_session(repo, config, session, generation)?;
+    let generation = tmux::latest_agent_session_generation(repo, config, &session.branch)
+        .await
+        .unwrap_or(0);
+    let running = ensure_session(repo, config, session, generation).await?;
     let tmux_session =
         tmux::TmuxAgentSession::for_worktree_session(repo, &session.branch, generation)
             .name()
@@ -324,41 +312,37 @@ pub(crate) fn ensure_latest_session(
     })
 }
 
-pub(crate) fn attach_session(
+pub(crate) async fn attach_session(
     repo: &Repository,
     config: &crate::config::Config,
     session: &Session,
     generation: u64,
 ) -> Result<bool, String> {
-    tmux::attach_or_create_agent(repo, config, session, generation)?;
-    Ok(tmux::agent_session_running(
-        repo, config, session, generation,
-    ))
+    tmux::attach_or_create_agent(repo, config, session, generation).await?;
+    Ok(tmux::agent_session_running(repo, config, session, generation).await)
 }
 
-pub(crate) fn attach_window(
+pub(crate) async fn attach_window(
     repo: &Repository,
     config: &crate::config::Config,
     session: &Session,
     generation: u64,
     window: tmux::TmuxWindow,
 ) -> Result<bool, String> {
-    tmux::attach_or_create_window(repo, config, session, generation, window)?;
-    Ok(tmux::agent_session_running(
-        repo, config, session, generation,
-    ))
+    tmux::attach_or_create_window(repo, config, session, generation, window).await?;
+    Ok(tmux::agent_session_running(repo, config, session, generation).await)
 }
 
-pub(crate) fn retire_generation(
+pub(crate) async fn retire_generation(
     repo: &Repository,
     config: &crate::config::Config,
     branch: &str,
     generation: u64,
 ) {
-    let _ = tmux::kill_agent_session(repo, config, branch, generation);
+    let _ = tmux::kill_agent_session(repo, config, branch, generation).await;
 }
 
-pub(crate) fn submit_prompt_with_selection(
+pub(crate) async fn submit_prompt_with_selection(
     repo: &Repository,
     config: &crate::config::Config,
     session: &Session,
@@ -366,13 +350,12 @@ pub(crate) fn submit_prompt_with_selection(
     prompt: &str,
     selection: crate::harness::AgentSelection<'_>,
 ) -> Result<bool, String> {
-    tmux::paste_agent_prompt_with_selection(repo, config, session, generation, prompt, selection)?;
-    Ok(tmux::agent_session_running(
-        repo, config, session, generation,
-    ))
+    tmux::paste_agent_prompt_with_selection(repo, config, session, generation, prompt, selection)
+        .await?;
+    Ok(tmux::agent_session_running(repo, config, session, generation).await)
 }
 
-pub(crate) fn apply_attach_result(
+pub(crate) async fn apply_attach_result(
     repos: &[ManagedRepo],
     sessions: &mut [Session],
     generations: &mut BTreeMap<AgentSessionSlot, u64>,
@@ -391,8 +374,9 @@ pub(crate) fn apply_attach_result(
         completion.config,
         completion.branch,
         completion.session_use.generation,
-    );
-    let next_generation = rotate_generation(repos, generations, slot.clone());
+    )
+    .await;
+    let next_generation = rotate_generation(repos, generations, slot.clone()).await;
     AgentSessionLifecycleOutcome {
         delayed_warmup: Some(AgentSessionDelayedWarmup {
             key: AgentSessionWarmupKey::new(slot, next_generation),
@@ -502,8 +486,12 @@ pub(crate) fn remove_owned_log(repo: &Repository, branch: &str) -> Result<(), St
     Ok(())
 }
 
-pub(crate) fn shutdown(repo: &Repository, config: &Config, branch: &str) -> Result<(), String> {
-    tmux::kill_agent_sessions_for_branch(repo, config, branch)
+pub(crate) async fn shutdown(
+    repo: &Repository,
+    config: &Config,
+    branch: &str,
+) -> Result<(), String> {
+    tmux::kill_agent_sessions_for_branch(repo, config, branch).await
 }
 
 #[cfg(test)]
@@ -524,22 +512,22 @@ mod tests {
     use crate::session::{Session, worktree_incarnation};
     use crate::tui::ManagedRepo;
 
-    #[test]
-    fn idle_tmux_opencode_session_does_not_count_as_running_agent() {
+    #[tokio::test]
+    async fn idle_tmux_opencode_session_does_not_count_as_running_agent() {
         let state = observed_agent_state(AgentState::Idle, true);
 
         assert_eq!(state, Some(AgentState::Attached));
     }
 
-    #[test]
-    fn stale_running_state_without_process_is_cleared() {
+    #[tokio::test]
+    async fn stale_running_state_without_process_is_cleared() {
         let state = observed_agent_state(AgentState::Running, false);
 
         assert_eq!(state, Some(AgentState::ExitedOk));
     }
 
-    #[test]
-    fn attach_result_rotates_generation_and_schedules_delayed_rewarm_when_agent_exits() {
+    #[tokio::test]
+    async fn attach_result_rotates_generation_and_schedules_delayed_rewarm_when_agent_exits() {
         let repo = Repository {
             root: PathBuf::from("/tmp/prism-agent-session-test"),
         };
@@ -562,7 +550,8 @@ mod tests {
                 branch: "feature",
                 running: false,
             },
-        );
+        )
+        .await;
 
         assert_eq!(sessions[0].agent_state, AgentState::ExitedOk);
         assert_eq!(generations.get(&slot), Some(&3));
@@ -571,8 +560,8 @@ mod tests {
         assert!(!delayed.delay.is_zero());
     }
 
-    #[test]
-    fn warmup_job_for_key_rejects_stale_or_in_flight_generations() {
+    #[tokio::test]
+    async fn warmup_job_for_key_rejects_stale_or_in_flight_generations() {
         let repo = Repository {
             root: PathBuf::from("/tmp/prism-agent-session-test"),
         };
@@ -611,8 +600,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn warmup_jobs_for_sessions_uses_current_generation_interface() {
+    #[tokio::test]
+    async fn warmup_jobs_for_sessions_uses_current_generation_interface() {
         let repo = Repository {
             root: PathBuf::from("/tmp/prism-agent-session-test"),
         };
@@ -637,8 +626,8 @@ mod tests {
         assert_eq!(jobs[0].session.branch, "feature");
     }
 
-    #[test]
-    fn removed_session_invalidates_in_flight_generation_across_repository_reorder() {
+    #[tokio::test]
+    async fn removed_session_invalidates_in_flight_generation_across_repository_reorder() {
         let first = ManagedRepo::new(
             Repository {
                 root: PathBuf::from("/tmp/repo-a"),
@@ -664,8 +653,8 @@ mod tests {
         assert!(!super::key_is_current(&generations, &stale));
     }
 
-    #[test]
-    fn recreated_session_rejects_warmup_for_previous_incarnation() {
+    #[tokio::test]
+    async fn recreated_session_rejects_warmup_for_previous_incarnation() {
         let managed = ManagedRepo::new(
             Repository {
                 root: PathBuf::from("/tmp/repo"),
@@ -705,8 +694,8 @@ mod tests {
         assert_eq!(recreated.agent_state, AgentState::Idle);
     }
 
-    #[test]
-    fn git_directory_activity_does_not_rotate_default_branch_generation() {
+    #[tokio::test]
+    async fn git_directory_activity_does_not_rotate_default_branch_generation() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()

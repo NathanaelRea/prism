@@ -2,32 +2,36 @@ use crate::agent::AgentState;
 use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey, AgentSessionWarmupResult};
 use crate::config::Config;
 use crate::opencode::{OpencodeState, OpencodeStatus, parse_event_payload};
+#[cfg(unix)]
 use crate::platform::CommandCandidate;
 use crate::remote::{PrCache, PrDetails, PrSummary, pr_summary_or_error};
 use crate::repo::Repository;
 use crate::session::{DeleteWorktreeOutcome, Session};
 use crate::tui::{
     DefaultBranchPollResult, DeleteSessionKey, DeleteSessionResult, OpencodeEventResult,
-    OpencodeListenerKey, OpencodePollKey, OpencodePollResult, PanelFocus, PrPollKey, Tui,
-    TuiJobKey, TuiJobKind, WtObservation, WtPollResult,
+    OpencodeListenerKey, OpencodePollKey, OpencodePollResult, PrPollKey, Tui, TuiJobKey,
+    TuiJobKind, WtObservation, WtPollResult,
 };
 
+#[cfg(unix)]
+use super::run_browser_opener;
 use super::worktrees::development_url_opened_message;
 use super::{
     apply_bulk_review_resolution, archived_picker_overflow_message, discover_wt_columns,
     open_http_url_in_browser, pr_target_choice_list, remote_create_mutation_target,
-    remote_pr_choice_keys, remote_pr_worktree_branch, run_browser_opener, status_label_with_behind,
+    remote_pr_choice_keys, remote_pr_worktree_branch, status_label_with_behind,
     unresolved_review_thread_ids, worktree_column_choices,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-#[test]
-fn declined_bulk_review_resolution_does_not_resolve_threads() {
+#[tokio::test(flavor = "multi_thread")]
+async fn declined_bulk_review_resolution_does_not_resolve_threads() {
     let resolved = RefCell::new(Vec::new());
 
     let count = apply_bulk_review_resolution(
@@ -44,8 +48,8 @@ fn declined_bulk_review_resolution_does_not_resolve_threads() {
     assert!(resolved.borrow().is_empty());
 }
 
-#[test]
-fn confirmed_bulk_review_resolution_resolves_each_thread_once() {
+#[tokio::test(flavor = "multi_thread")]
+async fn confirmed_bulk_review_resolution_resolves_each_thread_once() {
     let resolved = RefCell::new(Vec::new());
 
     let count = apply_bulk_review_resolution(
@@ -66,8 +70,8 @@ fn confirmed_bulk_review_resolution_resolves_each_thread_once() {
     assert_eq!(resolved.into_inner(), vec!["thread-1", "thread-2"]);
 }
 
-#[test]
-fn review_resolution_uses_only_unresolved_threads_in_the_observed_details() {
+#[tokio::test(flavor = "multi_thread")]
+async fn review_resolution_uses_only_unresolved_threads_in_the_observed_details() {
     let details = PrDetails {
         review_comments: vec![
             crate::remote::PrReviewComment {
@@ -95,8 +99,9 @@ fn review_resolution_uses_only_unresolved_threads_in_the_observed_details() {
     );
 }
 
-#[test]
-fn browser_opener_invokes_first_available_candidate() {
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn browser_opener_invokes_first_available_candidate() {
     let temp = unique_temp_dir("prism-browser-opener-test");
     fs::create_dir_all(&temp).unwrap();
     let log = temp.join("open.log");
@@ -130,7 +135,9 @@ exit 0
         },
     ];
 
-    let used = run_browser_opener(&candidates, "https://example.test/pr/42").unwrap();
+    let used = run_browser_opener(&candidates, "https://example.test/pr/42")
+        .await
+        .unwrap();
 
     assert_eq!(used, opener);
     assert_eq!(
@@ -140,16 +147,16 @@ exit 0
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn development_browser_rejects_non_http_urls_without_exposing_the_value() {
+#[tokio::test(flavor = "multi_thread")]
+async fn development_browser_rejects_non_http_urls_without_exposing_the_value() {
     let secret_url = "file:///tmp/private-token-123";
-    let error = open_http_url_in_browser(secret_url).unwrap_err();
+    let error = open_http_url_in_browser(secret_url).await.unwrap_err();
     assert_eq!(error, "development URL must use http or https");
     assert!(!error.contains(secret_url));
 }
 
-#[test]
-fn worktree_url_column_choices_are_unconditional_and_semantically_deduplicated() {
+#[tokio::test(flavor = "multi_thread")]
+async fn worktree_url_column_choices_are_unconditional_and_semantically_deduplicated() {
     let unconditional = worktree_column_choices(&[], &[], 0);
     assert_eq!(
         unconditional
@@ -182,8 +189,8 @@ fn worktree_url_column_choices_are_unconditional_and_semantically_deduplicated()
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn discover_wt_columns_flattens_available_primitive_values() {
+#[tokio::test(flavor = "multi_thread")]
+async fn discover_wt_columns_flattens_available_primitive_values() {
     let columns = discover_wt_columns(
         r#"{
             "path":"/repo/feature",
@@ -212,8 +219,8 @@ fn discover_wt_columns_flattens_available_primitive_values() {
     assert!(!columns.contains_key("labels"));
 }
 
-#[test]
-fn remote_pr_picker_uses_stable_keys_and_preserves_branch_names() {
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_pr_picker_uses_stable_keys_and_preserves_branch_names() {
     let keys = remote_pr_choice_keys();
 
     assert_eq!(keys.first().map(String::as_str), Some("1"));
@@ -278,8 +285,8 @@ fn pr_summary_or_error_returns_refresh_error() {
     assert_eq!(error, "gh pr view: authentication failed");
 }
 
-#[test]
-fn default_branch_status_replaces_stale_behind_count() {
+#[tokio::test(flavor = "multi_thread")]
+async fn default_branch_status_replaces_stale_behind_count() {
     assert_eq!(status_label_with_behind("clean", 2), "behind 2");
     assert_eq!(status_label_with_behind("dirty 1 behind 9", 0), "dirty 1");
     assert_eq!(
@@ -288,8 +295,8 @@ fn default_branch_status_replaces_stale_behind_count() {
     );
 }
 
-#[test]
-fn archived_picker_reports_overflow_instead_of_truncating() {
+#[tokio::test(flavor = "multi_thread")]
+async fn archived_picker_reports_overflow_instead_of_truncating() {
     assert!(archived_picker_overflow_message(35, 35).is_none());
 
     let message = archived_picker_overflow_message(36, 35).unwrap();
@@ -298,8 +305,8 @@ fn archived_picker_reports_overflow_instead_of_truncating() {
     assert!(message.contains("picker limit 35"));
 }
 
-#[test]
-fn opencode_poll_does_not_mark_busy_session_done_before_completed_message() {
+#[tokio::test(flavor = "multi_thread")]
+async fn opencode_poll_does_not_mark_busy_session_done_before_completed_message() {
     let temp = unique_temp_dir("prism-opencode-status-order-test");
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
     let mut session = test_session(temp.join("worktree"), "feature");
@@ -392,8 +399,8 @@ fn opencode_poll_does_not_mark_busy_session_done_before_completed_message() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn opencode_poll_does_not_mark_reconnected_running_session_done_before_completed_message() {
+#[tokio::test(flavor = "multi_thread")]
+async fn opencode_poll_does_not_mark_reconnected_running_session_done_before_completed_message() {
     let temp = unique_temp_dir("prism-opencode-reconnected-status-order-test");
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
     let mut session = test_session(temp.join("worktree"), "feature");
@@ -453,8 +460,8 @@ fn opencode_poll_does_not_mark_reconnected_running_session_done_before_completed
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn opencode_permission_event_marks_session_as_needing_input() {
+#[tokio::test(flavor = "multi_thread")]
+async fn opencode_permission_event_marks_session_as_needing_input() {
     let temp = unique_temp_dir("prism-opencode-permission-status-test");
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
     let mut session = test_session(temp.join("worktree"), "feature");
@@ -493,8 +500,8 @@ fn opencode_permission_event_marks_session_as_needing_input() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn opencode_event_from_stale_generation_is_rejected() {
+#[tokio::test(flavor = "multi_thread")]
+async fn opencode_event_from_stale_generation_is_rejected() {
     let temp = unique_temp_dir("prism-opencode-stale-generation-test");
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
     let mut session = test_session(temp.join("worktree"), "feature");
@@ -517,8 +524,8 @@ fn opencode_event_from_stale_generation_is_rejected() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn opencode_listener_replaces_reused_url_when_stream_identity_changes() {
+#[tokio::test(flavor = "multi_thread")]
+async fn opencode_listener_replaces_reused_url_when_stream_identity_changes() {
     let temp = unique_temp_dir("prism-opencode-listener-identity-test");
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
     let mut session = test_session(temp.join("worktree"), "feature");
@@ -535,8 +542,8 @@ fn opencode_listener_replaces_reused_url_when_stream_identity_changes() {
         old.generation,
         None,
         "obsolete-opencode-listener".to_string(),
-        |context| {
-            while !context.wait(Duration::from_secs(60)) {}
+        |context| async move {
+            while !context.wait(Duration::from_secs(60)).await {}
             Ok(None)
         },
     );
@@ -556,8 +563,8 @@ fn opencode_listener_replaces_reused_url_when_stream_identity_changes() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn opencode_prompt_submission_clears_done_status_immediately() {
+#[tokio::test(flavor = "multi_thread")]
+async fn opencode_prompt_submission_clears_done_status_immediately() {
     let temp = unique_temp_dir("prism-opencode-prompt-status-test");
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
     let mut config = test_config();
@@ -570,6 +577,7 @@ fn opencode_prompt_submission_clears_done_status_immediately() {
     tui.prompt_submissions = Some(Vec::new());
 
     tui.paste_prompt_into_tmux_agent(0, "try again", false)
+        .await
         .unwrap();
 
     assert_eq!(
@@ -585,8 +593,9 @@ fn opencode_prompt_submission_clears_done_status_immediately() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn automatic_pr_polling_does_not_block_input_loop() {
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn automatic_pr_polling_does_not_block_input_loop() {
     let temp = unique_temp_dir("prism-pr-poll-test");
     fs::create_dir_all(&temp).unwrap();
     let gh = temp.join("gh");
@@ -624,8 +633,9 @@ exit 1
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn idle_pr_polling_does_not_launch_git_for_worktree_sessions() {
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn idle_pr_polling_does_not_launch_git_for_worktree_sessions() {
     let temp = unique_temp_dir("prism-idle-pr-poll-test");
     fs::create_dir_all(&temp).unwrap();
     let git_log = temp.join("git.log");
@@ -662,8 +672,9 @@ fn idle_pr_polling_does_not_launch_git_for_worktree_sessions() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn delete_session_does_not_block_input_loop() {
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_session_does_not_block_input_loop() {
     let temp = unique_temp_dir("prism-delete-nonblocking-test");
     fs::create_dir_all(&temp).unwrap();
     let git_log = temp.join("git.log");
@@ -783,8 +794,8 @@ exit 0
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn completed_delete_schedules_inventory_refresh_without_tui_thread_io() {
+#[tokio::test(flavor = "multi_thread")]
+async fn completed_delete_schedules_inventory_refresh_without_tui_thread_io() {
     let temp = unique_temp_dir("prism-delete-refresh-boundary-test");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -833,8 +844,9 @@ fn completed_delete_schedules_inventory_refresh_without_tui_thread_io() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn failed_async_delete_restores_hidden_worktree() {
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_async_delete_restores_hidden_worktree() {
     let temp = unique_temp_dir("prism-delete-restore-test");
     fs::create_dir_all(&temp).unwrap();
     let worktree = temp.join("worktree");
@@ -923,8 +935,9 @@ exit 0
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn phase_1_branch_delete_failure_reconciles_without_vanished_worktree_path() {
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn phase_1_branch_delete_failure_reconciles_without_vanished_worktree_path() {
     let temp = unique_temp_dir("prism-phase-1-delete-reconcile-test");
     fs::create_dir_all(&temp).unwrap();
     let worktree = temp.join("worktree");
@@ -1017,8 +1030,9 @@ exit 0
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn unavailable_remote_preserves_stale_live_and_persisted_display_state() {
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn unavailable_remote_preserves_stale_live_and_persisted_display_state() {
     let temp = unique_temp_dir("prism-phase-1-removed-remote-poll-test");
     fs::create_dir_all(&temp).unwrap();
     let git = temp.join("git");
@@ -1073,8 +1087,9 @@ fn unavailable_remote_preserves_stale_live_and_persisted_display_state() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn missing_github_remote_clears_hidden_non_pollable_pr_cache_state() {
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_github_remote_clears_hidden_non_pollable_pr_cache_state() {
     let temp = unique_temp_dir("prism-removed-remote-hidden-cache-test");
     fs::create_dir_all(&temp).unwrap();
     let git = temp.join("git");
@@ -1118,8 +1133,8 @@ fn wait_for_pr_persistence(tui: &mut Tui) {
     }
 }
 
-#[test]
-fn default_branch_starts_only_repository_level_remote_polling() {
+#[tokio::test(flavor = "multi_thread")]
+async fn default_branch_starts_only_repository_level_remote_polling() {
     let temp = unique_temp_dir("prism-default-branch-pr-poll-test");
     fs::create_dir_all(&temp).unwrap();
 
@@ -1138,8 +1153,9 @@ fn default_branch_starts_only_repository_level_remote_polling() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn tmux_agent_warmup_does_not_block_startup() {
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn tmux_agent_warmup_does_not_block_startup() {
     let temp = unique_temp_dir("prism-tmux-warmup-test");
     fs::create_dir_all(&temp).unwrap();
     let state = temp.join("tmux-state");
@@ -1226,8 +1242,9 @@ exit 0
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn attach_waits_for_selected_tmux_warmup() {
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn attach_waits_for_selected_tmux_warmup() {
     let temp = unique_temp_dir("prism-tmux-attach-wait-test");
     fs::create_dir_all(&temp).unwrap();
     let tmux = temp.join("tmux");
@@ -1282,7 +1299,7 @@ exit 0
     });
 
     let started = Instant::now();
-    tui.attach_selected_tmux_session().unwrap();
+    tui.attach_selected_tmux_session().await.unwrap();
 
     assert!(
         started.elapsed() >= Duration::from_millis(100),
@@ -1299,8 +1316,9 @@ exit 0
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn prompt_paste_targets_tmux_agent_session() {
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn prompt_paste_targets_tmux_agent_session() {
     let temp = unique_temp_dir("prism-tmux-prompt-paste-test");
     fs::create_dir_all(&temp).unwrap();
     let log = temp.join("tmux.log");
@@ -1361,6 +1379,7 @@ exit 1
     let mut tui = Tui::new_single(repo, config, vec![session]);
 
     tui.paste_prompt_into_tmux_agent(0, "build the thing", false)
+        .await
         .unwrap();
 
     assert_eq!(fs::read_to_string(&prompt_file).unwrap(), "build the thing");
@@ -1372,8 +1391,8 @@ exit 1
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn stale_tmux_warmup_result_does_not_update_current_generation() {
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_tmux_warmup_result_does_not_update_current_generation() {
     let temp = unique_temp_dir("prism-tmux-stale-generation-test");
     fs::create_dir_all(&temp).unwrap();
     let mut config = test_config();
@@ -1397,8 +1416,8 @@ fn stale_tmux_warmup_result_does_not_update_current_generation() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn tmux_warmup_liveness_does_not_replay_current_notification() {
+#[tokio::test(flavor = "multi_thread")]
+async fn tmux_warmup_liveness_does_not_replay_current_notification() {
     let temp = unique_temp_dir("prism-tmux-notification-replay-test");
     fs::create_dir_all(&temp).unwrap();
     let mut config = test_config();
@@ -1439,8 +1458,8 @@ fn tmux_warmup_liveness_does_not_replay_current_notification() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn tmux_warmup_liveness_can_report_a_distinct_completion() {
+#[tokio::test(flavor = "multi_thread")]
+async fn tmux_warmup_liveness_can_report_a_distinct_completion() {
     let temp = unique_temp_dir("prism-tmux-completion-notification-test");
     fs::create_dir_all(&temp).unwrap();
     let mut config = test_config();
@@ -1474,8 +1493,8 @@ fn tmux_warmup_liveness_can_report_a_distinct_completion() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn worktrunk_columns_reject_deleted_and_recreated_session_result() {
+#[tokio::test(flavor = "multi_thread")]
+async fn worktrunk_columns_reject_deleted_and_recreated_session_result() {
     let temp = unique_temp_dir("prism-wt-recreated-session-result-test");
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
     let mut session = test_session(temp.join("worktree"), "feature");
@@ -1510,8 +1529,8 @@ fn worktrunk_columns_reject_deleted_and_recreated_session_result() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn worktrunk_failure_preserves_successful_columns_as_stale() {
+#[tokio::test(flavor = "multi_thread")]
+async fn worktrunk_failure_preserves_successful_columns_as_stale() {
     let temp = unique_temp_dir("prism-wt-stale-observation-test");
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
     let session = test_session(temp.join("worktree"), "feature");
@@ -1519,7 +1538,9 @@ fn worktrunk_failure_preserves_successful_columns_as_stale() {
     config
         .tools
         .insert("wt".to_string(), "/definitely/missing/wt".to_string());
-    let failure = crate::worktrunk::observe_repository(&repo, &config).unwrap_err();
+    let failure = crate::worktrunk::observe_repository(&repo, &config)
+        .await
+        .unwrap_err();
     let mut tui = Tui::new_single(repo, config, vec![session]);
     let key = tui.sessions[0].identity_key(&tui.repos[0].identity);
     let observed_at = std::time::Instant::now();
@@ -1558,8 +1579,8 @@ fn worktrunk_failure_preserves_successful_columns_as_stale() {
     ));
 }
 
-#[test]
-fn stale_development_url_reports_generic_feedback_without_the_cached_url() {
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_development_url_reports_generic_feedback_without_the_cached_url() {
     let cached_url = "http://localhost:3000/private-token-123";
     let message = development_url_opened_message(true);
     assert_eq!(
@@ -1569,8 +1590,8 @@ fn stale_development_url_reports_generic_feedback_without_the_cached_url() {
     assert!(!message.contains(cached_url));
 }
 
-#[test]
-fn worktrunk_refresh_requests_coalesce_while_poll_is_in_flight() {
+#[tokio::test(flavor = "multi_thread")]
+async fn worktrunk_refresh_requests_coalesce_while_poll_is_in_flight() {
     let temp = unique_temp_dir("prism-wt-coalesced-refresh-test");
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
     let mut tui = Tui::new_single(repo, test_config(), Vec::new());
@@ -1583,8 +1604,8 @@ fn worktrunk_refresh_requests_coalesce_while_poll_is_in_flight() {
     assert!(tui.repos[0].wt_poll_in_flight);
 }
 
-#[test]
-fn worktrunk_hook_log_inventory_is_repository_scoped_and_preserves_stale_entries() {
+#[tokio::test(flavor = "multi_thread")]
+async fn worktrunk_hook_log_inventory_is_repository_scoped_and_preserves_stale_entries() {
     let temp = unique_temp_dir("prism-wt-hook-log-cache-test");
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
     let mut tui = Tui::new_single(repo, test_config(), Vec::new());
@@ -1628,8 +1649,8 @@ fn worktrunk_hook_log_inventory_is_repository_scoped_and_preserves_stale_entries
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn worktrunk_hook_log_refresh_coalesces_while_in_flight() {
+#[tokio::test(flavor = "multi_thread")]
+async fn worktrunk_hook_log_refresh_coalesces_while_in_flight() {
     let temp = unique_temp_dir("prism-wt-hook-log-coalesce-test");
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
     let mut tui = Tui::new_single(repo, test_config(), Vec::new());
@@ -1643,8 +1664,8 @@ fn worktrunk_hook_log_refresh_coalesces_while_in_flight() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn default_branch_result_is_rejected_after_default_branch_config_changes() {
+#[tokio::test(flavor = "multi_thread")]
+async fn default_branch_result_is_rejected_after_default_branch_config_changes() {
     let temp = unique_temp_dir("prism-default-branch-config-result-test");
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
     let mut config = test_config();
@@ -1666,8 +1687,9 @@ fn default_branch_result_is_rejected_after_default_branch_config_changes() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn attach_creates_session_when_pre_attach_resize_finds_it_missing() {
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn attach_creates_session_when_pre_attach_resize_finds_it_missing() {
     let temp = unique_temp_dir("prism-tmux-missing-before-attach-test");
     fs::create_dir_all(&temp).unwrap();
     let log = temp.join("tmux.log");
@@ -1727,8 +1749,10 @@ exit 0
     let session = test_session(temp.join("worktree"), "feature");
     let mut tui = Tui::new_single(repo, config, vec![session]);
 
-    tui.prepare_tmux_session_for_attach(0, (120, 39)).unwrap();
-    tui.attach_tmux_session_for_index(0).unwrap();
+    tui.prepare_tmux_session_for_attach(0, (120, 39))
+        .await
+        .unwrap();
+    tui.attach_tmux_session_for_index(0).await.unwrap();
 
     let commands = fs::read_to_string(&log).unwrap();
     assert!(commands.contains("resize-window -x 120 -y 39"));
@@ -1738,8 +1762,9 @@ exit 0
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn attach_schedules_delayed_rewarm_after_return() {
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn attach_schedules_delayed_rewarm_after_return() {
     let temp = unique_temp_dir("prism-tmux-delayed-rewarm-test");
     fs::create_dir_all(&temp).unwrap();
     let log = temp.join("tmux.log");
@@ -1792,11 +1817,13 @@ exit 0
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
     let session = test_session(temp.join("worktree"), "feature");
     let mut tui = Tui::new_single(repo, config, vec![session]);
-    tui.focused_panel = PanelFocus::Worktrees;
+    tui.focused_panel = crate::tui::PanelFocus::Worktrees;
     tui.tmux_portal_size = Some((72, 18));
 
-    tui.prepare_tmux_session_for_attach(0, (120, 39)).unwrap();
-    tui.attach_tmux_session_for_index(0).unwrap();
+    tui.prepare_tmux_session_for_attach(0, (120, 39))
+        .await
+        .unwrap();
+    tui.attach_tmux_session_for_index(0).await.unwrap();
 
     let wait_started = Instant::now();
     while !tui.tmux_warmups_in_flight.is_empty() && wait_started.elapsed() < Duration::from_secs(5)

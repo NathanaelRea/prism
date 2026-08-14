@@ -1,33 +1,51 @@
 //! Fresh-session Agent execution for prompt-first Workflow Steps.
 
 use std::future::Future;
-use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::process::Command;
+use crate::process::{CancellationToken, Command, LiveProcessCompletion, Outcome, ProcessInput};
 
 use super::step_trigger::{AgentOutcome, AgentOutcomeStatus};
 
 static SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+struct InvocationCleanup(crate::harness::Invocation);
+
+impl std::ops::Deref for InvocationCleanup {
+    type Target = crate::harness::Invocation;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for InvocationCleanup {
+    fn drop(&mut self) {
+        self.0.cleanup();
+    }
+}
+
 pub type AgentFuture<'a> =
     Pin<Box<dyn Future<Output = Result<AgentOutcome, AgentExecutionError>> + Send + 'a>>;
 
 #[derive(Clone, Debug, Default)]
-pub struct AgentCancellation(Arc<AtomicBool>);
+pub struct AgentCancellation(CancellationToken);
 
 impl AgentCancellation {
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
+        self.0.cancel();
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.is_cancelled()
+    }
+
+    pub(crate) fn token(&self) -> CancellationToken {
+        self.0.clone()
     }
 }
 
@@ -137,110 +155,80 @@ async fn execute_invocation(
     stdout_limit: usize,
     stderr_limit: usize,
 ) -> Result<AgentOutcome, AgentExecutionError> {
+    let invocation = InvocationCleanup(invocation);
     let (program, args) = invocation
         .argv
         .split_first()
         .ok_or_else(|| AgentExecutionError::Configuration("harness invocation is empty".into()))?;
-    let mut command = Command::new(program);
-    command.as_std_mut().process_group(0);
-    command
+    let command = Command::new(program)
         .args(args)
         .current_dir(&request.worktree)
-        .envs(&invocation.environment)
-        .kill_on_drop(true)
-        .stdin(if invocation.stdin.is_some() {
-            std::process::Stdio::piped()
-        } else {
-            std::process::Stdio::null()
-        })
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let mut child = command.spawn().map_err(AgentExecutionError::Io)?;
-    let process_id = child.id();
-    let mut process_group = process_id.map(ProcessGroupGuard::new);
-    if let Some(input) = &invocation.stdin {
-        let mut stdin = child.stdin.take().ok_or_else(|| {
-            AgentExecutionError::Protocol("harness stdin was not captured".into())
-        })?;
-        stdin
-            .write_all(input.as_bytes())
-            .await
-            .map_err(AgentExecutionError::Io)?;
-    }
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| AgentExecutionError::Protocol("harness stdout was not captured".into()))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| AgentExecutionError::Protocol("harness stderr was not captured".into()))?;
-    let stdout_task = tokio::spawn(read_bounded(stdout, stdout_limit));
-    let stderr_task = tokio::spawn(read_bounded(stderr, stderr_limit));
-    let started = tokio::time::Instant::now();
-    let status = loop {
+        .envs(&invocation.environment);
+    let input = invocation
+        .stdin
+        .as_deref()
+        .map_or(ProcessInput::Null, |input| {
+            ProcessInput::Bytes(input.as_bytes())
+        });
+    let cancellation = request.cancellation.token();
+    let mut process = crate::process::spawn_streaming_configured(
+        command,
+        crate::process::ProcessPolicy::WorkflowStep,
+        timeout,
+        input,
+        Some(cancellation),
+        crate::process::ProcessDescriptor::new("workflow.agent.execute"),
+        crate::harness::WORKFLOW_OUTPUT_CHANNEL_CAPACITY,
+        crate::harness::MAX_OUTPUT_LINE_BYTES,
+        stdout_limit,
+        stderr_limit,
+    )
+    .await
+    .map_err(|error| {
         if request.cancellation.is_cancelled() {
-            terminate_process_group(&mut child).await;
-            let _ = child.wait().await;
-            let _ = stdout_task.await;
-            let _ = stderr_task.await;
-            if let Some(process_group) = &mut process_group {
-                process_group.disarm();
-            }
-            invocation.cleanup();
-            return Err(AgentExecutionError::Cancelled);
+            AgentExecutionError::Cancelled
+        } else {
+            AgentExecutionError::Protocol(format!("execute Agent subprocess: {error}"))
         }
-        let elapsed = started.elapsed();
-        if elapsed >= timeout {
-            terminate_process_group(&mut child).await;
-            let _ = child.wait().await;
-            let _ = stdout_task.await;
-            let _ = stderr_task.await;
-            if let Some(process_group) = &mut process_group {
-                process_group.disarm();
-            }
-            invocation.cleanup();
+    })?;
+    let process_id = Some(process.pid());
+    // Lines are a bounded live-display side channel only. Protocol parsing and
+    // byte limits consume the independent raw captures so unterminated output,
+    // non-UTF-8 bytes, CRLF, and large lines remain byte-exact.
+    while process.next_line().await.is_some() {}
+    let completion = process.wait().await;
+    let (stdout, stderr) = process.captured_output();
+    if request.cancellation.is_cancelled() {
+        return Err(AgentExecutionError::Cancelled);
+    }
+    match completion {
+        LiveProcessCompletion::Canceled => return Err(AgentExecutionError::Cancelled),
+        LiveProcessCompletion::Exited(Outcome::TimedOut | Outcome::InactivityTimedOut) => {
             return Err(AgentExecutionError::Timeout(timeout));
         }
-        match tokio::time::timeout(Duration::from_millis(100), child.wait()).await {
-            Ok(status) => break status.map_err(AgentExecutionError::Io)?,
-            Err(_) => continue,
+        LiveProcessCompletion::Failed(error) => {
+            return Err(AgentExecutionError::Protocol(format!(
+                "execute Agent subprocess: {error}"
+            )));
         }
-    };
-    let drain_timeout = timeout.min(Duration::from_secs(5));
-    let (stdout, stderr) = match tokio::time::timeout(drain_timeout, async {
-        let stdout = stdout_task.await.map_err(|error| {
-            AgentExecutionError::Protocol(format!("join harness stdout: {error}"))
-        })??;
-        let stderr = stderr_task.await.map_err(|error| {
-            AgentExecutionError::Protocol(format!("join harness stderr: {error}"))
-        })??;
-        Ok::<_, AgentExecutionError>((stdout, stderr))
-    })
-    .await
-    {
-        Ok(output) => output?,
-        Err(_) => {
-            invocation.cleanup();
-            return Err(AgentExecutionError::Protocol(
-                "Agent output streams did not close after process exit".into(),
-            ));
+        LiveProcessCompletion::Exited(Outcome::Exited(0)) => {}
+        LiveProcessCompletion::Exited(outcome) => {
+            return Err(AgentExecutionError::Process {
+                status: outcome.name().to_string(),
+                diagnostic: single_line(&String::from_utf8_lossy(&stderr.bytes)),
+            });
         }
-    };
-    if let Some(process_group) = &mut process_group {
-        process_group.disarm();
     }
-    invocation.cleanup();
-    if stdout.truncated {
+    if stdout.total_bytes > stdout_limit as u64 {
         return Err(AgentExecutionError::OutputLimit {
             stream: "stdout",
             limit: stdout_limit,
         });
     }
-    if !status.success() {
-        return Err(AgentExecutionError::Process {
-            status: status.to_string(),
-            diagnostic: single_line(&String::from_utf8_lossy(&stderr.bytes)),
+    if stderr.total_bytes > stderr_limit as u64 {
+        return Err(AgentExecutionError::OutputLimit {
+            stream: "stderr",
+            limit: stderr_limit,
         });
     }
     let (native_session, final_text) = extract_agent_result(&adapter, &stdout.bytes);
@@ -278,69 +266,6 @@ async fn execute_invocation(
         }),
         final_text,
     })
-}
-
-struct ProcessGroupGuard {
-    process_id: u32,
-    armed: bool,
-}
-
-impl ProcessGroupGuard {
-    fn new(process_id: u32) -> Self {
-        Self {
-            process_id,
-            armed: true,
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for ProcessGroupGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            let _ =
-                crate::system::process::send_process_group_signal(self.process_id, libc::SIGKILL);
-        }
-    }
-}
-
-struct BoundedOutput {
-    bytes: Vec<u8>,
-    truncated: bool,
-}
-
-async fn terminate_process_group(child: &mut tokio::process::Child) {
-    if let Some(process_id) = child.id() {
-        let _ = crate::system::process::send_process_group_signal(process_id, libc::SIGKILL);
-    }
-    let _ = child.kill().await;
-}
-
-async fn read_bounded(
-    mut reader: impl AsyncRead + Unpin,
-    limit: usize,
-) -> Result<BoundedOutput, AgentExecutionError> {
-    let mut output = Vec::with_capacity(limit.min(8192));
-    let mut buffer = [0_u8; 8192];
-    let mut truncated = false;
-    loop {
-        let count = reader
-            .read(&mut buffer)
-            .await
-            .map_err(AgentExecutionError::Io)?;
-        if count == 0 {
-            return Ok(BoundedOutput {
-                bytes: output,
-                truncated,
-            });
-        }
-        let remaining = limit.saturating_sub(output.len());
-        output.extend_from_slice(&buffer[..count.min(remaining)]);
-        truncated |= count > remaining;
-    }
 }
 
 fn extract_agent_result(adapter: &str, stdout: &[u8]) -> (Option<String>, Option<String>) {
@@ -513,11 +438,22 @@ mod tests {
     async fn followup_requires_and_reuses_a_native_session_identity() {
         fn invocation() -> crate::harness::Invocation {
             crate::harness::Invocation {
-                argv: vec![
-                    "/bin/sh".into(),
-                    "-c".into(),
-                    "printf '%s\\n' '{\"result\":\"done\"}'".into(),
-                ],
+                argv: if cfg!(windows) {
+                    vec![
+                        "powershell.exe".into(),
+                        "-NoLogo".into(),
+                        "-NoProfile".into(),
+                        "-NonInteractive".into(),
+                        "-Command".into(),
+                        "Write-Output '{\"result\":\"done\"}'".into(),
+                    ]
+                } else {
+                    vec![
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        "printf '%s\\n' '{\"result\":\"done\"}'".into(),
+                    ]
+                },
                 environment: std::collections::BTreeMap::new(),
                 stdin: None,
                 prompt_file: None,
@@ -566,7 +502,101 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(error.to_string().contains("required for follow-ups"));
+        assert!(
+            error.to_string().contains("required for follow-ups"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_agent_future_removes_temporary_prompt_artifact() {
+        let root = std::env::temp_dir().join(format!(
+            "prism-agent-cleanup-{}-{}",
+            std::process::id(),
+            crate::util::timestamp_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let prompt_file = root.join("prompt.txt");
+        std::fs::write(&prompt_file, "temporary prompt").unwrap();
+        let invocation = crate::harness::Invocation {
+            argv: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+            environment: std::collections::BTreeMap::new(),
+            stdin: None,
+            prompt_file: Some(prompt_file.clone()),
+            structured_events: false,
+            attach: false,
+        };
+        let request = AgentRequest {
+            run_id: "run".into(),
+            step_key: "step".into(),
+            attempt_id: "attempt".into(),
+            repository: root.clone(),
+            worktree: root.clone(),
+            harness: Some("generic".into()),
+            model: None,
+            variant: None,
+            prompt: "prompt".into(),
+            resume_session_id: None,
+            require_resumable_session: false,
+            cancellation: AgentCancellation::default(),
+        };
+        let task = tokio::spawn(execute_invocation(
+            invocation,
+            request,
+            "generic".into(),
+            Duration::from_secs(60),
+            1024,
+            1024,
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        task.abort();
+        let _ = task.await;
+
+        assert!(!prompt_file.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_cancellation_wins_over_process_completion_shape() {
+        let cancellation = AgentCancellation::default();
+        let invocation = crate::harness::Invocation {
+            argv: vec!["/bin/sh".into(), "-c".into(), "exec sleep 30".into()],
+            environment: std::collections::BTreeMap::new(),
+            stdin: None,
+            prompt_file: None,
+            structured_events: false,
+            attach: false,
+        };
+        let request = AgentRequest {
+            run_id: "run".into(),
+            step_key: "step".into(),
+            attempt_id: "attempt".into(),
+            repository: "/tmp".into(),
+            worktree: "/tmp".into(),
+            harness: Some("generic".into()),
+            model: None,
+            variant: None,
+            prompt: "prompt".into(),
+            resume_session_id: None,
+            require_resumable_session: false,
+            cancellation: cancellation.clone(),
+        };
+        let task = tokio::spawn(execute_invocation(
+            invocation,
+            request,
+            "generic".into(),
+            Duration::from_secs(60),
+            1024,
+            1024,
+        ));
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(AgentExecutionError::Cancelled)
+        ));
     }
 
     #[test]

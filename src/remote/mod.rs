@@ -45,8 +45,10 @@ pub(crate) use model::{
 #[cfg(test)]
 pub(crate) use model::{HeadAssociation, NativeMergeGuard};
 #[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use store::record_pr_summary;
 #[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use store::save_repo_policy_cache;
 pub(crate) use store::{
     load_pr_cache, load_repo_policy_cache_for_identity, persist_pr_cache_snapshot,

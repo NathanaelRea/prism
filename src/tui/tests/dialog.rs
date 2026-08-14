@@ -2,7 +2,7 @@ use crate::view::{ChoiceList, FormFieldKind, KeyChoice, OrderedToggleItem};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::super::{
-    confirmation_result, create_session_fields, create_session_submit_key,
+    append_line_paste, confirmation_result, create_session_fields, create_session_submit_key,
     move_enabled_ordered_item, selectable_choice_key, toggle_item_in_place, toggle_ordered_item,
     update_create_session_variant_field,
 };
@@ -76,6 +76,15 @@ fn confirmation_yes_and_no_override_the_default() {
 fn confirmation_rejects_unknown_answers() {
     assert_eq!(confirmation_result("maybe", true), None);
     assert_eq!(confirmation_result("ny", false), None);
+}
+
+#[test]
+fn prompt_paste_preserves_unicode_and_shell_characters_but_stays_single_line() {
+    let mut input = "prefix ".to_string();
+
+    append_line_paste(&mut input, "Unicode δ; $HOME\r\nnext\tvalue");
+
+    assert_eq!(input, "prefix Unicode δ; $HOMEnextvalue");
 }
 
 #[test]

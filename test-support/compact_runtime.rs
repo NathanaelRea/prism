@@ -16,8 +16,11 @@ impl CompactTempDir {
             .duration_since(UNIX_EPOCH)
             .expect("system clock before unix epoch")
             .as_nanos();
-        let path =
-            PathBuf::from("/tmp").join(format!("pt-{:x}-{unique:x}-{id:x}", std::process::id()));
+        #[cfg(unix)]
+        let base = PathBuf::from("/tmp");
+        #[cfg(windows)]
+        let base = std::env::temp_dir();
+        let path = base.join(format!("pt-{:x}-{unique:x}-{id:x}", std::process::id()));
         let runtime_path = path.join("r");
         fs::create_dir_all(&path).expect("create compact test directory");
         Self { path, runtime_path }

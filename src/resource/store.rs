@@ -309,7 +309,7 @@ fn sorted_entries(path: &Path) -> Result<Vec<fs::DirEntry>, ResourceError> {
 }
 
 fn sync_directory(path: &Path) -> Result<(), ResourceError> {
-    fs::File::open(path)?.sync_all()?;
+    crate::durability::sync_directory(path, crate::durability::DurabilityIntent::Standard)?;
     Ok(())
 }
 

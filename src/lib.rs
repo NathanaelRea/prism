@@ -1,5 +1,5 @@
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-compile_error!("unsupported Prism target OS; Prism supports only Linux and macOS");
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+compile_error!("unsupported Prism target OS; Prism supports only Linux, macOS, and Windows");
 
 mod actions;
 mod agent_runtime;
@@ -22,8 +22,10 @@ mod telemetry;
 pub(crate) use telemetry::{flight_recorder, observability, run_marker};
 #[cfg(test)]
 mod testing;
+#[cfg(all(test, unix))]
+pub(crate) use testing::compact_runtime;
 #[cfg(test)]
-pub(crate) use testing::{compact_runtime, test_support};
+pub(crate) use testing::test_support;
 mod tui;
 pub(crate) use tui::{
     input, jobs as tui_jobs, runtime as tui_runtime, signal as tui_signal, state as ui_state,

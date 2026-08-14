@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -8,9 +9,11 @@ use crate::repo::Repository;
 use crate::view::RepoMainView;
 
 use super::super::{GitAction, PanelFocus, PrPollResult, Tui};
+#[cfg(unix)]
+use super::support::unique_temp_dir;
 use super::support::{
     test_change_request_identity, test_change_request_identity_for, test_config, test_pr_summary,
-    test_session, unique_temp_dir,
+    test_session,
 };
 
 #[test]
@@ -42,6 +45,7 @@ fn open_pr_action_requires_an_observed_change_request() {
     assert!(tui.git_action_enabled(GitAction::OpenPr));
 }
 
+#[cfg(unix)]
 #[test]
 fn merge_action_requires_fresh_summary_and_supported_guarded_merge() {
     let repo = Repository {

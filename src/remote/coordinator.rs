@@ -24,7 +24,7 @@ pub(crate) struct PrCacheEligibility {
 }
 
 impl PrCacheEligibility {
-    fn for_worktree(branch: &str, path: &std::path::Path, config: &Config) -> Self {
+    async fn for_worktree(branch: &str, path: &std::path::Path, config: &Config) -> Self {
         Self {
             is_default_branch: config.is_default_branch(branch),
             is_detached: branch == "(detached)",
@@ -34,6 +34,7 @@ impl PrCacheEligibility {
                 "origin",
                 super::RemoteUrlKind::Fetch,
             )
+            .await
             .is_ok(),
         }
     }
@@ -51,15 +52,17 @@ impl PrCacheEligibility {
     }
 }
 
-pub(super) fn cache_eligible_for_worktree(
+pub(super) async fn cache_eligible_for_worktree(
     branch: &str,
     path: &std::path::Path,
     config: &Config,
 ) -> bool {
-    PrCacheEligibility::for_worktree(branch, path, config).can_observe()
+    PrCacheEligibility::for_worktree(branch, path, config)
+        .await
+        .can_observe()
 }
 
-pub(crate) fn load_pr_cache_for_branch(
+pub(crate) async fn load_pr_cache_for_branch(
     repo: &Repository,
     config: &Config,
     branch: &str,
@@ -70,7 +73,7 @@ pub(crate) fn load_pr_cache_for_branch(
     }
     let mut cache = super::store::load_pr_cache(repo, branch);
     if let Err(error) =
-        super::discover_git_remote(path, config, "origin", super::RemoteUrlKind::Fetch)
+        super::discover_git_remote(path, config, "origin", super::RemoteUrlKind::Fetch).await
     {
         cache.record_remote_unavailable(error.to_string());
         super::store::persist_observation_errors(repo, branch, &mut cache);
@@ -125,7 +128,7 @@ pub(super) fn pr_summary_matches_worktree(
     summary.merged && (cached_canonical_association || initial_canonical_association)
 }
 
-pub(crate) fn resolve_pr_summary_for_session(
+pub(crate) async fn resolve_pr_summary_for_session(
     session: &Session,
     config: &Config,
     summaries: &[PrSummary],
@@ -133,7 +136,9 @@ pub(crate) fn resolve_pr_summary_for_session(
     if !PrCacheEligibility::for_successful_index(session, config).can_observe() {
         return None;
     }
-    let source_push = super::dispatcher::prepare_push(&session.path, config, &session.branch).ok();
+    let source_push = super::dispatcher::prepare_push(&session.path, config, &session.branch)
+        .await
+        .ok();
     let known_summary = session
         .pr
         .summary_observed_in_process
@@ -172,7 +177,7 @@ pub(crate) fn pr_details_pollable(session: &Session, config: &Config) -> bool {
 }
 
 #[cfg(test)]
-pub(crate) fn refresh_pr_summary_index_for_sessions(
+pub(crate) async fn refresh_pr_summary_index_for_sessions(
     repos: &[PrCacheRepository<'_>],
     sessions: &mut [Session],
     repo_index: usize,
@@ -187,11 +192,12 @@ pub(crate) fn refresh_pr_summary_index_for_sessions(
         &targets,
         summaries,
         poll_started_at,
-    );
+    )
+    .await;
 }
 
 #[cfg(test)]
-pub(crate) fn refresh_pr_summary_index_for_target_sessions(
+pub(crate) async fn refresh_pr_summary_index_for_target_sessions(
     repos: &[PrCacheRepository<'_>],
     sessions: &mut [Session],
     repo_index: usize,
@@ -209,7 +215,7 @@ pub(crate) fn refresh_pr_summary_index_for_target_sessions(
         if !session.pr.finish_summary_poll(poll_started_at) {
             continue;
         }
-        let summary = resolve_pr_summary_for_session(session, managed.config, &summaries);
+        let summary = resolve_pr_summary_for_session(session, managed.config, &summaries).await;
         let mutation = session
             .pr
             .record_summary_observation(summary, refreshed.clone());

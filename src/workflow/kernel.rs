@@ -213,7 +213,7 @@ pub struct WorkflowScheduler {
     agents: Arc<dyn AgentExecutor>,
     run_locks: Arc<tokio::sync::Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     worktree_locks: Arc<tokio::sync::Mutex<BTreeMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>>,
-    active_phases: Arc<tokio::sync::Mutex<BTreeMap<String, AgentCancellation>>>,
+    run_cancellations: Arc<tokio::sync::Mutex<BTreeMap<String, AgentCancellation>>>,
     worker_id: String,
 }
 
@@ -229,7 +229,7 @@ impl WorkflowScheduler {
             agents,
             run_locks: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
             worktree_locks: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
-            active_phases: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+            run_cancellations: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
             worker_id: format!(
                 "worker-{}-{}",
                 std::process::id(),
@@ -307,6 +307,10 @@ impl WorkflowScheduler {
         run_id: &str,
         now_unix_ms: i64,
     ) -> Result<SchedulerProgress, WorkflowKernelError> {
+        // Register cancellation before contending for the run lock. A concurrent
+        // control request can then cancel every eventual phase of this tick,
+        // including the window before a Trigger check is constructed.
+        let cancellation = self.run_cancellation(run_id).await;
         let run_lock = self.named_run_lock(run_id).await;
         let _claim = run_lock.lock().await;
         let mut run = self
@@ -422,8 +426,14 @@ impl WorkflowScheduler {
                 run.steps[step_index].phase = StepPhase::Checking;
                 run.steps[step_index].wake_at_unix_ms = None;
                 self.store.save_run(&mut run).await?;
+                if cancellation.is_cancelled() {
+                    return Err(WorkflowKernelError::PhaseCancelled);
+                }
                 let context = trigger_context(&run, compiled_step, None);
-                let decision = match trigger.should_run_step(&context).await {
+                let check = self
+                    .supervise_check(&cancellation, trigger.should_run_step(&context))
+                    .await;
+                let decision = match check? {
                     Ok(decision) => decision,
                     Err(error) => {
                         fail_step(
@@ -659,7 +669,7 @@ impl WorkflowScheduler {
             .lock_owned()
             .await;
         let cancellation = AgentCancellation::default();
-        self.active_phases
+        self.run_cancellations
             .lock()
             .await
             .insert(run.id.clone(), cancellation.clone());
@@ -794,7 +804,7 @@ impl WorkflowScheduler {
                 }
             }
         }
-        self.active_phases.lock().await.remove(&run.id);
+        self.run_cancellations.lock().await.remove(&run.id);
 
         if failed {
             run.status = WorkflowRunStatus::Failed;
@@ -834,11 +844,7 @@ impl WorkflowScheduler {
             .await
             .lock_owned()
             .await;
-        let cancellation = AgentCancellation::default();
-        self.active_phases
-            .lock()
-            .await
-            .insert(run.id.clone(), cancellation.clone());
+        let cancellation = self.run_cancellation(&run.id).await;
         let preparation = self
             .supervise_phase(
                 run,
@@ -849,7 +855,6 @@ impl WorkflowScheduler {
                 trigger.pre_step_run(&context),
             )
             .await;
-        self.active_phases.lock().await.remove(&run.id);
         let (prepared, completed_unix_ms) = preparation?;
         let prepared = match prepared {
             Ok(prepared) => prepared,
@@ -965,11 +970,7 @@ impl WorkflowScheduler {
             .await
             .lock_owned()
             .await;
-        let cancellation = AgentCancellation::default();
-        self.active_phases
-            .lock()
-            .await
-            .insert(run.id.clone(), cancellation.clone());
+        let cancellation = self.run_cancellation(&run.id).await;
         let mut turn_started_unix_ms = now_unix_ms;
 
         loop {
@@ -1029,22 +1030,17 @@ impl WorkflowScheduler {
                 .await;
             let (outcome, completed_unix_ms) = match execution {
                 Ok(execution) => execution,
-                Err(error) => {
-                    self.active_phases.lock().await.remove(&run.id);
-                    return Err(error);
-                }
+                Err(error) => return Err(error),
             };
             let outcome = match outcome {
                 Ok(outcome) => outcome,
                 Err(AgentExecutionError::Cancelled) => {
-                    self.active_phases.lock().await.remove(&run.id);
                     run.steps[step_index].attempts[attempt_index].agent_turn_in_flight = None;
                     cancel_run(run, completed_unix_ms);
                     self.store.save_run(run).await?;
                     return Ok(SchedulerProgress::Cancelled);
                 }
                 Err(error) => {
-                    self.active_phases.lock().await.remove(&run.id);
                     run.steps[step_index].attempts[attempt_index].agent_turn_in_flight = None;
                     fail_attempt(
                         run,
@@ -1060,7 +1056,6 @@ impl WorkflowScheduler {
             if let Some(expected) = resume_session_id.as_deref()
                 && outcome.session_id != expected
             {
-                self.active_phases.lock().await.remove(&run.id);
                 run.steps[step_index].attempts[attempt_index].agent_turn_in_flight = None;
                 fail_attempt(
                     run,
@@ -1091,7 +1086,6 @@ impl WorkflowScheduler {
             turn_started_unix_ms = completed_unix_ms;
         }
 
-        self.active_phases.lock().await.remove(&run.id);
         drop(_worktree_claim);
         let outcome = run.steps[step_index].attempts[attempt_index]
             .agent_turns
@@ -1158,11 +1152,7 @@ impl WorkflowScheduler {
                 .await
                 .lock_owned()
                 .await;
-            let cancellation = AgentCancellation::default();
-            self.active_phases
-                .lock()
-                .await
-                .insert(run.id.clone(), cancellation.clone());
+            let cancellation = self.run_cancellation(&run.id).await;
             let finalization = self
                 .supervise_phase(
                     run,
@@ -1173,7 +1163,6 @@ impl WorkflowScheduler {
                     trigger.post_step_run(&context, &prepared, &outcome),
                 )
                 .await;
-            self.active_phases.lock().await.remove(&run.id);
             let (completion, completed_unix_ms) = finalization?;
             match completion {
                 Ok(completion) => (completion, completed_unix_ms),
@@ -1233,6 +1222,24 @@ impl WorkflowScheduler {
         }
     }
 
+    async fn supervise_check<F, T>(
+        &self,
+        cancellation: &AgentCancellation,
+        future: F,
+    ) -> Result<T, WorkflowKernelError>
+    where
+        F: Future<Output = T>,
+    {
+        let token = cancellation.token();
+        let future = crate::process::with_cancellation(token.clone(), future);
+        tokio::pin!(future);
+        tokio::select! {
+            biased;
+            () = token.cancelled() => Err(WorkflowKernelError::PhaseCancelled),
+            output = &mut future => Ok(output),
+        }
+    }
+
     async fn supervise_phase<F, T>(
         &self,
         run: &mut WorkflowRunState,
@@ -1248,6 +1255,7 @@ impl WorkflowScheduler {
         let fencing_token = run.steps[step_index].attempts[attempt_index].fencing_token;
         let started = tokio::time::Instant::now();
         let mut next_renewal_ms = PHASE_LEASE_RENEW_MS;
+        let future = crate::process::with_cancellation(cancellation.token(), future);
         tokio::pin!(future);
         loop {
             tokio::select! {
@@ -1410,7 +1418,7 @@ impl WorkflowScheduler {
     }
 
     pub async fn cancel(&self, run_id: &str, now: i64) -> Result<(), WorkflowKernelError> {
-        if let Some(cancellation) = self.active_phases.lock().await.get(run_id).cloned() {
+        if let Some(cancellation) = self.run_cancellations.lock().await.get(run_id).cloned() {
             cancellation.cancel();
         }
         let run_lock = self.named_run_lock(run_id).await;
@@ -1478,6 +1486,11 @@ impl WorkflowScheduler {
         run.updated_unix_ms = now;
         push_event(&mut run, now, None, None, event, event);
         self.store.save_run(&mut run).await
+    }
+
+    async fn run_cancellation(&self, run_id: &str) -> AgentCancellation {
+        let mut cancellations = self.run_cancellations.lock().await;
+        cancellations.entry(run_id.to_string()).or_default().clone()
     }
 
     async fn named_run_lock(&self, run_id: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -2074,8 +2087,44 @@ mod tests {
     use crate::workflow::source::{TriggerCatalog, compile_workflow};
     use crate::workflow::step_trigger::{AgentOutcomeStatus, ScriptedTrigger};
     use std::path::Path;
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use tokio::sync::{Barrier, Notify};
+
+    #[derive(Default)]
+    struct TriggerStartGateStore {
+        inner: MemoryWorkflowRunStore,
+        gate_next_workflow_load: AtomicBool,
+        tick_holds_run_lock: tokio::sync::Notify,
+        release_tick: tokio::sync::Notify,
+    }
+
+    impl WorkflowRunStore for TriggerStartGateStore {
+        fn retain_workflow<'a>(&'a self, workflow: &'a CompiledWorkflow) -> StoreFuture<'a, ()> {
+            self.inner.retain_workflow(workflow)
+        }
+
+        fn load_workflow<'a>(&'a self, digest: &'a str) -> StoreFuture<'a, CompiledWorkflow> {
+            Box::pin(async move {
+                if self.gate_next_workflow_load.swap(false, Ordering::AcqRel) {
+                    self.tick_holds_run_lock.notify_one();
+                    self.release_tick.notified().await;
+                }
+                self.inner.load_workflow(digest).await
+            })
+        }
+
+        fn create_run<'a>(&'a self, run: &'a WorkflowRunState) -> StoreFuture<'a, ()> {
+            self.inner.create_run(run)
+        }
+
+        fn load_run<'a>(&'a self, run_id: &'a str) -> StoreFuture<'a, Option<WorkflowRunState>> {
+            self.inner.load_run(run_id)
+        }
+
+        fn save_run<'a>(&'a self, run: &'a mut WorkflowRunState) -> StoreFuture<'a, ()> {
+            self.inner.save_run(run)
+        }
+    }
 
     fn subject() -> TriggerSubject {
         TriggerSubject {
@@ -2587,7 +2636,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_interrupts_an_owned_trigger_phase() {
+    async fn cancel_interrupts_a_trigger_check_without_waiting_for_its_timeout() {
         struct BlockingTrigger {
             started: Arc<std::sync::atomic::AtomicBool>,
         }
@@ -2596,21 +2645,12 @@ mod tests {
                 &'a self,
                 _context: &'a TriggerContext,
             ) -> super::super::step_trigger::TriggerFuture<'a, TriggerDecision> {
-                Box::pin(async {
-                    Ok(TriggerDecision::Run {
-                        summary: "run".into(),
-                    })
-                })
-            }
-
-            fn pre_step_run<'a>(
-                &'a self,
-                _context: &'a TriggerContext,
-            ) -> super::super::step_trigger::TriggerFuture<'a, PreparedState> {
                 self.started.store(true, Ordering::Release);
                 Box::pin(async {
                     std::future::pending::<()>().await;
-                    Ok(PreparedState::default())
+                    Ok(TriggerDecision::Run {
+                        summary: "run".into(),
+                    })
                 })
             }
         }
@@ -2649,11 +2689,88 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
+        let cancel_started = std::time::Instant::now();
         scheduler.cancel("run", 3).await.unwrap();
+        assert!(cancel_started.elapsed() < std::time::Duration::from_secs(1));
         assert!(matches!(
             ticking.await.unwrap(),
             Err(WorkflowKernelError::PhaseCancelled)
         ));
+        assert_eq!(
+            store.load_run("run").await.unwrap().unwrap().status,
+            WorkflowRunStatus::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_before_trigger_start_cancels_eventual_check_without_run_lock_deadlock() {
+        struct BlockingTrigger {
+            started: Arc<AtomicBool>,
+        }
+        impl StepTrigger for BlockingTrigger {
+            fn should_run_step<'a>(
+                &'a self,
+                _context: &'a TriggerContext,
+            ) -> super::super::step_trigger::TriggerFuture<'a, TriggerDecision> {
+                self.started.store(true, Ordering::Release);
+                Box::pin(std::future::pending())
+            }
+        }
+
+        let workflow = workflow("[[step]]\ntrigger='needs_review'\nprompt='fix'\n");
+        let trigger_started = Arc::new(AtomicBool::new(false));
+        let triggers = TriggerRegistry::default();
+        triggers
+            .insert(
+                "needs_review",
+                BlockingTrigger {
+                    started: trigger_started.clone(),
+                },
+            )
+            .unwrap();
+        let store = Arc::new(TriggerStartGateStore::default());
+        let scheduler = WorkflowScheduler::new(
+            store.clone(),
+            triggers,
+            Arc::new(RecordingAgentExecutor::default()),
+        );
+        scheduler
+            .start(StartPromptWorkflow {
+                run_id: "run",
+                workflow: &workflow,
+                subject: subject(),
+                now_unix_ms: 1,
+            })
+            .await
+            .unwrap();
+
+        store.gate_next_workflow_load.store(true, Ordering::Release);
+        let ticking = {
+            let scheduler = scheduler.clone();
+            tokio::spawn(async move { scheduler.tick("run", 2).await })
+        };
+        store.tick_holds_run_lock.notified().await;
+        let run_cancellation = scheduler
+            .run_cancellations
+            .lock()
+            .await
+            .get("run")
+            .cloned()
+            .expect("tick registered run cancellation before taking the lock");
+        let canceling = {
+            let scheduler = scheduler.clone();
+            tokio::spawn(async move { scheduler.cancel("run", 3).await })
+        };
+        run_cancellation.token().cancelled().await;
+        assert!(!trigger_started.load(Ordering::Acquire));
+
+        store.release_tick.notify_one();
+        assert!(matches!(
+            ticking.await.unwrap(),
+            Err(WorkflowKernelError::PhaseCancelled)
+        ));
+        assert!(!trigger_started.load(Ordering::Acquire));
+        canceling.await.unwrap().unwrap();
         assert_eq!(
             store.load_run("run").await.unwrap().unwrap().status,
             WorkflowRunStatus::Cancelled

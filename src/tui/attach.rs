@@ -64,29 +64,36 @@ impl Tui {
         }
     }
 
-    pub(super) fn enter_agent_mode(&mut self, runtime: &mut TerminalRuntime) -> Result<(), String> {
+    pub(super) async fn enter_agent_mode(
+        &mut self,
+        runtime: &mut TerminalRuntime,
+    ) -> Result<(), String> {
         if self.selected_worktree_context().is_none() {
             return Ok(());
         }
         let Some(index) = self.selected_worktree_index() else {
             return Ok(());
         };
-        self.enter_agent_mode_for_index(runtime, index)
+        self.enter_agent_mode_for_index(runtime, index).await
     }
 
-    pub(crate) fn enter_agent_mode_for_index(
+    pub(crate) async fn enter_agent_mode_for_index(
         &mut self,
         runtime: &mut TerminalRuntime,
         index: usize,
     ) -> Result<(), String> {
-        self.prepare_worktree_harness_for_open(runtime, index)?;
+        self.prepare_worktree_harness_for_open(runtime, index)
+            .await?;
         let navigation = self.navigation_snapshot();
         let terminal_area = runtime.area()?;
         self.prepare_tmux_session_for_attach(
             index,
             (terminal_area.width, terminal_area.height.saturating_sub(1)),
-        )?;
-        let result = runtime.suspend_for(|| self.attach_tmux_session_for_index(index));
+        )
+        .await?;
+        let result = runtime
+            .suspend_for_async(self.attach_tmux_session_for_index(index))
+            .await;
         let refresh_started = Instant::now();
         self.refresh_sessions_after_tmux()?;
         crate::flight_recorder::record(
@@ -103,7 +110,7 @@ impl Tui {
         Ok(())
     }
 
-    pub(super) fn prepare_worktree_harness_for_open(
+    pub(super) async fn prepare_worktree_harness_for_open(
         &mut self,
         runtime: &mut TerminalRuntime,
         index: usize,
@@ -142,14 +149,15 @@ impl Tui {
                     &mut self.tmux_generations,
                     &session,
                 );
-                self.finish_tmux_warmup_for_key(&use_.warmup_key);
+                self.finish_tmux_warmup_for_key(&use_.warmup_key).await;
                 if let Some(managed) = self.repos.get(session.repo_index) {
                     crate::agent_session::retire_generation(
                         &repo,
                         &managed.config,
                         &session.branch,
                         use_.generation,
-                    );
+                    )
+                    .await;
                 }
                 crate::session::set_worktree_harness(&repo, &session, &target, false)?;
                 self.reload_worktree_harness_config(index);
@@ -157,7 +165,8 @@ impl Tui {
                     &self.repos,
                     &mut self.tmux_generations,
                     use_.slot,
-                );
+                )
+                .await;
             }
             Some("k") => crate::session::set_worktree_harness(
                 &repo,
@@ -170,7 +179,7 @@ impl Tui {
         Ok(())
     }
 
-    pub(super) fn migrate_worktree_harness(&mut self, index: usize) -> Result<(), String> {
+    pub(super) async fn migrate_worktree_harness(&mut self, index: usize) -> Result<(), String> {
         let Some(session) = self
             .sessions
             .get(index)
@@ -191,21 +200,23 @@ impl Tui {
         }
         let use_ =
             crate::agent_session::session_use(&self.repos, &mut self.tmux_generations, &session);
-        self.finish_tmux_warmup_for_key(&use_.warmup_key);
+        self.finish_tmux_warmup_for_key(&use_.warmup_key).await;
         crate::agent_session::retire_generation(
             &repo,
             &repository_config,
             &session.branch,
             use_.generation,
-        );
+        )
+        .await;
         crate::session::set_worktree_harness(&repo, &session, &target, false)?;
         self.reload_worktree_harness_config(index);
-        crate::agent_session::rotate_generation(&self.repos, &mut self.tmux_generations, use_.slot);
+        crate::agent_session::rotate_generation(&self.repos, &mut self.tmux_generations, use_.slot)
+            .await;
         self.show_message(&format!("migrated worktree to harness '{target}'"))?;
         Ok(())
     }
 
-    pub(super) fn open_tmux_window(
+    pub(super) async fn open_tmux_window(
         &mut self,
         runtime: &mut TerminalRuntime,
         window: TmuxWindow,
@@ -214,7 +225,9 @@ impl Tui {
             return Ok(());
         }
         let navigation = self.navigation_snapshot();
-        let result = runtime.suspend_for(|| self.attach_selected_tmux_window(window));
+        let result = runtime
+            .suspend_for_async(self.attach_selected_tmux_window(window))
+            .await;
         self.refresh_sessions_after_tmux()?;
         self.restore_navigation_snapshot(navigation);
         self.start_tmux_agent_warmup();

@@ -1,8 +1,9 @@
 //! Durable replacement for Prism-managed TOML files.
 //!
-//! Workspace, UI, user, and repository config files all follow a final symlink.
-//! This preserves user-managed config symlinks while replacing the resolved target
-//! atomically. Writers serialize on a permanent adjacent `.lock` file.
+//! On Unix, workspace, UI, user, and repository config files follow a final symlink so
+//! user-managed config links retain their identity. Windows rejects final reparse points because
+//! a pathname replacement cannot safely preserve that contract across junction races. Writers
+//! serialize on a permanent adjacent `.lock` file.
 
 use std::error::Error;
 use std::ffi::OsString;
@@ -14,7 +15,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
 
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -58,6 +62,7 @@ pub enum Stage {
     SyncFile,
     FullSyncFile,
     Rename,
+    SyncCommittedFile,
     SyncParent,
 }
 
@@ -83,6 +88,7 @@ impl Stage {
             Self::SyncFile => "sync_file",
             Self::FullSyncFile => "full_sync_file",
             Self::Rename => "rename",
+            Self::SyncCommittedFile => "sync_committed_file",
             Self::SyncParent => "sync_parent",
         }
     }
@@ -102,6 +108,7 @@ impl Stage {
             Self::SyncFile => "sync staging file",
             Self::FullSyncFile => "fully sync staging file",
             Self::Rename => "rename staging file",
+            Self::SyncCommittedFile => "sync committed file",
             Self::SyncParent => "sync parent directory",
         }
     }
@@ -216,6 +223,7 @@ const fn persistence_error_kind(stage: Stage) -> PersistenceErrorKind {
         | Stage::SyncFile
         | Stage::FullSyncFile
         | Stage::Rename
+        | Stage::SyncCommittedFile
         | Stage::SyncParent => PersistenceErrorKind::Io,
     }
 }
@@ -278,7 +286,30 @@ struct StagingGuard {
 impl Drop for StagingGuard {
     fn drop(&mut self) {
         if !self.renamed {
-            let _ = fs::remove_file(&self.path);
+            remove_staging_best_effort(&self.path);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn remove_staging_best_effort(path: &Path) {
+    let _ = fs::remove_file(path);
+}
+
+#[cfg(windows)]
+fn remove_staging_best_effort(path: &Path) {
+    let deadline = Instant::now() + Duration::from_millis(100);
+    loop {
+        match fs::remove_file(path) {
+            Ok(()) => return,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+            Err(error)
+                if matches!(error.raw_os_error(), Some(5 | 32 | 33))
+                    && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => return,
         }
     }
 }
@@ -367,12 +398,23 @@ fn update_inner_with_fault<T>(
         .unwrap_or(Path::new("."));
     fs::create_dir_all(parent)
         .map_err(|error| PersistenceError::new(Stage::CreateParent, parent, false, error))?;
+    #[cfg(windows)]
+    if parent != Path::new(".") {
+        crate::system::windows_security::secure_path(parent, true)
+            .map_err(|error| PersistenceError::new(Stage::CreateParent, parent, false, error))?;
+    }
 
     let target = resolve_final_symlink(path)?;
     let target_parent = target
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
+    #[cfg(windows)]
+    if target.exists() {
+        crate::system::windows_security::secure_path(&target, false).map_err(|error| {
+            PersistenceError::new(Stage::InspectPermissions, &target, false, error)
+        })?;
+    }
     let lock_path = adjacent_lock_path(&target);
     let lock = open_lock(&lock_path)?;
     acquire_lock(&lock, &lock_path, options.lock_timeout)?;
@@ -410,10 +452,13 @@ fn update_inner_with_fault<T>(
         .map_err(|error| PersistenceError::new(Stage::Write, &staging_path, false, error))?;
     fault(Stage::Write)
         .map_err(|error| PersistenceError::new(Stage::Write, &staging_path, false, error))?;
-    if let Some(permissions) = permissions {
-        staging_file.set_permissions(permissions).map_err(|error| {
-            PersistenceError::new(Stage::ApplyPermissions, &staging_path, false, error)
-        })?;
+    #[cfg(unix)]
+    if let Some(permissions) = permissions.as_ref() {
+        staging_file
+            .set_permissions(permissions.clone())
+            .map_err(|error| {
+                PersistenceError::new(Stage::ApplyPermissions, &staging_path, false, error)
+            })?;
     }
     crate::durability::sync_file(&staging_file, options.durability).map_err(|error| {
         let stage = match error.stage() {
@@ -430,12 +475,39 @@ fn update_inner_with_fault<T>(
     })?;
     fault(Stage::SyncFile)
         .map_err(|error| PersistenceError::new(Stage::SyncFile, &staging_path, false, error))?;
+    // ReplaceFileW opens the replacement path without sharing, so Windows must close every
+    // staging handle before committing it.
+    #[cfg(windows)]
     drop(staging_file);
-    fs::rename(&staging_path, &target)
+    commit_staging(&staging_path, &target)
         .map_err(|error| PersistenceError::new(Stage::Rename, &target, false, error))?;
     staging.renamed = true;
     fault(Stage::Rename)
         .map_err(|error| PersistenceError::new(Stage::Rename, &target, true, error))?;
+    #[cfg(unix)]
+    let committed_file = staging_file;
+    #[cfg(windows)]
+    let committed_file = {
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&target)
+            .map_err(|error| {
+                PersistenceError::new(Stage::SyncCommittedFile, &target, true, error)
+            })?;
+        if let Some(permissions) = permissions {
+            file.set_permissions(permissions).map_err(|error| {
+                PersistenceError::new(Stage::ApplyPermissions, &target, true, error)
+            })?;
+        }
+        file
+    };
+    // On Windows this is the explicit FlushFileBuffers after ReplaceFileW/MoveFileExW.
+    committed_file
+        .sync_all()
+        .map_err(|error| PersistenceError::new(Stage::SyncCommittedFile, &target, true, error))?;
+    fault(Stage::SyncCommittedFile)
+        .map_err(|error| PersistenceError::new(Stage::SyncCommittedFile, &target, true, error))?;
+    drop(committed_file);
     crate::durability::sync_directory(target_parent, options.durability).map_err(|error| {
         let kind = if error.kind() == io::ErrorKind::Unsupported {
             PersistenceErrorKind::Unsupported
@@ -451,8 +523,23 @@ fn update_inner_with_fault<T>(
 
 fn resolve_final_symlink(path: &Path) -> Result<PathBuf, PersistenceError> {
     match fs::symlink_metadata(path) {
+        #[cfg(unix)]
         Ok(metadata) if metadata.file_type().is_symlink() => fs::canonicalize(path)
             .map_err(|error| PersistenceError::new(Stage::ResolveFinalSymlink, path, false, error)),
+        #[cfg(windows)]
+        Ok(_) => {
+            crate::system::windows_security::reject_reparse_point(path).map_err(|error| {
+                PersistenceError::new_with_kind(
+                    PersistenceErrorKind::Unsupported,
+                    Stage::ResolveFinalSymlink,
+                    path,
+                    false,
+                    error,
+                )
+            })?;
+            Ok(path.to_path_buf())
+        }
+        #[cfg(unix)]
         Ok(_) => Ok(path.to_path_buf()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(path.to_path_buf()),
         Err(error) => Err(PersistenceError::new(
@@ -473,18 +560,43 @@ pub fn adjacent_lock_path(path: &Path) -> PathBuf {
 fn open_lock(path: &Path) -> Result<File, PersistenceError> {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true);
+    #[cfg(unix)]
     options.mode(0o600);
+    #[cfg(windows)]
     options
+        .access_mode(
+            windows::Win32::Foundation::GENERIC_READ.0
+                | windows::Win32::Foundation::GENERIC_WRITE.0
+                | windows::Win32::Storage::FileSystem::READ_CONTROL.0
+                | windows::Win32::Storage::FileSystem::WRITE_DAC.0
+                | windows::Win32::Storage::FileSystem::WRITE_OWNER.0,
+        )
+        .custom_flags(windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT.0);
+    let file = options
         .open(path)
-        .map_err(|error| PersistenceError::new(Stage::OpenLock, path, false, error))
+        .map_err(|error| PersistenceError::new(Stage::OpenLock, path, false, error))?;
+    #[cfg(windows)]
+    crate::system::windows_security::secure_file(&file, false)
+        .map_err(|error| PersistenceError::new(Stage::OpenLock, path, false, error))?;
+    Ok(file)
 }
 
 fn acquire_lock(file: &File, path: &Path, timeout: Duration) -> Result<(), PersistenceError> {
     let started = Instant::now();
     loop {
-        match file.try_lock() {
+        #[cfg(unix)]
+        let result = file.try_lock().map_err(|error| match error {
+            fs::TryLockError::WouldBlock => None,
+            fs::TryLockError::Error(error) => Some(error),
+        });
+        #[cfg(windows)]
+        let result = fs4::FileExt::try_lock(file).map_err(|error| match error {
+            fs4::TryLockError::WouldBlock => None,
+            fs4::TryLockError::Error(error) => Some(error),
+        });
+        match result {
             Ok(()) => return Ok(()),
-            Err(fs::TryLockError::WouldBlock) => {
+            Err(None) => {
                 if started.elapsed() >= timeout {
                     return Err(PersistenceError::new_with_kind(
                         PersistenceErrorKind::Contention,
@@ -496,7 +608,7 @@ fn acquire_lock(file: &File, path: &Path, timeout: Duration) -> Result<(), Persi
                 }
                 thread::sleep(Duration::from_millis(5).min(timeout));
             }
-            Err(fs::TryLockError::Error(error)) => {
+            Err(Some(error)) => {
                 return Err(PersistenceError::new(
                     Stage::AcquireLock,
                     path,
@@ -523,8 +635,23 @@ fn create_staging(target: &Path, parent: &Path) -> Result<(File, PathBuf), Persi
         options.write(true).create_new(true);
         #[cfg(unix)]
         options.mode(0o600);
+        #[cfg(windows)]
+        options
+            .access_mode(
+                windows::Win32::Foundation::GENERIC_WRITE.0
+                    | windows::Win32::Storage::FileSystem::READ_CONTROL.0
+                    | windows::Win32::Storage::FileSystem::WRITE_DAC.0
+                    | windows::Win32::Storage::FileSystem::WRITE_OWNER.0,
+            )
+            .custom_flags(windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT.0);
         match options.open(&path) {
-            Ok(file) => return Ok((file, path)),
+            Ok(file) => {
+                #[cfg(windows)]
+                crate::system::windows_security::secure_file(&file, false).map_err(|error| {
+                    PersistenceError::new(Stage::CreateStaging, &path, false, error)
+                })?;
+                return Ok((file, path));
+            }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
                 return Err(PersistenceError::new(
@@ -547,9 +674,62 @@ fn create_staging(target: &Path, parent: &Path) -> Result<(File, PathBuf), Persi
     ))
 }
 
+#[cfg(unix)]
+pub(crate) fn commit_staging(staging: &Path, target: &Path) -> io::Result<()> {
+    fs::rename(staging, target)
+}
+
+#[cfg(windows)]
+pub(crate) fn commit_staging(staging: &Path, target: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Storage::FileSystem::{
+        MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACE_FILE_FLAGS, ReplaceFileW,
+    };
+    use windows::core::PCWSTR;
+
+    fn wide(path: &Path) -> Vec<u16> {
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    let staging = wide(staging);
+    let target = wide(target);
+    if unsafe {
+        ReplaceFileW(
+            PCWSTR(target.as_ptr()),
+            PCWSTR(staging.as_ptr()),
+            PCWSTR::null(),
+            REPLACE_FILE_FLAGS(0),
+            None,
+            None,
+        )
+    }
+    .is_ok()
+    {
+        return Ok(());
+    }
+    let replace_error = io::Error::last_os_error();
+    if !matches!(replace_error.raw_os_error(), Some(2 | 3)) {
+        return Err(replace_error);
+    }
+    // ReplaceFileW requires an existing destination. MoveFileExW commits the first generation
+    // without creating a missing-destination interval.
+    unsafe {
+        MoveFileExW(
+            PCWSTR(staging.as_ptr()),
+            PCWSTR(target.as_ptr()),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    }
+    .map_err(io::Error::other)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::fs::Permissions;
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -645,6 +825,33 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_atomic_replace_changes_identity_and_keeps_old_open_handle() {
+        use std::io::{Read, Seek};
+
+        let dir = temp_dir("windows-identity");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.toml");
+        fs::write(&path, "value = 'old'\n").unwrap();
+        let old_identity = file_id::get_file_id(&path).unwrap();
+        let mut old_handle = File::open(&path).unwrap();
+
+        update(&path, UpdateOptions::important_toml(), |_| {
+            Ok(((), Some(b"value = 'new'\n".to_vec())))
+        })
+        .unwrap();
+
+        assert_ne!(file_id::get_file_id(&path).unwrap(), old_identity);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "value = 'new'\n");
+        old_handle.rewind().unwrap();
+        let mut old = String::new();
+        old_handle.read_to_string(&mut old).unwrap();
+        assert_eq!(old, "value = 'old'\n");
+        drop(old_handle);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn bounded_lock_contention_returns_at_acquire_stage_and_keeps_lock_file() {
         let dir = temp_dir("lock");
@@ -725,7 +932,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn child_hard_exits_leave_complete_old_or_new_files() {
         for (stage, expected) in [
             ("write", "value = 'old'\n"),
@@ -774,7 +980,7 @@ mod tests {
             |_| Ok(((), Some(b"value = 'new'\n".to_vec()))),
             |stage| {
                 if stage == crash_stage {
-                    unsafe { libc::_exit(75) };
+                    std::process::exit(75);
                 }
                 Ok(())
             },

@@ -18,6 +18,7 @@ use super::{
 const MAX_HEADERS_SIZE: usize = 64 * 1024;
 const MAX_PAGES: usize = 100;
 
+#[derive(Clone)]
 pub(super) struct HttpClient {
     api_base: Url,
     agent: ureq::Agent,
@@ -728,13 +729,13 @@ fn io_error(operation: RemoteOperation, error: &std::io::Error) -> RemoteError {
 mod tests {
     use super::*;
 
-    #[test]
-    fn parses_retry_after_seconds() {
+    #[tokio::test]
+    async fn parses_retry_after_seconds() {
         assert_eq!(parse_retry_after("12"), Some(Duration::from_secs(12)));
     }
 
-    #[test]
-    fn recognizes_only_next_link_relation() {
+    #[tokio::test]
+    async fn recognizes_only_next_link_relation() {
         let link = "<https://example.test/api/v1/pulls?page=1>; rel=\"prev\", <https://example.test/api/v1/pulls?page=3>; rel=\"next\"";
         assert_eq!(
             parse_next_link(link),

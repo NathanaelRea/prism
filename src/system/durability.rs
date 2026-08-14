@@ -23,6 +23,9 @@ impl DurabilityIntent {
 pub(crate) enum DurabilityPolicy {
     FileAndDirectory,
     MacOsFullSyncAndDirectory,
+    // Windows has no documented parent-directory fsync equivalent. Phase 4 owns
+    // atomic replacement and FlushFileBuffers guarantees; until then file data is flushed.
+    WindowsFileOnly,
 }
 
 pub(crate) const fn policy_for(os: SupportedOs, intent: DurabilityIntent) -> DurabilityPolicy {
@@ -31,6 +34,7 @@ pub(crate) const fn policy_for(os: SupportedOs, intent: DurabilityIntent) -> Dur
             DurabilityPolicy::MacOsFullSyncAndDirectory
         }
         (SupportedOs::Linux | SupportedOs::MacOs, _) => DurabilityPolicy::FileAndDirectory,
+        (SupportedOs::Windows, _) => DurabilityPolicy::WindowsFileOnly,
     }
 }
 
@@ -90,7 +94,7 @@ fn full_sync(file: &File) -> io::Result<()> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(not(target_os = "macos"))]
 fn full_sync(_file: &File) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -98,8 +102,17 @@ fn full_sync(_file: &File) -> io::Result<()> {
     ))
 }
 
+#[cfg(unix)]
 fn sync_directory_native(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_directory_native(_path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "directory synchronization is not available on Windows",
+    ))
 }
 
 pub(crate) fn create_dir_all(path: &Path, intent: DurabilityIntent) -> io::Result<()> {
@@ -122,6 +135,7 @@ pub(crate) fn sync_directory(path: &Path, intent: DurabilityIntent) -> io::Resul
         DurabilityPolicy::FileAndDirectory | DurabilityPolicy::MacOsFullSyncAndDirectory => {
             sync_directory_native(path)
         }
+        DurabilityPolicy::WindowsFileOnly => Ok(()),
     }
 }
 
@@ -149,6 +163,10 @@ mod tests {
                 DurabilityPolicy::FileAndDirectory,
             );
         }
+        assert_eq!(
+            policy_for(SupportedOs::Windows, DurabilityIntent::Standard),
+            DurabilityPolicy::WindowsFileOnly,
+        );
     }
 
     #[cfg(target_os = "linux")]

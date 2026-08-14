@@ -5,7 +5,6 @@ pub(super) use adapter::GitHubAdapter;
 #[cfg(test)]
 mod tests;
 
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -13,7 +12,7 @@ use serde::Deserialize;
 use crate::config::Config;
 use crate::config::MergeMethod;
 use crate::process::{
-    ProcessDescriptor, ProcessPolicy, run_capture_named, run_output_allow_failure_named,
+    Command, ProcessDescriptor, ProcessPolicy, run_capture_named, run_output_allow_failure_named,
 };
 use crate::repo::Repository;
 use crate::util::{strip_ansi, timestamp_label};
@@ -457,7 +456,7 @@ struct GithubStatusContext {
     state: Option<String>,
 }
 
-pub fn refresh_pr_cache(
+pub async fn refresh_pr_cache(
     repo: &Repository,
     branch: &str,
     cache: &mut PrCache,
@@ -467,33 +466,37 @@ pub fn refresh_pr_cache(
 ) -> Result<(), String> {
     let started_at = Instant::now();
     cache.begin_summary_poll(started_at);
-    if !super::coordinator::cache_eligible_for_worktree(branch, path, config) {
+    if !super::coordinator::cache_eligible_for_worktree(branch, path, config).await {
         cache.finish_summary_poll(started_at);
         let mutation = cache.record_summary_observation(None, timestamp_label());
         super::store::persist_pr_summary_mutation(repo, branch, cache, mutation);
         return cache.refresh_result();
     }
-    let source_push = super::dispatcher::prepare_push(path, config, branch).ok();
+    let source_push = super::dispatcher::prepare_push(path, config, branch)
+        .await
+        .ok();
     let source_branch = source_push
         .as_ref()
         .map(|guard| guard.remote_branch.as_str())
         .unwrap_or(branch);
-    let result = fetch_pr_summary(path, source_branch, config).map(|observation| {
-        observation.filter(|(summary, _)| {
-            super::coordinator::pr_summary_matches_worktree(
-                summary,
-                source_branch,
-                cache
-                    .summary_observed_in_process
-                    .then_some(cache.summary.as_ref())
-                    .flatten(),
-                source_push.as_ref().map(|guard| &guard.repository),
-                source_push
-                    .as_ref()
-                    .map(|guard| guard.expected_head_sha.as_str()),
-            )
-        })
-    });
+    let result = fetch_pr_summary(path, source_branch, config)
+        .await
+        .map(|observation| {
+            observation.filter(|(summary, _)| {
+                super::coordinator::pr_summary_matches_worktree(
+                    summary,
+                    source_branch,
+                    cache
+                        .summary_observed_in_process
+                        .then_some(cache.summary.as_ref())
+                        .flatten(),
+                    source_push.as_ref().map(|guard| &guard.repository),
+                    source_push
+                        .as_ref()
+                        .map(|guard| guard.expected_head_sha.as_str()),
+                )
+            })
+        });
     match result {
         Ok(Some((summary, _raw))) => {
             if !cache.finish_summary_poll(started_at) {
@@ -501,7 +504,8 @@ pub fn refresh_pr_cache(
             }
             let mutation = cache.record_summary_observation(Some(summary), timestamp_label());
             if force_details || pr_details_due(cache) {
-                let details_result = refresh_pr_details_cache(repo, branch, cache, path, config);
+                let details_result =
+                    refresh_pr_details_cache(repo, branch, cache, path, config).await;
                 super::store::persist_pr_summary_mutation(repo, branch, cache, mutation);
                 details_result?;
             } else {
@@ -526,20 +530,20 @@ pub fn refresh_pr_cache(
     cache.refresh_result()
 }
 
-pub fn wait_for_pr_merged(
+pub async fn wait_for_pr_merged(
     path: &std::path::Path,
     pr_number: u64,
     config: &Config,
 ) -> Result<bool, String> {
     let mut last_error = None;
     for attempt in 0..PR_MERGE_VERIFY_ATTEMPTS {
-        match fetch_pr_merged_status(path, pr_number, config) {
+        match fetch_pr_merged_status(path, pr_number, config).await {
             Ok(true) => return Ok(true),
             Ok(false) => last_error = None,
             Err(error) => last_error = Some(error),
         }
         if attempt + 1 < PR_MERGE_VERIFY_ATTEMPTS {
-            std::thread::sleep(PR_MERGE_VERIFY_INTERVAL);
+            tokio::time::sleep(PR_MERGE_VERIFY_INTERVAL).await;
         }
     }
     match last_error {
@@ -548,7 +552,7 @@ pub fn wait_for_pr_merged(
     }
 }
 
-pub(crate) fn create_pull_request(
+pub(crate) async fn create_pull_request(
     repo: &Repository,
     config: &Config,
     branch: &str,
@@ -564,11 +568,12 @@ pub(crate) fn create_pull_request(
         target_repo,
         config.default_base.as_deref(),
         None,
-    )?;
-    refresh_pr_cache(repo, branch, cache, path, config, true)
+    )
+    .await?;
+    refresh_pr_cache(repo, branch, cache, path, config, true).await
 }
 
-pub(super) fn run_create_pull_request(
+pub(super) async fn run_create_pull_request(
     config: &Config,
     path: &std::path::Path,
     body: &str,
@@ -582,11 +587,12 @@ pub(super) fn run_create_pull_request(
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
         ProcessDescriptor::new("gh.pr.create"),
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
-pub(crate) fn merge_pull_request(
+pub(crate) async fn merge_pull_request(
     config: &Config,
     path: &std::path::Path,
     pr_number: u64,
@@ -604,7 +610,8 @@ pub(crate) fn merge_pull_request(
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
         ProcessDescriptor::new("gh.pr.merge"),
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
@@ -657,7 +664,7 @@ fn merge_pr_args(
     args
 }
 
-fn fetch_pr_merged_status(
+async fn fetch_pr_merged_status(
     path: &std::path::Path,
     pr_number: u64,
     config: &Config,
@@ -672,9 +679,10 @@ fn fetch_pr_merged_status(
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
         ProcessDescriptor::new("gh.pr.view"),
-    )?;
+    )
+    .await?;
     if !output.status.success() {
-        let stderr = output.stderr.trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let message = if stderr.is_empty() {
             format!("exited with {}", output.status)
         } else {
@@ -682,10 +690,12 @@ fn fetch_pr_merged_status(
         };
         return Err(format!("gh pr view: {message}"));
     }
-    Ok(parse_merged_status(&output.stdout))
+    Ok(parse_merged_status(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
 }
 
-pub fn refresh_pr_details_cache(
+pub async fn refresh_pr_details_cache(
     repo: &Repository,
     branch: &str,
     cache: &mut PrCache,
@@ -693,7 +703,7 @@ pub fn refresh_pr_details_cache(
     config: &Config,
 ) -> Result<(), String> {
     cache.begin_details_poll();
-    refresh_pr_details_cache_state(branch, cache, path, config);
+    refresh_pr_details_cache_state(branch, cache, path, config).await;
     let Some(association) = cache.summary_identity() else {
         cache.pending_details = None;
         return cache.refresh_result();
@@ -725,13 +735,13 @@ pub fn refresh_pr_details_cache(
     cache.refresh_result()
 }
 
-pub(crate) fn refresh_pr_details_cache_state(
+pub(crate) async fn refresh_pr_details_cache_state(
     branch: &str,
     cache: &mut PrCache,
     path: &std::path::Path,
     config: &Config,
 ) {
-    if !super::coordinator::cache_eligible_for_worktree(branch, path, config) {
+    if !super::coordinator::cache_eligible_for_worktree(branch, path, config).await {
         cache.details = None;
         cache.details_association = None;
         cache.details_quality = PrObservationQuality::AuthoritativeAbsence;
@@ -751,7 +761,9 @@ pub(crate) fn refresh_pr_details_cache_state(
         branch,
         PrDetailsAssociation::from_summary(&summary),
         config,
-    ) {
+    )
+    .await
+    {
         Ok(observation) => {
             cache.record_details_observation(observation);
         }
@@ -809,41 +821,41 @@ pub(crate) fn record_pr_merged(repo: &Repository, branch: &str, cache: &mut PrCa
     super::store::record_pr_summary(repo, branch, cache, summary);
 }
 
-pub(crate) fn github_remote_repo(
+pub(crate) async fn github_remote_repo(
     path: &std::path::Path,
     config: &Config,
     remote_name: &str,
 ) -> Result<String, String> {
-    let (owner, name) = github_remote_owner_repo(path, config, remote_name)?;
+    let (owner, name) = github_remote_owner_repo(path, config, remote_name).await?;
     Ok(format!("{owner}/{name}"))
 }
 
-pub fn fetch_pr_summary_index(
+pub async fn fetch_pr_summary_index(
     path: &std::path::Path,
     config: &Config,
 ) -> Result<Vec<PrSummary>, String> {
-    let repository = github_remote_repository_id(path, config, "origin")?;
-    fetch_pr_summary_index_for_repository(path, config, &repository)
+    let repository = github_remote_repository_id(path, config, "origin").await?;
+    fetch_pr_summary_index_for_repository(path, config, &repository).await
 }
 
-pub(super) fn fetch_pr_summary_index_for_repository(
+pub(super) async fn fetch_pr_summary_index_for_repository(
     path: &std::path::Path,
     config: &Config,
     repository: &crate::remote::RemoteRepositoryId,
 ) -> Result<Vec<PrSummary>, String> {
-    fetch_open_pr_summaries_for_repository(path, config, repository, None)
+    fetch_open_pr_summaries_for_repository(path, config, repository, None).await
 }
 
-pub(super) fn fetch_open_pr_summaries_for_repository_head(
+pub(super) async fn fetch_open_pr_summaries_for_repository_head(
     path: &std::path::Path,
     config: &Config,
     repository: &crate::remote::RemoteRepositoryId,
     head_ref: &str,
 ) -> Result<Vec<PrSummary>, String> {
-    fetch_open_pr_summaries_for_repository(path, config, repository, Some(head_ref))
+    fetch_open_pr_summaries_for_repository(path, config, repository, Some(head_ref)).await
 }
 
-fn fetch_open_pr_summaries_for_repository(
+async fn fetch_open_pr_summaries_for_repository(
     path: &std::path::Path,
     config: &Config,
     repository: &crate::remote::RemoteRepositoryId,
@@ -857,8 +869,7 @@ fn fetch_open_pr_summaries_for_repository(
         .split_once('/')
         .filter(|(_, name)| !name.contains('/'))
         .ok_or_else(|| "GitHub project path is malformed".to_string())?;
-    let mut command = Command::new(config.tool("gh"));
-    command
+    let mut command = Command::new(config.tool("gh"))
         .args(github_graphql_api_args(config, repository.host()))
         .args(["--paginate", "--slurp"])
         .arg("-F")
@@ -866,7 +877,7 @@ fn fetch_open_pr_summaries_for_repository(
         .arg("-F")
         .arg(format!("name={name}"));
     if let Some(head_ref) = head_ref {
-        command.arg("-f").arg(format!("headRefName={head_ref}"));
+        command = command.arg("-f").arg(format!("headRefName={head_ref}"));
     }
     let raw = run_capture_named(
         command
@@ -875,11 +886,12 @@ fn fetch_open_pr_summaries_for_repository(
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
         ProcessDescriptor::new("gh.api.graphql"),
-    )?;
+    )
+    .await?;
     try_parse_pr_summary_index_for_repository(&raw, Some(repository))
 }
 
-pub(super) fn fetch_pr_summary_for_repository_number(
+pub(super) async fn fetch_pr_summary_for_repository_number(
     path: &std::path::Path,
     config: &Config,
     repository: &crate::remote::RemoteRepositoryId,
@@ -907,21 +919,22 @@ pub(super) fn fetch_pr_summary_for_repository_number(
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
         ProcessDescriptor::new("gh.api.graphql"),
-    )?;
+    )
+    .await?;
     try_parse_pr_summary_for_repository(&raw, repository)
 }
 
-pub(crate) fn refresh_repo_policy_cache(
+pub(crate) async fn refresh_repo_policy_cache(
     repo: &Repository,
     path: &std::path::Path,
     config: &Config,
 ) -> Result<RepoPolicyCache, String> {
-    let repository = github_remote_repository_id(path, config, "origin")?;
+    let repository = github_remote_repository_id(path, config, "origin").await?;
     let target_branch = config.default_base.as_deref().unwrap_or("main");
-    refresh_repo_policy_cache_for_repository(repo, path, config, &repository, target_branch)
+    refresh_repo_policy_cache_for_repository(repo, path, config, &repository, target_branch).await
 }
 
-pub(crate) fn refresh_repo_policy_cache_for_repository(
+pub(crate) async fn refresh_repo_policy_cache_for_repository(
     repo: &Repository,
     path: &std::path::Path,
     config: &Config,
@@ -929,7 +942,7 @@ pub(crate) fn refresh_repo_policy_cache_for_repository(
     target_branch: &str,
 ) -> Result<RepoPolicyCache, String> {
     let remote = repository.project_path().to_string();
-    let policy = match fetch_repo_policy(path, config, repository, target_branch) {
+    let policy = match fetch_repo_policy(path, config, repository, target_branch).await {
         Ok(mut policy) => {
             policy.repo_remote = remote.clone();
             policy.provider = Some(repository.provider());
@@ -964,7 +977,7 @@ pub(crate) fn refresh_repo_policy_cache_for_repository(
     Ok(policy)
 }
 
-pub(crate) fn resolve_review_thread(
+pub(crate) async fn resolve_review_thread(
     path: &std::path::Path,
     config: &Config,
     host: &crate::remote::HostIdentity,
@@ -976,7 +989,8 @@ pub(crate) fn resolve_review_thread(
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
         ProcessDescriptor::new("gh.api.graphql"),
-    )?;
+    )
+    .await?;
     let value = serde_json::from_str::<serde_json::Value>(&raw)
         .map_err(|error| format!("parse review thread resolution: {error}"))?;
     let thread = value
@@ -1060,7 +1074,7 @@ mutation($thread: ID!) {
 }
 "#;
 
-fn fetch_repo_policy(
+async fn fetch_repo_policy(
     path: &std::path::Path,
     config: &Config,
     repository: &crate::remote::RemoteRepositoryId,
@@ -1084,7 +1098,8 @@ fn fetch_repo_policy(
         config,
         &repository.host().to_string(),
         &classic_endpoint,
-    )?;
+    )
+    .await?;
     let raw_rules = run_capture_named(
         Command::new(config.tool("gh"))
             .args(github_policy_api_args(
@@ -1095,7 +1110,8 @@ fn fetch_repo_policy(
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
         ProcessDescriptor::new("gh.api.rules.branch"),
-    )?;
+    )
+    .await?;
     let rulesets = parse_evaluated_branch_rules(&raw_rules)?;
     let facts = classic.combine(rulesets);
 
@@ -1135,7 +1151,7 @@ fn github_policy_api_args(host: &str, endpoint: &str, paginate: bool) -> Vec<Str
     args
 }
 
-fn fetch_classic_branch_protection(
+async fn fetch_classic_branch_protection(
     path: &std::path::Path,
     config: &Config,
     host: &str,
@@ -1147,7 +1163,8 @@ fn fetch_classic_branch_protection(
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
         ProcessDescriptor::new("gh.api.branch.protection"),
-    )?;
+    )
+    .await?;
     if output.status.success() {
         if output.stdout_truncated {
             return Err(format!(
@@ -1155,12 +1172,15 @@ fn fetch_classic_branch_protection(
                 output.stdout_total_bytes
             ));
         }
-        return parse_classic_branch_protection(&output.stdout);
+        return parse_classic_branch_protection(&String::from_utf8_lossy(&output.stdout));
     }
-    if !output.stderr_truncated && is_unprotected_branch_response(&output.stderr) {
+    if !output.stderr_truncated
+        && is_unprotected_branch_response(&String::from_utf8_lossy(&output.stderr))
+    {
         return Ok(GithubPolicyFacts::default());
     }
-    let message = output.stderr.trim();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let message = stderr.trim();
     Err(if message.is_empty() {
         format!(
             "gh api classic branch protection exited with {}",
@@ -1605,16 +1625,19 @@ query($owner: String!, $name: String!, $number: Int!) {
 }
 "#;
 
-fn github_owner_repo(path: &std::path::Path, config: &Config) -> Result<(String, String), String> {
-    github_remote_owner_repo(path, config, "origin")
+async fn github_owner_repo(
+    path: &std::path::Path,
+    config: &Config,
+) -> Result<(String, String), String> {
+    github_remote_owner_repo(path, config, "origin").await
 }
 
-fn github_remote_owner_repo(
+async fn github_remote_owner_repo(
     path: &std::path::Path,
     config: &Config,
     remote_name: &str,
 ) -> Result<(String, String), String> {
-    let repository = github_remote_repository_id(path, config, remote_name)?;
+    let repository = github_remote_repository_id(path, config, remote_name).await?;
     let (owner, name) = repository
         .project_path()
         .split_once('/')
@@ -1625,7 +1648,7 @@ fn github_remote_owner_repo(
     Ok((owner.to_string(), name.to_string()))
 }
 
-fn github_remote_repository_id(
+async fn github_remote_repository_id(
     path: &std::path::Path,
     config: &Config,
     remote_name: &str,
@@ -1636,6 +1659,7 @@ fn github_remote_repository_id(
         remote_name,
         crate::remote::RemoteUrlKind::Fetch,
     )
+    .await
     .map_err(|error| error.to_string())?;
     if remote.repository.id.provider() != crate::remote::ProviderKind::GitHub {
         return Err(format!("{remote_name} remote is not a GitHub repository"));
@@ -1901,7 +1925,7 @@ fn github_change_request_identity(
     ))
 }
 
-fn fetch_pr_summary(
+async fn fetch_pr_summary(
     path: &std::path::Path,
     branch: &str,
     config: &Config,
@@ -1909,7 +1933,7 @@ fn fetch_pr_summary(
     if branch == "(detached)" {
         return Ok(None);
     }
-    let repository = github_remote_repository_id(path, config, "origin")?;
+    let repository = github_remote_repository_id(path, config, "origin").await?;
     let fields = [
         "id",
         "number",
@@ -1941,9 +1965,10 @@ fn fetch_pr_summary(
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
         ProcessDescriptor::new("gh.pr.view"),
-    )?;
+    )
+    .await?;
     if !output.status.success() {
-        let stderr = output.stderr.trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         if stderr.contains("no pull requests found")
             || stderr.contains("not found")
             || stderr.contains("Could not resolve to a PullRequest")
@@ -1957,15 +1982,21 @@ fn fetch_pr_summary(
         };
         return Err(format!("gh pr view: {message}"));
     }
+    if output.stdout_truncated {
+        return Err(format!(
+            "gh pr view: stdout was truncated from {} bytes",
+            output.stdout_total_bytes
+        ));
+    }
     let raw = output.stdout;
-    let node = serde_json::from_str::<GithubPullRequest>(&raw)
+    let node = serde_json::from_slice::<GithubPullRequest>(&raw)
         .map_err(|error| format!("parse gh pr view output: {error}"))?;
     let summary = pr_summary_from_node(&node, Some(&repository))
         .ok_or_else(|| "parse gh pr view output: missing pull request number".to_string())?;
-    Ok(Some((summary, raw)))
+    Ok(Some((summary, String::from_utf8_lossy(&raw).into_owned())))
 }
 
-fn fetch_pr_details(
+async fn fetch_pr_details(
     path: &std::path::Path,
     branch: &str,
     association: PrDetailsAssociation,
@@ -1975,7 +2006,7 @@ fn fetch_pr_details(
         Some(identity) => identity
             .target_repository()
             .map_err(|error| format!("invalid canonical GitHub target repository: {error}"))?,
-        None => github_remote_repository_id(path, config, "origin")?,
+        None => github_remote_repository_id(path, config, "origin").await?,
     };
     let details = fetch_pr_details_for_repository_number(
         path,
@@ -1984,7 +2015,8 @@ fn fetch_pr_details(
         association.pr_number,
         branch,
         &association.head_sha,
-    )?;
+    )
+    .await?;
     Ok(PrDetailsObservation {
         association,
         comments: details.comments,
@@ -1998,7 +2030,7 @@ fn fetch_pr_details(
     })
 }
 
-pub(super) fn fetch_pr_details_for_repository_number(
+pub(super) async fn fetch_pr_details_for_repository_number(
     path: &std::path::Path,
     config: &Config,
     repository: &crate::remote::RemoteRepositoryId,
@@ -2017,6 +2049,7 @@ pub(super) fn fetch_pr_details_for_repository_number(
         &endpoint(&format!("issues/{pr_number}/comments?per_page=100"))?,
         "pull request comments",
     )
+    .await
     .map(|comments| parse_gh_comments(&comments));
     let reviews = fetch_paginated_github_array::<GhPrReview>(
         path,
@@ -2025,6 +2058,7 @@ pub(super) fn fetch_pr_details_for_repository_number(
         &endpoint(&format!("pulls/{pr_number}/reviews?per_page=100"))?,
         "pull request reviews",
     )
+    .await
     .map(|reviews| parse_gh_reviews(&reviews));
     let files = fetch_paginated_github_array::<GhPrFile>(
         path,
@@ -2033,6 +2067,7 @@ pub(super) fn fetch_pr_details_for_repository_number(
         &endpoint(&format!("pulls/{pr_number}/files?per_page=100"))?,
         "pull request files",
     )
+    .await
     .and_then(|files| {
         // GitHub documents a hard ceiling of 3,000 files for this endpoint. At the ceiling
         // pagination cannot prove that the observed set is complete.
@@ -2050,7 +2085,7 @@ pub(super) fn fetch_pr_details_for_repository_number(
     });
     let review_comments = fetch_inline_review_comments(path, repository, pr_number, config);
     let checks = fetch_complete_check_contexts(path, config, repository, head_sha);
-    let (failing_checks, check_contexts) = match checks {
+    let (failing_checks, check_contexts) = match checks.await {
         Ok(contexts) => (
             Ok(collect_failing_checks_from_contexts(&contexts)),
             Ok(collect_check_contexts_from_contexts(&contexts)),
@@ -2059,14 +2094,14 @@ pub(super) fn fetch_pr_details_for_repository_number(
     };
     let ci_failures = match &failing_checks {
         Ok(failing_checks) if !failing_checks.is_empty() => {
-            fetch_ci_failures(path, repository, source_branch, head_sha, config)
+            fetch_ci_failures(path, repository, source_branch, head_sha, config).await
         }
         _ => Ok(Vec::new()),
     };
     Ok(ProviderDetailsObservation {
         comments,
         reviews,
-        review_comments,
+        review_comments: review_comments.await,
         files,
         failing_checks,
         check_contexts,
@@ -2091,7 +2126,7 @@ fn github_repository_api_endpoint(
     ))
 }
 
-fn fetch_paginated_github_array<T: serde::de::DeserializeOwned>(
+async fn fetch_paginated_github_array<T: serde::de::DeserializeOwned>(
     path: &std::path::Path,
     config: &Config,
     repository: &crate::remote::RemoteRepositoryId,
@@ -2108,7 +2143,8 @@ fn fetch_paginated_github_array<T: serde::de::DeserializeOwned>(
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
         ProcessDescriptor::new("gh.api.paginated"),
-    )?;
+    )
+    .await?;
     let pages = serde_json::from_str::<Vec<Vec<T>>>(&raw)
         .map_err(|error| format!("parse paginated GitHub {label}: {error}"))?;
     if pages.is_empty() {
@@ -2119,7 +2155,7 @@ fn fetch_paginated_github_array<T: serde::de::DeserializeOwned>(
     Ok(pages.into_iter().flatten().collect())
 }
 
-fn fetch_complete_check_contexts(
+async fn fetch_complete_check_contexts(
     path: &std::path::Path,
     config: &Config,
     repository: &crate::remote::RemoteRepositoryId,
@@ -2145,7 +2181,8 @@ fn fetch_complete_check_contexts(
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
         ProcessDescriptor::new("gh.api.check-runs"),
-    )?;
+    )
+    .await?;
     let pages = serde_json::from_str::<Vec<GhCheckRunsPage>>(&raw)
         .map_err(|error| format!("parse paginated GitHub check runs: {error}"))?;
     let Some(total_count) = pages.first().map(|page| page.total_count) else {
@@ -2171,13 +2208,16 @@ fn fetch_complete_check_contexts(
             encode_path_segment(head_sha)
         ),
     )?;
-    contexts.extend(fetch_paginated_github_array::<GithubStatusContext>(
-        path,
-        config,
-        repository,
-        &statuses_endpoint,
-        "commit statuses",
-    )?);
+    contexts.extend(
+        fetch_paginated_github_array::<GithubStatusContext>(
+            path,
+            config,
+            repository,
+            &statuses_endpoint,
+            "commit statuses",
+        )
+        .await?,
+    );
     Ok(contexts)
 }
 
@@ -2219,7 +2259,7 @@ fn try_parse_pr_details(raw: &str) -> Result<PrDetails, String> {
     })
 }
 
-fn fetch_ci_failures(
+async fn fetch_ci_failures(
     path: &std::path::Path,
     repository: &crate::remote::RemoteRepositoryId,
     _branch: &str,
@@ -2243,7 +2283,8 @@ fn fetch_ci_failures(
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
         ProcessDescriptor::new("gh.api.workflow-runs"),
-    )?;
+    )
+    .await?;
     let pages = serde_json::from_str::<Vec<GhWorkflowRunsPage>>(&raw)
         .map_err(|error| format!("parse paginated GitHub workflow runs: {error}"))?;
     let Some(total_count) = pages.first().map(|page| page.total_count) else {
@@ -2273,7 +2314,7 @@ fn fetch_ci_failures(
             continue;
         }
         let run_id = run.database_id.to_string();
-        let log_tail = fetch_failed_run_log_tail(path, repository, &run_id, config)?;
+        let log_tail = fetch_failed_run_log_tail(path, repository, &run_id, config).await?;
         failures.push(CiFailure {
             workflow: first_non_empty([run.workflow_name.as_str(), run.name.as_str()]),
             name: first_non_empty([run.display_title.as_str(), run.name.as_str()]),
@@ -2286,7 +2327,7 @@ fn fetch_ci_failures(
     Ok(failures)
 }
 
-fn fetch_failed_run_log_tail(
+async fn fetch_failed_run_log_tail(
     path: &std::path::Path,
     repository: &crate::remote::RemoteRepositoryId,
     run_id: &str,
@@ -2306,16 +2347,21 @@ fn fetch_failed_run_log_tail(
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
         ProcessDescriptor::new("gh.run.view"),
-    )?;
+    )
+    .await?;
     if !output.status.success() {
-        let message = output.stderr.trim();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let message = stderr.trim();
         return Err(if message.is_empty() {
             format!("gh run view exited with {}", output.status)
         } else {
             format!("gh run view: {message}")
         });
     }
-    Ok(tail_lines(&strip_ansi(&output.stdout), 80))
+    Ok(tail_lines(
+        &strip_ansi(&String::from_utf8_lossy(&output.stdout)),
+        80,
+    ))
 }
 
 fn gh_repository_selector(repository: &crate::remote::RemoteRepositoryId) -> String {
@@ -2339,7 +2385,7 @@ fn tail_lines(text: &str, max_lines: usize) -> String {
     lines[start..].join("\n")
 }
 
-fn fetch_inline_review_comments(
+async fn fetch_inline_review_comments(
     path: &std::path::Path,
     repository: &crate::remote::RemoteRepositoryId,
     pr_number: u64,
@@ -2366,7 +2412,8 @@ fn fetch_inline_review_comments(
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
         ProcessDescriptor::new("gh.api.graphql"),
-    )?;
+    )
+    .await?;
     try_parse_review_thread_comments(&raw)
 }
 

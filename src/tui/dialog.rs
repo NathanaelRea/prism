@@ -1,11 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write as _;
 use std::path::Path;
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+use crate::process::{Command, ProcessPolicy, Stdin};
 use crate::tui_runtime::{RuntimeEvent, TerminalRuntime};
 use crate::view;
 use crate::workspace_state::{InspectRequest, WorkspaceContext, WorkspaceState};
@@ -21,6 +20,10 @@ fn plain_key(event: KeyEvent) -> bool {
 
 pub(super) fn ctrl_key(event: KeyEvent) -> bool {
     event.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+pub(super) fn append_line_paste(input: &mut String, pasted: &str) {
+    input.extend(pasted.chars().filter(|character| !character.is_control()));
 }
 
 pub(super) fn create_session_submit_key(
@@ -247,7 +250,7 @@ fn validate_workflow_form(
         .map_err(|problem| (0, problem.to_string()))
 }
 
-fn pick_workflow_file(
+async fn pick_workflow_file(
     fzf: &str,
     name: &str,
     worktree: &Path,
@@ -266,27 +269,23 @@ fn pick_workflow_file(
             worktree.display()
         ));
     }
-    let mut child = Command::new(fzf)
-        .args([
-            &format!("--prompt={name}> "),
-            &format!("--header=Select a file matching {glob}"),
-            "--height=80%",
-            "--reverse",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("start fzf '{fzf}' for Workflow input '{name}': {error}"))?;
-    {
-        let stdin = child.stdin.as_mut().expect("fzf stdin is piped");
-        for candidate in candidates {
-            writeln!(stdin, "{candidate}")
-                .map_err(|error| format!("write Workflow input candidates: {error}"))?;
-        }
-    }
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("wait for Workflow input picker: {error}"))?;
+    let candidate_input = candidates
+        .into_iter()
+        .map(|candidate| format!("{candidate}\n"))
+        .collect::<String>();
+    let output = crate::process::run_output_allow_failure(
+        Command::new(fzf)
+            .args([
+                &format!("--prompt={name}> "),
+                &format!("--header=Select a file matching {glob}"),
+                "--height=80%",
+                "--reverse",
+            ])
+            .stdin(Stdin::from_bytes(candidate_input.into_bytes())),
+        ProcessPolicy::LocalMutation,
+    )
+    .await
+    .map_err(|error| format!("run fzf '{fzf}' for Workflow input '{name}': {error}"))?;
     if output
         .status
         .code()
@@ -526,33 +525,33 @@ impl Tui {
             let Some(event) = runtime.poll_event(Duration::from_millis(100))? else {
                 continue;
             };
-            let RuntimeEvent::Key(event) = event else {
-                self.draw(runtime)?;
-                continue;
-            };
-            if event.kind != KeyEventKind::Press {
-                continue;
-            }
-            match event.code {
-                KeyCode::Enter => {
-                    self.dialog = None;
+            match event {
+                RuntimeEvent::Paste(pasted) => append_line_paste(&mut input, &pasted),
+                RuntimeEvent::Key(event) if event.kind == KeyEventKind::Press => match event.code {
+                    KeyCode::Enter => {
+                        self.dialog = None;
+                        self.draw(runtime)?;
+                        return Ok(Some(input));
+                    }
+                    KeyCode::Esc | KeyCode::Char('c')
+                        if event.code == KeyCode::Esc || ctrl_key(event) =>
+                    {
+                        self.dialog = None;
+                        self.draw(runtime)?;
+                        return Ok(None);
+                    }
+                    KeyCode::Backspace => {
+                        input.pop();
+                    }
+                    KeyCode::Char(ch) if plain_key(event) && !ch.is_control() => {
+                        input.push(ch);
+                    }
+                    _ => {}
+                },
+                _ => {
                     self.draw(runtime)?;
-                    return Ok(Some(input));
+                    continue;
                 }
-                KeyCode::Esc | KeyCode::Char('c')
-                    if event.code == KeyCode::Esc || ctrl_key(event) =>
-                {
-                    self.dialog = None;
-                    self.draw(runtime)?;
-                    return Ok(None);
-                }
-                KeyCode::Backspace => {
-                    input.pop();
-                }
-                KeyCode::Char(ch) if plain_key(event) && !ch.is_control() => {
-                    input.push(ch);
-                }
-                _ => {}
             }
             self.dialog = Some(view::DialogModel::Prompt {
                 title: title.to_string(),
@@ -741,7 +740,7 @@ impl Tui {
         }
     }
 
-    pub(crate) fn prompt_workflow_input_form(
+    pub(crate) async fn prompt_workflow_input_form(
         &mut self,
         runtime: &mut TerminalRuntime,
         workflow: &crate::CompiledWorkflow,
@@ -914,14 +913,14 @@ impl Tui {
                         });
                     }
                     Some(view::FormFieldKind::File { .. }) => {
-                        let picked = runtime.suspend_for(|| {
-                            Ok(pick_workflow_file(
+                        let picked = runtime
+                            .suspend_for_async(pick_workflow_file(
                                 fzf,
                                 &fields[selected].name,
                                 worktree,
                                 workflow,
                             ))
-                        })?;
+                            .await;
                         match picked {
                             Ok(Some(value)) => fields[selected].value = value,
                             Ok(None) => {}
@@ -940,14 +939,14 @@ impl Tui {
                         });
                     }
                     Some(view::FormFieldKind::File { .. }) => {
-                        let picked = runtime.suspend_for(|| {
-                            Ok(pick_workflow_file(
+                        let picked = runtime
+                            .suspend_for_async(pick_workflow_file(
                                 fzf,
                                 &fields[selected].name,
                                 worktree,
                                 workflow,
                             ))
-                        })?;
+                            .await;
                         match picked {
                             Ok(Some(value)) => fields[selected].value = value,
                             Ok(None) => {}
@@ -1184,18 +1183,21 @@ impl Tui {
         }
     }
 
-    pub(super) fn offer_interrupted_run_recovery(
+    pub(super) async fn offer_interrupted_run_recovery(
         &mut self,
         runtime: &mut TerminalRuntime,
     ) -> Result<(), String> {
         let state = WorkspaceState::open(WorkspaceContext {
             repo: None,
             cwd: self.repo.root.clone(),
-        })?;
-        let snapshot = state.inspect(InspectRequest {
-            include_hidden: true,
-            include_terminal: true,
-        })?;
+        })
+        .await?;
+        let snapshot = state
+            .inspect(InspectRequest {
+                include_hidden: true,
+                include_terminal: true,
+            })
+            .await?;
         let candidates = snapshot
             .repositories
             .iter()
