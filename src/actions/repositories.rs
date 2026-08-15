@@ -38,7 +38,7 @@ fn editor_command(path: &Path) -> Result<Command, String> {
 impl Tui {
     pub(crate) fn select_default_harness(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
         let config = self.config.clone();
         let entries = harness_choice_entries(&config);
@@ -115,7 +115,7 @@ impl Tui {
 
     fn prompt_generic_harness(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
         config: &Config,
     ) -> Result<Option<(String, HarnessConfig)>, String> {
         let Some(id) = self.prompt_line_dialog(
@@ -241,14 +241,14 @@ impl Tui {
 
     pub(crate) fn edit_config(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
         let context = self
             .selected_repo_context()
             .ok_or_else(|| "no selected repository".to_string())?;
         ensure_repo_config_file(&context.config.repo_config_path, false)?;
         let mut editor = editor_command(&context.config.repo_config_path)?;
-        raw.suspend_for(|| crate::process::run_status_inherited(&mut editor))?;
+        crate::tui_runtime::suspend_for(raw, || crate::process::run_status_inherited(&mut editor))?;
         let config = crate::config::Config::load(&context.repo);
         if !config.config_errors.is_empty() {
             return Err(config.config_errors.join("\n"));
@@ -266,7 +266,7 @@ impl Tui {
 
     pub(crate) fn edit_user_config(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
         let path = self
             .repos
@@ -275,7 +275,7 @@ impl Tui {
             .ok_or_else(|| "no selected repository".to_string())?;
         ensure_user_config_file(&path)?;
         let mut editor = editor_command(&path)?;
-        raw.suspend_for(|| crate::process::run_status_inherited(&mut editor))?;
+        crate::tui_runtime::suspend_for(raw, || crate::process::run_status_inherited(&mut editor))?;
         let configs = self
             .repos
             .iter()
@@ -301,7 +301,7 @@ impl Tui {
 
     pub(crate) fn edit_worktrunk_user_config(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
         let context = self
             .selected_repo_context()
@@ -369,7 +369,7 @@ impl Tui {
             }
         }
         let mut editor = editor_command(&location.path)?;
-        raw.suspend_for(|| crate::process::run_status_inherited(&mut editor))?;
+        crate::tui_runtime::suspend_for(raw, || crate::process::run_status_inherited(&mut editor))?;
         for repo_index in 0..self.repos.len() {
             self.request_worktrunk_refreshes(repo_index);
         }
@@ -379,7 +379,7 @@ impl Tui {
 
     fn discover_worktrunk_user_config(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
         context: &SelectedRepoContext,
     ) -> Result<crate::worktrunk::UserConfigLocation, String> {
         let repo = context.repo.clone();
@@ -409,7 +409,7 @@ impl Tui {
 
     pub(crate) fn edit_worktree_columns(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
         let context = self
             .selected_repo_context()
@@ -443,7 +443,7 @@ impl Tui {
 
     pub(crate) fn add_repository(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
         let old_roots = self
             .repos
@@ -475,7 +475,7 @@ impl Tui {
 
     pub(crate) fn edit_repositories(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
         let path = crate::workspace::repos_path();
         if !path.exists() {
@@ -490,7 +490,7 @@ impl Tui {
             crate::workspace::initialize_entries(&entries)?;
         }
         let mut editor = editor_command(&path)?;
-        raw.suspend_for(|| crate::process::run_status_inherited(&mut editor))?;
+        crate::tui_runtime::suspend_for(raw, || crate::process::run_status_inherited(&mut editor))?;
         let entries = crate::workspace::load_entries()?;
         if entries.is_empty() {
             return Err("repository list is empty; add at least one [[repos]] block".to_string());
@@ -529,7 +529,7 @@ impl Tui {
 
     pub(crate) fn reorder_repositories(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
         let entries = crate::workspace::load_entries()?;
         let items = repository_order_choices(&entries);
@@ -585,7 +585,7 @@ impl Tui {
 
     pub(super) fn offer_worktrunk_approval_if_pending(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
         repo: &Repository,
         config: &Config,
     ) -> Result<(), String> {
@@ -620,7 +620,7 @@ impl Tui {
 
     pub(super) fn offer_worktrunk_approval(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
         repo: &Repository,
         config: &Config,
     ) -> Result<bool, String> {
@@ -644,7 +644,7 @@ impl Tui {
         )? {
             return Ok(false);
         }
-        raw.suspend_for(|| run_worktrunk_approval_prompt(repo, config))?;
+        crate::tui_runtime::suspend_for(raw, || run_worktrunk_approval_prompt(repo, config))?;
         Ok(true)
     }
 

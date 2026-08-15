@@ -5,7 +5,7 @@ use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
 use crate::session::Session;
-use crate::tui_runtime::TerminalRuntime;
+use crate::tui_runtime::TerminalDriver;
 use crate::view;
 
 use super::Tui;
@@ -609,7 +609,7 @@ impl Tui {
 
     pub(super) fn open_selected_comment_dialog(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
     ) -> Result<bool, String> {
         if !self.main_focused || self.focused_panel != PanelFocus::Worktrees {
             return Ok(false);
@@ -740,7 +740,10 @@ impl Tui {
         self.leader_hint = None;
     }
 
-    pub(super) fn search_sessions(&mut self, runtime: &mut TerminalRuntime) -> Result<(), String> {
+    pub(super) fn search_sessions(
+        &mut self,
+        runtime: &mut dyn TerminalDriver,
+    ) -> Result<(), String> {
         match self.focused_panel {
             PanelFocus::Status => {
                 self.show_message("status panel has no filter")?;

@@ -7,7 +7,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use crate::remote::{PrCache, PrSummary};
 use crate::session::WorktreeRepositoryKey;
 use crate::tui_jobs::{JobContext, JobId};
-use crate::tui_runtime::{RuntimeEvent, TerminalRuntime};
+use crate::tui_runtime::{RuntimeEvent, TerminalDriver};
 use crate::view;
 
 use super::{
@@ -559,7 +559,7 @@ impl Tui {
 
     pub(crate) fn run_remote_action<F>(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
         request: RemoteActionRequest<'_>,
         action: F,
     ) -> Result<RemoteActionValue, String>

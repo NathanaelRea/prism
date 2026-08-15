@@ -2,14 +2,14 @@ use std::time::Instant;
 
 use crate::agent::AgentState;
 use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey};
-use crate::tui_runtime::TerminalRuntime;
+use crate::tui_runtime::TerminalDriver;
 use crate::view;
 use crate::workspace_state::CiState;
 
 use super::{GitAction, LeaderHint, PanelFocus, Tui, choice_list, worktree_updated_label};
 
 impl Tui {
-    pub(crate) fn draw(&mut self, runtime: &mut TerminalRuntime) -> Result<(), String> {
+    pub(crate) fn draw(&mut self, runtime: &mut dyn TerminalDriver) -> Result<(), String> {
         let input = crate::flight_recorder::take_input_for_frame();
         let started = Instant::now();
         self.tmux_portal_size =

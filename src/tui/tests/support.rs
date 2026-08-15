@@ -1,15 +1,74 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::layout::Rect;
 
 use crate::agent::AgentState;
 use crate::config::Config;
 use crate::remote::{PrCache, PrSummary};
 use crate::repo::Repository;
 use crate::session::Session;
+use crate::tui_runtime::{DrawTiming, RuntimeEvent, TerminalDriver};
 
 use super::super::{ManagedRepo, Tui};
+
+pub(super) struct ScriptedTerminal {
+    events: VecDeque<RuntimeEvent>,
+    pub(super) draws: usize,
+    pub(super) suspends: usize,
+    pub(super) resumes: usize,
+    area: Rect,
+}
+
+impl Default for ScriptedTerminal {
+    fn default() -> Self {
+        Self {
+            events: VecDeque::new(),
+            draws: 0,
+            suspends: 0,
+            resumes: 0,
+            area: Rect::new(0, 0, 120, 40),
+        }
+    }
+}
+
+impl ScriptedTerminal {
+    pub(super) fn push_key(&mut self, code: KeyCode) {
+        self.events
+            .push_back(RuntimeEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+    }
+}
+
+impl TerminalDriver for ScriptedTerminal {
+    fn draw(&mut self, _model: &crate::view::FrameModel<'_>) -> Result<DrawTiming, String> {
+        self.draws += 1;
+        Ok(DrawTiming {
+            render: Duration::ZERO,
+            terminal: Duration::ZERO,
+        })
+    }
+
+    fn area(&self) -> Result<Rect, String> {
+        Ok(self.area)
+    }
+
+    fn poll_event(&mut self, _timeout: Duration) -> Result<Option<RuntimeEvent>, String> {
+        Ok(self.events.pop_front())
+    }
+
+    fn suspend(&mut self) -> Result<(), String> {
+        self.suspends += 1;
+        Ok(())
+    }
+
+    fn resume(&mut self) -> Result<(), String> {
+        self.resumes += 1;
+        Ok(())
+    }
+}
 
 pub(super) fn test_tui() -> Tui {
     let repos = vec![

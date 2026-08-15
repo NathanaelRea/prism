@@ -332,7 +332,7 @@ impl Tui {
 
     pub(crate) fn create_session(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<bool, String> {
         let context = self
             .selected_repo_context()
@@ -464,7 +464,7 @@ impl Tui {
 
     pub(super) fn ensure_default_branch_ready_for_create(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
         let context = self
             .selected_repo_context()
@@ -500,7 +500,7 @@ impl Tui {
 
     pub(crate) fn pull_default_branch(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
         let context = self
             .selected_repo_context()
@@ -540,7 +540,7 @@ impl Tui {
 
     pub(crate) fn archive_session(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
         let Some(context) = self.selected_worktree_context() else {
             return Ok(());
@@ -576,7 +576,7 @@ impl Tui {
 
     pub(crate) fn unarchive_session(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
         let context = self
             .selected_repo_context()
@@ -668,7 +668,7 @@ impl Tui {
 
     pub(crate) fn delete_session(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
         let Some(context) = self.selected_worktree_context() else {
             return Ok(());

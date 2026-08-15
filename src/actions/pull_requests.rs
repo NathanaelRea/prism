@@ -288,7 +288,7 @@ impl Tui {
 
     pub(crate) fn merge_selected_change_request(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
         let context = self
             .selected_worktree_context()
@@ -414,7 +414,7 @@ impl Tui {
 
     pub(crate) fn push_selected_branch(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
         let context = self
             .selected_worktree_context()
@@ -596,7 +596,7 @@ impl Tui {
 
     pub(crate) fn resolve_review_comments(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
         let context = self
             .selected_worktree_context()
@@ -712,7 +712,7 @@ impl Tui {
 
     pub(crate) fn open_remote_pr_worktree(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
         let context = self
             .selected_repo_context()
@@ -790,7 +790,7 @@ impl Tui {
 
     pub(crate) fn open_selected_repo_pr_agent(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
         let context = self
             .selected_repo_context()
@@ -810,7 +810,7 @@ impl Tui {
 
     fn open_repo_pr_worktree(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
         context: &crate::tui::SelectedRepoContext,
         summary: crate::remote::PrSummary,
     ) -> Result<Option<usize>, String> {
@@ -999,7 +999,7 @@ impl Tui {
 
     pub(crate) fn submit_selected_repo_pr_review(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
         let context = self
             .selected_repo_context()
@@ -1146,7 +1146,7 @@ impl Tui {
 
     pub(crate) fn open_selected_pr(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
         let Some(context) = self.selected_worktree_context() else {
             return Ok(());

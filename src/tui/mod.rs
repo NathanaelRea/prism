@@ -6,20 +6,23 @@ use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey, AgentSession
 use crate::config::Config;
 #[cfg(test)]
 use crate::desktop_notification::DesktopNotifier;
-use crate::input::{Key, KeyInput};
+use crate::input::KeyInput;
 use crate::repo::Repository;
 use crate::session::{Session, WorktreeRepositoryKey, WorktreeSessionKey};
 use crate::terminal::stdin_is_tty;
 use crate::tmux::TmuxWindow;
 use crate::tui_jobs::{LatestReceiver, LatestSender, latest_channel};
-use crate::tui_runtime::{RuntimeEvent, TerminalRuntime};
+use crate::tui_runtime::{RuntimeEvent, TerminalDriver, TerminalRuntime};
 use crate::tui_signal::{ShutdownNotification, ShutdownSignal};
 use crate::view;
 use crate::workspace_state::RepositorySnapshot;
+pub(crate) use command::DashboardCommand;
+use command::{CommandOutcome, CommandState};
 
 mod agent_state;
 mod attach;
 mod background_runtime;
+mod command;
 mod dialog;
 mod git_actions;
 pub(crate) mod input;
@@ -51,7 +54,7 @@ use dialog::{
 };
 pub(crate) use git_actions::GitAction;
 use git_actions::{
-    GitActionExecution, git_action_error_title, git_action_execution, git_action_for_key,
+    GitActionExecution, git_action_error_title, git_action_execution, git_action_for_command,
 };
 use job_orchestration::ShutdownReason;
 pub(crate) use job_orchestration::{TuiJobKey, TuiJobKind, TuiJobPayload};
@@ -510,7 +513,7 @@ impl Tui {
 
     fn run_inner(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
         shutdown: &ShutdownNotification,
     ) -> Result<ShutdownReason, String> {
         crate::worker::ensure_running()?;
@@ -527,7 +530,7 @@ impl Tui {
             }
         }
         let mut key_input = KeyInput::default();
-        let mut pending_g = false;
+        let mut command_state = CommandState::default();
         let shutdown_reason = loop {
             if let Some(reason) = requested_shutdown(shutdown) {
                 break reason;
@@ -571,402 +574,13 @@ impl Tui {
                 continue;
             };
 
-            let mut should_quit = false;
-            match key {
-                Key::Quit => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    should_quit = self.confirm_quit()?;
-                }
-                Key::Down => {
-                    self.clear_leader_hint();
-                    self.move_down();
-                    pending_g = false;
-                }
-                Key::Left => {
-                    self.clear_leader_hint();
-                    self.move_left();
-                    pending_g = false;
-                }
-                Key::Right => {
-                    self.clear_leader_hint();
-                    self.move_right();
-                    pending_g = false;
-                }
-                Key::FocusNext => {
-                    self.clear_leader_hint();
-                    self.focus_next_panel();
-                    pending_g = false;
-                }
-                Key::FocusPrevious => {
-                    self.clear_leader_hint();
-                    self.focus_previous_panel();
-                    pending_g = false;
-                }
-                Key::FocusMain => {
-                    self.clear_leader_hint();
-                    self.focus_main();
-                    pending_g = false;
-                }
-                Key::FocusStatus => {
-                    self.clear_leader_hint();
-                    self.focus_status();
-                    pending_g = false;
-                }
-                Key::FocusRepos => {
-                    self.clear_leader_hint();
-                    self.focus_repos();
-                    pending_g = false;
-                }
-                Key::FocusWorktrees => {
-                    self.clear_leader_hint();
-                    self.focus_worktrees();
-                    pending_g = false;
-                }
-                Key::Up => {
-                    self.clear_leader_hint();
-                    self.move_up();
-                    pending_g = false;
-                }
-                Key::Bottom => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    self.select_bottom_visible();
-                }
-                Key::G => {
-                    self.clear_leader_hint();
-                    if pending_g {
-                        self.select_top_visible();
-                        pending_g = false;
-                    } else {
-                        pending_g = true;
-                    }
-                }
-                Key::PreviousBlock => {
-                    self.clear_leader_hint();
-                    self.select_adjacent_workflow(-1);
-                    pending_g = false;
-                }
-                Key::NextBlock => {
-                    self.clear_leader_hint();
-                    self.select_adjacent_workflow(1);
-                    pending_g = false;
-                }
-                Key::PreviousView => {
-                    self.clear_leader_hint();
-                    self.switch_worktree_list_mode(WorktreeListMode::Global);
-                    pending_g = false;
-                }
-                Key::NextView => {
-                    self.clear_leader_hint();
-                    self.switch_worktree_list_mode(WorktreeListMode::Repo);
-                    pending_g = false;
-                }
-                Key::Leader => {
-                    self.leader_hint = Some(LeaderHint::Root);
-                }
-                Key::LeaderGit => {
-                    self.leader_hint = Some(LeaderHint::Git);
-                }
-                Key::LeaderWorkflow => {
-                    self.leader_hint = Some(LeaderHint::Workflow);
-                }
-                Key::OpenTmuxSession => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if self.handle_workflow_enter() {
-                        self.draw(runtime)?;
-                        continue;
-                    }
-                    if self.open_selected_comment_dialog(runtime)? {
-                        self.draw(runtime)?;
-                        continue;
-                    }
-                    match self.open_tmux_session_target() {
-                        OpenTmuxSessionTarget::RepoDefaultAgent(index) => {
-                            self.enter_agent_mode_for_index(runtime, index)?
-                        }
-                        OpenTmuxSessionTarget::WorktreeAgent => self.enter_agent_mode(runtime)?,
-                        OpenTmuxSessionTarget::RepoPr => {
-                            self.open_selected_repo_pr_agent(runtime)?
-                        }
-                        OpenTmuxSessionTarget::Blocked(message) => self.show_message(message)?,
-                    }
-                }
-                Key::WorkflowLauncher => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if let Err(error) = self.launch_workflow(runtime) {
-                        self.show_error("workflow launcher failed", &error)?;
-                    }
-                }
-                Key::WorkflowAi => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if let Err(error) = self.create_ai_workflow(runtime) {
-                        self.show_error("AI Workflow creation failed", &error)?;
-                    }
-                }
-                Key::WorkflowPauseResume => {
-                    if let Err(error) = self.control_selected_workflow(runtime, "toggle") {
-                        self.show_error("Workflow control failed", &error)?;
-                    }
-                }
-                Key::WorkflowRetry => {
-                    if let Err(error) = self.control_selected_workflow(runtime, "retry") {
-                        self.show_error("Workflow retry failed", &error)?;
-                    }
-                }
-                Key::Configuration => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if let Err(error) = self.show_configuration_tree(runtime) {
-                        self.show_error("configuration failed", &error)?;
-                    }
-                }
-                Key::LazyGit => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if self.git_action_enabled(GitAction::LazyGit) {
-                        if self.focused_panel == PanelFocus::Repos {
-                            if let Err(error) = self.open_selected_repo_lazygit(runtime) {
-                                self.show_error("repository lazygit failed", &error)?;
-                            }
-                        } else if let Err(error) =
-                            self.open_tmux_window(runtime, TmuxWindow::LazyGit)
-                        {
-                            self.show_error("lazygit failed", &error)?;
-                        }
-                    }
-                }
-                Key::OpenPr => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if self.git_action_enabled(GitAction::OpenPr)
-                        && let Err(error) = self.open_selected_pr(runtime)
-                    {
-                        self.show_error("open PR failed", &error)?;
-                    }
-                }
-                Key::OpenDevelopmentUrl => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if let Err(error) = self.open_selected_development_url() {
-                        self.show_error("open development URL failed", &error)?;
-                    }
-                }
-                Key::WorktrunkLogs => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if let Err(error) = self.show_selected_worktrunk_logs(runtime) {
-                        self.show_error("Worktrunk hook logs failed", &error)?;
-                    }
-                }
-                Key::SubmitReview => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if self.git_action_enabled(GitAction::SubmitReview)
-                        && let Err(error) = self.submit_selected_repo_pr_review(runtime)
-                    {
-                        self.show_error("submit review failed", &error)?;
-                    }
-                }
-                Key::Terminal => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if self.focused_panel == PanelFocus::Status {
-                        self.show_message("focus repos or worktrees to open a terminal")?;
-                    } else if self.focused_panel == PanelFocus::Repos {
-                        if let Err(error) = self.open_selected_repo_terminal(runtime) {
-                            self.show_error("repository terminal failed", &error)?;
-                        }
-                    } else if let Err(error) = self.open_tmux_window(runtime, TmuxWindow::Terminal)
-                    {
-                        self.show_error("terminal failed", &error)?;
-                    }
-                }
-                Key::Help => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    self.show_keybindings_dialog(runtime)?;
-                }
-                Key::Refresh => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if self.focused_panel == PanelFocus::Repos && !self.main_focused {
-                        if let Err(error) = self.reorder_repositories(runtime) {
-                            self.show_error("reorder repositories failed", &error)?;
-                        }
-                    } else {
-                        self.start_wt_column_poll();
-                        self.refresh_sessions_after_tmux()?;
-                    }
-                }
-                Key::VisibilityUp => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if self.focused_panel != PanelFocus::Worktrees {
-                        self.show_message("focus worktrees to change visibility")?;
-                    } else if let Err(error) = self.adjust_selected_visibility(1) {
-                        self.show_error("visibility update failed", &error)?;
-                    }
-                }
-                Key::VisibilityDown => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if self.focused_panel != PanelFocus::Worktrees {
-                        self.show_message("focus worktrees to change visibility")?;
-                    } else if let Err(error) = self.adjust_selected_visibility(-1) {
-                        self.show_error("visibility update failed", &error)?;
-                    }
-                }
-                Key::RepoShortcut(key) => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if let Err(error) = self.select_repo_by_key(key) {
-                        self.show_error("select repository failed", &error)?;
-                    }
-                }
-                Key::Push => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if self.git_action_enabled(GitAction::Push)
-                        && let Err(error) = self.push_selected_branch(runtime)
-                    {
-                        self.show_error("push failed", &error)?;
-                    }
-                }
-                Key::Merge | Key::CiFix | Key::ReviewFix => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    let action = git_action_for_key(key).expect("matched Git action key");
-                    if self.git_action_enabled(action) {
-                        let result = match git_action_execution(action) {
-                            GitActionExecution::ProviderMerge => {
-                                self.merge_selected_change_request(runtime)
-                            }
-                            GitActionExecution::Stabilize => {
-                                self.launch_stabilization_workflow(runtime)
-                            }
-                        };
-                        if let Err(error) = result {
-                            self.show_error(git_action_error_title(action), &error)?;
-                        }
-                    }
-                }
-                Key::ResolveAllComments => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if self.git_action_enabled(GitAction::ResolveAllComments)
-                        && let Err(error) = self.resolve_review_comments(runtime)
-                    {
-                        self.show_error("resolve review comments failed", &error)?;
-                    }
-                }
-                Key::PullDefault => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if self.focused_panel != PanelFocus::Repos {
-                        self.show_message("focus repos to pull the default branch")?;
-                    } else if let Err(error) = self.pull_default_branch(runtime) {
-                        self.show_error("pull failed", &error)?;
-                    }
-                }
-                Key::Create => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if self.focused_panel != PanelFocus::Repos {
-                        self.show_message("focus repos to create a worktree session")?;
-                    } else {
-                        match self.create_session(runtime) {
-                            Ok(true) => self.focus_worktrees(),
-                            Ok(false) => {}
-                            Err(error) => self.show_error("create session failed", &error)?,
-                        }
-                    }
-                }
-                Key::MigrateHarness => {
-                    if self.focused_panel != PanelFocus::Worktrees {
-                        self.show_message("focus worktrees to migrate an agent harness")?;
-                    } else if let Some(index) = self.selected_worktree_index() {
-                        self.migrate_worktree_harness(index)?;
-                    }
-                }
-                Key::AbortOpencode => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    match self.control_selected_workflow(runtime, "cancel") {
-                        Ok(true) => {}
-                        Ok(false) if self.focused_panel != PanelFocus::Worktrees => {
-                            self.show_message("focus worktrees to abort an agent session")?;
-                        }
-                        Ok(false) => {
-                            if let Err(error) = self.abort_selected_opencode_session(runtime) {
-                                self.show_error("abort failed", &error)?;
-                            }
-                        }
-                        Err(error) => self.show_error("Workflow control failed", &error)?,
-                    }
-                }
-                Key::OpenRemotePrs => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if self.focused_panel != PanelFocus::Repos {
-                        self.show_message("focus repos to open a remote PR worktree")?;
-                    } else if self.selected_repo_list_support()
-                        != Some(crate::remote::SupportLevel::Supported)
-                    {
-                        self.show_message("remote PR listing is unavailable for this provider")?;
-                    } else if let Err(error) = self.open_remote_pr_worktree(runtime) {
-                        self.show_error("open remote PR worktree failed", &error)?;
-                    }
-                }
-                Key::Delete => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if self.focused_panel == PanelFocus::Status {
-                        self.show_message("focus worktrees to delete a worktree/session")?;
-                    } else if self.focused_panel == PanelFocus::Repos {
-                        self.show_message("repository removal is available from r")?;
-                    } else if let Err(error) = self.archive_session(runtime) {
-                        self.show_error("archive failed", &error)?;
-                    }
-                }
-                Key::Unarchive => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if self.focused_panel != PanelFocus::Repos {
-                        self.show_message("focus repos to unarchive a worktree")?;
-                    } else if let Err(error) = self.unarchive_session(runtime) {
-                        self.show_error("unarchive failed", &error)?;
-                    }
-                }
-                Key::DeletePermanent => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if self.focused_panel != PanelFocus::Worktrees {
-                        self.show_message(
-                            "focus worktrees to permanently delete a worktree/session",
-                        )?;
-                    } else if let Err(error) = self.delete_session(runtime) {
-                        self.show_error("delete failed", &error)?;
-                    }
-                }
-                Key::Search => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    self.search_sessions(runtime)?;
-                }
-                Key::Other => {
-                    self.clear_leader_hint();
-                    pending_g = false;
+            match self.dispatch_command(runtime, key, &mut command_state)? {
+                CommandOutcome::Continue => self.draw(runtime)?,
+                CommandOutcome::Quit => {
+                    crate::flight_recorder::finish_pending_input_without_frame();
+                    break ShutdownReason::UserQuit;
                 }
             }
-            if should_quit {
-                crate::flight_recorder::finish_pending_input_without_frame();
-                break ShutdownReason::UserQuit;
-            }
-            self.draw(runtime)?;
         };
         Ok(shutdown_reason)
     }

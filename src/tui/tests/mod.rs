@@ -1,3 +1,4 @@
+mod command;
 mod dialog;
 mod git_actions;
 mod job_orchestration;

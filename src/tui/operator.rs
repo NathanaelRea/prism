@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEventKind};
 
-use crate::tui_runtime::{RuntimeEvent, TerminalRuntime};
+use crate::tui_runtime::{RuntimeEvent, TerminalDriver};
 use crate::view;
 
 use super::Tui;
@@ -18,7 +18,7 @@ struct WorkflowControlRequest {
 impl Tui {
     pub(super) fn create_ai_workflow(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
     ) -> Result<(), String> {
         let Some(session_index) = self.selected_worktree_index() else {
             return self
@@ -214,7 +214,7 @@ impl Tui {
 
     pub(super) fn control_selected_workflow(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
         requested: &str,
     ) -> Result<bool, String> {
         let Some(dashboard) = self.current_workflow_dashboard() else {
@@ -238,7 +238,7 @@ impl Tui {
             return Ok(true);
         }
         let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-        let status = runtime.suspend_for(|| {
+        let status = crate::tui_runtime::suspend_for(runtime, || {
             Command::new(executable)
                 .arg("--repo")
                 .arg(&self.repo.root)
@@ -257,7 +257,10 @@ impl Tui {
     }
 
     /// Open one flat, hot-discovered Workflow picker. Enter runs and Ctrl-E edits.
-    pub(super) fn launch_workflow(&mut self, runtime: &mut TerminalRuntime) -> Result<(), String> {
+    pub(super) fn launch_workflow(
+        &mut self,
+        runtime: &mut dyn TerminalDriver,
+    ) -> Result<(), String> {
         let global = crate::util::prism_config_dir();
         let local = self.repo.root.join(".prism");
         let snapshot = crate::RepositoryResourceSnapshot::capture(&local)
@@ -265,7 +268,7 @@ impl Tui {
         let repository_has_resources = !snapshot.is_empty();
         let repository = crate::trusted_repository_resources(&global, &self.repo.root, snapshot)
             .map_err(|error| error.to_string())?;
-        let catalog = runtime.suspend_for(|| {
+        let catalog = crate::tui_runtime::suspend_for(runtime, || {
             crate::PromptWorkflowCatalog::discover(&global, repository.as_ref())
                 .map_err(format_diagnostics)
         })?;
@@ -279,7 +282,8 @@ impl Tui {
             return self.show_message("no Workflow is available for the selected worktree");
         }
         let fzf = self.config.tool("fzf");
-        let selected = runtime.suspend_for(|| select_prompt_workflow(&fzf, &candidates))?;
+        let selected =
+            crate::tui_runtime::suspend_for(runtime, || select_prompt_workflow(&fzf, &candidates))?;
         let Some((action, name)) = selected else {
             return Ok(());
         };
@@ -298,7 +302,7 @@ impl Tui {
         } else {
             Default::default()
         };
-        let status = runtime.suspend_for(|| {
+        let status = crate::tui_runtime::suspend_for(runtime, || {
             let mut command = Command::new(executable);
             command
                 .arg("--repo")
@@ -335,11 +339,11 @@ impl Tui {
 
     pub(super) fn launch_stabilization_workflow(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
     ) -> Result<(), String> {
         let executable = std::env::current_exe().map_err(|error| error.to_string())?;
         let (worktree, change_request) = self.selected_workflow_subject();
-        let status = runtime.suspend_for(|| {
+        let status = crate::tui_runtime::suspend_for(runtime, || {
             let mut command = Command::new(executable);
             command
                 .arg("--repo")
@@ -359,7 +363,7 @@ impl Tui {
 
     pub(super) fn show_configuration_tree(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
     ) -> Result<(), String> {
         let choices = view::ChoiceList {
             title: "Configuration".into(),
@@ -388,7 +392,7 @@ impl Tui {
 }
 
 fn edit_draft_source(
-    runtime: &mut TerminalRuntime,
+    runtime: &mut dyn TerminalDriver,
     draft_path: &std::path::Path,
     source: &mut String,
 ) -> Result<(), String> {
@@ -397,22 +401,21 @@ fn edit_draft_source(
     let source_path = draft_path.with_extension("toml");
     std::fs::write(&source_path, source.as_bytes())
         .map_err(|error| format!("write editable Workflow draft: {error}"))?;
-    let result = runtime
-        .suspend_for(|| {
-            Command::new(&editor[0])
-                .args(&editor[1..])
-                .arg(&source_path)
-                .status()
-                .map_err(|error| format!("edit one-off Workflow: {error}"))
-        })
-        .and_then(|status| {
-            if !status.success() {
-                return Err(format!("editor exited with {status}"));
-            }
-            *source = std::fs::read_to_string(&source_path)
-                .map_err(|error| format!("read edited Workflow draft: {error}"))?;
-            Ok(())
-        });
+    let result = crate::tui_runtime::suspend_for(runtime, || {
+        Command::new(&editor[0])
+            .args(&editor[1..])
+            .arg(&source_path)
+            .status()
+            .map_err(|error| format!("edit one-off Workflow: {error}"))
+    })
+    .and_then(|status| {
+        if !status.success() {
+            return Err(format!("editor exited with {status}"));
+        }
+        *source = std::fs::read_to_string(&source_path)
+            .map_err(|error| format!("read edited Workflow draft: {error}"))?;
+        Ok(())
+    });
     let _ = std::fs::remove_file(source_path);
     result
 }

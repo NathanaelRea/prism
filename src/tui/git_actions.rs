@@ -1,6 +1,7 @@
 use crate::remote::PrSummary;
 use crate::view;
 
+use super::command::DashboardCommand;
 use super::{PanelFocus, Tui};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,11 +22,11 @@ pub(crate) enum GitActionExecution {
     Stabilize,
 }
 
-pub(crate) fn git_action_for_key(key: crate::input::Key) -> Option<GitAction> {
-    match key {
-        crate::input::Key::Merge => Some(GitAction::Merge),
-        crate::input::Key::CiFix => Some(GitAction::CiFix),
-        crate::input::Key::ReviewFix => Some(GitAction::ReviewFix),
+pub(crate) fn git_action_for_command(command: DashboardCommand) -> Option<GitAction> {
+    match command {
+        DashboardCommand::Merge => Some(GitAction::Merge),
+        DashboardCommand::CiFix => Some(GitAction::CiFix),
+        DashboardCommand::ReviewFix => Some(GitAction::ReviewFix),
         _ => None,
     }
 }
@@ -226,15 +227,15 @@ mod tests {
     #[test]
     fn merge_key_uses_provider_mutation_while_repairs_only_stabilize() {
         assert_eq!(
-            git_action_execution(git_action_for_key(crate::input::Key::Merge).unwrap()),
+            git_action_execution(git_action_for_command(DashboardCommand::Merge).unwrap()),
             GitActionExecution::ProviderMerge
         );
         assert_eq!(
-            git_action_execution(git_action_for_key(crate::input::Key::CiFix).unwrap()),
+            git_action_execution(git_action_for_command(DashboardCommand::CiFix).unwrap()),
             GitActionExecution::Stabilize
         );
         assert_eq!(
-            git_action_execution(git_action_for_key(crate::input::Key::ReviewFix).unwrap()),
+            git_action_execution(git_action_for_command(DashboardCommand::ReviewFix).unwrap()),
             GitActionExecution::Stabilize
         );
     }
