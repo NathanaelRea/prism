@@ -1,5 +1,4 @@
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
@@ -654,13 +653,14 @@ pub(crate) fn submit_review(
 }
 
 pub(crate) fn capabilities(path: &Path, config: &Config) -> Result<Capabilities, String> {
-    let (adapter, _) = Adapter::resolve(path, config)?;
-    if let Adapter::Forgejo(adapter) = &adapter {
-        adapter
-            .discover_instance()
-            .map_err(|error| error.to_string())?;
+    let (adapter, remote) = Adapter::resolve(path, config)?;
+    match adapter {
+        Adapter::Forgejo(adapter) => adapter
+            .runtime_diagnostics(&remote.repository.id)
+            .map(|diagnostics| diagnostics.capabilities)
+            .map_err(|error| error.to_string()),
+        adapter => Ok(adapter.capabilities()),
     }
-    Ok(adapter.capabilities())
 }
 
 pub(crate) fn authentication_status(path: &Path, config: &Config) -> Result<String, String> {

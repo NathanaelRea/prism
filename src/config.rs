@@ -26,7 +26,7 @@ use crate::util::prism_config_dir;
 pub const AGENT_CANDIDATES: [&str; 1] = ["opencode"];
 pub const CONFIG_SCHEMA_URL: &str =
     "https://raw.githubusercontent.com/NathanaelRea/prism/main/schemas/config.schema.json";
-pub const CONFIG_SCHEMA_JSON: &str = include_str!("../../schemas/config.schema.json");
+pub const CONFIG_SCHEMA_JSON: &str = include_str!("../schemas/config.schema.json");
 
 pub fn config_example() -> String {
     format!("#:schema {CONFIG_SCHEMA_URL}\n")
@@ -46,7 +46,7 @@ opencode_shutdown_owned_servers = false
 icon_style = "unicode" # or "nerd-font"
 
 [notifications]
-enabled = true
+enabled = false
 needs_input = true
 completed = false
 failed = true
@@ -127,7 +127,7 @@ pub struct NotificationConfig {
 impl Default for NotificationConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             needs_input: true,
             completed: false,
             failed: true,
@@ -245,6 +245,7 @@ pub struct Config {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawConfig {
     default_harness: Option<String>,
     harnesses: Option<BTreeMap<String, RawHarnessConfig>>,
@@ -288,16 +289,19 @@ struct RawRemoteHostConfig {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawUiConfig {
     icon_style: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawLayoutConfig {
     sidebar_width: Option<u16>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawNotificationConfig {
     enabled: Option<bool>,
     needs_input: Option<bool>,
@@ -314,17 +318,20 @@ struct RawWorkflowAiConfig {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawWorktrees {
     columns: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawAgentConfig {
     command: Option<String>,
     prompt_mode: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawHarnessConfig {
     adapter: Option<String>,
     program: Option<String>,
@@ -440,7 +447,9 @@ fn parse_and_validate_config(
 }
 
 fn validate_config_values(raw: &RawConfig, is_user_config: bool) -> Result<(), String> {
-    if raw.opencode_port_span == Some(0) {
+    if let Some(base) = raw.opencode_port_base {
+        validate_opencode_port_range(base, raw.opencode_port_span.unwrap_or(1))?;
+    } else if raw.opencode_port_span == Some(0) {
         return Err("opencode_port_span must be greater than zero".to_string());
     }
     if let Some(value) = raw.merge_method.as_deref()
@@ -472,6 +481,23 @@ fn validate_config_values(raw: &RawConfig, is_user_config: bool) -> Result<(), S
         return Err(
             "repository config cannot contain default_harness or [harnesses.*]".to_string(),
         );
+    }
+    Ok(())
+}
+
+fn validate_opencode_port_range(base: u16, span: u16) -> Result<(), String> {
+    if base == 0 {
+        return Err("opencode_port_base must be greater than zero".to_string());
+    }
+    if span == 0 {
+        return Err("opencode_port_span must be greater than zero".to_string());
+    }
+    let last = u32::from(base) + u32::from(span) - 1;
+    if last > u32::from(u16::MAX) {
+        return Err(format!(
+            "opencode port range {base}..={last} exceeds port {}",
+            u16::MAX
+        ));
     }
     Ok(())
 }
@@ -644,6 +670,15 @@ impl Config {
                 return;
             }
         };
+        let effective_port_base = raw.opencode_port_base.unwrap_or(self.opencode_port_base);
+        let effective_port_span = raw.opencode_port_span.unwrap_or(self.opencode_port_span);
+        if let Err(error) = validate_opencode_port_range(effective_port_base, effective_port_span) {
+            self.config_errors.push(format!(
+                "load {}: config is semantically invalid: {error}",
+                path.display()
+            ));
+            return;
+        }
         if raw.default_agent.is_some() || raw.agents.is_some() {
             self.config_errors.push(format!(
                 "{} uses obsolete default_agent/[agents.*] settings; replace them with default_harness/[harnesses.*]",
@@ -1156,10 +1191,21 @@ fn string_array(items: &[String]) -> Array {
 fn save_user_icon_style(path: &Path, style: IconStyle) -> Result<(), String> {
     update_config_file(path, true, |text, _| {
         let mut text = text.to_string();
-        if text.contains("icon_style") {
-            return Ok(text);
-        }
         let setting = format!("icon_style = \"{}\"\n", style.label());
+        if text
+            .lines()
+            .any(|line| line.trim_start().starts_with("icon_style"))
+        {
+            let mut updated = String::with_capacity(text.len());
+            for line in text.split_inclusive('\n') {
+                if line.trim_start().starts_with("icon_style") {
+                    updated.push_str(&setting);
+                } else {
+                    updated.push_str(line);
+                }
+            }
+            return Ok(updated);
+        }
         if let Some(index) = ui_table_insert_index(&text) {
             text.insert_str(index, &setting);
         } else {
@@ -1397,9 +1443,14 @@ pub fn doctor(repo: &Repository, config: &mut Config) -> Result<(), String> {
 fn print_workflow_doctor(repo: &Repository) {
     let global = crate::util::prism_config_dir();
     let repository = repo.root.join(".prism");
-    let trusted =
-        crate::repository_resources_are_trusted(&global, &repo.root, &repository).unwrap_or(false);
-    match crate::PromptWorkflowCatalog::discover(&global, Some(&repository), trusted) {
+    let trusted = crate::RepositoryResourceSnapshot::capture(&repository)
+        .ok()
+        .and_then(|snapshot| {
+            crate::trusted_repository_resources(&global, &repo.root, snapshot)
+                .ok()
+                .flatten()
+        });
+    match crate::PromptWorkflowCatalog::discover(&global, trusted.as_ref()) {
         Ok(catalog) => {
             let workflows = catalog.list();
             println!("workflow definitions: {}", workflows.len());
@@ -1892,6 +1943,28 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unknown_fields_and_invalid_opencode_port_ranges() {
+        for text in [
+            "typo = true\n",
+            "[ui]\ntyop = true\n",
+            "[notifications]\ntyop = true\n",
+            "[worktrees]\ntyop = true\n",
+            "[harnesses.custom]\nadapter = \"generic\"\ntyop = true\n",
+        ] {
+            let error = parse_and_validate_config(text, true).unwrap_err();
+            assert!(error.to_string().contains("unknown field"), "{error}");
+        }
+
+        for text in [
+            "opencode_port_base = 0\nopencode_port_span = 1\n",
+            "opencode_port_base = 65535\nopencode_port_span = 2\n",
+            "opencode_port_base = 41000\nopencode_port_span = 0\n",
+        ] {
+            assert!(parse_and_validate_config(text, true).is_err(), "{text}");
+        }
+    }
+
+    #[test]
     fn parses_escape_key() {
         assert_eq!(EscapeKey::parse("ctrl-space"), Some(EscapeKey::CtrlSpace));
         assert_eq!(EscapeKey::parse("esc-esc"), Some(EscapeKey::EscEsc));
@@ -1922,7 +1995,7 @@ mod tests {
         assert_eq!(
             config.notifications,
             NotificationConfig {
-                enabled: true,
+                enabled: false,
                 needs_input: true,
                 completed: false,
                 failed: true,
@@ -2152,7 +2225,11 @@ review = "fix\nreview"
                 .unwrap()
                 .as_nanos()
         ));
-        fs::write(&path, "[ui]\nother = true\n[tools]\ngh = \"gh\"\n").unwrap();
+        fs::write(
+            &path,
+            "[ui]\nicon_style = \"unicode\"\n[tools]\ngh = \"gh\"\n",
+        )
+        .unwrap();
 
         save_user_icon_style(&path, IconStyle::NerdFont).unwrap();
 

@@ -83,12 +83,6 @@ pub(crate) fn load_worktree_harness_configs(
         .collect()
 }
 
-pub(crate) fn maintain_workflow_storage(_repo: &Repository) -> Result<(), String> {
-    // Workflow history and retention are owned by the global ledger/worker. Repository databases
-    // retain only repository-local caches and Worktree Session state.
-    Ok(())
-}
-
 impl ManagedRepo {
     pub(crate) fn new(repo: Repository, config: Config, key: Option<char>) -> Self {
         let label = crate::workspace::label_for_root(&repo.root);

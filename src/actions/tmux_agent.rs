@@ -343,7 +343,7 @@ impl Tui {
     }
 
     pub(crate) fn poll_tmux_agent_warmup(&mut self) -> bool {
-        if !self.tui_tick_active && !self.routing_tui_jobs {
+        if !self.tui_tick_active && !self.background.is_routing() {
             self.route_tui_job_messages();
         }
         let mut changed = false;

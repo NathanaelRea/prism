@@ -259,16 +259,13 @@ impl ExternalTrigger {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(TriggerError::Io)?;
-        let mut process_group = child.id().map(ProcessGroupGuard::new);
+        let process_id = child.id();
+        let mut process_group = process_id.map(ProcessGroupGuard::new);
         let body = serde_json::to_vec(&request)
             .map_err(|error| TriggerError::Protocol(error.to_string()))?;
         let mut stdin = child.stdin.take().ok_or_else(|| {
             TriggerError::Protocol("external trigger stdin was not captured".into())
         })?;
-        stdin.write_all(&body).await.map_err(TriggerError::Io)?;
-        stdin.write_all(b"\n").await.map_err(TriggerError::Io)?;
-        drop(stdin);
-
         let stdout = child.stdout.take().ok_or_else(|| {
             TriggerError::Protocol("external trigger stdout was not captured".into())
         })?;
@@ -279,10 +276,22 @@ impl ExternalTrigger {
         let stderr_limit = self.limits.stderr_bytes;
         let stdout_task = tokio::spawn(read_bounded(stdout, stdout_limit));
         let stderr_task = tokio::spawn(read_bounded(stderr, stderr_limit));
-        let status = match tokio::time::timeout(self.limits.timeout, child.wait()).await {
-            Ok(status) => status.map_err(TriggerError::Io)?,
+        let mut stdin_task = tokio::spawn(async move {
+            stdin.write_all(&body).await.map_err(TriggerError::Io)?;
+            stdin.write_all(b"\n").await.map_err(TriggerError::Io)
+        });
+        let status = match tokio::time::timeout(self.limits.timeout, async {
+            let status = child.wait().await.map_err(TriggerError::Io)?;
+            (&mut stdin_task).await.map_err(|error| {
+                TriggerError::Protocol(format!("join trigger stdin: {error}"))
+            })??;
+            Ok::<_, TriggerError>(status)
+        })
+        .await
+        {
+            Ok(status) => status?,
             Err(_) => {
-                if let Some(process_id) = child.id() {
+                if let Some(process_id) = process_id {
                     let _ = crate::system::process::send_process_group_signal(
                         process_id,
                         libc::SIGKILL,
@@ -290,22 +299,25 @@ impl ExternalTrigger {
                 }
                 let _ = child.kill().await;
                 let _ = child.wait().await;
+                stdin_task.abort();
+                let _ = stdin_task.await;
                 if let Some(process_group) = &mut process_group {
                     process_group.disarm();
                 }
+                stdout_task.abort();
+                stderr_task.abort();
                 let _ = stdout_task.await;
-                let stderr = stderr_task
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
-                    .map(|output| String::from_utf8_lossy(&output.bytes).into_owned())
-                    .unwrap_or_default();
+                let _ = stderr_task.await;
+                let stderr = String::new();
                 return Err(TriggerError::Timeout {
                     executable: self.executable.clone(),
                     diagnostic: stderr,
                 });
             }
         };
+        if let Some(process_id) = process_id {
+            let _ = crate::system::process::send_process_group_signal(process_id, libc::SIGKILL);
+        }
         let drain_timeout = self.limits.timeout.min(Duration::from_secs(5));
         let (stdout, stderr) = match tokio::time::timeout(drain_timeout, async {
             let stdout = stdout_task.await.map_err(|error| {
@@ -581,13 +593,21 @@ impl TriggerSnapshotStore {
 
     pub fn retain(&self, executable: &Path) -> Result<TriggerExecutableSnapshot, TriggerError> {
         let bytes = std::fs::read(executable).map_err(TriggerError::Io)?;
+        self.retain_bytes(executable, &bytes)
+    }
+
+    pub fn retain_bytes(
+        &self,
+        executable: &Path,
+        bytes: &[u8],
+    ) -> Result<TriggerExecutableSnapshot, TriggerError> {
         if !bytes.starts_with(b"#!") {
             return Err(TriggerError::Protocol(format!(
                 "trigger {} does not begin with a shebang",
                 executable.display()
             )));
         }
-        let digest = format!("sha256:{:x}", Sha256::digest(&bytes));
+        let digest = format!("sha256:{:x}", Sha256::digest(bytes));
         let path = self.root.join(digest.trim_start_matches("sha256:"));
         if path.exists() {
             let actual = std::fs::read(&path).map_err(TriggerError::Io)?;
@@ -599,10 +619,13 @@ impl TriggerSnapshotStore {
             }
         } else {
             std::fs::create_dir_all(&self.root).map_err(TriggerError::Io)?;
+            static TEMPORARY_SEQUENCE: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(1);
             let temporary = self.root.join(format!(
-                ".{}-{}.tmp",
+                ".{}-{}-{}.tmp",
                 digest.trim_start_matches("sha256:"),
-                std::process::id()
+                std::process::id(),
+                TEMPORARY_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ));
             std::fs::write(&temporary, bytes).map_err(TriggerError::Io)?;
             std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o700))
@@ -641,7 +664,11 @@ pub fn pin_workflow_triggers(
         let Some(executable) = &trigger.executable else {
             continue;
         };
-        let snapshot = store.retain(executable)?;
+        let snapshot = if let Some(bytes) = trigger.captured_bytes.take() {
+            store.retain_bytes(executable, &bytes)?
+        } else {
+            store.retain(executable)?
+        };
         if snapshot.digest != trigger.digest {
             return Err(TriggerError::Protocol(format!(
                 "Trigger '{}' changed while the Workflow snapshot was being retained",
@@ -792,7 +819,14 @@ impl std::fmt::Display for TriggerError {
     }
 }
 
-impl std::error::Error for TriggerError {}
+impl std::error::Error for TriggerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 impl From<std::io::Error> for TriggerError {
     fn from(value: std::io::Error) -> Self {
@@ -879,6 +913,44 @@ mod tests {
             trigger.should_run_step(&context()).await.unwrap(),
             TriggerDecision::Fail { .. }
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_trigger_timeout_covers_blocked_stdin_delivery() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = std::env::temp_dir().join(format!(
+            "prism-blocked-trigger-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let executable = root.join("trigger");
+        std::fs::write(&executable, "#!/bin/sh\nsleep 10\n").unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        let trigger = ExternalTrigger::new(
+            &executable,
+            ExternalTriggerLimits {
+                timeout: Duration::from_millis(50),
+                ..ExternalTriggerLimits::default()
+            },
+        );
+        let mut request = TriggerPhaseRequest::check(context());
+        if let TriggerPhaseBody::Check { context } = &mut request.body {
+            context.subject.change_request = Some("x".repeat(1024 * 1024));
+        }
+        let error = tokio::time::timeout(Duration::from_secs(2), trigger.invoke(request))
+            .await
+            .expect("Trigger timeout supervision must not hang")
+            .unwrap_err();
+        assert!(matches!(error, TriggerError::Timeout { .. }));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]

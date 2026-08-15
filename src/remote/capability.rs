@@ -64,7 +64,7 @@ impl Capabilities {
                 review_threads: SupportLevel::Supported,
                 resolve_review_thread: SupportLevel::Supported,
                 check_rollup: SupportLevel::Supported,
-                ci_logs: SupportLevel::Conditional,
+                ci_logs: SupportLevel::Supported,
                 changed_files: SupportLevel::Supported,
                 repository_policy: SupportLevel::Conditional,
                 fetch_change_request: SupportLevel::Supported,

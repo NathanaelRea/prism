@@ -35,7 +35,7 @@ fn prompt_worker_starts_once_lists_editable_defaults_and_stops() {
 
     let health = prism(&temp, &["worker", "health"]);
     let health = String::from_utf8_lossy(&health.stdout);
-    assert!(health.starts_with("ok 5 "), "unexpected health: {health}");
+    assert!(health.starts_with("ok 6 "), "unexpected health: {health}");
     assert!(health.contains("state=running"));
 
     let list = prism(&temp, &["workflow", "list", "--json"]);

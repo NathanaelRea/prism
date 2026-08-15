@@ -17,13 +17,12 @@ use sha2::{Digest as _, Sha256};
 
 use crate::platform::SupportedOs;
 
-const PROTOCOL_VERSION: u32 = 5;
+const PROTOCOL_VERSION: u32 = 6;
 const TRANSITION_TIMEOUT: Duration = Duration::from_secs(3);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(6);
-const MAX_CONNECTION_HANDLERS: usize = 32;
 const SOCKET_PATH_BUDGET: usize = 103;
-const AUTHENTICATION_FAILED_RESPONSE: &str = "error authentication-failed";
-const AUTHENTICATION_SECRET_BYTES: usize = 32;
+const SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_CONNECTIONS: usize = 16;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -68,13 +67,18 @@ pub fn probe_health() -> Result<DaemonHealth, String> {
                 std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
             ) =>
         {
-            return Ok(DaemonHealth::stopped());
+            return if worker_lock_is_available()? {
+                Ok(DaemonHealth::stopped())
+            } else {
+                Ok(DaemonHealth {
+                    state: DaemonState::Draining,
+                    ..DaemonHealth::stopped()
+                })
+            };
         }
         Err(error) => return Err(format!("connect to Prism worker: {error}")),
     };
-    parse_health(&request_with_authentication_fallback(
-        &path, stream, "health",
-    )?)
+    parse_health(&request_stream(stream, "health")?)
 }
 
 pub fn ensure_running() -> Result<(), String> {
@@ -146,12 +150,54 @@ pub fn shutdown() -> Result<(), String> {
 fn wait_stopped(timeout: Duration) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if probe_health()?.state == DaemonState::Stopped {
-            return Ok(());
+        match probe_health() {
+            Ok(health) if health.state == DaemonState::Stopped => return Ok(()),
+            Ok(_) => {}
+            Err(error) if is_worker_transition_error(&error) && worker_lock_is_available()? => {
+                return Ok(());
+            }
+            Err(error) if is_worker_transition_error(&error) => {}
+            Err(error) => return Err(error),
         }
         thread::sleep(Duration::from_millis(25));
     }
     Err("timed out waiting for Prism worker daemon to stop".into())
+}
+
+fn worker_lock_is_available() -> Result<bool, String> {
+    let directory = runtime_dir();
+    if !directory.exists() {
+        return Ok(true);
+    }
+    let path = directory.join("worker.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|error| format!("open Prism worker ownership lock: {error}"))?;
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        Ok(true)
+    } else if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
+        Ok(false)
+    } else {
+        Err(format!(
+            "probe Prism worker ownership lock: {}",
+            std::io::Error::last_os_error()
+        ))
+    }
+}
+
+fn is_worker_transition_error(error: &str) -> bool {
+    error.contains("Connection reset by peer")
+        || error.contains("Broken pipe")
+        || error.contains("connection refused")
+        || error.contains("Connection refused")
+        || error.contains("closed connection without a response")
 }
 
 pub fn serve() -> Result<(), String> {
@@ -159,6 +205,12 @@ pub fn serve() -> Result<(), String> {
         .ok()
         .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
         .map_or_else(binary_generation, Ok)?;
+    let directory = runtime_dir();
+    secure_runtime_directory(&directory)?;
+    // Exclusivity must cover stale socket removal and storage opening because opening may replace
+    // a pre-cutover database. The ownership lock, not socket path existence, is authoritative.
+    let lock = acquire_lock(&directory.join("worker.lock"))?;
+    remove_owned_socket(&validated_socket_path()?)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -191,7 +243,7 @@ pub fn serve() -> Result<(), String> {
             }
         }
     });
-    let result = serve_socket(&runtime, &service, &generation);
+    let result = serve_socket(&runtime, &service, &generation, &lock);
     let _ = shutdown.send(true);
     runtime
         .block_on(scheduler)
@@ -203,33 +255,15 @@ pub fn serve() -> Result<(), String> {
 struct DaemonControl {
     draining: AtomicBool,
     handlers: AtomicUsize,
-    requests: AtomicUsize,
 }
 
 fn serve_socket(
     runtime: &tokio::runtime::Runtime,
     service: &crate::PromptWorkflowService,
     generation: &str,
+    _lock: &File,
 ) -> Result<(), String> {
-    let directory = runtime_dir();
-    secure_runtime_directory(&directory)?;
-    let _lock = acquire_lock(&directory.join("worker.lock"))?;
     let socket = validated_socket_path()?;
-    if socket.exists() {
-        match UnixStream::connect(&socket) {
-            Ok(_) => return Err("a live Prism worker already owns the socket".into()),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
-                ) =>
-            {
-                fs::remove_file(&socket)
-                    .map_err(|error| format!("remove stale worker socket: {error}"))?;
-            }
-            Err(error) => return Err(format!("inspect existing worker socket: {error}")),
-        }
-    }
     let listener = UnixListener::bind(&socket)
         .map_err(|error| format!("bind Prism worker socket {}: {error}", socket.display()))?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))
@@ -243,10 +277,16 @@ fn serve_socket(
         crate::workflow::prompt_worker::now_unix_ms()
     );
     let control = Arc::new(DaemonControl::default());
+    let mut handlers = Vec::new();
+    let mut serve_error = None;
     loop {
+        reap_finished_handlers(&mut handlers);
+        if control.draining.load(Ordering::Acquire) {
+            break;
+        }
         match listener.accept() {
             Ok((mut stream, _)) => {
-                if control.handlers.load(Ordering::Acquire) >= MAX_CONNECTION_HANDLERS {
+                if control.handlers.load(Ordering::Acquire) >= MAX_CONNECTIONS {
                     let _ = stream.write_all(b"error worker-busy\n");
                     continue;
                 }
@@ -256,50 +296,95 @@ fn serve_socket(
                 let instance = instance.clone();
                 let generation = generation.to_string();
                 let handler_control = Arc::clone(&control);
-                if let Err(error) = thread::Builder::new()
+                match thread::Builder::new()
                     .name("prism-worker-connection".to_string())
                     .spawn(move || {
+                        let _active = ActiveConnection(Arc::clone(&handler_control));
                         respond(
                             &handle,
                             &service,
-                            &mut stream,
+                            stream,
                             &instance,
                             &generation,
                             &handler_control,
                         );
-                        handler_control.handlers.fetch_sub(1, Ordering::AcqRel);
-                    })
-                {
-                    control.handlers.fetch_sub(1, Ordering::AcqRel);
-                    return Err(format!("spawn Prism worker connection handler: {error}"));
+                    }) {
+                    Ok(handler) => handlers.push(handler),
+                    Err(error) => {
+                        control.handlers.fetch_sub(1, Ordering::AcqRel);
+                        serve_error =
+                            Some(format!("spawn Prism worker connection handler: {error}"));
+                        break;
+                    }
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(error) => return Err(format!("accept Prism worker connection: {error}")),
-        }
-        if control.draining.load(Ordering::Acquire)
-            && control.handlers.load(Ordering::Acquire) == 0
-            && control.requests.load(Ordering::Acquire) == 0
-        {
-            break;
+            Err(error) => {
+                serve_error = Some(format!("accept Prism worker connection: {error}"));
+                break;
+            }
         }
         thread::sleep(Duration::from_millis(10));
     }
     drop(listener);
-    fs::remove_file(&socket).map_err(|error| format!("remove Prism worker socket: {error}"))
+    // The ownership lock remains in this stack frame until every request handler has stopped.
+    // Handler work can include durable/provider effects and is not bounded by socket I/O, so
+    // detaching a live handler would permit a replacement Worker to overlap this generation.
+    for handler in handlers {
+        let _ = handler.join();
+    }
+    finish_socket(&socket, serve_error)
+}
+
+fn remove_owned_socket(socket: &Path) -> Result<(), String> {
+    match fs::remove_file(socket) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("remove stale worker socket: {error}")),
+    }
+}
+
+fn finish_socket(socket: &Path, serve_error: Option<String>) -> Result<(), String> {
+    let cleanup_error = match fs::remove_file(socket) {
+        Ok(()) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => Some(format!("remove Prism worker socket: {error}")),
+    };
+    serve_error.or(cleanup_error).map_or(Ok(()), Err)
+}
+
+fn reap_finished_handlers(handlers: &mut Vec<thread::JoinHandle<()>>) {
+    let mut index = 0;
+    while index < handlers.len() {
+        if handlers[index].is_finished() {
+            let handle = handlers.swap_remove(index);
+            let _ = handle.join();
+        } else {
+            index += 1;
+        }
+    }
+}
+
+struct ActiveConnection(Arc<DaemonControl>);
+
+impl Drop for ActiveConnection {
+    fn drop(&mut self) {
+        self.0.handlers.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 fn respond(
     runtime: &tokio::runtime::Handle,
     service: &crate::PromptWorkflowService,
-    stream: &mut UnixStream,
+    mut stream: UnixStream,
     instance: &str,
     generation: &str,
     control: &DaemonControl,
 ) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_read_timeout(Some(SOCKET_IO_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(SOCKET_IO_TIMEOUT));
     let mut request = String::new();
-    if BufReader::new(&mut *stream)
+    if BufReader::new(&mut stream)
         .take(1024 * 1024 + 1)
         .read_line(&mut request)
         .is_err()
@@ -309,38 +394,48 @@ fn respond(
         return;
     }
     let request = request.trim();
-    let active = runtime
+    let response = match request {
+        "health" | "wake" => health_line(
+            instance,
+            generation,
+            control.draining.load(Ordering::Acquire),
+            active_run_count(runtime, service),
+        ),
+        "shutdown" => {
+            control.draining.store(true, Ordering::Release);
+            health_line(
+                instance,
+                generation,
+                true,
+                active_run_count(runtime, service),
+            )
+        }
+        request if request.starts_with('{') => {
+            if control.draining.load(Ordering::Acquire) {
+                json_error("Prism worker is draining".to_string())
+            } else {
+                prompt_response(runtime, service, request)
+            }
+        }
+        _ => "error unknown-command\n".into(),
+    };
+    if stream.write_all(response.as_bytes()).is_ok() {
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+    }
+}
+
+fn active_run_count(
+    runtime: &tokio::runtime::Handle,
+    service: &crate::PromptWorkflowService,
+) -> usize {
+    runtime
         .block_on(service.list(None, 10_000))
         .map(|runs| {
             runs.into_iter()
                 .filter(|run| !run.status.terminal())
                 .count()
         })
-        .unwrap_or(0);
-    let response = match request {
-        "health" | "wake" => health_line(
-            instance,
-            generation,
-            control.draining.load(Ordering::Acquire),
-            active,
-        ),
-        "shutdown" => {
-            control.draining.store(true, Ordering::Release);
-            health_line(instance, generation, true, active)
-        }
-        request if request.starts_with('{') => {
-            if control.draining.load(Ordering::Acquire) {
-                json_error("Prism worker is draining".to_string())
-            } else {
-                control.requests.fetch_add(1, Ordering::AcqRel);
-                let response = prompt_response(runtime, service, request);
-                control.requests.fetch_sub(1, Ordering::AcqRel);
-                response
-            }
-        }
-        _ => "error unknown-command\n".into(),
-    };
-    let _ = stream.write_all(response.as_bytes());
+        .unwrap_or(0)
 }
 
 fn health_line(instance: &str, generation: &str, draining: bool, active: usize) -> String {
@@ -377,17 +472,26 @@ enum SocketRequest {
     RemoteObserve {
         repository: PathBuf,
         worktree: PathBuf,
-        operation: String,
+        #[serde(flatten)]
+        operation: super::remote_operation::RemoteObservationOperation,
         subject: String,
-        payload: serde_json::Value,
     },
     RemoteMutate {
         repository: PathBuf,
         worktree: PathBuf,
         request_id: String,
-        operation: String,
+        #[serde(flatten)]
+        operation: Box<super::remote_operation::RemoteMutationOperation>,
         subject: String,
-        payload: serde_json::Value,
+    },
+    RemoteReconcile {
+        repository: PathBuf,
+        worktree: PathBuf,
+        request_id: String,
+        #[serde(flatten)]
+        operation: Box<super::remote_operation::RemoteMutationOperation>,
+        subject: String,
+        reconciliation: crate::remote::request_coordinator::RemoteMutationReconciliation,
     },
 }
 
@@ -398,6 +502,8 @@ enum SocketControl {
     Resume,
     Cancel,
     Retry,
+    Recover { evidence: String },
+    Discard,
 }
 
 fn prompt_response(
@@ -441,6 +547,10 @@ fn prompt_response(
                     SocketControl::Resume => service.resume(&run_id, now_unix_ms).await,
                     SocketControl::Cancel => service.cancel(&run_id, now_unix_ms).await,
                     SocketControl::Retry => service.retry(&run_id, now_unix_ms).await,
+                    SocketControl::Recover { evidence } => {
+                        service.recover(&run_id, now_unix_ms, &evidence).await
+                    }
+                    SocketControl::Discard => service.discard(&run_id, now_unix_ms).await,
                 };
                 result
                     .map(|()| serde_json::json!({"ok": true}))
@@ -451,9 +561,8 @@ fn prompt_response(
                 worktree,
                 operation,
                 subject,
-                payload,
             } => service
-                .remote_observe(&repository, &worktree, operation, subject, payload)
+                .remote_observe(&repository, &worktree, operation, subject)
                 .await
                 .and_then(|result| match result {
                     crate::remote::request_coordinator::RemoteObservationResult::Fresh(value) => {
@@ -472,28 +581,44 @@ fn prompt_response(
                 request_id,
                 operation,
                 subject,
-                payload,
             } => service
-                .remote_mutate(
+                .remote_mutate(&repository, &worktree, request_id, *operation, subject)
+                .await
+                .map(|result| match result {
+                    crate::remote::request_coordinator::RemoteMutationResult::Applied(value) => {
+                        serde_json::json!({"ok": true, "state": "applied", "value": value})
+                    }
+                    crate::remote::request_coordinator::RemoteMutationResult::Pending(wait) => {
+                        serde_json::json!({"ok": true, "state": "pending", "wait": wait})
+                    }
+                    crate::remote::request_coordinator::RemoteMutationResult::Failed {
+                        reason,
+                        disposition,
+                    } => serde_json::json!({
+                        "ok": true,
+                        "state": "failed",
+                        "reason": reason,
+                        "disposition": disposition,
+                    }),
+                }),
+            SocketRequest::RemoteReconcile {
+                repository,
+                worktree,
+                request_id,
+                operation,
+                subject,
+                reconciliation,
+            } => service
+                .reconcile_remote_mutation(
                     &repository,
                     &worktree,
                     request_id,
-                    operation,
+                    *operation,
                     subject,
-                    payload,
+                    reconciliation,
                 )
                 .await
-                .and_then(|result| match result {
-                    crate::remote::request_coordinator::RemoteMutationResult::Applied(value) => {
-                        Ok(serde_json::json!({"ok": true, "state": "applied", "value": value}))
-                    }
-                    crate::remote::request_coordinator::RemoteMutationResult::Pending(wait) => {
-                        Ok(serde_json::json!({"ok": true, "state": "pending", "wait": wait}))
-                    }
-                    crate::remote::request_coordinator::RemoteMutationResult::Failed(reason) => {
-                        Err(reason)
-                    }
-                }),
+                .map(|()| serde_json::json!({"ok": true})),
         }
     });
     match result {
@@ -506,10 +631,13 @@ fn json_error(error: String) -> String {
     format!("{}\n", serde_json::json!({"ok": false, "error": error}))
 }
 
+const WORKER_CHANNEL_ERROR_PREFIX: &str = "worker channel error: ";
+
 fn worker_request(value: serde_json::Value) -> Result<serde_json::Value, String> {
-    let response = request(&value.to_string())?;
+    let response = request(&value.to_string())
+        .map_err(|error| format!("{WORKER_CHANNEL_ERROR_PREFIX}{error}"))?;
     let response: serde_json::Value = serde_json::from_str(&response)
-        .map_err(|error| format!("decode Worker response: {error}"))?;
+        .map_err(|error| format!("{WORKER_CHANNEL_ERROR_PREFIX}decode Worker response: {error}"))?;
     if response["ok"] == true {
         Ok(response)
     } else {
@@ -562,13 +690,15 @@ pub fn inspect_prompt_workflow(run_id: &str) -> Result<Option<crate::WorkflowRun
         .map_err(|error| format!("decode Workflow inspection: {error}"))
 }
 
-#[derive(Clone, Copy, Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptWorkflowControl {
     Pause,
     Resume,
     Cancel,
     Retry,
+    Recover { evidence: String },
+    Discard,
 }
 
 pub fn command_prompt_workflow(run_id: &str, command: PromptWorkflowControl) -> Result<(), String> {
@@ -585,27 +715,17 @@ pub fn command_prompt_workflow(run_id: &str, command: PromptWorkflowControl) -> 
 pub(crate) fn observe_remote<T: serde::de::DeserializeOwned>(
     repository: &Path,
     worktree: &Path,
-    operation: &str,
+    operation: super::remote_operation::RemoteObservationOperation,
     subject: &str,
-    payload: impl serde::Serialize,
 ) -> Result<T, String> {
-    observe_remote_with_progress(
-        repository,
-        worktree,
-        operation,
-        subject,
-        payload,
-        |_| {},
-        || false,
-    )
+    observe_remote_with_progress(repository, worktree, operation, subject, |_| {}, || false)
 }
 
 pub(crate) fn observe_remote_with_progress<T, F, C>(
     repository: &Path,
     worktree: &Path,
-    operation: &str,
+    operation: super::remote_operation::RemoteObservationOperation,
     subject: &str,
-    payload: impl serde::Serialize,
     on_wait: F,
     is_cancelled: C,
 ) -> Result<T, String>
@@ -615,21 +735,19 @@ where
     C: Fn() -> bool,
 {
     ensure_compatible_running()?;
-    let payload = serde_json::to_value(payload)
+    let mut request = serde_json::to_value(operation)
         .map_err(|error| format!("encode remote observation: {error}"))?;
-    coordinated_remote_request(
-        serde_json::json!({
-            "type": "remote_observe",
-            "repository": repository,
-            "worktree": worktree,
-            "operation": operation,
-            "subject": subject,
-            "payload": payload,
-        }),
-        "fresh",
-        on_wait,
-        is_cancelled,
-    )
+    let object = request
+        .as_object_mut()
+        .expect("operation serializes as object");
+    object.insert("type".into(), "remote_observe".into());
+    object.insert(
+        "repository".into(),
+        serde_json::to_value(repository).unwrap(),
+    );
+    object.insert("worktree".into(), serde_json::to_value(worktree).unwrap());
+    object.insert("subject".into(), subject.into());
+    coordinated_remote_request(request, "fresh", on_wait, is_cancelled)
 }
 
 pub(crate) struct RemoteRequestProgress<F, C> {
@@ -646,13 +764,18 @@ impl<F, C> RemoteRequestProgress<F, C> {
     }
 }
 
+const UNCERTAIN_REMOTE_MUTATION_PREFIX: &str = "uncertain remote mutation: ";
+
+pub(crate) fn remote_mutation_error_is_uncertain(error: &str) -> bool {
+    error.starts_with(UNCERTAIN_REMOTE_MUTATION_PREFIX)
+}
+
 pub(crate) fn mutate_remote_with_progress<T, F, C>(
     repository: &Path,
     worktree: &Path,
     request_id: &str,
-    operation: &str,
+    operation: super::remote_operation::RemoteMutationOperation,
     subject: &str,
-    payload: impl serde::Serialize,
     progress: RemoteRequestProgress<F, C>,
 ) -> Result<T, String>
 where
@@ -661,22 +784,69 @@ where
     C: Fn() -> bool,
 {
     ensure_running()?;
-    let payload = serde_json::to_value(payload)
+    let mut request = serde_json::to_value(operation)
         .map_err(|error| format!("encode remote mutation: {error}"))?;
-    coordinated_remote_request(
-        serde_json::json!({
-            "type": "remote_mutate",
-            "repository": repository,
-            "worktree": worktree,
-            "request_id": request_id,
-            "operation": operation,
-            "subject": subject,
-            "payload": payload,
-        }),
-        "applied",
-        progress.on_wait,
-        progress.is_cancelled,
-    )
+    let object = request
+        .as_object_mut()
+        .expect("operation serializes as object");
+    object.insert("type".into(), "remote_mutate".into());
+    object.insert(
+        "repository".into(),
+        serde_json::to_value(repository).unwrap(),
+    );
+    object.insert("worktree".into(), serde_json::to_value(worktree).unwrap());
+    object.insert("request_id".into(), request_id.into());
+    object.insert("subject".into(), subject.into());
+    coordinated_remote_request(request, "applied", progress.on_wait, progress.is_cancelled)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum CoordinatedRemoteResponse {
+    Fresh {
+        value: serde_json::Value,
+    },
+    Applied {
+        value: serde_json::Value,
+    },
+    Pending {
+        wait: crate::remote::request_coordinator::RemoteWait,
+    },
+    Failed {
+        reason: String,
+        disposition: crate::remote::request_coordinator::RemoteMutationFailureDisposition,
+    },
+}
+
+pub(crate) fn reconcile_remote_mutation(
+    repository: &Path,
+    worktree: &Path,
+    request_id: &str,
+    operation: super::remote_operation::RemoteMutationOperation,
+    subject: &str,
+    reconciliation: crate::remote::request_coordinator::RemoteMutationReconciliation,
+) -> Result<(), String> {
+    ensure_running()?;
+    let mut request = serde_json::to_value(operation)
+        .map_err(|error| format!("encode remote reconciliation: {error}"))?;
+    let object = request
+        .as_object_mut()
+        .expect("operation serializes as object");
+    object.insert("type".into(), "remote_reconcile".into());
+    object.insert(
+        "repository".into(),
+        serde_json::to_value(repository).unwrap(),
+    );
+    object.insert("worktree".into(), serde_json::to_value(worktree).unwrap());
+    object.insert("request_id".into(), request_id.into());
+    object.insert("subject".into(), subject.into());
+    object.insert(
+        "reconciliation".into(),
+        serde_json::to_value(reconciliation)
+            .map_err(|error| format!("encode remote reconciliation result: {error}"))?,
+    );
+    worker_request(request)?;
+    Ok(())
 }
 
 fn coordinated_remote_request<T, F, C>(
@@ -691,21 +861,74 @@ where
     C: Fn() -> bool,
 {
     let deadline = Instant::now() + Duration::from_secs(90);
+    let mutation = completed_state == "applied";
+    let uncertain = |reason: String| format!("{UNCERTAIN_REMOTE_MUTATION_PREFIX}{reason}");
+    let mut pending = false;
     loop {
         if is_cancelled() {
-            return Err("remote request cancelled while queued".into());
+            let reason = "remote request cancelled while queued".to_string();
+            return Err(if mutation && pending {
+                uncertain(reason)
+            } else {
+                reason
+            });
         }
-        let response = worker_request(request_value.clone())?;
-        if response["state"] == completed_state {
-            return serde_json::from_value(response["value"].clone())
-                .map_err(|error| format!("decode coordinated remote response: {error}"));
-        }
-        let wait: crate::remote::request_coordinator::RemoteWait =
-            serde_json::from_value(response["wait"].clone())
-                .map_err(|error| format!("decode coordinated remote Wait: {error}"))?;
-        on_wait(wait.clone());
+        let response = match worker_request(request_value.clone()) {
+            Ok(response) => response,
+            Err(error) if mutation && error.starts_with(WORKER_CHANNEL_ERROR_PREFIX) => {
+                return Err(uncertain(
+                    error
+                        .strip_prefix(WORKER_CHANNEL_ERROR_PREFIX)
+                        .unwrap_or(&error)
+                        .to_string(),
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        let response: CoordinatedRemoteResponse = match serde_json::from_value(response) {
+            Ok(response) => response,
+            Err(error) if mutation => {
+                return Err(uncertain(format!(
+                    "decode coordinated remote response: {error}"
+                )));
+            }
+            Err(error) => {
+                return Err(format!("decode coordinated remote response: {error}"));
+            }
+        };
+        let wait = match response {
+            CoordinatedRemoteResponse::Fresh { value } if completed_state == "fresh" => {
+                return serde_json::from_value(value)
+                    .map_err(|error| format!("decode coordinated remote response: {error}"));
+            }
+            CoordinatedRemoteResponse::Applied { value } if completed_state == "applied" => {
+                return serde_json::from_value(value).map_err(|error| {
+                    uncertain(format!("decode coordinated remote response: {error}"))
+                });
+            }
+            CoordinatedRemoteResponse::Failed {
+                reason,
+                disposition: crate::remote::request_coordinator::RemoteMutationFailureDisposition::OutcomeUncertain,
+            } => return Err(uncertain(reason)),
+            CoordinatedRemoteResponse::Failed { reason, .. } => return Err(reason),
+            CoordinatedRemoteResponse::Pending { wait } => {
+                pending = true;
+                on_wait(wait.clone());
+                wait
+            }
+            _ if mutation => {
+                return Err(uncertain(
+                    "Worker returned the wrong coordinated remote response state".into(),
+                ));
+            }
+            _ => return Err("Worker returned the wrong coordinated remote response state".into()),
+        };
         if Instant::now() >= deadline {
-            return Err(wait.summary);
+            return Err(if mutation {
+                uncertain(wait.summary)
+            } else {
+                wait.summary
+            });
         }
         let wake = wait.wake_at_unix_ms;
         let delay = wake
@@ -719,48 +942,16 @@ fn request(command: &str) -> Result<String, String> {
     let path = validated_socket_path()?;
     let stream =
         UnixStream::connect(&path).map_err(|error| format!("connect to Prism worker: {error}"))?;
-    request_with_authentication_fallback(&path, stream, command)
-}
-
-fn request_with_authentication_fallback(
-    socket_path: &Path,
-    stream: UnixStream,
-    command: &str,
-) -> Result<String, String> {
-    let response = request_stream(stream, command)?;
-    if response != AUTHENTICATION_FAILED_RESPONSE {
-        return Ok(response);
-    }
-
-    let secret = read_authentication_secret(socket_path)?;
-    let stream = UnixStream::connect(socket_path)
-        .map_err(|error| format!("reconnect to authenticated Prism worker: {error}"))?;
-    request_stream(stream, &format!("auth {secret} {command}"))
-}
-
-fn read_authentication_secret(socket_path: &Path) -> Result<String, String> {
-    let secret_path = socket_path.with_file_name("worker.secret");
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&secret_path)
-        .map_err(|error| format!("read worker authentication secret: {error}"))?;
-    let mut secret = String::new();
-    file.read_to_string(&mut secret)
-        .map_err(|error| format!("read worker authentication secret: {error}"))?;
-    let secret = secret.trim();
-    if secret.len() != AUTHENTICATION_SECRET_BYTES * 2
-        || !secret.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err("worker authentication secret is invalid".to_string());
-    }
-    Ok(secret.to_string())
+    request_stream(stream, command)
 }
 
 fn request_stream(mut stream: UnixStream, command: &str) -> Result<String, String> {
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
-        .map_err(|error| format!("configure Prism worker socket: {error}"))?;
+        .map_err(|error| format!("configure Prism worker socket read timeout: {error}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(30)))
+        .map_err(|error| format!("configure Prism worker socket write timeout: {error}"))?;
     stream
         .write_all(format!("{command}\n").as_bytes())
         .map_err(|error| format!("write Prism worker request: {error}"))?;
@@ -768,7 +959,11 @@ fn request_stream(mut stream: UnixStream, command: &str) -> Result<String, Strin
     stream
         .read_to_string(&mut response)
         .map_err(|error| format!("read Prism worker response: {error}"))?;
-    Ok(response.trim().to_string())
+    let response = response.trim();
+    if response.is_empty() {
+        return Err("Prism worker closed connection without a response".into());
+    }
+    Ok(response.to_string())
 }
 
 fn parse_health(response: &str) -> Result<DaemonHealth, String> {
@@ -927,7 +1122,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn same_protocol_stale_worker_is_not_compatible() {
+    fn recover_control_requires_explicit_typed_evidence() {
+        let missing = serde_json::json!({
+            "type": "prompt_workflow_command",
+            "run_id": "run-1",
+            "command": "recover",
+            "now_unix_ms": 1
+        });
+        assert!(serde_json::from_value::<SocketRequest>(missing).is_err());
+
+        let explicit = serde_json::json!({
+            "type": "prompt_workflow_command",
+            "run_id": "run-1",
+            "command": {"recover": {"evidence": "authoritative provider observation"}},
+            "now_unix_ms": 1
+        });
+        assert!(matches!(
+            serde_json::from_value::<SocketRequest>(explicit).unwrap(),
+            SocketRequest::Command {
+                command: SocketControl::Recover { evidence },
+                ..
+            } if evidence == "authoritative provider observation"
+        ));
+    }
+
+    #[test]
+    fn same_protocol_stale_worker_is_not_current_generation() {
         let health = DaemonHealth {
             state: DaemonState::Running,
             protocol_version: Some(PROTOCOL_VERSION),
@@ -939,6 +1159,21 @@ mod tests {
         };
 
         assert!(!worker_matches_generation(&health, "current-generation"));
+    }
+
+    #[test]
+    fn connection_closed_without_response_is_a_worker_transition() {
+        let (server, client) = UnixStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            let mut request = String::new();
+            BufReader::new(server).read_line(&mut request).unwrap();
+            assert_eq!(request, "health\n");
+        });
+
+        let result = request_stream(client, "health");
+        server.join().unwrap();
+        let error = result.unwrap_err();
+        assert!(is_worker_transition_error(&error), "{error}");
     }
 
     #[test]
@@ -956,7 +1191,7 @@ mod tests {
             .expect("open test service");
         let control = Arc::new(DaemonControl::default());
         let (slow_server, _slow_client) = UnixStream::pair().expect("create slow socket pair");
-        let (mut health_server, mut health_client) =
+        let (health_server, mut health_client) =
             UnixStream::pair().expect("create health socket pair");
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let slow_control = Arc::clone(&control);
@@ -973,7 +1208,7 @@ mod tests {
             respond(
                 &handle,
                 &health_service,
-                &mut health_server,
+                health_server,
                 "test-instance",
                 "test-generation",
                 &health_control,
@@ -990,12 +1225,46 @@ mod tests {
         health_client
             .read_to_string(&mut response)
             .expect("read health response");
-        assert!(response.starts_with("ok 5 test-instance"), "{response}");
+        assert!(response.starts_with("ok 6 test-instance"), "{response}");
         assert_eq!(control.handlers.load(Ordering::Acquire), 1);
 
         release_tx.send(()).expect("release slow handler");
         slow.join().expect("join slow handler");
         health.join().expect("join health handler");
+    }
+
+    #[test]
+    fn draining_worker_rejects_new_json_requests() {
+        let temporary = crate::compact_runtime::CompactTempDir::new("worker-draining");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("create test runtime");
+        let service = runtime
+            .block_on(crate::PromptWorkflowService::open(
+                &temporary.path().join("workflow.db"),
+                &temporary.path().join("state"),
+            ))
+            .expect("open test service");
+        let control = DaemonControl::default();
+        control.draining.store(true, Ordering::Release);
+        let (server, mut client) = UnixStream::pair().expect("create socket pair");
+        client
+            .write_all(b"{\"type\":\"prompt_workflow_list\",\"repository\":null,\"limit\":1}\n")
+            .expect("write request");
+        respond(
+            runtime.handle(),
+            &service,
+            server,
+            "test-instance",
+            "test-generation",
+            &control,
+        );
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("read draining response");
+        assert!(response.contains("Prism worker is draining"), "{response}");
     }
 
     #[test]
@@ -1029,37 +1298,59 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_daemon_response_is_retried_with_runtime_secret() {
-        let runtime = crate::compact_runtime::CompactTempDir::new("auth-fallback");
-        let root = runtime.runtime_path();
-        fs::create_dir_all(root).expect("create test runtime");
-        let socket = root.join("worker.sock");
-        let secret = "ab".repeat(AUTHENTICATION_SECRET_BYTES);
-        fs::write(root.join("worker.secret"), &secret).expect("write test worker secret");
-        let listener = UnixListener::bind(&socket).expect("bind test worker socket");
-        let expected_authenticated = format!("auth {secret} health");
+    fn exclusive_owner_removes_stale_socket_before_cutover_and_cleanup_preserves_accept_error() {
+        let runtime = crate::compact_runtime::CompactTempDir::new("stale-worker-socket");
+        let socket = runtime.runtime_path().join("worker.sock");
+        fs::create_dir_all(runtime.runtime_path()).unwrap();
+        fs::write(&socket, b"stale").unwrap();
+        remove_owned_socket(&socket).unwrap();
+        assert!(!socket.exists());
+        let listener = UnixListener::bind(&socket).unwrap();
+        drop(listener);
+        let error = finish_socket(&socket, Some("forced accept failure".into())).unwrap_err();
+        assert_eq!(error, "forced accept failure");
+        assert!(!socket.exists());
+    }
 
-        let server = thread::spawn(move || {
-            for (expected, response) in [
-                ("health".to_string(), AUTHENTICATION_FAILED_RESPONSE),
-                (expected_authenticated, "ok authenticated"),
-            ] {
-                let (mut stream, _) = listener.accept().expect("accept test client");
-                let mut request = String::new();
-                BufReader::new(&mut stream)
-                    .read_line(&mut request)
-                    .expect("read test request");
-                assert_eq!(request.trim(), expected);
-                stream
-                    .write_all(format!("{response}\n").as_bytes())
-                    .expect("write test response");
-            }
+    #[test]
+    fn blocked_handler_retains_exclusive_worker_ownership_until_joined() {
+        let runtime = crate::compact_runtime::CompactTempDir::new("blocked-worker-handler");
+        fs::create_dir_all(runtime.runtime_path()).unwrap();
+        let lock_path = runtime.runtime_path().join("worker.lock");
+        let owner = acquire_lock(&lock_path).unwrap();
+        let (release, wait) = std::sync::mpsc::channel();
+        let handler = thread::spawn(move || wait.recv().unwrap());
+        let joining = thread::spawn(move || {
+            handler.join().unwrap();
+            drop(owner);
         });
 
-        let stream = UnixStream::connect(&socket).expect("connect test client");
-        let response = request_with_authentication_fallback(&socket, stream, "health")
-            .expect("retry authenticated request");
-        assert_eq!(response, "ok authenticated");
-        server.join().expect("join test server");
+        assert!(
+            acquire_lock(&lock_path)
+                .unwrap_err()
+                .contains("already running")
+        );
+        release.send(()).unwrap();
+        joining.join().unwrap();
+        assert!(acquire_lock(&lock_path).is_ok());
+    }
+
+    #[test]
+    fn finished_handlers_are_reaped_without_waiting_for_live_handlers() {
+        let (release, wait) = std::sync::mpsc::channel();
+        let live = thread::spawn(move || {
+            let _ = wait.recv();
+        });
+        let finished = thread::spawn(|| {});
+        while !finished.is_finished() {
+            thread::yield_now();
+        }
+        let mut handlers = vec![live, finished];
+        let started = Instant::now();
+        reap_finished_handlers(&mut handlers);
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(handlers.len(), 1);
+        release.send(()).unwrap();
+        handlers.pop().unwrap().join().unwrap();
     }
 }

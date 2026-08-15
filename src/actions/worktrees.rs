@@ -165,7 +165,7 @@ impl Tui {
     }
 
     pub(crate) fn poll_session_refresh(&mut self) -> bool {
-        if !self.tui_tick_active && !self.routing_tui_jobs {
+        if !self.tui_tick_active && !self.background.is_routing() {
             self.route_tui_job_messages();
         }
         let mut changed = false;
@@ -233,7 +233,6 @@ impl Tui {
                 self.tmux_generations.entry(slot).or_insert(generation);
             }
             self.session_inventory_generation = self.session_inventory_generation.saturating_add(1);
-            self.request_workflow_maintenance();
             changed = true;
         }
         if restart {
@@ -282,7 +281,6 @@ impl Tui {
         self.reconcile_session_inventory();
         self.worktree_harness_configs =
             crate::tui::load_worktree_harness_configs(&self.repos, &self.sessions);
-        self.request_workflow_maintenance();
         Ok(())
     }
 
@@ -783,11 +781,12 @@ impl Tui {
     }
 
     pub(crate) fn poll_delete_sessions(&mut self) -> bool {
-        if !self.tui_tick_active && !self.routing_tui_jobs {
+        if !self.tui_tick_active && !self.background.is_routing() {
             self.route_tui_job_messages();
         }
         let mut changed = false;
         while let Ok(result) = self.delete_session_rx.try_recv() {
+            self.delete_sessions_in_flight.remove(&result.key);
             let Some(current_generation) =
                 self.worktree_generations.get(&result.key.worktree).copied()
             else {

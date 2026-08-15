@@ -22,9 +22,6 @@ supported-operating-systems = ["linux", "macos"]
 
 [dependencies]
 ansi-to-tui = { version = "8.0.1", default-features = false }
-chrono = { version = "0.4.45", default-features = false, features = ["std"] }
-chrono-tz = "0.10.4"
-cron = "0.15.0"
 crossterm = { version = "0.29.0", default-features = false, features = [
   "events",
 ] }
@@ -47,6 +44,14 @@ sqlx = { version = "0.8.6", default-features = false, features = [
 ] }
 toml = "=1.1.2"
 toml_edit = "0.24"
-tokio = { version = "1", default-features = false, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", default-features = false, features = [
+  "io-util",
+  "macros",
+  "net",
+  "process",
+  "rt-multi-thread",
+  "sync",
+  "time",
+] }
 ureq = { version = "3.3", default-features = false, features = ["native-tls"] }
 url = "2.5"

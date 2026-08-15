@@ -1,4 +1,5 @@
 use super::*;
+use crate::workflow::remote_operation;
 
 pub(super) const DEFAULT_BRANCH_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(60);
 pub(super) const BACKGROUND_PR_SUMMARY_POLL_INTERVAL: Duration = Duration::from_secs(60);
@@ -140,34 +141,26 @@ impl Tui {
                         let summaries: Result<Vec<crate::remote::PrSummary>, String> =
                             if github_remote_configured {
                                 let payload =
-                                    crate::workflow::standard_remote::TuiRemoteListPayload {
+                                    remote_operation::TuiRemoteListPayload {
                                         repository: path.clone(),
                                         worktree: path.clone(),
                                     };
                                 let _ = crate::worker::observe_remote::<bool>(
                                     &path,
                                     &path,
-                                    "tui.repository_policy",
+                                    remote_operation::RemoteObservationOperation::TuiRepositoryPolicy(payload.clone()),
                                     &path.to_string_lossy(),
-                                    &payload,
                                 );
                                 crate::worker::observe_remote(
                                     &path,
                                     &path,
-                                    "tui.change_requests",
+                                    remote_operation::RemoteObservationOperation::TuiChangeRequests(payload),
                                     &path.to_string_lossy(),
-                                    payload,
                                 )
                             } else {
                                 Err(adapter.as_ref().unwrap_err().clone())
                             };
-                        let capabilities = if summaries.is_ok() {
-                            crate::remote::dispatcher::capabilities(&path, &config)
-                                .ok()
-                                .or_else(|| adapter.ok())
-                        } else {
-                            adapter.ok()
-                        };
+                        let capabilities = adapter.ok();
                         let observations = match &summaries {
                             Ok(summaries) => Ok(session_snapshots
                                 .into_iter()
@@ -187,14 +180,13 @@ impl Tui {
                                 crate::worker::observe_remote::<Option<String>>(
                                     &path,
                                     &path,
-                                    "tui.remote_branch_head",
-                                    &subject,
-                                    crate::workflow::standard_remote::TuiRemoteBranchHeadPayload {
+                                    remote_operation::RemoteObservationOperation::TuiRemoteBranchHead(remote_operation::TuiRemoteBranchHeadPayload {
                                         repository: path.clone(),
                                         worktree: path.clone(),
                                         remote: remote.clone(),
                                         branch: branch.clone(),
-                                    },
+                                    }),
+                                    &subject,
                                 )
                                 .ok()
                                 .flatten()
@@ -252,14 +244,15 @@ impl Tui {
                         let snapshot = crate::worker::observe_remote(
                             &repository,
                             &path,
-                            "tui.change_request_cache",
+                            remote_operation::RemoteObservationOperation::TuiChangeRequestCache(
+                                remote_operation::TuiRemoteCachePayload {
+                                    repository: repository.clone(),
+                                    worktree: path.clone(),
+                                    branch: branch.clone(),
+                                    force_details: true,
+                                },
+                            ),
                             &format!("{}:{}:details", path.display(), branch),
-                            crate::workflow::standard_remote::TuiRemoteCachePayload {
-                                repository: repository.clone(),
-                                worktree: path.clone(),
-                                branch,
-                                force_details: true,
-                            },
                         )?;
                         cache.apply_worker_snapshot(snapshot);
                         Ok(Some(TuiJobPayload::PrPoll(PrPollResult::Details {
@@ -275,7 +268,7 @@ impl Tui {
     }
 
     pub(crate) fn drain_pr_poll_results(&mut self) -> bool {
-        if !self.tui_tick_active && !self.routing_tui_jobs {
+        if !self.tui_tick_active && !self.background.is_routing() {
             self.route_tui_job_messages();
         }
         let mut changed = false;
@@ -381,7 +374,7 @@ impl Tui {
                         self.queue_pr_persistence(index, false, remote_update);
                     }
                     if let Some(summaries) = summary_evidence {
-                        self.reconcile_remote_mutation_summaries(
+                        self.enqueue_summary_reconciliation(
                             &repository,
                             &summaries,
                             &remote_branch_heads,
@@ -440,7 +433,7 @@ impl Tui {
                                 .identity
                                 .clone();
                             let cache = self.sessions[session_index].pr.clone();
-                            self.reconcile_remote_mutation_details(&repository, &cache);
+                            self.enqueue_details_reconciliation(&repository, &cache);
                         }
                     }
                 }
@@ -658,7 +651,7 @@ impl Tui {
     }
 
     pub(crate) fn poll_wt_columns(&mut self) -> bool {
-        if !self.tui_tick_active && !self.routing_tui_jobs {
+        if !self.tui_tick_active && !self.background.is_routing() {
             self.route_tui_job_messages();
         }
         let mut changed = false;
@@ -801,7 +794,7 @@ impl Tui {
     }
 
     pub(crate) fn poll_default_branch_status(&mut self) -> bool {
-        if !self.tui_tick_active && !self.routing_tui_jobs {
+        if !self.tui_tick_active && !self.background.is_routing() {
             self.route_tui_job_messages();
         }
         let mut changed = false;

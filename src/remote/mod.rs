@@ -1,4 +1,7 @@
-#![allow(dead_code, unused_imports)]
+#![allow(
+    dead_code,
+    reason = "provider adapters expose capabilities that are activated by optional workflows"
+)]
 
 mod cache;
 mod capability;
@@ -16,11 +19,13 @@ mod store;
 
 pub(crate) use cache::PrCheckContext;
 pub(crate) use cache::{
-    CiFailure as CachedCiFailure, PR_SUMMARY_POLL_INTERVAL, PrCache, PrCheckState, PrComment,
-    PrDetails, PrReview, PrReviewComment, PrSummary, RepoPolicyCache, WorkerPrCacheSnapshot,
-    apply_pr_details_poll_result, apply_pr_summary_poll_result, pr_cache_comment_count,
-    pr_cache_render_signature, pr_summary_or_error, trusted_pr_for_session,
+    PR_SUMMARY_POLL_INTERVAL, PrCache, PrCheckState, PrDetails, PrReviewComment, PrSummary,
+    RepoPolicyCache, WorkerPrCacheSnapshot, apply_pr_details_poll_result,
+    apply_pr_summary_poll_result, pr_cache_comment_count, pr_cache_render_signature,
+    pr_summary_or_error,
 };
+#[cfg(test)]
+pub(crate) use cache::{PrComment, PrReview};
 pub(crate) use capability::{Capabilities, SupportLevel};
 pub(crate) use coordinator::{
     load_pr_cache_for_branch, pr_details_pollable, resolve_pr_summary_for_session,
@@ -45,14 +50,8 @@ pub(crate) use model::{
 #[cfg(test)]
 pub(crate) use model::{HeadAssociation, NativeMergeGuard};
 #[cfg(test)]
-pub(crate) use store::record_pr_summary;
-#[cfg(test)]
-pub(crate) use store::save_repo_policy_cache;
-pub(crate) use store::{
-    load_pr_cache, load_repo_policy_cache_for_identity, persist_pr_cache_snapshot,
-};
-#[cfg(test)]
-pub(crate) use store::{save_pr_cache, save_pr_details_cache};
+pub(crate) use store::save_pr_cache;
+pub(crate) use store::{load_pr_cache, persist_pr_cache_snapshot};
 
 #[cfg(test)]
 pub(crate) fn test_change_request_identity() -> CanonicalChangeRequestIdentity {

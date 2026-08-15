@@ -349,7 +349,7 @@ impl Tui {
                     title: "Worktrunk Configuration",
                     message: "Creating Worktrunk user config",
                     abandon_cancelable: false,
-                    mutation: None,
+                    effect: crate::tui::RemoteActionEffect::LocalMutation,
                 },
                 move |_| {
                     crate::worktrunk::create_user_config(&repo, &config)
@@ -393,7 +393,7 @@ impl Tui {
                 title: "Worktrunk Configuration",
                 message: "Locating Worktrunk user config",
                 abandon_cancelable: true,
-                mutation: None,
+                effect: crate::tui::RemoteActionEffect::ReadOnly,
             },
             move |_| {
                 crate::worktrunk::discover_user_config(&repo, &config)
@@ -669,6 +669,13 @@ impl Tui {
             repos.push(managed);
         }
         self.repos = repos;
+        self.background.retain_repositories(
+            &self
+                .repos
+                .iter()
+                .map(|managed| managed.identity.clone())
+                .collect(),
+        );
         crate::flight_recorder::register_repositories(
             self.repos.iter().map(|managed| &managed.repo),
         );
@@ -679,6 +686,7 @@ impl Tui {
             .map(|repo| repo.repo.root.clone());
         self.refresh_sessions()?;
         self.sync_selected_repo_context();
+        self.load_remote_mutation_reconciliation_markers();
         Ok(())
     }
 }

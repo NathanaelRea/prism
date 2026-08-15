@@ -20,13 +20,17 @@ use super::step_trigger::{
 
 static SCHEDULER_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const PHASE_LEASE_MS: i64 = 30_000;
+
+async fn wait_for_cancellation(cancellation: &AgentCancellation) {
+    while !cancellation.is_cancelled() {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
 const MAX_RUN_EVENTS: usize = 4_096;
 #[cfg(not(test))]
 const PHASE_LEASE_RENEW_MS: u64 = 10_000;
 #[cfg(test)]
 const PHASE_LEASE_RENEW_MS: u64 = 10;
-
-pub use crate::persistence::workflow_kernel::DurableWorkflowRunStore;
 
 pub type StoreFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, WorkflowKernelError>> + Send + 'a>>;
@@ -211,9 +215,10 @@ pub struct WorkflowScheduler {
     store: Arc<dyn WorkflowRunStore>,
     triggers: TriggerRegistry,
     agents: Arc<dyn AgentExecutor>,
-    run_locks: Arc<tokio::sync::Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>>,
-    worktree_locks: Arc<tokio::sync::Mutex<BTreeMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>>,
-    active_phases: Arc<tokio::sync::Mutex<BTreeMap<String, AgentCancellation>>>,
+    run_locks: Arc<tokio::sync::Mutex<BTreeMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
+    worktree_locks:
+        Arc<tokio::sync::Mutex<BTreeMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
+    run_cancellations: Arc<tokio::sync::Mutex<BTreeMap<String, AgentCancellation>>>,
     worker_id: String,
 }
 
@@ -229,7 +234,7 @@ impl WorkflowScheduler {
             agents,
             run_locks: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
             worktree_locks: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
-            active_phases: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+            run_cancellations: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
             worker_id: format!(
                 "worker-{}-{}",
                 std::process::id(),
@@ -307,28 +312,42 @@ impl WorkflowScheduler {
         run_id: &str,
         now_unix_ms: i64,
     ) -> Result<SchedulerProgress, WorkflowKernelError> {
+        let cancellation = self.run_cancellation(run_id).await;
         let run_lock = self.named_run_lock(run_id).await;
-        let _claim = run_lock.lock().await;
+        if cancellation.is_cancelled() {
+            return Err(WorkflowKernelError::PhaseCancelled);
+        }
+        let _claim = tokio::select! {
+            biased;
+            _ = wait_for_cancellation(&cancellation) => {
+                return Err(WorkflowKernelError::PhaseCancelled);
+            }
+            claim = run_lock.lock() => claim,
+        };
         let mut run = self
             .store
             .load_run(run_id)
             .await?
             .ok_or_else(|| WorkflowKernelError::UnknownRun(run_id.into()))?;
         if run.status.terminal() {
+            self.run_cancellations.lock().await.remove(run_id);
             return Ok(progress_for(run.status));
         }
         if run.status == WorkflowRunStatus::Paused {
             return Ok(SchedulerProgress::Paused);
         }
         if run.status == WorkflowRunStatus::NeedsInput {
+            self.run_cancellations.lock().await.remove(run_id);
             return Ok(SchedulerProgress::NeedsInput);
         }
         if run.status == WorkflowRunStatus::RecoveryRequired {
+            self.run_cancellations.lock().await.remove(run_id);
             return Ok(SchedulerProgress::RecoveryRequired);
         }
         if run.cancellation_requested {
             cancel_run(&mut run, now_unix_ms);
             self.store.save_run(&mut run).await?;
+            self.run_cancellations.lock().await.remove(run_id);
             return Ok(SchedulerProgress::Cancelled);
         }
         if run.status == WorkflowRunStatus::Waiting
@@ -423,7 +442,14 @@ impl WorkflowScheduler {
                 run.steps[step_index].wake_at_unix_ms = None;
                 self.store.save_run(&mut run).await?;
                 let context = trigger_context(&run, compiled_step, None);
-                let decision = match trigger.should_run_step(&context).await {
+                let cancellation = self.run_cancellation(&run.id).await;
+                let check = tokio::select! {
+                    decision = trigger.should_run_step(&context) => decision,
+                    _ = wait_for_cancellation(&cancellation) => {
+                        return Err(WorkflowKernelError::PhaseCancelled);
+                    }
+                };
+                let decision = match check {
                     Ok(decision) => decision,
                     Err(error) => {
                         fail_step(
@@ -524,6 +550,7 @@ impl WorkflowScheduler {
                 "one full graph cycle is satisfied",
             );
             self.store.save_run(&mut run).await?;
+            self.run_cancellations.lock().await.remove(run_id);
             Ok(SchedulerProgress::Succeeded)
         } else {
             run.status = WorkflowRunStatus::Waiting;
@@ -653,16 +680,14 @@ impl WorkflowScheduler {
 
         // Hold one worktree claim for the wave. Branches inside this claim intentionally overlap,
         // while a different Workflow Run cannot mutate the same worktree at the same time.
-        let _worktree_claim = self
-            .worktree_lock(&run.subject.worktree)
-            .await
-            .lock_owned()
-            .await;
-        let cancellation = AgentCancellation::default();
-        self.active_phases
-            .lock()
-            .await
-            .insert(run.id.clone(), cancellation.clone());
+        let cancellation = self.run_cancellation(&run.id).await;
+        let worktree_lock = self.worktree_lock(&run.subject.worktree).await;
+        let _worktree_claim = tokio::select! {
+            claim = worktree_lock.lock_owned() => claim,
+            _ = wait_for_cancellation(&cancellation) => {
+                return Err(WorkflowKernelError::PhaseCancelled);
+            }
+        };
         let (turn_tx, mut turn_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut tasks = tokio::task::JoinSet::new();
         for branch in branches {
@@ -794,7 +819,6 @@ impl WorkflowScheduler {
                 }
             }
         }
-        self.active_phases.lock().await.remove(&run.id);
 
         if failed {
             run.status = WorkflowRunStatus::Failed;
@@ -829,16 +853,14 @@ impl WorkflowScheduler {
             step,
             Some(&run.steps[step_index].attempts[attempt_index].id),
         );
-        let _worktree_claim = self
-            .worktree_lock(&run.subject.worktree)
-            .await
-            .lock_owned()
-            .await;
-        let cancellation = AgentCancellation::default();
-        self.active_phases
-            .lock()
-            .await
-            .insert(run.id.clone(), cancellation.clone());
+        let cancellation = self.run_cancellation(&run.id).await;
+        let worktree_lock = self.worktree_lock(&run.subject.worktree).await;
+        let _worktree_claim = tokio::select! {
+            claim = worktree_lock.lock_owned() => claim,
+            _ = wait_for_cancellation(&cancellation) => {
+                return Err(WorkflowKernelError::PhaseCancelled);
+            }
+        };
         let preparation = self
             .supervise_phase(
                 run,
@@ -849,8 +871,23 @@ impl WorkflowScheduler {
                 trigger.pre_step_run(&context),
             )
             .await;
-        self.active_phases.lock().await.remove(&run.id);
-        let (prepared, completed_unix_ms) = preparation?;
+        let (prepared, completed_unix_ms) = match preparation {
+            Ok(preparation) => preparation,
+            Err(WorkflowKernelError::PhaseCancelled)
+                if !trigger.recovery_policy().prepare_repeatable =>
+            {
+                recovery_required(
+                    run,
+                    step_index,
+                    attempt_index,
+                    now_unix_ms,
+                    "pre-Step hook was cancelled after its durable mutation boundary; authoritative reconciliation is required",
+                );
+                self.store.save_run(run).await?;
+                return Ok(SchedulerProgress::RecoveryRequired);
+            }
+            Err(error) => return Err(error),
+        };
         let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -942,6 +979,7 @@ impl WorkflowScheduler {
                     "needs input",
                 );
                 self.store.save_run(run).await?;
+                self.run_cancellations.lock().await.remove(&run.id);
                 return Ok(SchedulerProgress::NeedsInput);
             }
             run.agent_runs_consumed += 1;
@@ -960,16 +998,14 @@ impl WorkflowScheduler {
         self.store.save_run(run).await?;
 
         let attempt_id = run.steps[step_index].attempts[attempt_index].id.clone();
-        let _worktree_claim = self
-            .worktree_lock(&run.subject.worktree)
-            .await
-            .lock_owned()
-            .await;
-        let cancellation = AgentCancellation::default();
-        self.active_phases
-            .lock()
-            .await
-            .insert(run.id.clone(), cancellation.clone());
+        let cancellation = self.run_cancellation(&run.id).await;
+        let worktree_lock = self.worktree_lock(&run.subject.worktree).await;
+        let _worktree_claim = tokio::select! {
+            claim = worktree_lock.lock_owned() => claim,
+            _ = wait_for_cancellation(&cancellation) => {
+                return Err(WorkflowKernelError::PhaseCancelled);
+            }
+        };
         let mut turn_started_unix_ms = now_unix_ms;
 
         loop {
@@ -1030,21 +1066,18 @@ impl WorkflowScheduler {
             let (outcome, completed_unix_ms) = match execution {
                 Ok(execution) => execution,
                 Err(error) => {
-                    self.active_phases.lock().await.remove(&run.id);
                     return Err(error);
                 }
             };
             let outcome = match outcome {
                 Ok(outcome) => outcome,
                 Err(AgentExecutionError::Cancelled) => {
-                    self.active_phases.lock().await.remove(&run.id);
                     run.steps[step_index].attempts[attempt_index].agent_turn_in_flight = None;
                     cancel_run(run, completed_unix_ms);
                     self.store.save_run(run).await?;
                     return Ok(SchedulerProgress::Cancelled);
                 }
                 Err(error) => {
-                    self.active_phases.lock().await.remove(&run.id);
                     run.steps[step_index].attempts[attempt_index].agent_turn_in_flight = None;
                     fail_attempt(
                         run,
@@ -1060,7 +1093,6 @@ impl WorkflowScheduler {
             if let Some(expected) = resume_session_id.as_deref()
                 && outcome.session_id != expected
             {
-                self.active_phases.lock().await.remove(&run.id);
                 run.steps[step_index].attempts[attempt_index].agent_turn_in_flight = None;
                 fail_attempt(
                     run,
@@ -1091,7 +1123,6 @@ impl WorkflowScheduler {
             turn_started_unix_ms = completed_unix_ms;
         }
 
-        self.active_phases.lock().await.remove(&run.id);
         drop(_worktree_claim);
         let outcome = run.steps[step_index].attempts[attempt_index]
             .agent_turns
@@ -1153,16 +1184,14 @@ impl WorkflowScheduler {
                 .agent_outcome
                 .clone()
                 .ok_or_else(|| WorkflowKernelError::Invalid("missing Agent outcome".into()))?;
-            let _worktree_claim = self
-                .worktree_lock(&run.subject.worktree)
-                .await
-                .lock_owned()
-                .await;
-            let cancellation = AgentCancellation::default();
-            self.active_phases
-                .lock()
-                .await
-                .insert(run.id.clone(), cancellation.clone());
+            let cancellation = self.run_cancellation(&run.id).await;
+            let worktree_lock = self.worktree_lock(&run.subject.worktree).await;
+            let _worktree_claim = tokio::select! {
+                claim = worktree_lock.lock_owned() => claim,
+                _ = wait_for_cancellation(&cancellation) => {
+                        return Err(WorkflowKernelError::PhaseCancelled);
+                }
+            };
             let finalization = self
                 .supervise_phase(
                     run,
@@ -1173,8 +1202,23 @@ impl WorkflowScheduler {
                     trigger.post_step_run(&context, &prepared, &outcome),
                 )
                 .await;
-            self.active_phases.lock().await.remove(&run.id);
-            let (completion, completed_unix_ms) = finalization?;
+            let (completion, completed_unix_ms) = match finalization {
+                Ok(finalization) => finalization,
+                Err(WorkflowKernelError::PhaseCancelled)
+                    if !trigger.recovery_policy().finalize_repeatable =>
+                {
+                    recovery_required(
+                        run,
+                        step_index,
+                        attempt_index,
+                        now_unix_ms,
+                        "post-Step hook was cancelled after its durable mutation boundary; authoritative reconciliation is required",
+                    );
+                    self.store.save_run(run).await?;
+                    return Ok(SchedulerProgress::RecoveryRequired);
+                }
+                Err(error) => return Err(error),
+            };
             match completion {
                 Ok(completion) => (completion, completed_unix_ms),
                 Err(error) => {
@@ -1410,8 +1454,36 @@ impl WorkflowScheduler {
     }
 
     pub async fn cancel(&self, run_id: &str, now: i64) -> Result<(), WorkflowKernelError> {
-        if let Some(cancellation) = self.active_phases.lock().await.get(run_id).cloned() {
-            cancellation.cancel();
+        let cancellation = self.run_cancellation(run_id).await;
+        cancellation.cancel();
+        let run_lock = self.named_run_lock(run_id).await;
+        let _claim = run_lock.lock().await;
+        let Some(mut run) = self.store.load_run(run_id).await? else {
+            self.run_cancellations.lock().await.remove(run_id);
+            return Err(WorkflowKernelError::UnknownRun(run_id.into()));
+        };
+        if run.status != WorkflowRunStatus::RecoveryRequired {
+            run.cancellation_requested = true;
+            cancel_run(&mut run, now);
+        }
+        let saved = self.store.save_run(&mut run).await;
+        if saved.is_ok() {
+            self.run_cancellations.lock().await.remove(run_id);
+        }
+        saved
+    }
+
+    /// Records authoritative reconciliation and safely requeues the affected Step.
+    pub async fn recover(
+        &self,
+        run_id: &str,
+        now: i64,
+        evidence: &str,
+    ) -> Result<(), WorkflowKernelError> {
+        if evidence.trim().is_empty() {
+            return Err(WorkflowKernelError::Invalid(
+                "authoritative recovery evidence must not be empty".into(),
+            ));
         }
         let run_lock = self.named_run_lock(run_id).await;
         let _claim = run_lock.lock().await;
@@ -1420,9 +1492,73 @@ impl WorkflowScheduler {
             .load_run(run_id)
             .await?
             .ok_or_else(|| WorkflowKernelError::UnknownRun(run_id.into()))?;
-        run.cancellation_requested = true;
-        cancel_run(&mut run, now);
+        if run.status != WorkflowRunStatus::RecoveryRequired {
+            return Err(WorkflowKernelError::Invalid(
+                "run does not require authoritative recovery".into(),
+            ));
+        }
+        let step_index = run
+            .steps
+            .iter()
+            .position(|step| step.phase == StepPhase::RecoveryRequired)
+            .ok_or_else(|| {
+                WorkflowKernelError::Invalid("run has no recovery-required Step".into())
+            })?;
+        let attempt_index = run.steps[step_index]
+            .attempts
+            .iter()
+            .rposition(|attempt| attempt.status == AttemptStatus::RecoveryRequired)
+            .ok_or_else(|| {
+                WorkflowKernelError::Invalid("Step has no recovery-required Attempt".into())
+            })?;
+        run.steps[step_index].attempts[attempt_index].status = AttemptStatus::Cancelled;
+        run.steps[step_index].attempts[attempt_index].phase = StepPhase::Cancelled;
+        run.steps[step_index].attempts[attempt_index]
+            .finished_unix_ms
+            .get_or_insert(now);
+        run.steps[step_index].phase = StepPhase::Pending;
+        run.steps[step_index].summary =
+            Some("authoritative reconciliation accepted; Step requeued".into());
+        run.steps[step_index].wake_at_unix_ms = None;
+        run.status = WorkflowRunStatus::Queued;
+        run.cancellation_requested = false;
+        run.updated_unix_ms = now;
+        let step_key = run.steps[step_index].key.clone();
+        let attempt_id = run.steps[step_index].attempts[attempt_index].id.clone();
+        push_event(
+            &mut run,
+            now,
+            Some(&step_key),
+            Some(&attempt_id),
+            "recovery_reconciled",
+            evidence.trim(),
+        );
+        self.run_cancellations.lock().await.remove(run_id);
         self.store.save_run(&mut run).await
+    }
+
+    /// Explicitly discards a recovery-required run after the operator accepts the uncertainty.
+    pub async fn discard(&self, run_id: &str, now: i64) -> Result<(), WorkflowKernelError> {
+        let cancellation = self.run_cancellation(run_id).await;
+        cancellation.cancel();
+        let run_lock = self.named_run_lock(run_id).await;
+        let _claim = run_lock.lock().await;
+        let mut run = self
+            .store
+            .load_run(run_id)
+            .await?
+            .ok_or_else(|| WorkflowKernelError::UnknownRun(run_id.into()))?;
+        if run.status != WorkflowRunStatus::RecoveryRequired {
+            return Err(WorkflowKernelError::Invalid(
+                "only a recovery-required run can be discarded".into(),
+            ));
+        }
+        discard_recovery_run(&mut run, now);
+        let saved = self.store.save_run(&mut run).await;
+        if saved.is_ok() {
+            self.run_cancellations.lock().await.remove(run_id);
+        }
+        saved
     }
 
     pub async fn retry(&self, run_id: &str, now: i64) -> Result<(), WorkflowKernelError> {
@@ -1436,7 +1572,7 @@ impl WorkflowScheduler {
         let step = run
             .steps
             .iter_mut()
-            .find(|step| matches!(step.phase, StepPhase::Failed | StepPhase::RecoveryRequired))
+            .find(|step| step.phase == StepPhase::Failed)
             .ok_or_else(|| {
                 WorkflowKernelError::Invalid("run has no failed Step to retry".into())
             })?;
@@ -1452,6 +1588,7 @@ impl WorkflowScheduler {
         run.status = WorkflowRunStatus::Queued;
         run.updated_unix_ms = now;
         push_event(&mut run, now, None, None, "run_retried", "retry queued");
+        self.run_cancellations.lock().await.remove(run_id);
         self.store.save_run(&mut run).await
     }
 
@@ -1480,20 +1617,35 @@ impl WorkflowScheduler {
         self.store.save_run(&mut run).await
     }
 
+    async fn run_cancellation(&self, run_id: &str) -> AgentCancellation {
+        self.run_cancellations
+            .lock()
+            .await
+            .entry(run_id.to_string())
+            .or_default()
+            .clone()
+    }
+
     async fn named_run_lock(&self, run_id: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self.run_locks.lock().await;
-        locks
-            .entry(run_id.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(run_id).and_then(std::sync::Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(run_id.to_string(), Arc::downgrade(&lock));
+        lock
     }
 
     async fn worktree_lock(&self, worktree: &Path) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self.worktree_locks.lock().await;
-        locks
-            .entry(worktree.to_path_buf())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(worktree).and_then(std::sync::Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(worktree.to_path_buf(), Arc::downgrade(&lock));
+        lock
     }
 }
 
@@ -1873,7 +2025,47 @@ fn trigger_context(
     }
 }
 
+fn discard_recovery_run(run: &mut WorkflowRunState, now: i64) {
+    run.status = WorkflowRunStatus::Cancelled;
+    run.cancellation_requested = true;
+    run.updated_unix_ms = now;
+    for step in &mut run.steps {
+        if step.phase == StepPhase::RecoveryRequired {
+            step.phase = StepPhase::Cancelled;
+            step.summary = Some("discarded after operator accepted uncertain effects".into());
+            if let Some(attempt) = step
+                .attempts
+                .iter_mut()
+                .rev()
+                .find(|attempt| attempt.status == AttemptStatus::RecoveryRequired)
+            {
+                attempt.status = AttemptStatus::Cancelled;
+                attempt.phase = StepPhase::Cancelled;
+                attempt.finished_unix_ms.get_or_insert(now);
+                attempt.phase_owner = None;
+                attempt.lease_expires_unix_ms = None;
+            }
+        }
+    }
+    push_event(
+        run,
+        now,
+        None,
+        None,
+        "recovery_discarded",
+        "operator discarded run after accepting uncertain effects",
+    );
+}
+
 fn cancel_run(run: &mut WorkflowRunState, now: i64) {
+    if run.status == WorkflowRunStatus::RecoveryRequired
+        || run
+            .steps
+            .iter()
+            .any(|step| step.phase == StepPhase::RecoveryRequired)
+    {
+        return;
+    }
     run.status = WorkflowRunStatus::Cancelled;
     run.updated_unix_ms = now;
     for step in &mut run.steps {
@@ -2065,7 +2257,15 @@ impl std::fmt::Display for WorkflowKernelError {
     }
 }
 
-impl std::error::Error for WorkflowKernelError {}
+impl std::error::Error for WorkflowKernelError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Trigger { error, .. } => Some(error),
+            Self::Agent { error, .. } => Some(error),
+            _ => None,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2587,6 +2787,266 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_uncertain_prepare_requires_reconciliation() {
+        struct BlockingPrepare {
+            started: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl StepTrigger for BlockingPrepare {
+            fn should_run_step<'a>(
+                &'a self,
+                _context: &'a TriggerContext,
+            ) -> super::super::step_trigger::TriggerFuture<'a, TriggerDecision> {
+                Box::pin(async {
+                    Ok(TriggerDecision::Run {
+                        summary: "run".into(),
+                    })
+                })
+            }
+
+            fn pre_step_run<'a>(
+                &'a self,
+                _context: &'a TriggerContext,
+            ) -> super::super::step_trigger::TriggerFuture<'a, PreparedState> {
+                self.started.store(true, Ordering::Release);
+                Box::pin(async {
+                    std::future::pending::<()>().await;
+                    Ok(PreparedState::default())
+                })
+            }
+
+            fn recovery_policy(&self) -> crate::workflow::step_trigger::TriggerRecoveryPolicy {
+                crate::workflow::step_trigger::TriggerRecoveryPolicy::UNCERTAIN
+            }
+        }
+
+        let workflow = workflow("[[step]]\ntrigger='needs_review'\nprompt='fix'\n");
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let triggers = TriggerRegistry::default();
+        triggers
+            .insert(
+                "needs_review",
+                BlockingPrepare {
+                    started: started.clone(),
+                },
+            )
+            .unwrap();
+        let store = Arc::new(MemoryWorkflowRunStore::default());
+        let scheduler = WorkflowScheduler::new(
+            store.clone(),
+            triggers,
+            Arc::new(RecordingAgentExecutor::default()),
+        );
+        scheduler
+            .start(StartPromptWorkflow {
+                run_id: "run",
+                workflow: &workflow,
+                subject: subject(),
+                now_unix_ms: 1,
+            })
+            .await
+            .unwrap();
+        let ticking = {
+            let scheduler = scheduler.clone();
+            tokio::spawn(async move { scheduler.tick("run", 2).await })
+        };
+        while !started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        scheduler.cancel("run", 3).await.unwrap();
+        assert_eq!(
+            ticking.await.unwrap().unwrap(),
+            SchedulerProgress::RecoveryRequired
+        );
+        assert_eq!(
+            store.load_run("run").await.unwrap().unwrap().status,
+            WorkflowRunStatus::RecoveryRequired
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_uncertain_finalize_requires_reconciliation() {
+        struct BlockingFinalize {
+            started: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl StepTrigger for BlockingFinalize {
+            fn should_run_step<'a>(
+                &'a self,
+                _context: &'a TriggerContext,
+            ) -> super::super::step_trigger::TriggerFuture<'a, TriggerDecision> {
+                Box::pin(async {
+                    Ok(TriggerDecision::Run {
+                        summary: "run".into(),
+                    })
+                })
+            }
+
+            fn post_step_run<'a>(
+                &'a self,
+                _context: &'a TriggerContext,
+                _prepared: &'a PreparedState,
+                _outcome: &'a AgentOutcome,
+            ) -> super::super::step_trigger::TriggerFuture<'a, PostStepResult> {
+                self.started.store(true, Ordering::Release);
+                Box::pin(async {
+                    std::future::pending::<()>().await;
+                    Ok(PostStepResult::Success {
+                        summary: "never".into(),
+                    })
+                })
+            }
+
+            fn recovery_policy(&self) -> crate::workflow::step_trigger::TriggerRecoveryPolicy {
+                crate::workflow::step_trigger::TriggerRecoveryPolicy::UNCERTAIN
+            }
+        }
+
+        let workflow = workflow("[[step]]\ntrigger='needs_review'\nprompt='fix'\n");
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let triggers = TriggerRegistry::default();
+        triggers
+            .insert(
+                "needs_review",
+                BlockingFinalize {
+                    started: started.clone(),
+                },
+            )
+            .unwrap();
+        let store = Arc::new(MemoryWorkflowRunStore::default());
+        let agents = Arc::new(RecordingAgentExecutor::default());
+        agents.push_outcome(outcome("agent", "fixed"));
+        let scheduler = WorkflowScheduler::new(store.clone(), triggers, agents);
+        scheduler
+            .start(StartPromptWorkflow {
+                run_id: "run",
+                workflow: &workflow,
+                subject: subject(),
+                now_unix_ms: 1,
+            })
+            .await
+            .unwrap();
+        let ticking = {
+            let scheduler = scheduler.clone();
+            tokio::spawn(async move { scheduler.tick("run", 2).await })
+        };
+        while !started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        scheduler.cancel("run", 3).await.unwrap();
+        assert_eq!(
+            ticking.await.unwrap().unwrap(),
+            SchedulerProgress::RecoveryRequired
+        );
+        assert_eq!(
+            store.load_run("run").await.unwrap().unwrap().status,
+            WorkflowRunStatus::RecoveryRequired
+        );
+        assert!(scheduler.run_cancellations.lock().await.is_empty());
+        assert!(matches!(
+            scheduler.retry("run", 4).await,
+            Err(WorkflowKernelError::Invalid(message)) if message.contains("no failed Step")
+        ));
+    }
+
+    #[tokio::test]
+    async fn authoritative_recovery_requeues_and_records_evidence() {
+        let workflow = workflow("[[step]]\nprompt='work'\n");
+        let store = Arc::new(MemoryWorkflowRunStore::default());
+        let scheduler = WorkflowScheduler::new(
+            store.clone(),
+            TriggerRegistry::default(),
+            Arc::new(RecordingAgentExecutor::default()),
+        );
+        scheduler
+            .start(StartPromptWorkflow {
+                run_id: "run",
+                workflow: &workflow,
+                subject: subject(),
+                now_unix_ms: 1,
+            })
+            .await
+            .unwrap();
+        let mut run = store.load_run("run").await.unwrap().unwrap();
+        let attempt = begin_attempt(&mut run, 0, 2).unwrap();
+        recovery_required(&mut run, 0, attempt, 3, "uncertain effect");
+        store.save_run(&mut run).await.unwrap();
+
+        assert!(
+            scheduler
+                .recover("run", 4, "provider event E-17 confirms completion")
+                .await
+                .is_ok()
+        );
+        let run = store.load_run("run").await.unwrap().unwrap();
+        assert_eq!(run.status, WorkflowRunStatus::Queued);
+        assert_eq!(run.steps[0].phase, StepPhase::Pending);
+        assert_eq!(run.steps[0].attempts[0].status, AttemptStatus::Cancelled);
+        assert!(run.events.iter().any(|event| {
+            event.kind == "recovery_reconciled" && event.summary.contains("E-17")
+        }));
+    }
+
+    #[tokio::test]
+    async fn explicit_recovery_discard_terminally_cancels() {
+        let workflow = workflow("[[step]]\nprompt='work'\n");
+        let store = Arc::new(MemoryWorkflowRunStore::default());
+        let scheduler = WorkflowScheduler::new(
+            store.clone(),
+            TriggerRegistry::default(),
+            Arc::new(RecordingAgentExecutor::default()),
+        );
+        scheduler
+            .start(StartPromptWorkflow {
+                run_id: "run",
+                workflow: &workflow,
+                subject: subject(),
+                now_unix_ms: 1,
+            })
+            .await
+            .unwrap();
+        let mut run = store.load_run("run").await.unwrap().unwrap();
+        let attempt = begin_attempt(&mut run, 0, 2).unwrap();
+        recovery_required(&mut run, 0, attempt, 3, "uncertain effect");
+        store.save_run(&mut run).await.unwrap();
+
+        scheduler.discard("run", 4).await.unwrap();
+        let run = store.load_run("run").await.unwrap().unwrap();
+        assert_eq!(run.status, WorkflowRunStatus::Cancelled);
+        assert_eq!(run.steps[0].phase, StepPhase::Cancelled);
+        assert!(
+            run.events
+                .iter()
+                .any(|event| event.kind == "recovery_discarded")
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_unknown_run_does_not_poison_a_later_run() {
+        let workflow = workflow("[[step]]\nprompt='work'\n");
+        let store = Arc::new(MemoryWorkflowRunStore::default());
+        let agents = Arc::new(RecordingAgentExecutor::default());
+        agents.push_outcome(outcome("agent", "done"));
+        let scheduler = WorkflowScheduler::new(store, TriggerRegistry::default(), agents);
+        assert!(matches!(
+            scheduler.cancel("reused", 1).await,
+            Err(WorkflowKernelError::UnknownRun(_))
+        ));
+        assert!(scheduler.run_cancellations.lock().await.is_empty());
+        scheduler
+            .start(StartPromptWorkflow {
+                run_id: "reused",
+                workflow: &workflow,
+                subject: subject(),
+                now_unix_ms: 2,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            scheduler.tick("reused", 3).await.unwrap(),
+            SchedulerProgress::Advanced
+        );
+    }
+
+    #[tokio::test]
     async fn cancel_interrupts_an_owned_trigger_phase() {
         struct BlockingTrigger {
             started: Arc<std::sync::atomic::AtomicBool>,
@@ -2658,6 +3118,128 @@ mod tests {
             store.load_run("run").await.unwrap().unwrap().status,
             WorkflowRunStatus::Cancelled
         );
+    }
+
+    #[tokio::test]
+    async fn cancel_interrupts_a_blocked_trigger_check() {
+        struct BlockingCheck {
+            started: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl StepTrigger for BlockingCheck {
+            fn should_run_step<'a>(
+                &'a self,
+                _context: &'a TriggerContext,
+            ) -> super::super::step_trigger::TriggerFuture<'a, TriggerDecision> {
+                self.started.store(true, Ordering::Release);
+                Box::pin(async {
+                    std::future::pending::<()>().await;
+                    Ok(TriggerDecision::Satisfied {
+                        summary: "never".into(),
+                    })
+                })
+            }
+        }
+
+        let workflow = workflow("[[step]]\ntrigger='needs_review'\nprompt='fix'\n");
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let triggers = TriggerRegistry::default();
+        triggers
+            .insert(
+                "needs_review",
+                BlockingCheck {
+                    started: started.clone(),
+                },
+            )
+            .unwrap();
+        let store = Arc::new(MemoryWorkflowRunStore::default());
+        let scheduler = WorkflowScheduler::new(
+            store.clone(),
+            triggers,
+            Arc::new(RecordingAgentExecutor::default()),
+        );
+        scheduler
+            .start(StartPromptWorkflow {
+                run_id: "run",
+                workflow: &workflow,
+                subject: subject(),
+                now_unix_ms: 1,
+            })
+            .await
+            .unwrap();
+        let ticking = {
+            let scheduler = scheduler.clone();
+            tokio::spawn(async move { scheduler.tick("run", 2).await })
+        };
+        while !started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            scheduler.cancel("run", 3),
+        )
+        .await
+        .expect("cancellation must interrupt Trigger checks")
+        .unwrap();
+        assert!(matches!(
+            ticking.await.unwrap(),
+            Err(WorkflowKernelError::PhaseCancelled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancellation_published_before_tick_prevents_phase_registration() {
+        let workflow = workflow("[[step]]\ntrigger='needs_review'\nprompt='fix'\n");
+        let store = Arc::new(MemoryWorkflowRunStore::default());
+        let scheduler = WorkflowScheduler::new(
+            store.clone(),
+            TriggerRegistry::default(),
+            Arc::new(RecordingAgentExecutor::default()),
+        );
+        scheduler
+            .start(StartPromptWorkflow {
+                run_id: "run",
+                workflow: &workflow,
+                subject: subject(),
+                now_unix_ms: 1,
+            })
+            .await
+            .unwrap();
+        scheduler.run_cancellation("run").await.cancel();
+        assert!(matches!(
+            scheduler.tick("run", 2).await,
+            Err(WorkflowKernelError::PhaseCancelled)
+        ));
+        assert_eq!(
+            store.load_run("run").await.unwrap().unwrap().status,
+            WorkflowRunStatus::Queued
+        );
+    }
+
+    #[tokio::test]
+    async fn weak_lock_registries_preserve_live_identity_and_prune_dead_keys() {
+        let scheduler = WorkflowScheduler::new(
+            Arc::new(MemoryWorkflowRunStore::default()),
+            TriggerRegistry::default(),
+            Arc::new(RecordingAgentExecutor::default()),
+        );
+        let live = scheduler.named_run_lock("live").await;
+        for index in 0..100 {
+            drop(scheduler.named_run_lock(&format!("dead-{index}")).await);
+        }
+        let same = scheduler.named_run_lock("live").await;
+        assert!(Arc::ptr_eq(&live, &same));
+        drop(same);
+        drop(live);
+        drop(scheduler.named_run_lock("prune").await);
+        assert!(scheduler.run_locks.lock().await.len() <= 1);
+
+        let worktree = scheduler.worktree_lock(Path::new("/worktree/live")).await;
+        let same = scheduler.worktree_lock(Path::new("/worktree/live")).await;
+        assert!(Arc::ptr_eq(&worktree, &same));
+        drop(worktree);
+        drop(same);
+        drop(scheduler.worktree_lock(Path::new("/worktree/prune")).await);
+        assert!(scheduler.worktree_locks.lock().await.len() <= 1);
     }
 
     #[tokio::test]

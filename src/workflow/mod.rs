@@ -3,6 +3,7 @@ pub(crate) mod ai;
 pub mod kernel;
 pub(crate) mod prompt_daemon;
 pub mod prompt_worker;
+pub mod remote_operation;
 pub mod source;
 pub mod standard_remote;
 pub mod standard_triggers;

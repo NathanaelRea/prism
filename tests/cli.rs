@@ -465,7 +465,7 @@ fn config_discovery_commands_print_templates_schema_and_paths() {
     assert!(example_stdout.contains("#:schema https://raw.githubusercontent.com/"));
     assert!(example_stdout.contains("[ui]"));
     assert!(example_stdout.contains("[notifications]"));
-    assert!(example_stdout.contains("enabled = true"));
+    assert!(example_stdout.contains("enabled = false"));
     assert!(example_stdout.contains("completed = false"));
     assert!(example_stdout.contains("default_harness = \"opencode\""));
     assert!(example_stdout.contains("[worktrees]"));

@@ -14,9 +14,10 @@ use crate::tui::{
 
 use super::worktrees::development_url_opened_message;
 use super::{
-    apply_bulk_review_resolution, archived_picker_overflow_message, discover_wt_columns,
-    open_http_url_in_browser, pr_target_choice_list, remote_create_mutation_target,
-    remote_pr_choice_keys, remote_pr_worktree_branch, run_browser_opener, status_label_with_behind,
+    apply_bulk_review_resolution, archived_picker_overflow_message, create_change_request_id,
+    discover_wt_columns, open_http_url_in_browser, pr_target_choice_list, push_request_id,
+    remote_create_mutation_target, remote_pr_choice_keys, remote_pr_worktree_branch,
+    resolve_review_request_id, run_browser_opener, status_label_with_behind,
     unresolved_review_thread_ids, worktree_column_choices,
 };
 use std::cell::RefCell;
@@ -93,6 +94,58 @@ fn review_resolution_uses_only_unresolved_threads_in_the_observed_details() {
         unresolved_review_thread_ids(&details),
         vec!["thread-1", "thread-2"]
     );
+}
+
+#[test]
+fn review_resolution_request_identity_covers_the_complete_canonical_operation() {
+    let operation = |repository: &str, thread_ids: Vec<String>| {
+        let summary = phase_1_pr_summary("head");
+        crate::workflow::remote_operation::RemoteMutationOperation::TuiResolveReviewThreads(
+            crate::workflow::remote_operation::TuiRemoteResolvePayload {
+                repository: repository.into(),
+                worktree: format!("{repository}/worktree").into(),
+                summary,
+                thread_ids,
+            },
+        )
+    };
+    let first = resolve_review_request_id(
+        &operation(
+            "/repo",
+            vec!["thread-2".to_string(), "thread-1".to_string()],
+        ),
+        "/repo#42",
+    )
+    .unwrap();
+    let reordered = resolve_review_request_id(
+        &operation(
+            "/repo",
+            vec![
+                "thread-1".to_string(),
+                "thread-2".to_string(),
+                "thread-1".to_string(),
+            ],
+        ),
+        "/repo#42",
+    )
+    .unwrap();
+    let different_threads = resolve_review_request_id(
+        &operation("/repo", vec!["thread-3".to_string()]),
+        "/repo#42",
+    )
+    .unwrap();
+    let different_repository = resolve_review_request_id(
+        &operation(
+            "/other",
+            vec!["thread-1".to_string(), "thread-2".to_string()],
+        ),
+        "/other#42",
+    )
+    .unwrap();
+
+    assert_eq!(first, reordered);
+    assert_ne!(first, different_threads);
+    assert_ne!(first, different_repository);
 }
 
 #[test]
@@ -239,7 +292,7 @@ fn push_without_change_request_prepares_create_target_and_dialog() {
         "upstream/repo",
     )
     .unwrap();
-    let preparation = crate::workflow::standard_remote::TuiRemoteCreatePreparation {
+    let preparation = crate::workflow::remote_operation::TuiRemoteCreatePreparation {
         source_push: crate::remote::dispatcher::PushGuard {
             repository: source,
             remote: "origin".into(),
@@ -267,6 +320,91 @@ fn push_without_change_request_prepares_create_target_and_dialog() {
     let choices = pr_target_choice_list("origin/repo", "upstream/repo");
     assert_eq!(choices.choices[0].key, "u");
     assert_eq!(choices.choices[1].key, "o");
+}
+
+#[test]
+fn create_request_identity_covers_target_and_body() {
+    let repository = crate::remote::RemoteRepositoryId::new(
+        crate::remote::ProviderKind::GitHub,
+        crate::remote::HostIdentity::new("github.com", None).unwrap(),
+        "contributor/repo",
+    )
+    .unwrap();
+    let target = |project: &str| {
+        crate::remote::RemoteRepositoryId::new(
+            crate::remote::ProviderKind::GitHub,
+            crate::remote::HostIdentity::new("github.com", None).unwrap(),
+            project,
+        )
+        .unwrap()
+    };
+    let operation = |project: &str, body: &str| {
+        crate::workflow::remote_operation::RemoteMutationOperation::TuiCreateChangeRequest(
+            crate::workflow::remote_operation::TuiRemoteCreatePayload {
+                repository: "/repo".into(),
+                worktree: "/repo/worktree".into(),
+                branch: "feature".into(),
+                body: body.into(),
+                target_repository: target(project),
+                source_push: crate::remote::dispatcher::PushGuard {
+                    repository: repository.clone(),
+                    remote: "origin".into(),
+                    remote_branch: "feature".into(),
+                    local_branch: "feature".into(),
+                    expected_head_sha: "abc123".into(),
+                    set_upstream: false,
+                },
+            },
+        )
+    };
+
+    let first =
+        create_change_request_id(&operation("upstream/repo", "first"), "/repo:feature").unwrap();
+    let different_target =
+        create_change_request_id(&operation("fork/repo", "first"), "/repo:feature").unwrap();
+    let different_body =
+        create_change_request_id(&operation("upstream/repo", "second"), "/repo:feature").unwrap();
+
+    assert_ne!(first, different_target);
+    assert_ne!(first, different_body);
+}
+
+#[test]
+fn push_request_identity_covers_the_complete_destination() {
+    let repository = |project: &str| {
+        crate::remote::RemoteRepositoryId::new(
+            crate::remote::ProviderKind::GitHub,
+            crate::remote::HostIdentity::new("github.com", None).unwrap(),
+            project,
+        )
+        .unwrap()
+    };
+    let operation = |project: &str, remote_branch: &str| {
+        crate::workflow::remote_operation::RemoteMutationOperation::TuiPushBranch(
+            crate::workflow::remote_operation::TuiRemotePushPayload {
+                repository: "/repo".into(),
+                worktree: "/repo/worktree".into(),
+                branch: "feature".into(),
+                expected: crate::remote::dispatcher::PushGuard {
+                    repository: repository(project),
+                    remote: "origin".into(),
+                    remote_branch: remote_branch.into(),
+                    local_branch: "feature".into(),
+                    expected_head_sha: "abc123".into(),
+                    set_upstream: false,
+                },
+            },
+        )
+    };
+
+    let first = push_request_id(&operation("example/repo", "feature"), "/repo:feature").unwrap();
+    let different_repository =
+        push_request_id(&operation("fork/repo", "feature"), "/repo:feature").unwrap();
+    let different_branch =
+        push_request_id(&operation("example/repo", "other"), "/repo:feature").unwrap();
+
+    assert_ne!(first, different_repository);
+    assert_ne!(first, different_branch);
 }
 
 #[test]
@@ -1040,8 +1178,7 @@ fn unavailable_remote_preserves_stale_live_and_persisted_display_state() {
             ..PrDetails::default()
         }),
     );
-    crate::remote::save_pr_cache(&repo, "feature", &cache).unwrap();
-    crate::remote::save_pr_details_cache(&repo, "feature", cache.details().unwrap()).unwrap();
+    crate::remote::persist_pr_cache_snapshot(&repo, "feature", &cache).unwrap();
     let mut session = test_session(temp.join("worktree"), "feature");
     session.pr = cache;
     session.unseen_comments = true;

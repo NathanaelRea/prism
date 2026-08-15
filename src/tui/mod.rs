@@ -11,7 +11,7 @@ use crate::repo::Repository;
 use crate::session::{Session, WorktreeRepositoryKey, WorktreeSessionKey};
 use crate::terminal::stdin_is_tty;
 use crate::tmux::TmuxWindow;
-use crate::tui_jobs::{JobId, JobRegistry, LatestReceiver, LatestSender, latest_channel};
+use crate::tui_jobs::{LatestReceiver, LatestSender, latest_channel};
 use crate::tui_runtime::{RuntimeEvent, TerminalRuntime};
 use crate::tui_signal::{ShutdownNotification, ShutdownSignal};
 use crate::view;
@@ -19,6 +19,7 @@ use crate::workspace_state::RepositorySnapshot;
 
 mod agent_state;
 mod attach;
+mod background_runtime;
 mod dialog;
 mod git_actions;
 pub(crate) mod input;
@@ -29,6 +30,7 @@ mod navigation;
 mod operator;
 mod presentation;
 mod remote_action;
+mod remote_reconciliation;
 mod repository;
 pub(crate) mod runtime;
 pub(crate) mod signal;
@@ -39,6 +41,7 @@ mod workflow;
 mod tests;
 
 use agent_state::AgentStatePersistenceRequest;
+use background_runtime::BackgroundRuntime;
 use dialog::{choice_list, ctrl_key};
 #[cfg(test)]
 use dialog::{
@@ -63,12 +66,10 @@ pub(crate) use job_protocol::{
 #[allow(unused_imports)]
 pub(crate) use navigation::{NavigationSnapshot, PanelFocus, WorktreeListMode};
 use navigation::{OpenTmuxSessionTarget, worktree_updated_label};
+use remote_action::uncertain_remote_mutation_error;
 pub(crate) use remote_action::{
-    RemoteActionDelivery, RemoteActionRequest, RemoteActionValue, RemoteMutationTarget,
-};
-use remote_action::{
-    RemoteActionReconciliationContext, RemoteMutationReconciliationMarker,
-    uncertain_remote_mutation_error,
+    RemoteActionDelivery, RemoteActionEffect, RemoteActionRequest, RemoteActionValue,
+    RemoteMutationLedgerContext, RemoteMutationTarget,
 };
 #[cfg(test)]
 use remote_action::{
@@ -77,7 +78,7 @@ use remote_action::{
 #[allow(unused_imports)]
 pub(crate) use repository::{
     ManagedRepo, SelectedRepoContext, SelectedWorktreeContext, WtHookLogInventory,
-    load_worktree_harness_configs, maintain_workflow_storage,
+    load_worktree_harness_configs,
 };
 
 pub struct Tui {
@@ -98,11 +99,6 @@ pub struct Tui {
     pub(crate) session_inventory_generation: u64,
     agent_state_persistence_in_flight: BTreeSet<WorktreeSessionKey>,
     agent_state_persistence_pending: BTreeMap<WorktreeSessionKey, AgentStatePersistenceRequest>,
-    workflow_maintenance_tx: LatestSender<(), ()>,
-    workflow_maintenance_rx: LatestReceiver<(), ()>,
-    workflow_maintenance_in_flight: bool,
-    workflow_maintenance_due: bool,
-    workflow_maintenance_last_started: Instant,
     pub(crate) selected: usize,
     pub(crate) selected_repo_root: Option<PathBuf>,
     pub(crate) focused_panel: PanelFocus,
@@ -123,14 +119,7 @@ pub struct Tui {
     pub(crate) pr_persistence_in_flight: BTreeSet<PrPollKey>,
     pub(crate) pr_persistence_pending: BTreeMap<PrPollKey, PrPersistenceRequest>,
     pub(crate) pr_persistence_versions: BTreeMap<PrPollKey, u64>,
-    remote_action_tx: LatestSender<JobId, RemoteActionDelivery>,
-    remote_action_rx: LatestReceiver<JobId, RemoteActionDelivery>,
-    remote_action_failures: BTreeMap<JobId, String>,
-    remote_actions_requiring_reconciliation: BTreeSet<JobId>,
-    remote_action_reconciliation_contexts: BTreeMap<JobId, RemoteActionReconciliationContext>,
-    remote_mutations_requiring_reconciliation:
-        BTreeMap<PathBuf, Vec<RemoteMutationReconciliationMarker>>,
-    shutdown_remote_action_errors: Vec<String>,
+    pub(crate) background: BackgroundRuntime,
     pub(crate) delete_session_tx: LatestSender<(DeleteSessionKey, u64), DeleteSessionResult>,
     pub(crate) delete_session_rx: LatestReceiver<(DeleteSessionKey, u64), DeleteSessionResult>,
     pub(crate) delete_sessions_in_flight: BTreeSet<DeleteSessionKey>,
@@ -164,11 +153,8 @@ pub struct Tui {
     pub(crate) opencode_event_rx: LatestReceiver<Instant, OpencodeEventResult>,
     pub(crate) opencode_listeners: BTreeSet<OpencodeListenerKey>,
     pub(crate) opencode_listener_last_scanned: Option<Instant>,
-    pub(crate) jobs: JobRegistry<TuiJobKind, TuiJobKey, TuiJobPayload>,
     pub(crate) opencode_events_changed: bool,
     pub(crate) tui_tick_active: bool,
-    pub(crate) routing_tui_jobs: bool,
-    scheduling_stopped: bool,
     flight_recorder_servers: Vec<crate::flight_recorder::ServerGuard>,
     workflow_poll_tx: LatestSender<WorktreeRepositoryKey, WorkflowPollResult>,
     workflow_poll_rx: LatestReceiver<WorktreeRepositoryKey, WorkflowPollResult>,
@@ -189,7 +175,6 @@ pub struct Tui {
 }
 
 const STATUS_MESSAGE_DURATION: Duration = Duration::from_secs(5);
-const WORKFLOW_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 pub(crate) const TUI_ACTION_JOB_TIMEOUT: Duration = Duration::from_secs(120);
 const TUI_JOB_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const TUI_MUTATION_SHUTDOWN_BOUND: Duration = Duration::from_secs(30 * 60);
@@ -257,13 +242,10 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
 impl Tui {
     pub fn new(repos: Vec<ManagedRepo>, current_repo: usize, sessions: Vec<Session>) -> Self {
         let (pr_poll_tx, pr_poll_rx) = latest_channel(pr_delivery_key);
-        let (remote_action_tx, remote_action_rx) =
-            latest_channel(|result: &RemoteActionDelivery| result.id);
         let (workflow_poll_tx, workflow_poll_rx) =
             latest_channel(|result: &WorkflowPollResult| result.repository.clone());
         let (session_refresh_tx, session_refresh_rx) =
             latest_channel(|result: &SessionRefreshResult| result.base_generation);
-        let (workflow_maintenance_tx, workflow_maintenance_rx) = latest_channel(|_| ());
         let (delete_session_tx, delete_session_rx) =
             latest_channel(|result: &DeleteSessionResult| (result.key.clone(), result.delivery_id));
         let (tmux_warmup_tx, tmux_warmup_rx) =
@@ -323,11 +305,6 @@ impl Tui {
             session_inventory_generation: 0,
             agent_state_persistence_in_flight: BTreeSet::new(),
             agent_state_persistence_pending: BTreeMap::new(),
-            workflow_maintenance_tx,
-            workflow_maintenance_rx,
-            workflow_maintenance_in_flight: false,
-            workflow_maintenance_due: false,
-            workflow_maintenance_last_started: Instant::now(),
             selected: 0,
             selected_repo_root: None,
             focused_panel: PanelFocus::Repos,
@@ -347,13 +324,7 @@ impl Tui {
             pr_persistence_in_flight: BTreeSet::new(),
             pr_persistence_pending: BTreeMap::new(),
             pr_persistence_versions: BTreeMap::new(),
-            remote_action_tx,
-            remote_action_rx,
-            remote_action_failures: BTreeMap::new(),
-            remote_actions_requiring_reconciliation: BTreeSet::new(),
-            remote_action_reconciliation_contexts: BTreeMap::new(),
-            remote_mutations_requiring_reconciliation: BTreeMap::new(),
-            shutdown_remote_action_errors: Vec::new(),
+            background: BackgroundRuntime::default(),
             delete_session_tx,
             delete_session_rx,
             delete_sessions_in_flight: BTreeSet::new(),
@@ -387,11 +358,8 @@ impl Tui {
             opencode_event_rx,
             opencode_listeners: BTreeSet::new(),
             opencode_listener_last_scanned: None,
-            jobs: JobRegistry::default(),
             opencode_events_changed: false,
             tui_tick_active: false,
-            routing_tui_jobs: false,
-            scheduling_stopped: false,
             flight_recorder_servers: Vec::new(),
             workflow_poll_tx,
             workflow_poll_rx,

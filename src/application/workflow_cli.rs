@@ -59,14 +59,10 @@ async fn run_workflow_async(repo: Option<&Path>, arguments: &[String]) -> Result
     crate::seed_editable_defaults(&context.global).map_err(|error| error.to_string())?;
     let (arguments, json_output) = split_json(arguments);
     let repository_resources = context.repository_resources();
-    let repository_trusted = context.repository_resources_trusted()?;
+    let repository_snapshot = context.trusted_repository_resources()?;
     let discover = || {
-        crate::PromptWorkflowCatalog::discover(
-            &context.global,
-            repository_resources.as_deref(),
-            repository_trusted,
-        )
-        .map_err(format_workflow_diagnostics)
+        crate::PromptWorkflowCatalog::discover(&context.global, repository_snapshot.as_ref())
+            .map_err(format_workflow_diagnostics)
     };
     match arguments.first().map(String::as_str) {
         Some("trust-repository") => {
@@ -76,15 +72,19 @@ async fn run_workflow_async(repo: Option<&Path>, arguments: &[String]) -> Result
             let resources = repository_resources
                 .as_ref()
                 .expect("repository has resource root");
-            let revision = crate::repository_resource_revision(resources)
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| {
-                    "repository has no Workflow or Trigger resources to trust".to_string()
-                })?;
+            let snapshot = crate::RepositoryResourceSnapshot::capture(resources)
+                .map_err(|error| error.to_string())?;
+            let revision = snapshot.revision().cloned().ok_or_else(|| {
+                "repository has no Workflow or Trigger resources to trust".to_string()
+            })?;
             let apply = arguments.iter().any(|argument| argument == "--apply");
             if apply {
-                crate::trust_repository_resources(&context.global, repository, resources)
-                    .map_err(|error| error.to_string())?;
+                crate::workflow::source::trust_repository_resource_snapshot(
+                    &context.global,
+                    repository,
+                    &snapshot,
+                )
+                .map_err(|error| error.to_string())?;
             }
             output(
                 json_output,
@@ -131,28 +131,46 @@ async fn run_workflow_async(repo: Option<&Path>, arguments: &[String]) -> Result
         }
         Some("validate") => {
             if let Some(target) = arguments.get(1) {
-                let path = prompt_workflow_path(&context, target)?;
-                let source = fs::read_to_string(&path).map_err(string_error)?;
-                let triggers = crate::StepTriggerCatalog::discover(
-                    &context.global,
-                    repository_resources.as_deref(),
-                    repository_trusted,
-                )
-                .map_err(|error| error.to_string())?;
-                match crate::compile_workflow(&path, &source, &triggers) {
-                    Ok(workflow) => output(
+                let explicit_path = PathBuf::from(target);
+                if explicit_path.is_file() {
+                    let source = fs::read_to_string(&explicit_path).map_err(string_error)?;
+                    let triggers = crate::StepTriggerCatalog::discover(
+                        &context.global,
+                        repository_snapshot.as_ref(),
+                    )
+                    .map_err(|error| error.to_string())?;
+                    match crate::compile_workflow(&explicit_path, &source, &triggers) {
+                        Ok(workflow) => output(
+                            json_output,
+                            "workflow.validation",
+                            &json!({"valid": true, "name": workflow.name, "path": explicit_path, "diagnostics": []}),
+                            || format!("valid: {} ({})", workflow.name, explicit_path.display()),
+                        ),
+                        Err(diagnostics) if json_output => output(
+                            true,
+                            "workflow.validation",
+                            &json!({"valid": false, "path": explicit_path, "diagnostics": diagnostics}),
+                            String::new,
+                        ),
+                        Err(diagnostics) => Err(format_workflow_diagnostics(diagnostics)),
+                    }
+                } else {
+                    let catalog = discover()?;
+                    let workflow = catalog
+                        .get(target)
+                        .ok_or_else(|| format!("unknown workflow '{target}'"))?;
+                    output(
                         json_output,
                         "workflow.validation",
-                        &json!({"valid": true, "name": workflow.name, "path": path, "diagnostics": []}),
-                        || format!("valid: {} ({})", workflow.name, path.display()),
-                    ),
-                    Err(diagnostics) if json_output => output(
-                        true,
-                        "workflow.validation",
-                        &json!({"valid": false, "path": path, "diagnostics": diagnostics}),
-                        String::new,
-                    ),
-                    Err(diagnostics) => Err(format_workflow_diagnostics(diagnostics)),
+                        &json!({"valid": true, "name": workflow.name, "path": workflow.source_path, "diagnostics": []}),
+                        || {
+                            format!(
+                                "valid: {} ({})",
+                                workflow.name,
+                                workflow.source_path.display()
+                            )
+                        },
+                    )
                 }
             } else {
                 let workflows = discover()?.list();
@@ -341,12 +359,17 @@ async fn run_workflow_async(repo: Option<&Path>, arguments: &[String]) -> Result
                     .join("\n")
             })
         }
-        Some(command @ ("pause" | "resume" | "cancel" | "retry")) => {
+        Some(command @ ("pause" | "resume" | "cancel" | "retry" | "recover" | "discard")) => {
             let run_id = required(&arguments, 1, "workflow control requires <run-id>")?;
             let command_value = match command {
                 "pause" => crate::worker::PromptWorkflowControl::Pause,
                 "resume" => crate::worker::PromptWorkflowControl::Resume,
                 "cancel" => crate::worker::PromptWorkflowControl::Cancel,
+                "recover" => crate::worker::PromptWorkflowControl::Recover {
+                    evidence: "operator confirmed authoritative reconciliation from CLI"
+                        .to_string(),
+                },
+                "discard" => crate::worker::PromptWorkflowControl::Discard,
                 _ => crate::worker::PromptWorkflowControl::Retry,
             };
             crate::worker::command_prompt_workflow(run_id, command_value)?;
@@ -386,23 +409,6 @@ fn validate_prompt_workflow_name(name: &str) -> Result<(), String> {
     } else {
         Ok(())
     }
-}
-
-fn prompt_workflow_path(context: &ResourceContext, target: &str) -> Result<PathBuf, String> {
-    let path = PathBuf::from(target);
-    if path.is_file() {
-        return Ok(path);
-    }
-    let catalog = crate::PromptWorkflowCatalog::discover(
-        &context.global,
-        context.repository_resources().as_deref(),
-        context.repository_resources_trusted()?,
-    )
-    .map_err(format_workflow_diagnostics)?;
-    catalog
-        .get(target)
-        .map(|workflow| workflow.source_path.clone())
-        .ok_or_else(|| format!("unknown workflow '{target}'"))
 }
 
 fn prompt_change_request_subject(
@@ -458,19 +464,23 @@ impl ResourceContext {
         self.repository.as_ref().map(|root| root.join(".prism"))
     }
 
-    fn repository_resources_trusted(&self) -> Result<bool, String> {
+    fn trusted_repository_resources(
+        &self,
+    ) -> Result<Option<crate::TrustedRepositoryResources>, String> {
         match (self.repository.as_deref(), self.repository_resources()) {
             (Some(repository), Some(resources)) => {
-                crate::repository_resources_are_trusted(&self.global, repository, &resources)
+                let snapshot = crate::RepositoryResourceSnapshot::capture(&resources)
+                    .map_err(|error| error.to_string())?;
+                crate::trusted_repository_resources(&self.global, repository, snapshot)
                     .map_err(|error| error.to_string())
             }
-            _ => Ok(false),
+            _ => Ok(None),
         }
     }
 
     fn resources(&self) -> Result<Vec<DiscoveredResource>, String> {
-        discover(&self.global, self.repository_resources().as_deref())
-            .map_err(|error| error.to_string())
+        let repository = self.trusted_repository_resources()?;
+        discover(&self.global, repository.as_ref()).map_err(|error| error.to_string())
     }
 }
 
@@ -495,7 +505,7 @@ fn run_copyable_resource(
         Some("show") => {
             let id = required(&arguments, 1, &format!("{family} show requires <id>"))?;
             let resource = find_resource(context, kind, id)?;
-            let content = fs::read_to_string(&resource.path).map_err(string_error)?;
+            let content = resource_text(&resource)?;
             output(
                 json_output,
                 &format!("{family}.show"),
@@ -517,7 +527,7 @@ fn run_copyable_resource(
                 ));
             }
             let resource = find_resource(context, kind, id)?;
-            fs::copy(&resource.path, &destination).map_err(string_error)?;
+            fs::write(&destination, resource_bytes(&resource)?).map_err(string_error)?;
             output(
                 json_output,
                 "template.copy",
@@ -564,7 +574,7 @@ fn install_skill(
         ));
     }
     fs::create_dir_all(destination.parent().expect("skill parent")).map_err(string_error)?;
-    let bytes = fs::read(&resource.path).map_err(string_error)?;
+    let bytes = resource_bytes(&resource)?;
     fs::write(&destination, &bytes).map_err(string_error)?;
     let installation = SkillInstallation {
         skill_id: id.into(),
@@ -579,6 +589,18 @@ fn install_skill(
     output(json_output, "skill.install", &installation, || {
         format!("installed {id} for Pi at {}", destination.display())
     })
+}
+
+fn resource_bytes(resource: &DiscoveredResource) -> Result<Vec<u8>, String> {
+    resource
+        .captured_bytes
+        .clone()
+        .map_or_else(|| fs::read(&resource.path).map_err(string_error), Ok)
+}
+
+fn resource_text(resource: &DiscoveredResource) -> Result<String, String> {
+    String::from_utf8(resource_bytes(resource)?)
+        .map_err(|error| format!("resource {} is not UTF-8: {error}", resource.path.display()))
 }
 
 fn remove_skill(
