@@ -31,7 +31,9 @@ esac
 
 require_command cargo-nextest
 require_command cargo-sqlx
+require_command git
 require_command sqlite3
+require_command tmux
 nextest_version="0.9.143"
 if [[ "$(cargo nextest --version)" != *" $nextest_version"* ]]; then
 	printf 'incompatible cargo-nextest: expected %s, got %s\n' \

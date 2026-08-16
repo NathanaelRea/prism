@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use crate::tui_runtime::{RuntimeEvent, TerminalRuntime};
+use crate::tui_runtime::{RuntimeEvent, TerminalDriver};
 use crate::view;
 use crate::workspace_state::{InspectRequest, WorkspaceContext, WorkspaceState};
 
@@ -312,7 +312,7 @@ fn pick_workflow_file(
 impl Tui {
     pub(super) fn show_keybindings_dialog(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
     ) -> Result<(), String> {
         let items = [
             "1 / 2 / 3    focus status / repos / worktrees sidebars; 3 toggles repo/all worktrees",
@@ -424,7 +424,7 @@ impl Tui {
 
     pub(crate) fn confirm_archive_dialog(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
         branch: &str,
         path: &str,
         warnings: &[String],
@@ -467,7 +467,7 @@ impl Tui {
 
     pub(crate) fn confirm_delete_dialog(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
         branch: &str,
         path: &str,
         warnings: &[String],
@@ -507,7 +507,7 @@ impl Tui {
 
     pub(crate) fn prompt_line_dialog(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
         title: &str,
         prompt: &str,
         initial: &str,
@@ -565,7 +565,7 @@ impl Tui {
 
     pub(crate) fn prompt_create_session_form(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
         catalog: &crate::harness::AgentSelectionOptions,
     ) -> Result<Option<CreateSessionInput>, String> {
         let mut fields = create_session_fields(catalog);
@@ -743,7 +743,7 @@ impl Tui {
 
     pub(crate) fn prompt_workflow_input_form(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
         workflow: &crate::CompiledWorkflow,
         worktree: &Path,
         fzf: &str,
@@ -914,7 +914,7 @@ impl Tui {
                         });
                     }
                     Some(view::FormFieldKind::File { .. }) => {
-                        let picked = runtime.suspend_for(|| {
+                        let picked = crate::tui_runtime::suspend_for(runtime, || {
                             Ok(pick_workflow_file(
                                 fzf,
                                 &fields[selected].name,
@@ -940,7 +940,7 @@ impl Tui {
                         });
                     }
                     Some(view::FormFieldKind::File { .. }) => {
-                        let picked = runtime.suspend_for(|| {
+                        let picked = crate::tui_runtime::suspend_for(runtime, || {
                             Ok(pick_workflow_file(
                                 fzf,
                                 &fields[selected].name,
@@ -1013,7 +1013,7 @@ impl Tui {
 
     pub(crate) fn prompt_choice_dialog(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
         choices: view::ChoiceList,
     ) -> Result<Option<String>, String> {
         self.dialog = Some(view::DialogModel::Choice {
@@ -1061,7 +1061,7 @@ impl Tui {
 
     pub(crate) fn ordered_toggle_dialog(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
         title: &str,
         mut items: Vec<view::OrderedToggleItem>,
     ) -> Result<Option<Vec<String>>, String> {
@@ -1130,7 +1130,7 @@ impl Tui {
 
     pub(super) fn recovery_selection_dialog(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
         mut items: Vec<view::OrderedToggleItem>,
     ) -> Result<Option<Vec<String>>, String> {
         let mut selected = 0usize;
@@ -1186,7 +1186,7 @@ impl Tui {
 
     pub(super) fn offer_interrupted_run_recovery(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
     ) -> Result<(), String> {
         let state = WorkspaceState::open(WorkspaceContext {
             repo: None,
@@ -1267,7 +1267,7 @@ impl Tui {
 
     pub(crate) fn show_loading_dialog(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
         title: &str,
         message: &str,
     ) -> Result<(), String> {
@@ -1282,7 +1282,7 @@ impl Tui {
 
     pub(crate) fn wait_for_dialog_job<T>(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
         title: &str,
         message: &str,
         receiver: std::sync::mpsc::Receiver<T>,
@@ -1322,7 +1322,7 @@ impl Tui {
 
     pub(crate) fn confirm_dialog(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
         title: &str,
         lines: Vec<view::DialogLine>,
         prompt: &str,
@@ -1392,7 +1392,7 @@ impl Tui {
 
     pub(crate) fn confirm_action_dialog(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
         title: &str,
         message: &str,
         default: bool,
@@ -1402,7 +1402,7 @@ impl Tui {
 
     pub(crate) fn notice_dialog(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
         title: &str,
         lines: Vec<view::DialogLine>,
     ) -> Result<(), String> {

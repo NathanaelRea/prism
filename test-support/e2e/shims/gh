@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+import json
+import os
+import pathlib
+import subprocess
+import sys
+
+from _common import log_event, private_env, reject, root
+
+args = sys.argv[1:]
+log_event("gh", args)
+state_path = root() / "state" / "github.json"
+
+
+def read_state():
+    try:
+        return json.loads(state_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"next_number": 1, "pull_requests": []}
+
+
+def write_state(state):
+    temporary = state_path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, state_path)
+
+
+def option(name, default=None):
+    try:
+        return args[args.index(name) + 1]
+    except (ValueError, IndexError):
+        return default
+
+
+def git(*git_args):
+    real_git = (root() / "state" / "real-git").read_text(encoding="utf-8")
+    return subprocess.check_output([real_git, *git_args], env=private_env(), text=True).strip()
+
+
+def node(pull):
+    merged_at = "2026-01-01T00:00:00Z" if pull.get("merged") else None
+    return {
+        "id": f"PR_e2e_{pull['number']}",
+        "number": pull["number"],
+        "title": pull.get("title", f"PR {pull['number']}"),
+        "body": pull.get("body", ""),
+        "url": pull["url"],
+        "state": "MERGED" if pull.get("merged") else "OPEN",
+        "isDraft": False,
+        "mergedAt": merged_at,
+        "updatedAt": "2026-01-01T00:00:00Z",
+        "headRefName": pull["head"],
+        "baseRefName": pull["base"],
+        "headRefOid": pull["head_sha"],
+        "headRepository": {"nameWithOwner": pull["repository"]},
+        "baseRepository": {"nameWithOwner": pull["repository"]},
+        "mergeable": "MERGEABLE",
+        "mergeStateStatus": "CLEAN",
+        "mergeQueueEntry": None,
+        "reviewDecision": "APPROVED",
+        "author": {"login": "prism-e2e"},
+        "comments": {"totalCount": 0, "nodes": []},
+        "reviews": {"nodes": []},
+        "reviewRequests": {"nodes": []},
+        "reviewThreads": {"totalCount": 0, "nodes": []},
+        "commits": {"nodes": [{"commit": {"oid": pull["head_sha"], "statusCheckRollup": {"state": "SUCCESS", "contexts": {"nodes": [], "pageInfo": {"hasNextPage": False}}}}}]},
+        "files": {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}},
+    }
+
+
+if args == ["--version"]:
+    print("gh version 2.99.0 (prism e2e)")
+    raise SystemExit(0)
+if args[:2] == ["auth", "status"]:
+    if any(item not in ("auth", "status", "--hostname", "github.com") for item in args):
+        reject("gh", args, "unsupported auth status flags")
+    print("github.com\n  Logged in to github.com account prism-e2e")
+    raise SystemExit(0)
+
+if args[:2] == ["pr", "create"]:
+    allowed = {"--fill", "--body", "--base", "--repo", "--head"}
+    index = 2
+    while index < len(args):
+        current = args[index]
+        if current not in allowed:
+            reject("gh", args, f"unsupported pr create option {current}")
+        index += 1 if current == "--fill" else 2
+    state = read_state()
+    branch = git("branch", "--show-current")
+    head = option("--head", branch).split(":")[-1]
+    existing = next((pull for pull in state["pull_requests"] if pull["head"] == head and not pull.get("merged")), None)
+    if existing:
+        print(existing["url"])
+        raise SystemExit(0)
+    number = state["next_number"]
+    state["next_number"] += 1
+    pull = {
+        "number": number,
+        "title": f"PR for {head}",
+        "body": option("--body", ""),
+        "base": option("--base", "main"),
+        "head": head,
+        "head_sha": git("rev-parse", "HEAD"),
+        "repository": option("--repo", "prism-e2e/project"),
+        "url": f"https://github.com/prism-e2e/project/pull/{number}",
+        "merged": False,
+    }
+    state["pull_requests"].append(pull)
+    write_state(state)
+    print(pull["url"])
+    raise SystemExit(0)
+
+if args[:2] == ["pr", "merge"] and len(args) == 6:
+    number = int(args[2])
+    if args[3] not in ("--squash", "--merge", "--rebase") or args[4] != "--match-head-commit":
+        reject("gh", args, "merge must use a method and head guard")
+    state = read_state()
+    pull = next((item for item in state["pull_requests"] if item["number"] == number), None)
+    if pull is None:
+        print("pull request not found", file=sys.stderr)
+        raise SystemExit(1)
+    if pull["head_sha"] != args[5]:
+        print("head commit changed", file=sys.stderr)
+        raise SystemExit(1)
+    pull["merged"] = True
+    write_state(state)
+    print(f"Merged pull request #{number}")
+    raise SystemExit(0)
+
+if args[:2] == ["api", "graphql"]:
+    state = read_state()
+    pulls = [node(pull) for pull in state["pull_requests"]]
+    query = option("-f", "")
+    if "reviewThreads(first: 100" in query:
+        print(json.dumps([{"data": {"repository": {"pullRequest": {"reviewThreads": {"totalCount": 0, "nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}}}}}}]))
+        raise SystemExit(0)
+    print(json.dumps({"data": {"repository": {"nameWithOwner": "prism-e2e/project", "defaultBranchRef": {"name": "main"}, "branchProtectionRules": {"nodes": []}, "pullRequests": {"nodes": pulls, "pageInfo": {"hasNextPage": False, "endCursor": None}}, "pullRequest": pulls[0] if pulls else {}}}}))
+    raise SystemExit(0)
+
+if args[:1] == ["api"]:
+    endpoint = next((item for item in args[1:] if item.startswith("/")), "")
+    endpoint_path = endpoint.split("?", 1)[0]
+    if endpoint_path.endswith("/protection"):
+        print(json.dumps({"url": f"https://api.github.com{endpoint}"}))
+        raise SystemExit(0)
+    if "/rules/branches/" in endpoint:
+        print("[[]]" if "--slurp" in args else "[]")
+        raise SystemExit(0)
+    if endpoint_path.endswith("/check-runs"):
+        print('[{"total_count": 0, "check_runs": []}]')
+        raise SystemExit(0)
+    if endpoint_path.endswith(("/reviews", "/comments", "/files", "/statuses")):
+        print("[[]]" if "--slurp" in args else "[]")
+        raise SystemExit(0)
+    if "/pulls/" in endpoint_path:
+        state = read_state()
+        pull = state["pull_requests"][0] if state["pull_requests"] else None
+        print(json.dumps(node(pull) if pull else {}))
+        raise SystemExit(0)
+
+reject("gh", args)

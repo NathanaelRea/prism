@@ -40,6 +40,40 @@ pub(crate) struct DrawTiming {
     pub terminal: Duration,
 }
 
+/// Terminal interaction seam used by the dashboard controller.
+///
+/// Production uses [`TerminalRuntime`]. Tests can supply a scripted adapter to
+/// drive semantic commands without owning the process terminal.
+pub(crate) trait TerminalDriver {
+    fn draw(&mut self, model: &view::FrameModel<'_>) -> Result<DrawTiming, String>;
+    fn area(&self) -> Result<Rect, String>;
+    fn poll_event(&mut self, timeout: Duration) -> Result<Option<RuntimeEvent>, String>;
+    fn suspend(&mut self) -> Result<(), String>;
+    fn resume(&mut self) -> Result<(), String>;
+}
+
+pub(crate) fn suspend_for<T>(
+    runtime: &mut dyn TerminalDriver,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    runtime.suspend()?;
+    let away_started = Instant::now();
+    let result = operation();
+    let away = away_started.elapsed();
+    let resume_result = runtime.resume();
+    crate::flight_recorder::record(
+        "lifecycle",
+        "suspended_operation",
+        Some(away),
+        vec![
+            crate::flight_recorder::boolean("operation_success", result.is_ok()),
+            crate::flight_recorder::boolean("resume_success", resume_result.is_ok()),
+        ],
+    );
+    resume_result?;
+    result
+}
+
 impl TerminalRuntime {
     pub(crate) fn enter() -> Result<Self, String> {
         let backend = CrosstermBackend::new(io::stdout());
@@ -164,28 +198,6 @@ impl TerminalRuntime {
         result
     }
 
-    pub(crate) fn suspend_for<T>(
-        &mut self,
-        f: impl FnOnce() -> Result<T, String>,
-    ) -> Result<T, String> {
-        self.suspend()?;
-        let away_started = Instant::now();
-        let result = f();
-        let away = away_started.elapsed();
-        let resume_result = self.resume();
-        crate::flight_recorder::record(
-            "lifecycle",
-            "suspended_operation",
-            Some(away),
-            vec![
-                crate::flight_recorder::boolean("operation_success", result.is_ok()),
-                crate::flight_recorder::boolean("resume_success", resume_result.is_ok()),
-            ],
-        );
-        resume_result?;
-        result
-    }
-
     fn activate_terminal(&mut self, clear: bool) -> Result<(), String> {
         if self.active || self.keyboard_enhancement_active || self.raw_mode_active {
             self.leave_active_terminal(false)?;
@@ -266,6 +278,28 @@ impl TerminalRuntime {
             }
         }
         first_error.map_or(Ok(()), Err)
+    }
+}
+
+impl TerminalDriver for TerminalRuntime {
+    fn draw(&mut self, model: &view::FrameModel<'_>) -> Result<DrawTiming, String> {
+        TerminalRuntime::draw(self, model)
+    }
+
+    fn area(&self) -> Result<Rect, String> {
+        TerminalRuntime::area(self)
+    }
+
+    fn poll_event(&mut self, timeout: Duration) -> Result<Option<RuntimeEvent>, String> {
+        TerminalRuntime::poll_event(self, timeout)
+    }
+
+    fn suspend(&mut self) -> Result<(), String> {
+        TerminalRuntime::suspend(self)
+    }
+
+    fn resume(&mut self) -> Result<(), String> {
+        TerminalRuntime::resume(self)
     }
 }
 

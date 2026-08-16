@@ -1,5 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+use super::DashboardCommand;
+
 #[derive(Default)]
 pub struct KeyInput {
     state: KeyInputState,
@@ -15,7 +17,7 @@ enum KeyInputState {
 }
 
 impl KeyInput {
-    pub fn map_event(&mut self, event: KeyEvent) -> Option<Key> {
+    pub fn map_event(&mut self, event: KeyEvent) -> Option<DashboardCommand> {
         if event.kind != KeyEventKind::Press {
             return None;
         }
@@ -28,120 +30,120 @@ impl KeyInput {
         })
     }
 
-    fn map_normal(&mut self, event: KeyEvent) -> Key {
+    fn map_normal(&mut self, event: KeyEvent) -> DashboardCommand {
         if is_ctrl_char(event, 'c') {
-            return Key::Quit;
+            return DashboardCommand::Quit;
         }
         if is_terminal_key(event) {
-            return Key::Terminal;
+            return DashboardCommand::Terminal;
         }
 
         match event.code {
-            KeyCode::Char('q') if plain_char(event) => Key::Quit,
+            KeyCode::Char('q') if plain_char(event) => DashboardCommand::Quit,
             KeyCode::Char(' ') if plain_char(event) => {
                 self.state = KeyInputState::Leader;
-                Key::Leader
+                DashboardCommand::Leader
             }
-            KeyCode::Tab => Key::FocusNext,
-            KeyCode::BackTab => Key::FocusPrevious,
-            KeyCode::Enter => Key::OpenTmuxSession,
-            KeyCode::Up => Key::Up,
-            KeyCode::Down => Key::Down,
-            KeyCode::Left => Key::Left,
-            KeyCode::Right => Key::Right,
-            KeyCode::Char('k') if plain_char(event) => Key::Up,
-            KeyCode::Char('j') if plain_char(event) => Key::Down,
-            KeyCode::Char('h') if plain_char(event) => Key::Left,
-            KeyCode::Char('l') if plain_char(event) => Key::Right,
-            KeyCode::Char('G') if plain_char(event) => Key::Bottom,
-            KeyCode::Char('g') if plain_char(event) => Key::G,
-            KeyCode::Char('{') if plain_char(event) => Key::PreviousBlock,
-            KeyCode::Char('}') if plain_char(event) => Key::NextBlock,
-            KeyCode::Char('[') if plain_char(event) => Key::PreviousView,
-            KeyCode::Char(']') if plain_char(event) => Key::NextView,
-            KeyCode::Char('r') if plain_char(event) => Key::Refresh,
-            KeyCode::Char('o') if plain_char(event) => Key::OpenDevelopmentUrl,
-            KeyCode::Char('L') if plain_char(event) => Key::WorktrunkLogs,
-            KeyCode::Char('>') if plain_char(event) => Key::VisibilityUp,
-            KeyCode::Char('<') if plain_char(event) => Key::VisibilityDown,
-            KeyCode::Char('0') if plain_char(event) => Key::FocusMain,
-            KeyCode::Char('1') if plain_char(event) => Key::FocusStatus,
-            KeyCode::Char('2') if plain_char(event) => Key::FocusRepos,
-            KeyCode::Char('3') if plain_char(event) => Key::FocusWorktrees,
-            KeyCode::Char('4'..='9') if plain_char(event) => Key::Other,
-            KeyCode::Char('p') if plain_char(event) => Key::PullDefault,
-            KeyCode::Char('W') if plain_char(event) => Key::WorkflowLauncher,
-            KeyCode::Char('u') if plain_char(event) => Key::WorkflowPauseResume,
-            KeyCode::Char('f') if plain_char(event) => Key::WorkflowRetry,
-            KeyCode::Char('c') if plain_char(event) => Key::Create,
-            KeyCode::Char('x') if plain_char(event) => Key::AbortOpencode,
-            KeyCode::Char('X') if plain_char(event) => Key::DeletePermanent,
-            KeyCode::Char('C') if plain_char(event) => Key::OpenRemotePrs,
-            KeyCode::Char('D') if plain_char(event) => Key::Delete,
-            KeyCode::Char('U') if plain_char(event) => Key::Unarchive,
-            KeyCode::Char('M') if plain_char(event) => Key::MigrateHarness,
-            KeyCode::Char('?') if plain_char(event) => Key::Help,
-            KeyCode::Char('/') if plain_char(event) => Key::Search,
-            _ => Key::Other,
+            KeyCode::Tab => DashboardCommand::FocusNext,
+            KeyCode::BackTab => DashboardCommand::FocusPrevious,
+            KeyCode::Enter => DashboardCommand::OpenTmuxSession,
+            KeyCode::Up => DashboardCommand::Up,
+            KeyCode::Down => DashboardCommand::Down,
+            KeyCode::Left => DashboardCommand::Left,
+            KeyCode::Right => DashboardCommand::Right,
+            KeyCode::Char('k') if plain_char(event) => DashboardCommand::Up,
+            KeyCode::Char('j') if plain_char(event) => DashboardCommand::Down,
+            KeyCode::Char('h') if plain_char(event) => DashboardCommand::Left,
+            KeyCode::Char('l') if plain_char(event) => DashboardCommand::Right,
+            KeyCode::Char('G') if plain_char(event) => DashboardCommand::Bottom,
+            KeyCode::Char('g') if plain_char(event) => DashboardCommand::G,
+            KeyCode::Char('{') if plain_char(event) => DashboardCommand::PreviousBlock,
+            KeyCode::Char('}') if plain_char(event) => DashboardCommand::NextBlock,
+            KeyCode::Char('[') if plain_char(event) => DashboardCommand::PreviousView,
+            KeyCode::Char(']') if plain_char(event) => DashboardCommand::NextView,
+            KeyCode::Char('r') if plain_char(event) => DashboardCommand::Refresh,
+            KeyCode::Char('o') if plain_char(event) => DashboardCommand::OpenDevelopmentUrl,
+            KeyCode::Char('L') if plain_char(event) => DashboardCommand::WorktrunkLogs,
+            KeyCode::Char('>') if plain_char(event) => DashboardCommand::VisibilityUp,
+            KeyCode::Char('<') if plain_char(event) => DashboardCommand::VisibilityDown,
+            KeyCode::Char('0') if plain_char(event) => DashboardCommand::FocusMain,
+            KeyCode::Char('1') if plain_char(event) => DashboardCommand::FocusStatus,
+            KeyCode::Char('2') if plain_char(event) => DashboardCommand::FocusRepos,
+            KeyCode::Char('3') if plain_char(event) => DashboardCommand::FocusWorktrees,
+            KeyCode::Char('4'..='9') if plain_char(event) => DashboardCommand::Other,
+            KeyCode::Char('p') if plain_char(event) => DashboardCommand::PullDefault,
+            KeyCode::Char('W') if plain_char(event) => DashboardCommand::WorkflowLauncher,
+            KeyCode::Char('u') if plain_char(event) => DashboardCommand::WorkflowPauseResume,
+            KeyCode::Char('f') if plain_char(event) => DashboardCommand::WorkflowRetry,
+            KeyCode::Char('c') if plain_char(event) => DashboardCommand::Create,
+            KeyCode::Char('x') if plain_char(event) => DashboardCommand::AbortOpencode,
+            KeyCode::Char('X') if plain_char(event) => DashboardCommand::DeletePermanent,
+            KeyCode::Char('C') if plain_char(event) => DashboardCommand::OpenRemotePrs,
+            KeyCode::Char('D') if plain_char(event) => DashboardCommand::Delete,
+            KeyCode::Char('U') if plain_char(event) => DashboardCommand::Unarchive,
+            KeyCode::Char('M') if plain_char(event) => DashboardCommand::MigrateHarness,
+            KeyCode::Char('?') if plain_char(event) => DashboardCommand::Help,
+            KeyCode::Char('/') if plain_char(event) => DashboardCommand::Search,
+            _ => DashboardCommand::Other,
         }
     }
 
-    fn map_leader(&mut self, event: KeyEvent) -> Key {
+    fn map_leader(&mut self, event: KeyEvent) -> DashboardCommand {
         match event.code {
             KeyCode::Char(' ') if plain_char(event) => {
                 self.state = KeyInputState::Normal;
-                Key::OpenTmuxSession
+                DashboardCommand::OpenTmuxSession
             }
             KeyCode::Char('w') if plain_char(event) => {
                 self.state = KeyInputState::LeaderWorkflow;
-                Key::LeaderWorkflow
+                DashboardCommand::LeaderWorkflow
             }
             KeyCode::Char('c') if plain_char(event) => {
                 self.state = KeyInputState::Normal;
-                Key::Configuration
+                DashboardCommand::Configuration
             }
             KeyCode::Enter => {
                 self.state = KeyInputState::Normal;
-                Key::Terminal
+                DashboardCommand::Terminal
             }
             KeyCode::Char('g') if plain_char(event) => {
                 self.state = KeyInputState::LeaderG;
-                Key::LeaderGit
+                DashboardCommand::LeaderGit
             }
             KeyCode::Char(key @ '1'..='9') if plain_char(event) => {
                 self.state = KeyInputState::Normal;
-                Key::RepoShortcut(key)
+                DashboardCommand::RepoShortcut(key)
             }
             _ => {
                 self.state = KeyInputState::Normal;
-                Key::Other
+                DashboardCommand::Other
             }
         }
     }
 
-    fn map_leader_workflow(&mut self, event: KeyEvent) -> Key {
+    fn map_leader_workflow(&mut self, event: KeyEvent) -> DashboardCommand {
         self.state = KeyInputState::Normal;
         match event.code {
-            KeyCode::Char('a') if plain_char(event) => Key::WorkflowAi,
-            KeyCode::Char('w') if plain_char(event) => Key::WorkflowLauncher,
-            _ => Key::Other,
+            KeyCode::Char('a') if plain_char(event) => DashboardCommand::WorkflowAi,
+            KeyCode::Char('w') if plain_char(event) => DashboardCommand::WorkflowLauncher,
+            _ => DashboardCommand::Other,
         }
     }
 
-    fn map_leader_git(&mut self, event: KeyEvent) -> Key {
+    fn map_leader_git(&mut self, event: KeyEvent) -> DashboardCommand {
         self.state = KeyInputState::Normal;
         match event.code {
-            KeyCode::Char('g') if plain_char(event) => Key::LazyGit,
-            KeyCode::Char('a') if plain_char(event) => Key::Other,
-            KeyCode::Char('o') if plain_char(event) => Key::OpenPr,
-            KeyCode::Char('v') if plain_char(event) => Key::SubmitReview,
-            KeyCode::Char('P') if plain_char(event) => Key::Push,
-            KeyCode::Char('M') if plain_char(event) => Key::Merge,
-            KeyCode::Char('c') if plain_char(event) => Key::CiFix,
-            KeyCode::Char('f') if plain_char(event) => Key::ReviewFix,
-            KeyCode::Char('R') if plain_char(event) => Key::ResolveAllComments,
-            KeyCode::Char('p') if plain_char(event) => Key::PullDefault,
-            _ => Key::Other,
+            KeyCode::Char('g') if plain_char(event) => DashboardCommand::LazyGit,
+            KeyCode::Char('a') if plain_char(event) => DashboardCommand::Other,
+            KeyCode::Char('o') if plain_char(event) => DashboardCommand::OpenPr,
+            KeyCode::Char('v') if plain_char(event) => DashboardCommand::SubmitReview,
+            KeyCode::Char('P') if plain_char(event) => DashboardCommand::Push,
+            KeyCode::Char('M') if plain_char(event) => DashboardCommand::Merge,
+            KeyCode::Char('c') if plain_char(event) => DashboardCommand::CiFix,
+            KeyCode::Char('f') if plain_char(event) => DashboardCommand::ReviewFix,
+            KeyCode::Char('R') if plain_char(event) => DashboardCommand::ResolveAllComments,
+            KeyCode::Char('p') if plain_char(event) => DashboardCommand::PullDefault,
+            _ => DashboardCommand::Other,
         }
     }
 }
@@ -163,62 +165,6 @@ fn is_terminal_key(event: KeyEvent) -> bool {
         && event.modifiers.contains(KeyModifiers::CONTROL)
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum Key {
-    Up,
-    Down,
-    Left,
-    Right,
-    FocusNext,
-    FocusPrevious,
-    FocusMain,
-    FocusStatus,
-    FocusRepos,
-    FocusWorktrees,
-    Bottom,
-    G,
-    PreviousBlock,
-    NextBlock,
-    PreviousView,
-    NextView,
-    Leader,
-    LeaderGit,
-    LeaderWorkflow,
-    OpenTmuxSession,
-    WorkflowLauncher,
-    WorkflowAi,
-    WorkflowPauseResume,
-    WorkflowRetry,
-    Configuration,
-    LazyGit,
-    OpenPr,
-    OpenDevelopmentUrl,
-    WorktrunkLogs,
-    SubmitReview,
-    Terminal,
-    Help,
-    Refresh,
-    VisibilityUp,
-    VisibilityDown,
-    RepoShortcut(char),
-    OpenRemotePrs,
-    Push,
-    Merge,
-    CiFix,
-    ReviewFix,
-    ResolveAllComments,
-    PullDefault,
-    Create,
-    AbortOpencode,
-    Delete,
-    Unarchive,
-    MigrateHarness,
-    DeletePermanent,
-    Search,
-    Quit,
-    Other,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,86 +181,149 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::CONTROL)
     }
 
-    fn map(input: &mut KeyInput, event: KeyEvent) -> Key {
+    fn map(input: &mut KeyInput, event: KeyEvent) -> DashboardCommand {
         input.map_event(event).expect("press event should map")
     }
 
     #[test]
     fn key_input_handles_basic_keys() {
         let mut input = KeyInput::default();
-        assert_eq!(map(&mut input, key(KeyCode::Char('j'))), Key::Down);
-        assert_eq!(map(&mut input, ctrl_key(KeyCode::Char('c'))), Key::Quit);
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char('j'))),
+            DashboardCommand::Down
+        );
+        assert_eq!(
+            map(&mut input, ctrl_key(KeyCode::Char('c'))),
+            DashboardCommand::Quit
+        );
     }
 
     #[test]
     fn key_input_handles_horizontal_vim_motions() {
         let mut input = KeyInput::default();
-        assert_eq!(map(&mut input, key(KeyCode::Char('h'))), Key::Left);
-        assert_eq!(map(&mut input, key(KeyCode::Char('l'))), Key::Right);
-        assert_eq!(map(&mut input, key(KeyCode::Left)), Key::Left);
-        assert_eq!(map(&mut input, key(KeyCode::Right)), Key::Right);
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char('h'))),
+            DashboardCommand::Left
+        );
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char('l'))),
+            DashboardCommand::Right
+        );
+        assert_eq!(map(&mut input, key(KeyCode::Left)), DashboardCommand::Left);
+        assert_eq!(
+            map(&mut input, key(KeyCode::Right)),
+            DashboardCommand::Right
+        );
     }
 
     #[test]
     fn key_input_maps_brackets_to_view_switching() {
         let mut input = KeyInput::default();
-        assert_eq!(map(&mut input, key(KeyCode::Char('['))), Key::PreviousView);
-        assert_eq!(map(&mut input, key(KeyCode::Char(']'))), Key::NextView);
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char('['))),
+            DashboardCommand::PreviousView
+        );
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char(']'))),
+            DashboardCommand::NextView
+        );
     }
 
     #[test]
     fn key_input_uses_top_digits_for_panel_focus() {
         let mut input = KeyInput::default();
-        assert_eq!(map(&mut input, key(KeyCode::Char('1'))), Key::FocusStatus);
-        assert_eq!(map(&mut input, key(KeyCode::Char('0'))), Key::FocusMain);
-        assert_eq!(map(&mut input, key(KeyCode::Char('2'))), Key::FocusRepos);
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char('1'))),
+            DashboardCommand::FocusStatus
+        );
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char('0'))),
+            DashboardCommand::FocusMain
+        );
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char('2'))),
+            DashboardCommand::FocusRepos
+        );
         assert_eq!(
             map(&mut input, key(KeyCode::Char('3'))),
-            Key::FocusWorktrees
+            DashboardCommand::FocusWorktrees
         );
-        assert_eq!(map(&mut input, key(KeyCode::Tab)), Key::FocusNext);
-        assert_eq!(map(&mut input, key(KeyCode::Char('4'))), Key::Other);
+        assert_eq!(
+            map(&mut input, key(KeyCode::Tab)),
+            DashboardCommand::FocusNext
+        );
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char('4'))),
+            DashboardCommand::Other
+        );
     }
 
     #[test]
     fn key_input_uses_leader_digits_for_repo_shortcuts() {
         let mut input = KeyInput::default();
-        assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char(' '))),
+            DashboardCommand::Leader
+        );
         assert_eq!(
             map(&mut input, key(KeyCode::Char('1'))),
-            Key::RepoShortcut('1')
+            DashboardCommand::RepoShortcut('1')
         );
-        assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char(' '))),
+            DashboardCommand::Leader
+        );
         assert_eq!(
             map(&mut input, key(KeyCode::Char('9'))),
-            Key::RepoShortcut('9')
+            DashboardCommand::RepoShortcut('9')
         );
     }
 
     #[test]
     fn key_input_quits_on_q() {
         let mut input = KeyInput::default();
-        assert_eq!(map(&mut input, key(KeyCode::Char('q'))), Key::Quit);
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char('q'))),
+            DashboardCommand::Quit
+        );
     }
 
     #[test]
     fn key_input_handles_open_tmux_session_keys() {
         let mut input = KeyInput::default();
-        assert_eq!(map(&mut input, key(KeyCode::Char('i'))), Key::Other);
-        assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char('i'))),
+            DashboardCommand::Other
+        );
         assert_eq!(
             map(&mut input, key(KeyCode::Char(' '))),
-            Key::OpenTmuxSession
+            DashboardCommand::Leader
         );
-        assert_eq!(map(&mut input, key(KeyCode::Enter)), Key::OpenTmuxSession);
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char(' '))),
+            DashboardCommand::OpenTmuxSession
+        );
+        assert_eq!(
+            map(&mut input, key(KeyCode::Enter)),
+            DashboardCommand::OpenTmuxSession
+        );
     }
 
     #[test]
     fn key_input_handles_leader_lazygit() {
         let mut input = KeyInput::default();
-        assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
-        assert_eq!(map(&mut input, key(KeyCode::Char('g'))), Key::LeaderGit);
-        assert_eq!(map(&mut input, key(KeyCode::Char('g'))), Key::LazyGit);
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char(' '))),
+            DashboardCommand::Leader
+        );
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char('g'))),
+            DashboardCommand::LeaderGit
+        );
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char('g'))),
+            DashboardCommand::LazyGit
+        );
     }
 
     #[test]
@@ -322,33 +331,57 @@ mod tests {
         let mut input = KeyInput::default();
         assert_eq!(
             map(&mut input, shift_key(KeyCode::Char('W'))),
-            Key::WorkflowLauncher
+            DashboardCommand::WorkflowLauncher
         );
-        assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
         assert_eq!(
-            map(&mut input, key(KeyCode::Char('w'))),
-            Key::LeaderWorkflow
-        );
-        assert_eq!(map(&mut input, key(KeyCode::Char('a'))), Key::WorkflowAi);
-        assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
-        assert_eq!(
-            map(&mut input, key(KeyCode::Char('w'))),
-            Key::LeaderWorkflow
+            map(&mut input, key(KeyCode::Char(' '))),
+            DashboardCommand::Leader
         );
         assert_eq!(
             map(&mut input, key(KeyCode::Char('w'))),
-            Key::WorkflowLauncher
+            DashboardCommand::LeaderWorkflow
         );
-        assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
-        assert_eq!(map(&mut input, key(KeyCode::Char('c'))), Key::Configuration);
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char('a'))),
+            DashboardCommand::WorkflowAi
+        );
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char(' '))),
+            DashboardCommand::Leader
+        );
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char('w'))),
+            DashboardCommand::LeaderWorkflow
+        );
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char('w'))),
+            DashboardCommand::WorkflowLauncher
+        );
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char(' '))),
+            DashboardCommand::Leader
+        );
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char('c'))),
+            DashboardCommand::Configuration
+        );
     }
 
     #[test]
     fn key_input_handles_leader_open_pr() {
         let mut input = KeyInput::default();
-        assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
-        assert_eq!(map(&mut input, key(KeyCode::Char('g'))), Key::LeaderGit);
-        assert_eq!(map(&mut input, key(KeyCode::Char('o'))), Key::OpenPr);
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char(' '))),
+            DashboardCommand::Leader
+        );
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char('g'))),
+            DashboardCommand::LeaderGit
+        );
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char('o'))),
+            DashboardCommand::OpenPr
+        );
     }
 
     #[test]
@@ -356,24 +389,39 @@ mod tests {
         let mut input = KeyInput::default();
         assert_eq!(
             map(&mut input, key(KeyCode::Char('o'))),
-            Key::OpenDevelopmentUrl
+            DashboardCommand::OpenDevelopmentUrl
         );
-        assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
-        assert_eq!(map(&mut input, key(KeyCode::Char('g'))), Key::LeaderGit);
-        assert_eq!(map(&mut input, key(KeyCode::Char('o'))), Key::OpenPr);
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char(' '))),
+            DashboardCommand::Leader
+        );
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char('g'))),
+            DashboardCommand::LeaderGit
+        );
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char('o'))),
+            DashboardCommand::OpenPr
+        );
     }
 
     #[test]
     fn key_input_handles_restored_git_actions() {
         let mut input = KeyInput::default();
         for (code, expected) in [
-            ('P', Key::Push),
-            ('M', Key::Merge),
-            ('c', Key::CiFix),
-            ('f', Key::ReviewFix),
+            ('P', DashboardCommand::Push),
+            ('M', DashboardCommand::Merge),
+            ('c', DashboardCommand::CiFix),
+            ('f', DashboardCommand::ReviewFix),
         ] {
-            assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
-            assert_eq!(map(&mut input, key(KeyCode::Char('g'))), Key::LeaderGit);
+            assert_eq!(
+                map(&mut input, key(KeyCode::Char(' '))),
+                DashboardCommand::Leader
+            );
+            assert_eq!(
+                map(&mut input, key(KeyCode::Char('g'))),
+                DashboardCommand::LeaderGit
+            );
             assert_eq!(map(&mut input, key(KeyCode::Char(code))), expected);
         }
     }
@@ -381,99 +429,162 @@ mod tests {
     #[test]
     fn key_input_handles_review_resolution() {
         let mut input = KeyInput::default();
-        assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
-        assert_eq!(map(&mut input, key(KeyCode::Char('g'))), Key::LeaderGit);
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char(' '))),
+            DashboardCommand::Leader
+        );
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char('g'))),
+            DashboardCommand::LeaderGit
+        );
         assert_eq!(
             map(&mut input, shift_key(KeyCode::Char('R'))),
-            Key::ResolveAllComments
+            DashboardCommand::ResolveAllComments
         );
     }
 
     #[test]
     fn key_input_handles_enter_open_tmux_session_and_help_keys() {
         let mut input = KeyInput::default();
-        assert_eq!(map(&mut input, key(KeyCode::Enter)), Key::OpenTmuxSession);
-        assert_eq!(map(&mut input, shift_key(KeyCode::Char('?'))), Key::Help);
+        assert_eq!(
+            map(&mut input, key(KeyCode::Enter)),
+            DashboardCommand::OpenTmuxSession
+        );
+        assert_eq!(
+            map(&mut input, shift_key(KeyCode::Char('?'))),
+            DashboardCommand::Help
+        );
     }
 
     #[test]
     fn key_input_handles_terminal_key() {
         let mut input = KeyInput::default();
-        assert_eq!(map(&mut input, ctrl_key(KeyCode::Char('/'))), Key::Terminal);
-        assert_eq!(map(&mut input, ctrl_key(KeyCode::Char('_'))), Key::Terminal);
+        assert_eq!(
+            map(&mut input, ctrl_key(KeyCode::Char('/'))),
+            DashboardCommand::Terminal
+        );
+        assert_eq!(
+            map(&mut input, ctrl_key(KeyCode::Char('_'))),
+            DashboardCommand::Terminal
+        );
     }
 
     #[test]
     fn key_input_handles_leader_terminal_key() {
         let mut input = KeyInput::default();
-        assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
-        assert_eq!(map(&mut input, key(KeyCode::Enter)), Key::Terminal);
-        assert_eq!(map(&mut input, shift_key(KeyCode::Char('?'))), Key::Help);
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char(' '))),
+            DashboardCommand::Leader
+        );
+        assert_eq!(
+            map(&mut input, key(KeyCode::Enter)),
+            DashboardCommand::Terminal
+        );
+        assert_eq!(
+            map(&mut input, shift_key(KeyCode::Char('?'))),
+            DashboardCommand::Help
+        );
     }
 
     #[test]
     fn key_input_handles_cleanup_keys() {
         let mut input = KeyInput::default();
-        assert_eq!(map(&mut input, shift_key(KeyCode::Char('D'))), Key::Delete);
+        assert_eq!(
+            map(&mut input, shift_key(KeyCode::Char('D'))),
+            DashboardCommand::Delete
+        );
         assert_eq!(
             map(&mut input, shift_key(KeyCode::Char('U'))),
-            Key::Unarchive
+            DashboardCommand::Unarchive
         );
         assert_eq!(
             map(&mut input, shift_key(KeyCode::Char('X'))),
-            Key::DeletePermanent
+            DashboardCommand::DeletePermanent
         );
         assert_eq!(
             map(&mut input, shift_key(KeyCode::Char('C'))),
-            Key::OpenRemotePrs
+            DashboardCommand::OpenRemotePrs
         );
         assert_eq!(
             map(&mut input, shift_key(KeyCode::Char('W'))),
-            Key::WorkflowLauncher
+            DashboardCommand::WorkflowLauncher
         );
         for removed in ['e', 'w', 'E', 'H', 'P'] {
-            assert_eq!(map(&mut input, key(KeyCode::Char(removed))), Key::Other);
+            assert_eq!(
+                map(&mut input, key(KeyCode::Char(removed))),
+                DashboardCommand::Other
+            );
         }
         assert_eq!(
             map(&mut input, shift_key(KeyCode::Char('M'))),
-            Key::MigrateHarness
+            DashboardCommand::MigrateHarness
         );
     }
 
     #[test]
     fn key_input_uses_angle_brackets_for_visibility() {
         let mut input = KeyInput::default();
-        assert_eq!(map(&mut input, shift_key(KeyCode::Char('+'))), Key::Other);
-        assert_eq!(map(&mut input, key(KeyCode::Char('-'))), Key::Other);
+        assert_eq!(
+            map(&mut input, shift_key(KeyCode::Char('+'))),
+            DashboardCommand::Other
+        );
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char('-'))),
+            DashboardCommand::Other
+        );
         assert_eq!(
             map(&mut input, shift_key(KeyCode::Char('>'))),
-            Key::VisibilityUp
+            DashboardCommand::VisibilityUp
         );
         assert_eq!(
             map(&mut input, shift_key(KeyCode::Char('<'))),
-            Key::VisibilityDown
+            DashboardCommand::VisibilityDown
         );
     }
 
     #[test]
     fn key_input_uses_lazygit_style_branch_actions() {
         let mut input = KeyInput::default();
-        assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
-        assert_eq!(map(&mut input, key(KeyCode::Char('g'))), Key::LeaderGit);
-        assert_eq!(map(&mut input, shift_key(KeyCode::Char('P'))), Key::Push);
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char(' '))),
+            DashboardCommand::Leader
+        );
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char('g'))),
+            DashboardCommand::LeaderGit
+        );
+        assert_eq!(
+            map(&mut input, shift_key(KeyCode::Char('P'))),
+            DashboardCommand::Push
+        );
         assert_eq!(
             map(&mut input, shift_key(KeyCode::Char('M'))),
-            Key::MigrateHarness
+            DashboardCommand::MigrateHarness
         );
-        assert_eq!(map(&mut input, key(KeyCode::Char('n'))), Key::Other);
-        assert_eq!(map(&mut input, shift_key(KeyCode::Char('R'))), Key::Other);
-        assert_eq!(map(&mut input, key(KeyCode::Char('x'))), Key::AbortOpencode);
-        assert_eq!(map(&mut input, key(KeyCode::Char('m'))), Key::Other);
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char('n'))),
+            DashboardCommand::Other
+        );
+        assert_eq!(
+            map(&mut input, shift_key(KeyCode::Char('R'))),
+            DashboardCommand::Other
+        );
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char('x'))),
+            DashboardCommand::AbortOpencode
+        );
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char('m'))),
+            DashboardCommand::Other
+        );
         assert_eq!(
             map(&mut input, key(KeyCode::Char('u'))),
-            Key::WorkflowPauseResume
+            DashboardCommand::WorkflowPauseResume
         );
-        assert_eq!(map(&mut input, key(KeyCode::Char('a'))), Key::Other);
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char('a'))),
+            DashboardCommand::Other
+        );
     }
 
     #[test]
@@ -490,13 +601,34 @@ mod tests {
     #[test]
     fn key_input_cancels_incomplete_leaders_on_unknown_keys() {
         let mut input = KeyInput::default();
-        assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
-        assert_eq!(map(&mut input, key(KeyCode::Char('z'))), Key::Other);
-        assert_eq!(map(&mut input, key(KeyCode::Char('g'))), Key::G);
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char(' '))),
+            DashboardCommand::Leader
+        );
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char('z'))),
+            DashboardCommand::Other
+        );
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char('g'))),
+            DashboardCommand::G
+        );
 
-        assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
-        assert_eq!(map(&mut input, key(KeyCode::Char('g'))), Key::LeaderGit);
-        assert_eq!(map(&mut input, key(KeyCode::Char('z'))), Key::Other);
-        assert_eq!(map(&mut input, key(KeyCode::Char('g'))), Key::G);
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char(' '))),
+            DashboardCommand::Leader
+        );
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char('g'))),
+            DashboardCommand::LeaderGit
+        );
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char('z'))),
+            DashboardCommand::Other
+        );
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char('g'))),
+            DashboardCommand::G
+        );
     }
 }

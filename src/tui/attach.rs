@@ -4,7 +4,7 @@ use std::time::Instant;
 use crate::config::Config;
 use crate::session::Session;
 use crate::tmux::TmuxWindow;
-use crate::tui_runtime::TerminalRuntime;
+use crate::tui_runtime::TerminalDriver;
 use crate::view;
 
 use super::Tui;
@@ -64,7 +64,10 @@ impl Tui {
         }
     }
 
-    pub(super) fn enter_agent_mode(&mut self, runtime: &mut TerminalRuntime) -> Result<(), String> {
+    pub(super) fn enter_agent_mode(
+        &mut self,
+        runtime: &mut dyn TerminalDriver,
+    ) -> Result<(), String> {
         if self.selected_worktree_context().is_none() {
             return Ok(());
         }
@@ -76,7 +79,7 @@ impl Tui {
 
     pub(crate) fn enter_agent_mode_for_index(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
         index: usize,
     ) -> Result<(), String> {
         self.prepare_worktree_harness_for_open(runtime, index)?;
@@ -86,7 +89,8 @@ impl Tui {
             index,
             (terminal_area.width, terminal_area.height.saturating_sub(1)),
         )?;
-        let result = runtime.suspend_for(|| self.attach_tmux_session_for_index(index));
+        let result =
+            crate::tui_runtime::suspend_for(runtime, || self.attach_tmux_session_for_index(index));
         let refresh_started = Instant::now();
         self.refresh_sessions_after_tmux()?;
         crate::flight_recorder::record(
@@ -105,7 +109,7 @@ impl Tui {
 
     pub(super) fn prepare_worktree_harness_for_open(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
         index: usize,
     ) -> Result<(), String> {
         let Some(session) = self
@@ -207,14 +211,15 @@ impl Tui {
 
     pub(super) fn open_tmux_window(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
         window: TmuxWindow,
     ) -> Result<(), String> {
         if self.selected >= self.sessions.len() {
             return Ok(());
         }
         let navigation = self.navigation_snapshot();
-        let result = runtime.suspend_for(|| self.attach_selected_tmux_window(window));
+        let result =
+            crate::tui_runtime::suspend_for(runtime, || self.attach_selected_tmux_window(window));
         self.refresh_sessions_after_tmux()?;
         self.restore_navigation_snapshot(navigation);
         self.start_tmux_agent_warmup();
