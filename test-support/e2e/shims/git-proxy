@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+import os
+import subprocess
+import sys
+
+from _common import log_event, private_env, root
+
+args = sys.argv[1:]
+log_event("git", args)
+real_git = (root() / "state" / "real-git").read_text(encoding="utf-8")
+environment = private_env()
+
+# The sandbox rewrites its public-looking origin to a local bare repository so
+# real fetches and pushes cannot reach the network. Report the configured URL,
+# rather than Git's rewritten transport URL, so Prism still exercises GitHub
+# provider discovery and canonical identity handling.
+try:
+    remote_index = args.index("remote")
+except ValueError:
+    remote_index = -1
+remote_args = args[remote_index + 1 :] if remote_index >= 0 else []
+if remote_args[:1] == ["get-url"] and "origin" in remote_args[1:]:
+    prefix = args[:remote_index]
+    key = "remote.origin.pushurl" if "--push" in remote_args[1:] else "remote.origin.url"
+    result = subprocess.run(
+        [real_git, *prefix, "config", "--get", key],
+        env=environment,
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0 and key == "remote.origin.pushurl":
+        result = subprocess.run(
+            [real_git, *prefix, "config", "--get", "remote.origin.url"],
+            env=environment,
+            text=True,
+            capture_output=True,
+        )
+    sys.stdout.write(result.stdout)
+    sys.stderr.write(result.stderr)
+    raise SystemExit(result.returncode)
+
+os.execve(real_git, [real_git, *args], environment)

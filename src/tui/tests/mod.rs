@@ -1,5 +1,6 @@
 mod command;
 mod dialog;
+mod e2e;
 mod git_actions;
 mod job_orchestration;
 mod navigation;
