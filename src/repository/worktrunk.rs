@@ -406,7 +406,9 @@ pub(crate) fn approval_status(
     let output =
         run_output_allow_failure_named(&mut command, ProcessPolicy::Metadata, APPROVALS_PROCESS)
             .map_err(|error| WorktrunkFailure::process(&command, error))?;
-    if output.status.success() {
+    if output.status.success()
+        || is_missing_project_config(&format!("{}\n{}", output.stdout, output.stderr))
+    {
         return Ok(ApprovalStatus::Approved);
     }
     let failure = WorktrunkFailure::from_output(&command, &output);
@@ -462,6 +464,12 @@ pub(crate) fn user_config_create_command_display(repo: &Repository, config: &Con
 
 pub(crate) fn is_approval_failure(output: &str) -> bool {
     APPROVAL_FAILURE_RE.is_match(output)
+}
+
+fn is_missing_project_config(output: &str) -> bool {
+    output
+        .to_ascii_lowercase()
+        .contains("no project configuration found")
 }
 
 pub(crate) fn observe_repository(
