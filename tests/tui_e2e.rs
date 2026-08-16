@@ -46,7 +46,7 @@ fn dashboard_attaches_pushes_merges_and_quits_from_physical_keys() {
     let controller_socket = sandbox.controller_socket.clone();
     let prism = PathBuf::from(env!("CARGO_BIN_EXE_prism"));
 
-    let status = sandbox
+    let controller = sandbox
         .command(&sandbox.real_tmux)
         .args([
             "-S",
@@ -61,13 +61,47 @@ fn dashboard_attaches_pushes_merges_and_quits_from_physical_keys() {
             "controller",
             "-c",
             sandbox.repo.to_str().unwrap(),
+            "/bin/sleep",
+            "120",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(controller.success());
+    let remain_on_failure = sandbox
+        .command(&sandbox.real_tmux)
+        .args([
+            "-S",
+            controller_socket.to_str().unwrap(),
+            "set-option",
+            "-g",
+            "remain-on-exit",
+            "failed",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(remain_on_failure.success());
+    let prism_started = sandbox
+        .command(&sandbox.real_tmux)
+        .args([
+            "-S",
+            controller_socket.to_str().unwrap(),
+            "respawn-pane",
+            "-k",
+            "-c",
+            sandbox.repo.to_str().unwrap(),
+            "-t",
+            "controller:0",
             prism.to_str().unwrap(),
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .unwrap();
-    assert!(status.success());
+    assert!(prism_started.success());
 
     wait_until(
         Duration::from_secs(8),

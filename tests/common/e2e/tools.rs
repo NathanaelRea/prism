@@ -10,7 +10,11 @@ pub(crate) fn read_events(path: &Path) -> Vec<Value> {
     let Ok(contents) = fs::read_to_string(path) else {
         return Vec::new();
     };
-    contents
+    // Adapters append under a file lock, but readers do not take that lock and
+    // can observe the final JSON object mid-write. Only parse newline-terminated
+    // records; a later polling iteration will see the completed event.
+    let complete_len = contents.rfind('\n').map_or(0, |index| index + 1);
+    contents[..complete_len]
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
