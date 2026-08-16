@@ -6,6 +6,7 @@ mod common;
 mod e2e;
 
 use std::fs;
+use std::os::unix::process::CommandExt as _;
 use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -13,15 +14,60 @@ use std::time::{Duration, Instant};
 use common::CompactTempDir as TempDir;
 use e2e::{E2eSandbox, wait_until};
 
-fn prism(temp: &TempDir, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_prism"))
-        .args(args)
+fn prism_command(temp: &TempDir) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_prism"));
+    command
         .env("HOME", temp.path())
         .env("XDG_CONFIG_HOME", temp.path().join("config"))
         .env("XDG_RUNTIME_DIR", temp.path().join("runtime"))
-        .env("PRISM_RUNTIME_DIR", temp.runtime_path())
-        .output()
-        .unwrap()
+        .env("PRISM_RUNTIME_DIR", temp.runtime_path());
+    command
+}
+
+fn prism(temp: &TempDir, args: &[&str]) -> Output {
+    prism_command(temp).args(args).output().unwrap()
+}
+
+fn prism_with_timeout(temp: &TempDir, args: &[&str], timeout: Duration) -> Result<Output, String> {
+    let mut child = prism_command(temp)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait().map_err(|error| error.to_string())? {
+            Some(_) => return child.wait_with_output().map_err(|error| error.to_string()),
+            None if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            None => {
+                let _ = child.kill();
+                let output = child
+                    .wait_with_output()
+                    .map_err(|error| error.to_string())?;
+                return Err(format!(
+                    "timed out after {timeout:?}; stderr: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+        }
+    }
+}
+
+struct ProcessGuard(Option<u32>);
+
+impl ProcessGuard {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for ProcessGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        }
+    }
 }
 
 fn e2e_prism(sandbox: &E2eSandbox, args: &[&str], timeout: Duration) -> Output {
@@ -115,6 +161,73 @@ fn prompt_worker_starts_once_lists_editable_defaults_and_stops() {
     );
     let stopped = prism(&temp, &["worker", "health"]);
     assert!(String::from_utf8_lossy(&stopped.stdout).is_empty() || !stopped.status.success());
+}
+
+#[test]
+fn ensure_replaces_an_unresponsive_old_generation_worker() {
+    let temp = TempDir::new("worker-old-generation");
+    fs::create_dir_all(temp.runtime_path()).unwrap();
+    let stale_generation = "0".repeat(64);
+    let mut command = prism_command(&temp);
+    command
+        .args(["worker", "serve"])
+        .env("PRISM_WORKER_GENERATION", &stale_generation)
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut stale = command.spawn().unwrap();
+    let stale_pid = stale.id();
+    let mut stale_guard = ProcessGuard(Some(stale_pid));
+    let stale_reaper = thread::spawn(move || stale.wait());
+    let initial = wait_until(Duration::from_secs(3), "stale Worker to start", || {
+        let health = prism(&temp, &["worker", "health"]);
+        health.status.success().then_some(health)
+    });
+    assert!(
+        String::from_utf8_lossy(&initial.stdout)
+            .contains(&format!("generation={stale_generation}"))
+    );
+    let lock_path = temp.runtime_path().join("worker.lock");
+    let owner: serde_json::Value = serde_json::from_slice(&fs::read(&lock_path).unwrap()).unwrap();
+    assert_eq!(owner["pid"], stale_pid);
+    assert_eq!(owner["binary_generation"], stale_generation);
+    assert!(owner["process_identity"].as_u64().is_some());
+    fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&lock_path)
+        .unwrap();
+
+    assert_eq!(
+        unsafe { libc::kill(stale_pid as libc::pid_t, libc::SIGSTOP) },
+        0
+    );
+
+    let ensured = prism_with_timeout(&temp, &["worker", "ensure"], Duration::from_secs(10))
+        .unwrap_or_else(|error| panic!("failed to replace stopped old Worker: {error}"));
+    assert!(
+        ensured.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ensured.stderr)
+    );
+    let replacement = prism(&temp, &["worker", "health"]);
+    let replacement = String::from_utf8_lossy(&replacement.stdout);
+    assert!(replacement.contains("state=running"), "{replacement}");
+    assert!(
+        !replacement.contains(&format!("pid={stale_pid} ")),
+        "{replacement}"
+    );
+    assert!(!replacement.contains(&format!("generation={stale_generation}")));
+
+    stale_reaper.join().unwrap().unwrap();
+    stale_guard.disarm();
+    let shutdown = prism(&temp, &["worker", "shutdown"]);
+    assert!(
+        shutdown.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shutdown.stderr)
+    );
 }
 
 #[test]
