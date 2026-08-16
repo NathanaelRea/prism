@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/NathanaelRea/prism/compare/v0.1.4...v0.2.0) - 2026-08-16
+
+### Added
+
+- add initial prompt model picker ([#147](https://github.com/NathanaelRea/prism/pull/147))
+- workflow manager ([#145](https://github.com/NathanaelRea/prism/pull/145))
+- feat/migrations and queries ([#138](https://github.com/NathanaelRea/prism/pull/138))
+- rust cache ([#134](https://github.com/NathanaelRea/prism/pull/134))
+- feat/auto flow pr ([#124](https://github.com/NathanaelRea/prism/pull/124))
+- update default prompts ([#132](https://github.com/NathanaelRea/prism/pull/132))
+- multiline text input ([#130](https://github.com/NathanaelRea/prism/pull/130))
+- feat/durable notifications ([#127](https://github.com/NathanaelRea/prism/pull/127))
+- worktrunk config edit ([#129](https://github.com/NathanaelRea/prism/pull/129))
+- ui main panel scroll wheel ([#123](https://github.com/NathanaelRea/prism/pull/123))
+- feat/remote adapters ([#107](https://github.com/NathanaelRea/prism/pull/107))
+- feat/wt integration deepen ([#114](https://github.com/NathanaelRea/prism/pull/114))
+- feat/prism cli ([#113](https://github.com/NathanaelRea/prism/pull/113))
+- add desktop notifications ([#112](https://github.com/NathanaelRea/prism/pull/112))
+- single opencode server ([#111](https://github.com/NathanaelRea/prism/pull/111))
+- update tmux names ([#108](https://github.com/NathanaelRea/prism/pull/108))
+
+### Fixed
+
+- small window ([#158](https://github.com/NathanaelRea/prism/pull/158))
+- wt delete ([#156](https://github.com/NathanaelRea/prism/pull/156))
+- fix/remote push pr ([#154](https://github.com/NathanaelRea/prism/pull/154))
+- initial prompt submit ([#155](https://github.com/NathanaelRea/prism/pull/155))
+- push create PR, worker regression ([#152](https://github.com/NathanaelRea/prism/pull/152))
+- merge up to remote ([#151](https://github.com/NathanaelRea/prism/pull/151))
+- migrations ([#149](https://github.com/NathanaelRea/prism/pull/149))
+- pre commit ([#148](https://github.com/NathanaelRea/prism/pull/148))
+- workflow change request ([#146](https://github.com/NathanaelRea/prism/pull/146))
+- detached/rebase ([#144](https://github.com/NathanaelRea/prism/pull/144))
+- install and migrate ([#143](https://github.com/NathanaelRea/prism/pull/143))
+- ci ([#139](https://github.com/NathanaelRea/prism/pull/139))
+- completed notification spam ([#137](https://github.com/NathanaelRea/prism/pull/137))
+- drain timeout ([#136](https://github.com/NathanaelRea/prism/pull/136))
+- fix/old wts intial prompt ([#133](https://github.com/NathanaelRea/prism/pull/133))
+- review no inline ([#135](https://github.com/NathanaelRea/prism/pull/135))
+- cr ([#131](https://github.com/NathanaelRea/prism/pull/131))
+- sidebar text cutoff ([#128](https://github.com/NathanaelRea/prism/pull/128))
+- priority keybinds ([#126](https://github.com/NathanaelRea/prism/pull/126))
+- push sequencing ([#122](https://github.com/NathanaelRea/prism/pull/122))
+- ci ([#121](https://github.com/NathanaelRea/prism/pull/121))
+- fix/merge block status ([#118](https://github.com/NathanaelRea/prism/pull/118))
+- fix/notificaitons ([#117](https://github.com/NathanaelRea/prism/pull/117))
+- full initial prompt for template ([#116](https://github.com/NathanaelRea/prism/pull/116))
+- update agents md ([#115](https://github.com/NathanaelRea/prism/pull/115))
+- ui  main panel text overflow ([#110](https://github.com/NathanaelRea/prism/pull/110))
+
+### Other
+
+- Fix/e2e flows ([#157](https://github.com/NathanaelRea/prism/pull/157))
+- Refactor/improve arch ([#153](https://github.com/NathanaelRea/prism/pull/153))
+- Feat/workflows and triage ([#141](https://github.com/NathanaelRea/prism/pull/141))
+- files and directory structure ([#120](https://github.com/NathanaelRea/prism/pull/120))
+- split tui file ([#119](https://github.com/NathanaelRea/prism/pull/119))
+
 ## [0.1.4](https://github.com/NathanaelRea/prism/compare/v0.1.3...v0.1.4) - 2026-07-31
 
 ### Added
