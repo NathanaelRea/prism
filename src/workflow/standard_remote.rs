@@ -460,20 +460,16 @@ fn execute_typed(
                         "mutation",
                     );
                 }
-                let guard = crate::remote::dispatcher::prepare_create_change_request(
-                    &payload.worktree,
-                    &config,
-                    &payload.branch,
-                    &payload.target_repository,
-                    &payload.source_push,
-                )
-                .map_err(classify_failure)?;
                 crate::remote::dispatcher::create_change_request(
                     &repository,
                     &config,
                     &payload.worktree,
-                    &payload.body,
-                    &guard,
+                    crate::remote::dispatcher::CreateChangeRequestInput {
+                        branch: &payload.branch,
+                        body: &payload.body,
+                        target_repository: &payload.target_repository,
+                        source_push: &payload.source_push,
+                    },
                     &mut cache,
                 )
                 .map_err(classify_failure)?;

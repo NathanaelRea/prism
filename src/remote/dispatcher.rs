@@ -850,16 +850,20 @@ impl ConfiguredRemoteRepositories {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct CreateChangeRequestGuard {
-    pub(crate) source_push: PushGuard,
-    pub(crate) source_repository: RemoteRepositoryId,
-    pub(crate) target_repository: RemoteRepositoryId,
-    pub(crate) local_branch: String,
-    pub(crate) source_branch: String,
-    pub(crate) target_branch: String,
-    pub(crate) expected_head_sha: String,
-    pub(crate) expected_base_sha: String,
+pub(crate) struct CreateChangeRequestInput<'a> {
+    pub(crate) branch: &'a str,
+    pub(crate) body: &'a str,
+    pub(crate) target_repository: &'a RemoteRepositoryId,
+    pub(crate) source_push: &'a PushGuard,
+}
+
+struct PreparedChangeRequest {
+    source_repository: RemoteRepositoryId,
+    target_repository: RemoteRepositoryId,
+    local_branch: String,
+    source_branch: String,
+    target_branch: String,
+    expected_head_sha: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -878,16 +882,6 @@ pub(crate) fn same_push_target(left: &PushGuard, right: &PushGuard) -> bool {
         && left.remote_branch == right.remote_branch
         && left.local_branch == right.local_branch
         && left.expected_head_sha == right.expected_head_sha
-}
-
-fn validate_create_change_request_guard(
-    expected: &CreateChangeRequestGuard,
-    fresh: &CreateChangeRequestGuard,
-) -> Result<(), String> {
-    if fresh != expected {
-        return Err("change request source, target, or base changed before creation".to_string());
-    }
-    Ok(())
 }
 
 fn configured_remote_repositories(
@@ -974,13 +968,13 @@ pub(crate) fn fetch_change_request_base_head_sha(
     fetch_repository_branch_head_sha(path, config, &target, &summary.base_ref)
 }
 
-pub(crate) fn prepare_create_change_request(
+fn prepare_create_change_request(
     path: &Path,
     config: &Config,
     branch: &str,
     target_repository: &RemoteRepositoryId,
     source_push: &PushGuard,
-) -> Result<CreateChangeRequestGuard, String> {
+) -> Result<PreparedChangeRequest, String> {
     let current_branch = crate::git::current_branch_name(path, config)?
         .ok_or_else(|| "cannot create a change request from detached HEAD".to_string())?;
     if current_branch != branch {
@@ -1007,13 +1001,10 @@ pub(crate) fn prepare_create_change_request(
         .unwrap_or("main")
         .to_string();
     crate::git::fetch_remote_branch(path, target_remote, &target_branch, config)?;
-    let expected_base_sha =
-        crate::git::remote_branch_head_sha_on(path, target_remote, &target_branch, config)?
-            .ok_or_else(|| {
-                format!(
-                    "change request target branch {target_remote}/{target_branch} does not exist"
-                )
-            })?;
+    crate::git::remote_branch_head_sha_on(path, target_remote, &target_branch, config)?
+        .ok_or_else(|| {
+            format!("change request target branch {target_remote}/{target_branch} does not exist")
+        })?;
 
     let expected_head_sha = crate::git::current_head_sha(path, config)?;
     let source_head_sha = crate::git::push_remote_branch_head_sha(
@@ -1027,15 +1018,13 @@ pub(crate) fn prepare_create_change_request(
         return Err("change request source branch does not match the expected HEAD".to_string());
     }
 
-    Ok(CreateChangeRequestGuard {
-        source_push: source_push.clone(),
+    Ok(PreparedChangeRequest {
         source_repository: source_push.repository.clone(),
         target_repository: target_repository.clone(),
         local_branch: branch.to_string(),
         source_branch: source_push.remote_branch.clone(),
         target_branch,
         expected_head_sha,
-        expected_base_sha,
     })
 }
 
@@ -1320,18 +1309,16 @@ pub(crate) fn create_change_request(
     repo: &Repository,
     config: &Config,
     path: &Path,
-    body: &str,
-    guard: &CreateChangeRequestGuard,
+    input: CreateChangeRequestInput<'_>,
     cache: &mut PrCache,
 ) -> Result<(), String> {
-    let fresh = prepare_create_change_request(
+    let guard = prepare_create_change_request(
         path,
         config,
-        &guard.local_branch,
-        &guard.target_repository,
-        &guard.source_push,
+        input.branch,
+        input.target_repository,
+        input.source_push,
     )?;
-    validate_create_change_request_guard(guard, &fresh)?;
     let source = guard.source_repository.clone();
     let target = guard.target_repository.clone();
     let adapter = Adapter::for_repository(path, config, &target)?;
@@ -1342,14 +1329,14 @@ pub(crate) fn create_change_request(
         target_branch: guard.target_branch.clone(),
         expected_head_sha: guard.expected_head_sha.clone(),
         title: guard.local_branch.replace(['-', '_'], " "),
-        body: body.to_string(),
+        body: input.body.to_string(),
         draft: false,
     };
     let summary = adapter
         .create_change_request(&request)
         .map_err(|error| error.to_string())?;
     super::store::record_pr_summary(repo, &guard.local_branch, cache, legacy_summary(summary)?);
-    refresh_change_request_cache(repo, &guard.local_branch, cache, path, config, true)
+    Ok(())
 }
 
 pub(crate) fn merge_change_request(
@@ -2293,44 +2280,6 @@ mod tests {
         RemoteRepositoryId::new(provider, HostIdentity::parse(host).unwrap(), project).unwrap()
     }
 
-    #[test]
-    fn create_guard_rejects_target_or_base_drift() {
-        let source_repository = repository(ProviderKind::GitHub, "contributor/widget");
-        let expected = CreateChangeRequestGuard {
-            source_push: PushGuard {
-                repository: source_repository.clone(),
-                remote: "origin".to_string(),
-                remote_branch: "feature".to_string(),
-                local_branch: "feature".to_string(),
-                expected_head_sha: "head-a".to_string(),
-                set_upstream: false,
-            },
-            source_repository,
-            target_repository: repository(ProviderKind::GitHub, "acme/widget"),
-            local_branch: "feature".to_string(),
-            source_branch: "feature".to_string(),
-            target_branch: "main".to_string(),
-            expected_head_sha: "head-a".to_string(),
-            expected_base_sha: "base-a".to_string(),
-        };
-        assert!(validate_create_change_request_guard(&expected, &expected).is_ok());
-
-        let changed_target = CreateChangeRequestGuard {
-            target_repository: repository(ProviderKind::GitHub, "other/widget"),
-            ..expected.clone()
-        };
-        assert!(
-            validate_create_change_request_guard(&expected, &changed_target)
-                .unwrap_err()
-                .contains("target")
-        );
-        let changed_base = CreateChangeRequestGuard {
-            expected_base_sha: "base-b".to_string(),
-            ..expected.clone()
-        };
-        assert!(validate_create_change_request_guard(&expected, &changed_base).is_err());
-    }
-
     #[cfg(unix)]
     #[test]
     fn push_guard_uses_git_push_destination_and_canonical_push_url() {
@@ -2794,11 +2743,20 @@ esac
         let mut cache = PrCache::default();
         let target = repository(ProviderKind::GitHub, "acme/widget");
         let source_push = prepare_push(&directory, &config, "topic").unwrap();
-        let guard =
-            prepare_create_change_request(&directory, &config, "topic", &target, &source_push)
-                .unwrap();
 
-        create_change_request(&repo, &config, &directory, "body", &guard, &mut cache).unwrap();
+        create_change_request(
+            &repo,
+            &config,
+            &directory,
+            CreateChangeRequestInput {
+                branch: "topic",
+                body: "body",
+                target_repository: &target,
+                source_push: &source_push,
+            },
+            &mut cache,
+        )
+        .unwrap();
 
         let identity = cache
             .summary()
@@ -2818,9 +2776,35 @@ esac
         assert!(commands.contains(
             "pr create --fill --body body --repo acme/widget --base main --head contributor:topic"
         ));
+        assert_eq!(
+            commands
+                .lines()
+                .filter(|command| {
+                    command.starts_with("pr create") || command.starts_with("api graphql")
+                })
+                .count(),
+            2,
+            "unexpected GitHub round trips"
+        );
         let commands = std::fs::read_to_string(&git_log).unwrap();
         assert!(commands.contains("remote get-url origin"));
         assert!(commands.contains("remote get-url origin --push"));
+        assert_eq!(
+            commands
+                .lines()
+                .filter(|command| command.contains("fetch --no-tags"))
+                .count(),
+            1,
+            "target branch should be fetched once"
+        );
+        assert_eq!(
+            commands
+                .lines()
+                .filter(|command| command.contains("ls-remote --exit-code --heads"))
+                .count(),
+            1,
+            "source branch should be verified once"
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 
