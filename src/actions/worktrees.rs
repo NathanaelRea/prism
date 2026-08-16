@@ -457,7 +457,13 @@ impl Tui {
             )?;
             self.show_message("submitted initial prompt to agent session")?;
         } else {
-            self.start_tmux_agent_warmup();
+            let session = self.sessions[index].background_job_snapshot();
+            let use_ = crate::agent_session::session_use(
+                &self.repos,
+                &mut self.tmux_generations,
+                &session,
+            );
+            self.start_tmux_agent_warmup_for_key(use_.warmup_key, Duration::ZERO);
         }
         Ok(true)
     }

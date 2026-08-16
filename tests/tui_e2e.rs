@@ -222,6 +222,14 @@ fn dashboard_attaches_pushes_merges_and_quits_from_physical_keys() {
             .unwrap()
             .contains(&serde_json::json!(body))
     );
+    wait_until(
+        Duration::from_secs(30),
+        "pull request dashboard refresh",
+        || {
+            let screen = capture_pane(&sandbox.real_tmux, &controller_socket, "controller:0");
+            (screen.contains("feature/attach") && screen.contains('⇄')).then_some(())
+        },
+    );
 
     let merge = run_tmux(
         &sandbox.real_tmux,

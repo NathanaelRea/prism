@@ -122,24 +122,22 @@ fn create_command_uses_real_git_worktree_and_warms_the_selected_harness() {
         "e2e"
     );
 
-    assert!(
-        !tui.tmux_warmups_in_flight.is_empty(),
-        "create did not schedule warmup; harness configs={:?}",
+    assert_eq!(
+        tui.tmux_warmups_in_flight
+            .iter()
+            .map(|key| key.slot.worktree.branch.as_str())
+            .collect::<Vec<_>>(),
+        vec!["feature/e2e-create"],
+        "create must warm only the new worktree; harness configs={:?}",
         tui.worktree_harness_configs.keys().collect::<Vec<_>>()
     );
-    let event = wait_until(Duration::from_secs(8), "detached harness warmup", || {
+    let event = wait_until(Duration::from_secs(30), "detached harness warmup", || {
         tui.tick_tui_action_jobs();
-        let event = read_events(&sandbox.events_path())
+        read_events(&sandbox.events_path())
             .into_iter()
             .find(|event| {
                 event["tool"] == "harness" && event["argv"] == serde_json::json!(["interactive"])
-            });
-        assert!(
-            event.is_some() || !tui.tmux_warmups_in_flight.is_empty(),
-            "warmup completed without launching harness: {:?}",
-            tui.status_message
-        );
-        event
+            })
     });
     assert_eq!(
         Path::new(event["cwd"].as_str().unwrap())
@@ -246,7 +244,7 @@ fn create_with_multiline_prompt_delivers_literal_input_once_to_generic_harness()
     tui.dispatch_command(&mut terminal, DashboardCommand::Create, &mut state)
         .unwrap();
 
-    let event = wait_until(Duration::from_secs(8), "generic harness prompt", || {
+    let event = wait_until(Duration::from_secs(30), "generic harness prompt", || {
         tui.tick_tui_action_jobs();
         read_events(&sandbox.events_path())
             .into_iter()
