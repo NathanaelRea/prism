@@ -2,9 +2,35 @@ use super::*;
 
 pub(super) const MIN_MAIN_WIDTH: u16 = 20;
 
-pub(crate) fn sidebar_areas(area: Rect) -> (Rect, Rect, Rect) {
+pub(crate) fn sidebar_areas(area: Rect, focus: PanelFocus) -> (Rect, Rect, Rect) {
     const STATUS_HEIGHT: u16 = 6;
     const MIN_REPOS_HEIGHT: u16 = 3;
+    const MIN_EXPANDED_HEIGHT: u16 = (STATUS_HEIGHT + MIN_REPOS_HEIGHT) * 2;
+
+    if area.height < MIN_EXPANDED_HEIGHT {
+        let constraints = match focus {
+            PanelFocus::Status => [
+                Constraint::Min(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ],
+            PanelFocus::Repos => [
+                Constraint::Length(1),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ],
+            PanelFocus::Worktrees => [
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(1),
+            ],
+        };
+        let areas = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(constraints)
+            .split(area);
+        return (areas[0], areas[1], areas[2]);
+    }
 
     let halves = Layout::default()
         .direction(Direction::Vertical)
