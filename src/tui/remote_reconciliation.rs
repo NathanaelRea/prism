@@ -41,13 +41,8 @@ pub(crate) fn classify_summary_evidence(
         .filter_map(|marker| {
             let ledger = marker.ledger.as_ref()?;
             let (applied, observation) = match &marker.target {
-                RemoteMutationTarget::Push {
-                    remote,
-                    branch,
-                    expected_head_sha,
-                    ..
-                } if remote_branch_heads.get(&(remote.clone(), branch.clone()))
-                    == Some(expected_head_sha) =>
+                RemoteMutationTarget::Push { remote, branch, .. }
+                    if remote_branch_heads.contains_key(&(remote.clone(), branch.clone())) =>
                 {
                     let operation = match &ledger.operation {
                         crate::workflow::remote_operation::RemoteMutationOperation::TuiPushBranch(

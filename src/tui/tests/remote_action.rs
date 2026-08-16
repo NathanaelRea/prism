@@ -334,7 +334,7 @@ fn empty_list_retains_persisted_create_marker_until_matching_summary_is_observed
 }
 
 #[test]
-fn typed_push_and_create_markers_select_authoritative_result_observations() {
+fn typed_push_and_create_markers_select_authoritative_result_observations_after_push_advances() {
     let provider = crate::remote::ProviderKind::GitHub;
     let repository_id = crate::remote::RemoteRepositoryId::new(
         provider,
@@ -422,9 +422,12 @@ fn typed_push_and_create_markers_select_authoritative_result_observations() {
         &repository,
         &markers,
         &[summary],
+        // The branch may advance after the uncertain push. Seeing any authoritative head should
+        // schedule reconciliation; the worker separately proves that the expected push is in its
+        // ancestry before clearing the marker.
         &BTreeMap::from([(
             ("origin".to_string(), "feature".to_string()),
-            "abc123".to_string(),
+            "def456".to_string(),
         )]),
     );
 

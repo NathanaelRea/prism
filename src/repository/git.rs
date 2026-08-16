@@ -560,6 +560,31 @@ pub(crate) fn push_remote_branch_head_sha(
     Ok(Some(sha.to_string()))
 }
 
+pub(crate) fn commit_is_ancestor(
+    path: &std::path::Path,
+    ancestor: &str,
+    descendant: &str,
+    config: &Config,
+) -> Result<bool, String> {
+    let output = run_output_allow_failure(
+        Command::new(config.tool("git")).arg("-C").arg(path).args([
+            "merge-base",
+            "--is-ancestor",
+            ancestor,
+            descendant,
+        ]),
+        ProcessPolicy::Metadata,
+    )?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(format!(
+            "inspect commit ancestry {ancestor}..{descendant}: {}",
+            output.stderr.trim()
+        )),
+    }
+}
+
 pub(crate) fn single_push_remote_url(
     path: &std::path::Path,
     remote: &str,
@@ -811,6 +836,26 @@ mod tests {
         assert_eq!(result.branch, "feature");
         assert!(result.set_upstream);
         assert!(has_upstream(&work, &test_config()).unwrap());
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn commit_ancestry_accepts_descendants_but_not_ancestors() {
+        let temp = unique_temp_dir("prism-commit-ancestry-test");
+        fs::create_dir_all(&temp).unwrap();
+        run(Command::new("git").arg("init").arg(&temp));
+        configure_user(&temp);
+        fs::write(temp.join("tracked.txt"), "base\n").unwrap();
+        run_git(&temp, &["add", "tracked.txt"]);
+        run_git(&temp, &["commit", "-m", "base"]);
+        let base = current_head_sha(&temp, &test_config()).unwrap();
+        fs::write(temp.join("tracked.txt"), "next\n").unwrap();
+        run_git(&temp, &["commit", "-am", "next"]);
+        let next = current_head_sha(&temp, &test_config()).unwrap();
+
+        assert!(commit_is_ancestor(&temp, &base, &next, &test_config()).unwrap());
+        assert!(!commit_is_ancestor(&temp, &next, &base, &test_config()).unwrap());
 
         let _ = fs::remove_dir_all(temp);
     }
