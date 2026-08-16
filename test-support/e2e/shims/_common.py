@@ -90,7 +90,9 @@ def private_env():
         environment["XDG_STATE_HOME"] = str(root() / "xdg-state")
         environment["GIT_CONFIG_GLOBAL"] = str(root() / "gitconfig")
         environment["GIT_CONFIG_NOSYSTEM"] = "1"
-        environment["PRISM_RUNTIME_DIR"] = str(root() / "runtime")
+        environment["PRISM_RUNTIME_DIR"] = os.environ.get(
+                "PRISM_RUNTIME_DIR", str(root() / "runtime")
+        )
         environment["TZ"] = "UTC"
         environment["LC_ALL"] = "C"
         environment["LANG"] = "C"

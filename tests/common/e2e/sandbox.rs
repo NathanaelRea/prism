@@ -52,10 +52,10 @@ impl E2eSandbox {
             .unwrap_or_else(|error| panic!("canonicalize E2E sandbox root: {error}"));
         let real_git = find_command("git").expect("E2E tests require git");
         let real_tmux = find_command("tmux").expect("E2E tests require tmux");
-        // Keep tmux sockets below macOS's short sockaddr_un path limit even when
+        // Keep Unix sockets below macOS's short sockaddr_un path limit even when
         // the platform temporary directory itself has a long canonical path.
         let socket_root = Path::new("/tmp").join(format!(
-            "prism-e2e-tmux-{:x}-{unique:x}-{id:x}",
+            "prism-e2e-sockets-{:x}-{unique:x}-{id:x}",
             std::process::id()
         ));
         let sandbox = Self {
@@ -68,7 +68,7 @@ impl E2eSandbox {
             worktrees: root.join("worktrees"),
             controller_socket: socket_root.join("controller.sock"),
             prism_socket: socket_root.join("prism.sock"),
-            runtime_dir: root.join("runtime"),
+            runtime_dir: socket_root.join("runtime"),
             keep: env::var_os("PRISM_E2E_KEEP").is_some(),
             root,
             real_git,
