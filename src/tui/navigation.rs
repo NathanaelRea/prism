@@ -817,7 +817,7 @@ impl Tui {
             view::sidebar_width_for(area.width, self.config.layout.sidebar_width),
             body_height,
         );
-        let (_, repos, worktrees) = view::sidebar_areas(sidebar);
+        let (_, repos, worktrees) = view::sidebar_areas(sidebar, self.focused_panel);
         if point_in_rect(x, y, repos) {
             let row = y.saturating_sub(repos.y).saturating_sub(1) as usize;
             if let Some(index) = self.visible_repo_indices().get(row).copied() {

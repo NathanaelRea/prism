@@ -5,7 +5,7 @@ pub(super) fn render_sidebar(
     area: Rect,
     model: &crate::view::FrameModel<'_>,
 ) {
-    let (status, repos, worktrees) = sidebar_areas(area);
+    let (status, repos, worktrees) = sidebar_areas(area, model.focus);
     render_status(frame, status, model);
     render_repos(frame, repos, model);
     render_worktrees(frame, worktrees, model);

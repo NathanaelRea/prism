@@ -141,6 +141,23 @@ fn renders_tmux_portal_line_styles() {
 }
 
 #[test]
+fn compact_sidebar_gives_the_focused_panel_the_remaining_height() {
+    let area = Rect::new(0, 0, 40, 11);
+
+    for (focus, expected_heights) in [
+        (PanelFocus::Status, [9, 1, 1]),
+        (PanelFocus::Repos, [1, 9, 1]),
+        (PanelFocus::Worktrees, [1, 1, 9]),
+    ] {
+        let (status, repos, worktrees) = sidebar_areas(area, focus);
+        assert_eq!(
+            [status.height, repos.height, worktrees.height],
+            expected_heights,
+        );
+    }
+}
+
+#[test]
 fn renders_narrow_shell_without_panicking() {
     let config = test_config();
     let sessions = vec![test_session("feature", AgentState::Idle)];
