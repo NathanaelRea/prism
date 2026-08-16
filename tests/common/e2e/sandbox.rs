@@ -52,6 +52,12 @@ impl E2eSandbox {
             .unwrap_or_else(|error| panic!("canonicalize E2E sandbox root: {error}"));
         let real_git = find_command("git").expect("E2E tests require git");
         let real_tmux = find_command("tmux").expect("E2E tests require tmux");
+        // Keep tmux sockets below macOS's short sockaddr_un path limit even when
+        // the platform temporary directory itself has a long canonical path.
+        let socket_root = Path::new("/tmp").join(format!(
+            "prism-e2e-tmux-{:x}-{unique:x}-{id:x}",
+            std::process::id()
+        ));
         let sandbox = Self {
             bin: root.join("bin"),
             config_home: root.join("config"),
@@ -60,8 +66,8 @@ impl E2eSandbox {
             repo: root.join("repo"),
             origin: root.join("origin.git"),
             worktrees: root.join("worktrees"),
-            controller_socket: root.join("controller-tmux/tmux.sock"),
-            prism_socket: root.join("prism-tmux/tmux.sock"),
+            controller_socket: socket_root.join("controller.sock"),
+            prism_socket: socket_root.join("prism.sock"),
             runtime_dir: root.join("runtime"),
             keep: env::var_os("PRISM_E2E_KEEP").is_some(),
             root,
@@ -96,8 +102,9 @@ impl E2eSandbox {
             .env("GIT_CONFIG_GLOBAL", self.root.join("gitconfig"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("PRISM_RUNTIME_DIR", &self.runtime_dir)
-            .env("TMUX_TMPDIR", self.root.join("prism-tmux"))
+            .env("TMUX_TMPDIR", self.prism_socket.parent().unwrap())
             .env("PRISM_E2E_ROOT", &self.root)
+            .env("PRISM_E2E_TMUX_SOCKET", &self.prism_socket)
             .env("TERM", "xterm-256color")
             .env("TZ", "UTC")
             .env("LC_ALL", "C")
@@ -158,6 +165,11 @@ impl E2eSandbox {
             self.real_tmux.as_os_str().as_encoded_bytes(),
         )
         .expect("record real tmux path");
+        fs::write(
+            self.state.join("prism-tmux-socket"),
+            self.prism_socket.as_os_str().as_encoded_bytes(),
+        )
+        .expect("record Prism tmux socket path");
         fs::write(self.events_path(), "").expect("create event log");
         self.install_adapters();
         self.initialize_git();
@@ -300,6 +312,9 @@ impl Drop for E2eSandbox {
         let _ = run_tmux(&self.real_tmux, &self.prism_socket, &["kill-server"]);
         if !self.keep {
             let _ = fs::remove_dir_all(&self.root);
+            if let Some(socket_root) = self.prism_socket.parent() {
+                let _ = fs::remove_dir_all(socket_root);
+            }
         }
     }
 }

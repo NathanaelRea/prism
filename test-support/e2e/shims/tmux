@@ -11,5 +11,11 @@ environment = private_env()
 environment.pop("TMUX", None)
 if args in (["--version"], ["-V"]):
     os.execve(real_tmux, [real_tmux, "-V"], environment)
-socket = str(root() / "prism-tmux" / "tmux.sock")
+socket = os.environ.get("PRISM_E2E_TMUX_SOCKET")
+if not socket:
+    socket_path = root() / "state" / "prism-tmux-socket"
+    if socket_path.exists():
+        socket = socket_path.read_text(encoding="utf-8")
+    else:
+        socket = str(root() / "prism-tmux" / "tmux.sock")
 os.execve(real_tmux, [real_tmux, "-S", socket, *args], environment)

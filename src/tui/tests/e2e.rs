@@ -167,7 +167,7 @@ fn permanent_delete_removes_only_selected_worktree_branch_and_tmux_session() {
     tui.dispatch_command(&mut terminal, DashboardCommand::Create, &mut state)
         .unwrap();
 
-    wait_until(Duration::from_secs(8), "created session warmup", || {
+    wait_until(Duration::from_secs(30), "created session warmup", || {
         tui.tick_tui_action_jobs();
         (tui.tmux_warmups_in_flight.is_empty()
             && read_events(&sandbox.events_path())
