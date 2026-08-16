@@ -19,8 +19,8 @@ mod store;
 
 pub(crate) use cache::PrCheckContext;
 pub(crate) use cache::{
-    PR_SUMMARY_POLL_INTERVAL, PrCache, PrCheckState, PrDetails, PrReviewComment, PrSummary,
-    RepoPolicyCache, WorkerPrCacheSnapshot, apply_pr_details_poll_result,
+    PR_SUMMARY_POLL_INTERVAL, PrCache, PrCheckState, PrDetails, PrMergeProgress, PrReviewComment,
+    PrSummary, RepoPolicyCache, WorkerPrCacheSnapshot, apply_pr_details_poll_result,
     apply_pr_summary_poll_result, pr_cache_comment_count, pr_cache_render_signature,
     pr_summary_or_error,
 };

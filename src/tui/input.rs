@@ -70,7 +70,8 @@ impl KeyInput {
             KeyCode::Char('1') if plain_char(event) => DashboardCommand::FocusStatus,
             KeyCode::Char('2') if plain_char(event) => DashboardCommand::FocusRepos,
             KeyCode::Char('3') if plain_char(event) => DashboardCommand::FocusWorktrees,
-            KeyCode::Char('4'..='9') if plain_char(event) => DashboardCommand::Other,
+            KeyCode::Char('4') if plain_char(event) => DashboardCommand::FocusMerges,
+            KeyCode::Char('5'..='9') if plain_char(event) => DashboardCommand::Other,
             KeyCode::Char('p') if plain_char(event) => DashboardCommand::PullDefault,
             KeyCode::Char('W') if plain_char(event) => DashboardCommand::WorkflowLauncher,
             KeyCode::Char('u') if plain_char(event) => DashboardCommand::WorkflowPauseResume,
@@ -254,7 +255,7 @@ mod tests {
         );
         assert_eq!(
             map(&mut input, key(KeyCode::Char('4'))),
-            DashboardCommand::Other
+            DashboardCommand::FocusMerges
         );
     }
 

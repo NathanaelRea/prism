@@ -46,6 +46,40 @@ fn repeated_worktree_focus_does_not_change_list_mode() {
 }
 
 #[test]
+fn merge_panel_separates_authoritative_merge_progress_from_active_worktrees() {
+    let mut tui = test_tui();
+    tui.worktree_list_mode = WorktreeListMode::Global;
+
+    tui.sessions[1].pr = PrCache::observed(test_pr_summary(true), None);
+    let mut queued = test_pr_summary(false);
+    queued.queue_state = "queued".to_string();
+    queued.check_status = "successful".to_string();
+    tui.sessions[3].pr = PrCache::observed(queued, None);
+    tui.focus_worktrees();
+
+    assert!(tui.visible_worktree_indices().is_empty());
+    assert_eq!(tui.visible_merge_indices(), vec![1, 3]);
+
+    tui.focus_merges();
+    assert_eq!(tui.focused_panel, PanelFocus::Merges);
+    assert_eq!(tui.selected_worktree_index(), Some(1));
+}
+
+#[test]
+fn failed_queued_merge_returns_to_active_worktrees() {
+    let mut tui = test_tui();
+    tui.worktree_list_mode = WorktreeListMode::Global;
+    let mut failed = test_pr_summary(false);
+    failed.queue_state = "queued".to_string();
+    failed.check_status = "failed".to_string();
+    tui.sessions[1].pr = PrCache::observed(failed, None);
+    tui.focus_worktrees();
+
+    assert!(tui.visible_worktree_indices().contains(&1));
+    assert!(!tui.visible_merge_indices().contains(&1));
+}
+
+#[test]
 fn switching_from_global_to_repo_mode_preserves_selected_worktree() {
     let mut tui = test_tui();
     tui.worktree_list_mode = WorktreeListMode::Global;

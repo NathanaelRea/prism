@@ -13,6 +13,7 @@ pub(crate) enum DashboardCommand {
     FocusStatus,
     FocusRepos,
     FocusWorktrees,
+    FocusMerges,
     Bottom,
     G,
     PreviousBlock,
@@ -131,6 +132,11 @@ impl Tui {
             DashboardCommand::FocusWorktrees => {
                 self.clear_leader_hint();
                 self.focus_worktrees();
+                state.pending_g = false;
+            }
+            DashboardCommand::FocusMerges => {
+                self.clear_leader_hint();
+                self.focus_merges();
                 state.pending_g = false;
             }
             DashboardCommand::Up => {
@@ -310,8 +316,8 @@ impl Tui {
             DashboardCommand::VisibilityUp => {
                 self.clear_leader_hint();
                 state.pending_g = false;
-                if self.focused_panel != PanelFocus::Worktrees {
-                    self.show_message("focus worktrees to change visibility")?;
+                if !self.is_worktree_session_panel() {
+                    self.show_message("focus worktrees or merges to change visibility")?;
                 } else if let Err(error) = self.adjust_selected_visibility(1) {
                     self.show_error("visibility update failed", &error)?;
                 }
@@ -319,8 +325,8 @@ impl Tui {
             DashboardCommand::VisibilityDown => {
                 self.clear_leader_hint();
                 state.pending_g = false;
-                if self.focused_panel != PanelFocus::Worktrees {
-                    self.show_message("focus worktrees to change visibility")?;
+                if !self.is_worktree_session_panel() {
+                    self.show_message("focus worktrees or merges to change visibility")?;
                 } else if let Err(error) = self.adjust_selected_visibility(-1) {
                     self.show_error("visibility update failed", &error)?;
                 }
@@ -392,8 +398,8 @@ impl Tui {
                 }
             }
             DashboardCommand::MigrateHarness => {
-                if self.focused_panel != PanelFocus::Worktrees {
-                    self.show_message("focus worktrees to migrate an agent harness")?;
+                if !self.is_worktree_session_panel() {
+                    self.show_message("focus worktrees or merges to migrate an agent harness")?;
                 } else if let Some(index) = self.selected_worktree_index() {
                     self.migrate_worktree_harness(index)?;
                 }
@@ -403,8 +409,8 @@ impl Tui {
                 state.pending_g = false;
                 match self.control_selected_workflow(runtime, "cancel") {
                     Ok(true) => {}
-                    Ok(false) if self.focused_panel != PanelFocus::Worktrees => {
-                        self.show_message("focus worktrees to abort an agent session")?;
+                    Ok(false) if !self.is_worktree_session_panel() => {
+                        self.show_message("focus worktrees or merges to abort an agent session")?;
                     }
                     Ok(false) => {
                         if let Err(error) = self.abort_selected_opencode_session(runtime) {
@@ -450,8 +456,10 @@ impl Tui {
             DashboardCommand::DeletePermanent => {
                 self.clear_leader_hint();
                 state.pending_g = false;
-                if self.focused_panel != PanelFocus::Worktrees {
-                    self.show_message("focus worktrees to permanently delete a worktree/session")?;
+                if !self.is_worktree_session_panel() {
+                    self.show_message(
+                        "focus worktrees or merges to permanently delete a worktree/session",
+                    )?;
                 } else if let Err(error) = self.delete_session(runtime) {
                     self.show_error("delete failed", &error)?;
                 }

@@ -400,10 +400,22 @@ impl Tui {
         self.apply_remote_cache_result(selected, *cache);
         match outcome {
             remote_operation::TuiRemoteMergeOutcome::Merged => {
-                self.show_message("pull request merged")
+                self.select_worktree(selected);
+                self.focus_merges();
+                if !self.confirm_and_delete_session(raw, selected)? {
+                    self.show_message("pull request merged; worktree kept")?;
+                }
+                Ok(())
             }
             remote_operation::TuiRemoteMergeOutcome::Pending => {
-                self.show_message("pull request accepted by the provider and is pending merge")
+                self.select_worktree(selected);
+                self.focus_merges();
+                if !self.offer_deferred_merge_cleanup(raw, selected)? {
+                    self.show_message(
+                        "pull request accepted by the provider and is pending merge; worktree kept",
+                    )?;
+                }
+                Ok(())
             }
             remote_operation::TuiRemoteMergeOutcome::Uncertain => Err(
                 "provider merge outcome is uncertain; authoritative re-observation required"

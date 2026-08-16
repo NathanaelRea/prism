@@ -17,6 +17,10 @@ fn semantic_commands_dispatch_without_the_crossterm_adapter() {
     assert_eq!(outcome, CommandOutcome::Continue);
     assert_eq!(tui.focused_panel, PanelFocus::Repos);
     assert_eq!(terminal.draws, 0);
+
+    tui.dispatch_command(&mut terminal, DashboardCommand::FocusMerges, &mut state)
+        .expect("focus merges");
+    assert_eq!(tui.focused_panel, PanelFocus::Merges);
 }
 
 #[test]

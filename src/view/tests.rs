@@ -28,6 +28,7 @@ fn renders_wide_shell_with_sidebar_main_and_footer() {
     assert_region_contains(&buffer, 0..56, 0..30, "[1] Status");
     assert_region_contains(&buffer, 0..56, 0..30, "[2] Repos");
     assert_region_contains(&buffer, 0..56, 0..30, "[3] Worktrees");
+    assert_region_contains(&buffer, 0..56, 0..30, "[4] Merges");
     let (_, row) = sidebar_cell_containing(&buffer, "feature");
     assert_cell_style(
         &buffer,
@@ -40,6 +41,20 @@ fn renders_wide_shell_with_sidebar_main_and_footer() {
     assert_region_contains(&buffer, 56..120, 0..29, "Main");
     assert_region_contains(&buffer, 0..56, 0..30, "feature");
     assert!(!line_text(&buffer, 29).contains("normal"));
+}
+
+#[test]
+fn renders_merge_panel_rows_with_focus() {
+    let config = test_config();
+    let sessions = vec![test_session("merged-feature", AgentState::Idle)];
+    let mut model = test_model(&config, &sessions, PanelFocus::Merges, None, None);
+    model.merges = std::mem::take(&mut model.worktrees);
+
+    let buffer = render_to_buffer(&model, 120, 30);
+
+    assert_region_contains(&buffer, 0..56, 0..30, "[4] Merges");
+    let (branch_x, row) = sidebar_cell_containing(&buffer, "merged-feature");
+    assert_cell_style(&buffer, branch_x, row, selected_sidebar_row_style(true));
 }
 
 #[test]
@@ -80,7 +95,7 @@ fn sidebar_panel_heights_stay_stable_when_tmux_portal_is_hidden() {
     let without_portal = render_to_buffer(&without_portal, 120, 30);
     let with_portal = render_to_buffer(&with_portal, 120, 30);
 
-    for title in ["[1] Status", "[2] Repos", "[3] Worktrees"] {
+    for title in ["[1] Status", "[2] Repos", "[3] Worktrees", "[4] Merges"] {
         assert_eq!(
             find_line(&without_portal, title),
             find_line(&with_portal, title),
@@ -1536,17 +1551,18 @@ fn worktree_main_panel_hides_pr_section_without_pr() {
     let config = test_config();
     let sessions = vec![test_session("feature", AgentState::Idle)];
     let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
-    let buffer = render_to_string(&model, 120, 30);
+    let buffer = render_to_buffer(&model, 120, 30);
+    let main = region_text(&buffer, 56..120, 0..29);
 
     for key in [
         "PR", "pr #", "name", "state", "next", "ci", "review", "merge", "policy",
     ] {
-        assert!(!buffer.contains(key), "unexpected PR key: {key}");
+        assert!(!main.contains(key), "unexpected PR key: {key}");
     }
-    assert!(!buffer.contains("No PR detected"));
-    assert!(!buffer.contains("Description"));
-    assert!(!buffer.contains("Activity"));
-    assert!(!buffer.contains("refreshed"));
+    assert!(!main.contains("No PR detected"));
+    assert!(!main.contains("Description"));
+    assert!(!main.contains("Activity"));
+    assert!(!main.contains("refreshed"));
 }
 
 #[test]
@@ -1554,7 +1570,12 @@ fn main_panel_applies_scroll_for_every_focus() {
     let config = test_config();
     let sessions = vec![test_session("feature", AgentState::Running)];
 
-    for focus in [PanelFocus::Status, PanelFocus::Repos, PanelFocus::Worktrees] {
+    for focus in [
+        PanelFocus::Status,
+        PanelFocus::Repos,
+        PanelFocus::Worktrees,
+        PanelFocus::Merges,
+    ] {
         let mut model = test_model(&config, &sessions, focus, None, None);
         let unscrolled = render_to_string(&model, 120, 6);
         model.main_scroll = 2;
@@ -1781,6 +1802,7 @@ fn test_model<'a>(
                 selected: index == 0,
             })
             .collect(),
+        merges: Vec::new(),
         repo_prs: sessions
             .iter()
             .filter_map(|session| {

@@ -59,6 +59,7 @@ pub(super) fn status_label_with_behind(label: &str, behind: usize) -> String {
 impl Tui {
     pub(crate) fn poll_pull_requests(&mut self, force: bool) -> bool {
         let mut changed = self.drain_pr_poll_results();
+        changed |= self.reconcile_deferred_merge_cleanups();
         for repo_index in 0..self.repos.len() {
             let interval = if repo_index == self.current_repo {
                 PR_SUMMARY_POLL_INTERVAL

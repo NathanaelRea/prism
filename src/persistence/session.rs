@@ -24,6 +24,15 @@ pub(crate) struct PendingDeletion {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct DeferredMergeCleanup {
+    pub branch: String,
+    pub worktree_path: String,
+    pub worktree_incarnation: String,
+    pub branch_oid: String,
+    pub warnings_json: String,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct TaskMetadataRecord {
     pub prompt_summary: String,
     pub classification: String,
@@ -94,6 +103,27 @@ impl From<PendingDeletionRow> for PendingDeletion {
             branch_oid: row.branch_oid,
             worktree_removed: row.worktree_removed != 0,
             branch_deleted: row.branch_deleted != 0,
+        }
+    }
+}
+
+#[derive(FromRow)]
+struct DeferredMergeCleanupRow {
+    branch: String,
+    worktree_path: String,
+    worktree_incarnation: String,
+    branch_oid: String,
+    warnings_json: String,
+}
+
+impl From<DeferredMergeCleanupRow> for DeferredMergeCleanup {
+    fn from(row: DeferredMergeCleanupRow) -> Self {
+        Self {
+            branch: row.branch,
+            worktree_path: row.worktree_path,
+            worktree_incarnation: row.worktree_incarnation,
+            branch_oid: row.branch_oid,
+            warnings_json: row.warnings_json,
         }
     }
 }
@@ -270,6 +300,58 @@ impl SessionStore {
                     .await?;
                     require_one_row(result, "mark pending branch deletion")?;
                 }
+                Ok(())
+            })
+        })
+    }
+
+    pub(crate) fn load_deferred_merge_cleanup(
+        &self,
+        branch: &str,
+    ) -> Result<Option<DeferredMergeCleanup>, DatabaseError> {
+        self.with_connection(|connection| {
+            block_on(async {
+                sqlx::query_file_as!(
+                    DeferredMergeCleanupRow,
+                    "sql/session/load_deferred_merge_cleanup.sql",
+                    branch
+                )
+                .fetch_optional(&mut *connection)
+                .await
+                .map(|row| row.map(DeferredMergeCleanup::from))
+            })
+        })
+    }
+
+    pub(crate) fn save_deferred_merge_cleanup(
+        &self,
+        cleanup: &DeferredMergeCleanup,
+        updated_unix_ms: i64,
+    ) -> Result<(), DatabaseError> {
+        self.with_connection(|connection| {
+            block_on(async {
+                sqlx::query_file!(
+                    "sql/session/save_deferred_merge_cleanup.sql",
+                    cleanup.branch,
+                    cleanup.worktree_path,
+                    cleanup.worktree_incarnation,
+                    cleanup.branch_oid,
+                    cleanup.warnings_json,
+                    updated_unix_ms
+                )
+                .execute(&mut *connection)
+                .await?;
+                Ok(())
+            })
+        })
+    }
+
+    pub(crate) fn delete_deferred_merge_cleanup(&self, branch: &str) -> Result<(), DatabaseError> {
+        self.with_connection(|connection| {
+            block_on(async {
+                sqlx::query_file!("sql/session/delete_deferred_merge_cleanup.sql", branch)
+                    .execute(&mut *connection)
+                    .await?;
                 Ok(())
             })
         })
@@ -461,6 +543,9 @@ impl SessionStore {
                     )
                     .execute(&mut *connection)
                     .await?;
+                    sqlx::query_file!("sql/session/delete_deferred_merge_cleanup.sql", branch)
+                        .execute(&mut *connection)
+                        .await?;
                     super::database::commit_query()
                         .execute(&mut *connection)
                         .await?;

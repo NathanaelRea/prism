@@ -56,7 +56,7 @@ impl Tui {
                 PanelFocus::Repos => self
                     .selected_repo_context()
                     .map(|context| context.config.tool("lazygit")),
-                PanelFocus::Worktrees => self
+                PanelFocus::Worktrees | PanelFocus::Merges => self
                     .selected_worktree_context()
                     .map(|context| context.config.tool("lazygit")),
             };
@@ -78,7 +78,7 @@ impl Tui {
                         })
                 });
         }
-        if self.focused_panel != PanelFocus::Worktrees {
+        if !self.is_worktree_session_panel() {
             return false;
         }
         let Some(context) = self.selected_worktree_context() else {

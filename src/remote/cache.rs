@@ -559,6 +559,18 @@ impl PrSummary {
                 .any(|state| crate::remote::native_queue_evidence_is_positive(state))
     }
 
+    pub(crate) fn merge_progress(&self) -> PrMergeProgress {
+        if self.merged {
+            PrMergeProgress::Merged
+        } else if self.check_state() != PrCheckState::Failed
+            && self.merge_is_authoritatively_pending()
+        {
+            PrMergeProgress::Queued
+        } else {
+            PrMergeProgress::Active
+        }
+    }
+
     pub(crate) fn provider_noun(&self) -> &'static str {
         match self
             .change_request_identity
@@ -569,6 +581,14 @@ impl PrSummary {
             _ => "PR",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum PrMergeProgress {
+    #[default]
+    Active,
+    Queued,
+    Merged,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]

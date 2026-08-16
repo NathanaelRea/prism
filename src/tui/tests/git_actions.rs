@@ -34,11 +34,13 @@ fn open_pr_action_requires_an_observed_change_request() {
     assert!(tui.git_action_enabled(GitAction::OpenPr));
 
     tui.sessions[0].pr = PrCache::observed(test_pr_summary(true), None);
+    tui.focus_merges();
     assert!(tui.git_action_enabled(GitAction::OpenPr));
 
     let mut closed = test_pr_summary(false);
     closed.state = "CLOSED".to_string();
     tui.sessions[0].pr = PrCache::observed(closed, None);
+    tui.focus_worktrees();
     assert!(tui.git_action_enabled(GitAction::OpenPr));
 }
 

@@ -210,14 +210,24 @@ impl Session {
     }
 
     pub(crate) fn deletion_warnings(&self) -> Vec<String> {
+        let mut warnings = self.deferred_cleanup_warnings_for_status(&self.status_label);
+        if let Some(summary) = self.pr.summary()
+            && !summary.merged
+        {
+            warnings.push(format!("open PR #{} still exists", summary.number));
+        }
+        warnings
+    }
+
+    fn deferred_cleanup_warnings_for_status(&self, status_label: &str) -> Vec<String> {
         let mut warnings = Vec::new();
-        if status_count(&self.status_label, "dirty").is_some() {
+        if status_count(status_label, "dirty").is_some() {
             warnings.push("dirty worktree: uncommitted changes will be deleted".to_string());
         }
-        if status_count(&self.status_label, "ahead").is_some() {
+        if status_count(status_label, "ahead").is_some() {
             warnings.push("branch is ahead of upstream: unpushed commits may be lost".to_string());
         }
-        if status_count(&self.status_label, "behind").is_some() {
+        if status_count(status_label, "behind").is_some() {
             warnings.push("branch is behind upstream".to_string());
         }
         if !self.adopted {
@@ -228,11 +238,6 @@ impl Session {
         }
         if matches!(self.agent_state, AgentState::Attached | AgentState::Running) {
             warnings.push("agent is still running".to_string());
-        }
-        if let Some(summary) = self.pr.summary()
-            && !summary.merged
-        {
-            warnings.push(format!("open PR #{} still exists", summary.number));
         }
         warnings
     }
@@ -359,6 +364,139 @@ struct PendingWorktreeDeletion {
     branch_oid: Option<String>,
     worktree_removed: bool,
     branch_deleted: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DeferredMergeCleanupStatus {
+    NotScheduled,
+    Safe,
+    Unsafe(String),
+}
+
+pub(crate) fn deferred_merge_cleanup_warnings(config: &Config, session: &Session) -> Vec<String> {
+    let status_label = git_status_label(&session.path, config);
+    session.deferred_cleanup_warnings_for_status(&status_label)
+}
+
+pub(crate) fn schedule_deferred_merge_cleanup(
+    repo: &Repository,
+    config: &Config,
+    session: &Session,
+    approved_warnings: &[String],
+) -> Result<(), String> {
+    let current_warnings = deferred_merge_cleanup_warnings(config, session);
+    if current_warnings != approved_warnings {
+        return Err(
+            "worktree safety warnings changed while deletion approval was open; deletion was not scheduled"
+                .to_string(),
+        );
+    }
+    let warnings_json = serde_json::to_string(approved_warnings)
+        .map_err(|error| format!("encode deferred merge cleanup warnings: {error}"))?;
+    let cleanup = crate::persistence::session::DeferredMergeCleanup {
+        branch: session.branch.clone(),
+        worktree_path: session.path_display.clone(),
+        worktree_incarnation: session.incarnation.clone(),
+        branch_oid: crate::lifecycle::branch_oid(repo, config, &session.branch)?,
+        warnings_json,
+    };
+    session_store(repo)?
+        .save_deferred_merge_cleanup(&cleanup, unix_seconds())
+        .map_err(|error| format!("save deferred merge cleanup: {error}"))
+}
+
+pub(crate) fn cancel_deferred_merge_cleanup(
+    repo: &Repository,
+    branch: &str,
+) -> Result<bool, String> {
+    let store = session_store(repo)?;
+    let scheduled = store
+        .load_deferred_merge_cleanup(branch)
+        .map_err(|error| format!("load deferred merge cleanup: {error}"))?
+        .is_some();
+    if scheduled {
+        store
+            .delete_deferred_merge_cleanup(branch)
+            .map_err(|error| format!("delete deferred merge cleanup: {error}"))?;
+    }
+    Ok(scheduled)
+}
+
+pub(crate) fn deferred_merge_cleanup_status(
+    repo: &Repository,
+    config: &Config,
+    session: &Session,
+) -> Result<DeferredMergeCleanupStatus, String> {
+    let Some(cleanup) = session_store(repo)?
+        .load_deferred_merge_cleanup(&session.branch)
+        .map_err(|error| format!("load deferred merge cleanup: {error}"))?
+    else {
+        return Ok(DeferredMergeCleanupStatus::NotScheduled);
+    };
+    if cleanup.worktree_path != session.path_display
+        || cleanup.worktree_incarnation != session.incarnation
+    {
+        return Ok(DeferredMergeCleanupStatus::Unsafe(
+            "the Worktree Session identity changed while merge was pending".to_string(),
+        ));
+    }
+    let branch_oid = crate::lifecycle::branch_oid(repo, config, &session.branch)?;
+    if cleanup.branch_oid != branch_oid {
+        return Ok(DeferredMergeCleanupStatus::Unsafe(
+            "the branch advanced while merge was pending".to_string(),
+        ));
+    }
+    let approved_warnings = serde_json::from_str::<Vec<String>>(&cleanup.warnings_json)
+        .map_err(|error| format!("decode deferred merge cleanup warnings: {error}"))?;
+    let current_warnings = deferred_merge_cleanup_warnings(config, session);
+    if current_warnings != approved_warnings {
+        return Ok(DeferredMergeCleanupStatus::Unsafe(
+            "worktree deletion warning facts changed while merge was pending".to_string(),
+        ));
+    }
+    Ok(DeferredMergeCleanupStatus::Safe)
+}
+
+pub(crate) fn delete_deferred_merge_cleanup_if_current(
+    repo: &Repository,
+    config: &Config,
+    session: &Session,
+) -> Result<DeleteWorktreeOutcome, String> {
+    match deferred_merge_cleanup_status(repo, config, session)? {
+        DeferredMergeCleanupStatus::Safe => {}
+        DeferredMergeCleanupStatus::NotScheduled => {
+            return Err("deferred worktree deletion is no longer scheduled".to_string());
+        }
+        DeferredMergeCleanupStatus::Unsafe(reason) => {
+            cancel_deferred_merge_cleanup(repo, &session.branch)?;
+            return Err(format!("deferred worktree deletion was canceled: {reason}"));
+        }
+    }
+    let result = delete_worktree_session_if_current(
+        repo,
+        config,
+        &session.path,
+        &session.branch,
+        Some(&session.incarnation),
+    );
+    let should_cancel = match &result {
+        Ok(DeleteWorktreeOutcome::Deleted) => false,
+        Ok(
+            DeleteWorktreeOutcome::BranchRetained {
+                owned_state_removed,
+                ..
+            }
+            | DeleteWorktreeOutcome::DeletedWithWarnings {
+                owned_state_removed,
+                ..
+            },
+        ) => !owned_state_removed,
+        Err(_) => true,
+    };
+    if should_cancel {
+        cancel_deferred_merge_cleanup(repo, &session.branch)?;
+    }
+    result
 }
 
 fn load_pending_worktree_deletion(
@@ -2671,6 +2809,61 @@ exit 0
         );
         assert!(!warnings.iter().any(|warning| warning.contains("deleted")));
         assert!(!warnings.iter().any(|warning| warning.contains("lost")));
+    }
+
+    #[test]
+    fn deferred_merge_cleanup_requires_the_approved_session_and_branch_facts() {
+        let temp = unique_temp_dir("prism-deferred-merge-cleanup-test");
+        fs::create_dir_all(&temp).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
+        let mut config = test_config();
+        let git = crate::test_support::install_tool(
+            &mut config,
+            &temp,
+            "git",
+            "#!/bin/sh\ncase \"$*\" in\n  *rev-parse*) echo oid-one ;;\n  *status*) echo '## feature' ;;\nesac\n",
+        );
+        let mut session = test_session("feature", "/repo/feature");
+        session.incarnation = "incarnation-one".to_string();
+
+        let approved_warnings = deferred_merge_cleanup_warnings(&config, &session);
+        schedule_deferred_merge_cleanup(&repo, &config, &session, &approved_warnings).unwrap();
+        assert_eq!(
+            deferred_merge_cleanup_status(&repo, &config, &session).unwrap(),
+            DeferredMergeCleanupStatus::Safe
+        );
+
+        session.incarnation = "incarnation-two".to_string();
+        assert!(matches!(
+            deferred_merge_cleanup_status(&repo, &config, &session).unwrap(),
+            DeferredMergeCleanupStatus::Unsafe(reason) if reason.contains("identity changed")
+        ));
+
+        session.incarnation = "incarnation-one".to_string();
+        write_executable(
+            &git,
+            "#!/bin/sh\ncase \"$*\" in\n  *rev-parse*) echo oid-two ;;\n  *status*) echo '## feature' ;;\nesac\n",
+        );
+        assert!(matches!(
+            deferred_merge_cleanup_status(&repo, &config, &session).unwrap(),
+            DeferredMergeCleanupStatus::Unsafe(reason) if reason.contains("branch advanced")
+        ));
+
+        write_executable(
+            &git,
+            "#!/bin/sh\ncase \"$*\" in\n  *rev-parse*) echo oid-one ;;\n  *status*) printf '## feature\\n?? new-file\\n' ;;\nesac\n",
+        );
+        assert!(matches!(
+            deferred_merge_cleanup_status(&repo, &config, &session).unwrap(),
+            DeferredMergeCleanupStatus::Unsafe(reason) if reason.contains("warning facts changed")
+        ));
+
+        assert!(cancel_deferred_merge_cleanup(&repo, "feature").unwrap());
+        assert_eq!(
+            deferred_merge_cleanup_status(&repo, &config, &session).unwrap(),
+            DeferredMergeCleanupStatus::NotScheduled
+        );
+        fs::remove_dir_all(temp).unwrap();
     }
 
     fn test_session(branch: &str, path: &str) -> Session {

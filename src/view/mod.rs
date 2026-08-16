@@ -26,6 +26,7 @@ pub(crate) struct FrameModel<'a> {
     pub status: Vec<StatusRow>,
     pub repos: Vec<RepoRow>,
     pub worktrees: Vec<WorktreeRow>,
+    pub merges: Vec<WorktreeRow>,
     pub repo_prs: Vec<RepoPrRow>,
     pub current_repo_index: usize,
     pub selected_repo_label: String,
@@ -410,7 +411,7 @@ pub(crate) fn keybinding_info_lines(
                 "behind",
             )]),
         ],
-        PanelFocus::Worktrees => vec![
+        PanelFocus::Worktrees | PanelFocus::Merges => vec![
             Line::from(Span::styled("Worktree columns", title_style(true))),
             info_columns_row(&[
                 info_cell("↕", muted_style(), "visibility"),

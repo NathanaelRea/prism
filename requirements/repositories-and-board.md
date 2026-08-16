@@ -52,18 +52,19 @@
 ## Navigation
 
 - **Behavior**: The left side presents vertically stacked numbered panels:
-  `[1]` home/status, `[2]` repositories, and `[3]` worktrees. `[2]` is selected
-  on startup.
+  `[1]` home/status, `[2]` repositories, `[3]` active worktrees, and `[4]`
+  worktrees whose Change Requests are authoritatively queued, merging, or
+  merged. `[2]` is selected on startup.
 - **Behavior**: The home view presents Prism identity and project/help links. The
-  repository and worktree views update the contextual main panel for their
-  current selection.
+  repository, active-worktree, and merge-status views update the contextual main
+  panel for their current selection.
 - **Behavior**: `j`/`k`, arrows, Tab, and Shift-Tab provide forward and reverse
   vertical/focus traversal. Horizontal controls change contextual views rather
   than cycling through numbered panels.
 - **Behavior**: From any numbered panel, `0` focuses its corresponding main-panel
   content. Main-panel content is scrollable when it exceeds available space.
-- **Behavior**: Repositories and worktrees can be selected with the mouse as well
-  as the keyboard.
+- **Behavior**: Repositories, active worktrees, and merge-status worktrees can be
+  selected with the mouse as well as the keyboard.
 - **Behavior**: Search filters repositories by label, path, or shortcut and
   filters Worktree Sessions by branch, repository, prompt summary, path, or
   displayed Worktrunk values. Changing filters preserves a valid selection when
@@ -71,11 +72,16 @@
 - **Behavior**: Enter on a repository attaches to that repository's Default
   Branch Agent Session rather than merely moving focus to `[3]`.
 
-## Worktree List
+## Worktree Lists
 
-- **Behavior**: `[3]` offers visible repository-scoped and all-repositories modes,
-  switched with `[` and `]`. Repository-scoped rows omit redundant repository
-  names.
+- **Behavior**: `[3]` contains active Worktree Sessions. `[4]` contains all
+  non-default Worktree Sessions with provider-authoritative merged lifecycle or
+  active merge-queue evidence. Failed CI or removal from the provider queue
+  returns a session to `[3]`; stale or uncertain evidence does not move it to
+  `[4]`.
+- **Behavior**: `[3]` and `[4]` offer visible repository-scoped and
+  all-repositories modes, switched with `[` and `]`. Repository-scoped rows omit
+  redundant repository names.
 - **Default**: The last chosen worktree-list mode is remembered globally.
 - **Behavior**: Global worktrees sort by user priority, then repository name,
   then branch/worktree name. Neutral priority is represented by `.`.

@@ -201,7 +201,7 @@ impl Tui {
     fn selected_tmux_portal_target(
         &mut self,
     ) -> Option<Result<TmuxPortalTarget, AgentSessionWarmupKey>> {
-        if self.focused_panel != crate::tui::PanelFocus::Worktrees {
+        if !self.is_worktree_session_panel() {
             return None;
         }
         let context = self.selected_worktree_context()?;

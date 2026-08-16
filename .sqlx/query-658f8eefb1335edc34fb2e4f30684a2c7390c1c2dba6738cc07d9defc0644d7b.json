@@ -1,0 +1,44 @@
+{
+  "db_name": "SQLite",
+  "query": "select\n  branch as \"branch!\",\n  worktree_path as \"worktree_path!\",\n  worktree_incarnation as \"worktree_incarnation!\",\n  branch_oid as \"branch_oid!\",\n  warnings_json as \"warnings_json!\"\nfrom deferred_merge_cleanup\nwhere branch = ?\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "branch!",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "worktree_path!",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "worktree_incarnation!",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "branch_oid!",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "warnings_json!",
+        "ordinal": 4,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "658f8eefb1335edc34fb2e4f30684a2c7390c1c2dba6738cc07d9defc0644d7b"
+}
