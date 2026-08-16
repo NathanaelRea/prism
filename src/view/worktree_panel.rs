@@ -71,7 +71,7 @@ pub(super) fn worktree_detail_lines(model: &crate::view::FrameModel<'_>) -> Vec<
 }
 
 fn agent_lines(session: &Session) -> Vec<Line<'static>> {
-    let (state, icon, label, tool, user_message, messages) = session
+    let (state, icon, label, tool) = session
         .opencode_status
         .as_ref()
         .map(|status| {
@@ -107,8 +107,6 @@ fn agent_lines(session: &Session) -> Vec<Line<'static>> {
                     OpencodeState::Unknown | OpencodeState::Offline => "needs restart",
                 },
                 tool.or(status.detail.as_deref()),
-                status.latest_user_message.as_deref(),
-                status.recent_messages.as_slice(),
             )
         })
         .unwrap_or((
@@ -116,37 +114,19 @@ fn agent_lines(session: &Session) -> Vec<Line<'static>> {
             agent_icon(session.agent_state),
             session.agent_state.label(),
             None,
-            None,
-            &[],
         ));
     let status = match tool.filter(|tool| !tool.trim().is_empty()) {
         Some(tool) => format!("{label}  {tool}"),
         None => label.to_string(),
     };
-    let mut lines = vec![
+    vec![
         heading_line("Agent"),
         Line::from(vec![
             Span::styled("status ", muted_style()),
             Span::styled(icon, agent_style(state)),
             Span::raw(format!(" {status}")),
         ]),
-        Line::from(vec![
-            Span::styled("user ", muted_style()),
-            Span::styled(
-                truncate(user_message.unwrap_or_default(), 74),
-                Style::default().fg(Color::White),
-            ),
-        ]),
-    ];
-    for index in 0..5 {
-        lines.push(Line::from(
-            messages
-                .get(index)
-                .map(|message| truncate(message, 86))
-                .unwrap_or_default(),
-        ));
-    }
-    lines
+    ]
 }
 
 pub(crate) fn change_request_panel_model(
