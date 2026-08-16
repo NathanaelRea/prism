@@ -45,6 +45,11 @@ impl E2eSandbox {
             "prism-e2e-{safe_label}-{:x}-{unique:x}-{id:x}",
             std::process::id()
         ));
+        fs::create_dir_all(&root)
+            .unwrap_or_else(|error| panic!("create E2E sandbox root {}: {error}", root.display()));
+        let root = root
+            .canonicalize()
+            .unwrap_or_else(|error| panic!("canonicalize E2E sandbox root: {error}"));
         let real_git = find_command("git").expect("E2E tests require git");
         let real_tmux = find_command("tmux").expect("E2E tests require tmux");
         let sandbox = Self {
