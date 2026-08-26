@@ -35,6 +35,29 @@ fn editor_command(path: &Path) -> Result<Command, String> {
     Ok(command)
 }
 
+fn repository_edit_failure(
+    edited: &[crate::workspace::RepoEntry],
+    original: &[crate::workspace::RepoEntry],
+    error: &str,
+) -> String {
+    match crate::workspace::replace_entries(edited, original) {
+        Ok(_) => format!("{error}; repository list edit was rolled back"),
+        Err(rollback_error) => {
+            format!("{error}; failed to roll back repository list edit: {rollback_error}")
+        }
+    }
+}
+
+fn is_new_repository_entry(
+    configured_root: &Path,
+    discovered_root: &Path,
+    original_configured_roots: &BTreeSet<PathBuf>,
+    original_discovered_roots: &BTreeSet<PathBuf>,
+) -> bool {
+    !original_configured_roots.contains(configured_root)
+        && !original_discovered_roots.contains(discovered_root)
+}
+
 impl Tui {
     pub(crate) fn select_default_harness(
         &mut self,
@@ -337,36 +360,18 @@ impl Tui {
         if !self.confirm_dialog(raw, "Worktrunk Configuration", lines, prompt, default)? {
             return Ok(());
         }
+        self.ensure_worktrunk_user_project(
+            raw,
+            &context.repo,
+            &context.config,
+            TuiJobKey::Repository(self.repos[context.repo_index].identity.clone()),
+        )?;
+        location = self.discover_worktrunk_user_config(raw, &context)?;
         if !location.exists {
-            let repo = context.repo.clone();
-            let config = context.config.clone();
-            let RemoteActionValue::Complete = self.run_remote_action(
-                raw,
-                crate::tui::RemoteActionRequest {
-                    key: TuiJobKey::Repository(self.repos[context.repo_index].identity.clone()),
-                    generation: self.session_inventory_generation,
-                    name: "worktrunk-config-create",
-                    title: "Worktrunk Configuration",
-                    message: "Creating Worktrunk user config",
-                    abandon_cancelable: false,
-                    effect: crate::tui::RemoteActionEffect::LocalMutation,
-                },
-                move |_| {
-                    crate::worktrunk::create_user_config(&repo, &config)
-                        .map_err(|error| error.to_string())?;
-                    Ok(RemoteActionValue::Complete)
-                },
-            )?
-            else {
-                return Err("Worktrunk config creation returned an unexpected result".to_string());
-            };
-            location = self.discover_worktrunk_user_config(raw, &context)?;
-            if !location.exists {
-                return Err(format!(
-                    "Worktrunk created its user config, but {} is still unavailable",
-                    location.path.display()
-                ));
-            }
+            return Err(format!(
+                "Worktrunk created its user config, but {} is still unavailable",
+                location.path.display()
+            ));
         }
         let mut editor = editor_command(&location.path)?;
         crate::tui_runtime::suspend_for(raw, || crate::process::run_status_inherited(&mut editor))?;
@@ -445,11 +450,6 @@ impl Tui {
         &mut self,
         raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
-        let old_roots = self
-            .repos
-            .iter()
-            .map(|repo| repo.repo.root.clone())
-            .collect::<BTreeSet<_>>();
         let Some(path) = self.prompt_line_dialog(raw, "Add Repository", "Base/main path: ", "")?
         else {
             return Ok(());
@@ -458,17 +458,18 @@ impl Tui {
         if path.is_empty() {
             return Ok(());
         }
-        let (_, index, entries) = crate::workspace::ensure_repo_entry(Path::new(path))?;
+        let repo = Repository::discover(Some(Path::new(path)))?;
+        let config = Config::load(&repo);
+        self.ensure_worktrunk_user_project(raw, &repo, &config, TuiJobKey::System)?;
+        let (index, entries, added) = crate::workspace::ensure_repo_entry(&repo)?;
         self.reload_repositories(entries)?;
         self.select_repo(index);
+        if added && let Some(context) = self.selected_repo_context() {
+            self.offer_worktrunk_approval_if_pending(raw, &context.repo, &context.config)?;
+        }
         self.start_tmux_agent_warmup();
         self.start_wt_column_poll();
         self.start_default_branch_status_poll(true);
-        if let Some(context) = self.selected_repo_context()
-            && !old_roots.contains(&context.repo.root)
-        {
-            self.offer_worktrunk_approval_if_pending(raw, &context.repo, &context.config)?;
-        }
         self.show_message("repository added")?;
         Ok(())
     }
@@ -489,17 +490,50 @@ impl Tui {
                 .collect::<Vec<_>>();
             crate::workspace::initialize_entries(&entries)?;
         }
+        let original_entries = crate::workspace::load_entries()?;
         let mut editor = editor_command(&path)?;
         crate::tui_runtime::suspend_for(raw, || crate::process::run_status_inherited(&mut editor))?;
         let entries = crate::workspace::load_entries()?;
         if entries.is_empty() {
-            return Err("repository list is empty; add at least one [[repos]] block".to_string());
+            return Err(repository_edit_failure(
+                &entries,
+                &original_entries,
+                "repository list is empty; add at least one [[repos]] block",
+            ));
         }
-        let old_roots = self
-            .repos
+        let original_configured_roots = original_entries
             .iter()
-            .map(|repo| repo.repo.root.clone())
+            .map(|entry| entry.root.clone())
             .collect::<BTreeSet<_>>();
+        // Re-discover the original entries after the editor closes so an unchanged repository
+        // that became available while the editor was open is still recognized as already tracked.
+        let original_discovered_roots =
+            crate::workspace::discover_valid_entries(original_entries.clone())
+                .into_iter()
+                .map(|entry| entry.repo.root)
+                .collect::<BTreeSet<_>>();
+        let mut new_roots = BTreeSet::new();
+        let new_repos = crate::workspace::discover_valid_entries(entries.clone())
+            .into_iter()
+            .filter_map(|entry| {
+                let configured_root = &entries[entry.source_index].root;
+                let root = entry.repo.root.clone();
+                (is_new_repository_entry(
+                    configured_root,
+                    &root,
+                    &original_configured_roots,
+                    &original_discovered_roots,
+                ) && new_roots.insert(root))
+                .then(|| (entry.repo.clone(), Config::load(&entry.repo)))
+            })
+            .collect::<Vec<_>>();
+        for (repo, config) in &new_repos {
+            if let Err(error) =
+                self.ensure_worktrunk_user_project(raw, repo, config, TuiJobKey::System)
+            {
+                return Err(repository_edit_failure(&entries, &original_entries, &error));
+            }
+        }
         let current_root = self
             .selected_repo_context()
             .map(|context| context.repo.root)
@@ -514,12 +548,6 @@ impl Tui {
         self.start_tmux_agent_warmup();
         self.start_wt_column_poll();
         self.start_default_branch_status_poll(true);
-        let new_repos = self
-            .repos
-            .iter()
-            .filter(|repo| !old_roots.contains(&repo.repo.root))
-            .map(|repo| (repo.repo.clone(), repo.config.clone()))
-            .collect::<Vec<_>>();
         for (repo, config) in new_repos {
             self.offer_worktrunk_approval_if_pending(raw, &repo, &config)?;
         }
@@ -580,6 +608,37 @@ impl Tui {
         self.start_wt_column_poll();
         self.start_default_branch_status_poll(true);
         self.show_message("repositories updated")?;
+        Ok(())
+    }
+
+    fn ensure_worktrunk_user_project(
+        &mut self,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
+        repo: &Repository,
+        config: &Config,
+        key: TuiJobKey,
+    ) -> Result<(), String> {
+        let repo = repo.clone();
+        let config = config.clone();
+        let RemoteActionValue::Complete = self.run_remote_action(
+            raw,
+            crate::tui::RemoteActionRequest {
+                key,
+                generation: self.session_inventory_generation,
+                name: "worktrunk-project-register",
+                title: "Worktrunk Configuration",
+                message: "Registering repository in Worktrunk user config",
+                abandon_cancelable: false,
+                effect: crate::tui::RemoteActionEffect::LocalMutation,
+            },
+            move |_| {
+                crate::worktrunk::ensure_user_project_config(&repo, &config)?;
+                Ok(RemoteActionValue::Complete)
+            },
+        )?
+        else {
+            return Err("Worktrunk project registration returned an unexpected result".to_string());
+        };
         Ok(())
     }
 
@@ -978,6 +1037,31 @@ mod tests {
         assert!(!command_supports_prompt_transport(
             &repeated,
             PromptTransport::Argument
+        ));
+    }
+
+    #[test]
+    fn repository_addition_classification_uses_configured_and_discovered_identity() {
+        let original_configured_roots = BTreeSet::from([PathBuf::from("/repos/offline")]);
+        let original_discovered_roots = BTreeSet::from([PathBuf::from("/repos/canonical")]);
+
+        assert!(!is_new_repository_entry(
+            Path::new("/repos/offline"),
+            Path::new("/repos/offline"),
+            &original_configured_roots,
+            &original_discovered_roots,
+        ));
+        assert!(!is_new_repository_entry(
+            Path::new("/repos/alias"),
+            Path::new("/repos/canonical"),
+            &original_configured_roots,
+            &original_discovered_roots,
+        ));
+        assert!(is_new_repository_entry(
+            Path::new("/repos/new"),
+            Path::new("/repos/new"),
+            &original_configured_roots,
+            &original_discovered_roots,
         ));
     }
 

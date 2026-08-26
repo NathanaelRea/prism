@@ -754,8 +754,19 @@ fn observer_options(args: &Args) -> ObserverOptions {
 
 fn run_tui(repo_arg: Option<&std::path::Path>) -> Result<(), String> {
     (|| {
+        let requested_repo = observability::phase("discover_requested_repository", || {
+            repo_arg
+                .map(|path| Repository::discover(Some(path)))
+                .transpose()
+        })?;
+        if let Some(repo) = requested_repo.as_ref() {
+            let config = Config::load(repo);
+            observability::phase("register_worktrunk_project", || {
+                crate::worktrunk::ensure_user_project_config(repo, &config)
+            })?;
+        }
         let (entries, selected_repo) = observability::phase("load_workspace", || {
-            workspace::ensure_entries_for_tui(repo_arg)
+            workspace::ensure_entries_for_tui(requested_repo.as_ref())
         })?;
         let (entries, selected_repo) = observability::phase("reconcile_workspace", || {
             workspace::remove_missing_entries(entries, selected_repo)

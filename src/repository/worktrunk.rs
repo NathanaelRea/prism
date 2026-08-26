@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::LazyLock;
@@ -9,8 +9,10 @@ use std::time::Instant;
 
 use serde::Deserialize;
 use serde_json::Value;
+use toml_edit::{DocumentMut, InlineTable, Item, Table, Value as TomlValue};
 
 use crate::config::Config;
+use crate::file_persistence::{self, BoxError, FileContents, UpdateOptions};
 use crate::observability;
 use crate::process::{
     ProcessDescriptor, ProcessOutput, ProcessPolicy, run_output_allow_failure_named,
@@ -74,6 +76,7 @@ pub(crate) struct RemoveOutcome {
 pub(crate) struct UserConfigLocation {
     pub path: PathBuf,
     pub exists: bool,
+    pub project_identifier: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -359,12 +362,18 @@ struct HookLogJson {
 #[derive(Deserialize)]
 struct ConfigShowEnvelope {
     user: ConfigShowUser,
+    project: ConfigShowProject,
 }
 
 #[derive(Deserialize)]
 struct ConfigShowUser {
     path: PathBuf,
     exists: bool,
+}
+
+#[derive(Deserialize)]
+struct ConfigShowProject {
+    identifier: String,
 }
 
 pub(crate) fn switch_worktree(
@@ -458,6 +467,87 @@ pub(crate) fn create_user_config(
     }
 }
 
+pub(crate) fn ensure_user_project_config(repo: &Repository, config: &Config) -> Result<(), String> {
+    if config.worktree_command != "wt" {
+        return Ok(());
+    }
+    let location = discover_user_config(repo, config).map_err(|error| error.to_string())?;
+    ensure_user_project_entry_with_create(&location.path, &location.project_identifier, || {
+        create_user_config(repo, config)
+            .map_err(|error| Box::new(io::Error::other(error.to_string())) as BoxError)
+    })
+    .map(|_| ())
+}
+
+#[cfg(test)]
+fn ensure_user_project_entry(path: &Path, identifier: &str) -> Result<bool, String> {
+    ensure_user_project_entry_with_create(path, identifier, || {
+        Err(Box::new(io::Error::new(
+            io::ErrorKind::NotFound,
+            "Worktrunk user config is missing",
+        )) as BoxError)
+    })
+}
+
+fn ensure_user_project_entry_with_create(
+    path: &Path,
+    identifier: &str,
+    create_missing: impl FnOnce() -> Result<(), BoxError>,
+) -> Result<bool, String> {
+    if identifier.trim().is_empty() {
+        return Err("Worktrunk reported an empty project identifier".to_string());
+    }
+    // Match Worktrunk's own mutation lock and keep its unlocked `config create`
+    // inside the same read-modify-write transaction.
+    let lock_path = path.with_extension("toml.lock");
+    let mut create_missing = Some(create_missing);
+    file_persistence::update_with_lock_path(
+        path,
+        &lock_path,
+        UpdateOptions::important_toml(),
+        |contents| {
+            let bytes = match contents {
+                FileContents::Missing => {
+                    let Some(create_missing) = create_missing.take() else {
+                        return Err(Box::new(io::Error::other(
+                            "missing Worktrunk config callback was already consumed",
+                        )) as BoxError);
+                    };
+                    create_missing()?;
+                    fs::read(path).map_err(|error| Box::new(error) as BoxError)?
+                }
+                FileContents::Present(bytes) => bytes,
+            };
+            let text = String::from_utf8(bytes).map_err(|error| Box::new(error) as BoxError)?;
+            let mut document = text
+                .parse::<DocumentMut>()
+                .map_err(|error| Box::new(error) as BoxError)?;
+            let projects_item = document
+                .entry("projects")
+                .or_insert_with(|| Item::Table(Table::new()));
+            if let Some(projects) = projects_item.as_inline_table_mut() {
+                if projects.contains_key(identifier) {
+                    return Ok((false, None));
+                }
+                projects.insert(identifier, TomlValue::InlineTable(InlineTable::new()));
+                return Ok((true, Some(document.to_string().into_bytes())));
+            }
+            let projects = projects_item.as_table_mut().ok_or_else(|| {
+                Box::new(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Worktrunk user config `projects` value must be a table",
+                )) as BoxError
+            })?;
+            if projects.contains_key(identifier) {
+                return Ok((false, None));
+            }
+            projects.insert(identifier, Item::Table(Table::new()));
+            Ok((true, Some(document.to_string().into_bytes())))
+        },
+    )
+    .map_err(|error| format!("update Worktrunk user config: {error}"))
+}
+
 pub(crate) fn user_config_create_command_display(repo: &Repository, config: &Config) -> String {
     observability::command_display(&config_create_command(repo, config))
 }
@@ -537,9 +627,17 @@ fn parse_config_show_output(
             "user config path is empty",
         ));
     }
+    if envelope.project.identifier.trim().is_empty() {
+        return Err(WorktrunkFailure::malformed(
+            command,
+            output,
+            "project identifier is empty",
+        ));
+    }
     Ok(UserConfigLocation {
         path: envelope.user.path,
         exists: envelope.user.exists,
+        project_identifier: envelope.project.identifier,
     })
 }
 
@@ -1178,6 +1276,8 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -1322,8 +1422,17 @@ mod tests {
         let location = discover_user_config(&repo, &config).unwrap();
         assert_eq!(location.path, PathBuf::from(&wt_config));
         assert!(!location.exists);
-        create_user_config(&repo, &config).unwrap();
-        assert!(discover_user_config(&repo, &config).unwrap().exists);
+        ensure_user_project_config(&repo, &config).unwrap();
+        let location = discover_user_config(&repo, &config).unwrap();
+        assert!(location.exists);
+        let user_config =
+            toml::from_str::<toml::Value>(&fs::read_to_string(&location.path).unwrap()).unwrap();
+        assert!(
+            user_config
+                .get("projects")
+                .and_then(toml::Value::as_table)
+                .is_some_and(|projects| projects.contains_key(&location.project_identifier))
+        );
         let created = switch_worktree(SwitchRequest {
             repo: &repo,
             config: &config,
@@ -1410,13 +1519,130 @@ mod tests {
     }
 
     #[test]
+    fn missing_user_config_is_created_and_selected_project_is_registered() {
+        let temp = unique_temp_dir("prism-worktrunk-project-config");
+        fs::create_dir_all(&temp).unwrap();
+        let wt = temp.join("wt");
+        let user_config = temp.join("config.toml");
+        write_executable(
+            &wt,
+            &format!(
+                "#!/bin/sh\ncase \"$3 $4\" in\n  'config create') printf '%s\\n' 'worktree-path = \"{{{{ repo_path }}}}/worktrees/{{{{ branch | sanitize }}}}\"' > '{}' ;;\n  'config show') if [ -f '{}' ]; then exists=true; else exists=false; fi; printf '{{\"user\":{{\"path\":\"{}\",\"exists\":%s,\"config\":{{}}}},\"project\":{{\"identifier\":\"github.com/example/repo\"}}}}\\n' \"$exists\" ;;\n  *) exit 97 ;;\nesac\n",
+                user_config.display(),
+                user_config.display(),
+                user_config.display(),
+            ),
+        );
+        let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("prism"));
+        let mut config = crate::test_support::test_config();
+        config
+            .tools
+            .insert("wt".to_string(), wt.display().to_string());
+
+        ensure_user_project_config(&repo, &config).unwrap();
+
+        let text = fs::read_to_string(&user_config).unwrap();
+        let parsed = toml::from_str::<toml::Value>(&text).unwrap();
+        let projects = parsed
+            .get("projects")
+            .and_then(toml::Value::as_table)
+            .expect("Worktrunk user config should contain a projects table");
+        assert!(projects.contains_key("github.com/example/repo"));
+        assert!(text.contains("worktree-path"));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn user_project_registration_preserves_existing_config_and_is_idempotent() {
+        let temp = unique_temp_dir("prism-worktrunk-project-entry");
+        fs::create_dir_all(&temp).unwrap();
+        let user_config = temp.join("config.toml");
+        fs::write(
+            &user_config,
+            "# keep this comment\nworktree-path = \"custom/{{ branch }}\"\nprojects = { \"github.com/existing/repo\" = { worktree-path = \"existing/{{ branch }}\" } } # keep inline comment\n",
+        )
+        .unwrap();
+
+        assert!(ensure_user_project_entry(&user_config, "github.com/example/repo").unwrap());
+        let updated = fs::read_to_string(&user_config).unwrap();
+        let parsed = toml::from_str::<toml::Value>(&updated).unwrap();
+        let projects = parsed
+            .get("projects")
+            .and_then(toml::Value::as_table)
+            .unwrap();
+        assert!(projects.contains_key("github.com/existing/repo"));
+        assert!(projects.contains_key("github.com/example/repo"));
+        assert!(updated.contains("# keep this comment"));
+        assert!(updated.contains("# keep inline comment"));
+        assert!(updated.contains("custom/{{ branch }}"));
+
+        assert!(!ensure_user_project_entry(&user_config, "github.com/example/repo").unwrap());
+        assert_eq!(fs::read_to_string(&user_config).unwrap(), updated);
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn concurrent_first_project_registrations_retain_both_entries() {
+        let temp = unique_temp_dir("prism-worktrunk-concurrent-project-entries");
+        fs::create_dir_all(&temp).unwrap();
+        let user_config = temp.join("config.toml");
+        let barrier = Arc::new(Barrier::new(3));
+        let register = |identifier: &'static str| {
+            let user_config = user_config.clone();
+            let create_path = user_config.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                ensure_user_project_entry_with_create(&user_config, identifier, move || {
+                    fs::write(&create_path, "# generated by Worktrunk\n")
+                        .map_err(|error| Box::new(error) as BoxError)
+                })
+            })
+        };
+        let first = register("github.com/example/one");
+        let second = register("github.com/example/two");
+        barrier.wait();
+
+        assert!(first.join().unwrap().unwrap());
+        assert!(second.join().unwrap().unwrap());
+        let parsed =
+            toml::from_str::<toml::Value>(&fs::read_to_string(&user_config).unwrap()).unwrap();
+        let projects = parsed
+            .get("projects")
+            .and_then(toml::Value::as_table)
+            .unwrap();
+        assert!(projects.contains_key("github.com/example/one"));
+        assert!(projects.contains_key("github.com/example/two"));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn invalid_user_config_is_not_replaced_during_project_registration() {
+        let temp = unique_temp_dir("prism-worktrunk-invalid-project-entry");
+        fs::create_dir_all(&temp).unwrap();
+        let user_config = temp.join("config.toml");
+        let invalid = b"worktree-path = [invalid\n";
+        fs::write(&user_config, invalid).unwrap();
+
+        let error = ensure_user_project_entry(&user_config, "github.com/example/repo").unwrap_err();
+
+        assert!(error.contains("update Worktrunk user config"));
+        assert_eq!(fs::read(&user_config).unwrap(), invalid);
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn config_show_parses_existing_and_missing_user_config_locations() {
         let existing = parse_config_show_fixture(
-            r#"{"user":{"path":"/home/user/.config/worktrunk/config.toml","exists":true,"config":{}},"project":{}}"#,
+            r#"{"user":{"path":"/home/user/.config/worktrunk/config.toml","exists":true,"config":{}},"project":{"identifier":"github.com/example/repo"}}"#,
         )
         .unwrap();
         let missing = parse_config_show_fixture(
-            r#"{"user":{"path":"/home/user/.config/worktrunk/config.toml","exists":false,"config":null}}"#,
+            r#"{"user":{"path":"/home/user/.config/worktrunk/config.toml","exists":false,"config":null},"project":{"identifier":"github.com/example/repo"}}"#,
         )
         .unwrap();
 
@@ -1425,6 +1651,7 @@ mod tests {
             UserConfigLocation {
                 path: PathBuf::from("/home/user/.config/worktrunk/config.toml"),
                 exists: true,
+                project_identifier: "github.com/example/repo".to_string(),
             }
         );
         assert!(!missing.exists);
@@ -1432,12 +1659,13 @@ mod tests {
     }
 
     #[test]
-    fn config_show_rejects_missing_or_empty_user_config_locations() {
+    fn config_show_rejects_missing_or_empty_config_identity_fields() {
         for fixture in [
             r#"{}"#,
             r#"{"user":null}"#,
             r#"{"user":{"path":"","exists":false}}"#,
             r#"{"user":{"path":"/config.toml"}}"#,
+            r#"{"user":{"path":"/config.toml","exists":true},"project":{"identifier":" "}}"#,
         ] {
             assert_eq!(
                 parse_config_show_fixture(fixture).unwrap_err().kind,
