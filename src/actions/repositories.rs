@@ -48,6 +48,16 @@ fn repository_edit_failure(
     }
 }
 
+fn is_new_repository_entry(
+    configured_root: &Path,
+    discovered_root: &Path,
+    original_configured_roots: &BTreeSet<PathBuf>,
+    original_discovered_roots: &BTreeSet<PathBuf>,
+) -> bool {
+    !original_configured_roots.contains(configured_root)
+        && !original_discovered_roots.contains(discovered_root)
+}
+
 impl Tui {
     pub(crate) fn select_default_harness(
         &mut self,
@@ -491,18 +501,30 @@ impl Tui {
                 "repository list is empty; add at least one [[repos]] block",
             ));
         }
-        let old_roots = self
-            .repos
+        let original_configured_roots = original_entries
             .iter()
-            .map(|repo| repo.repo.root.clone())
+            .map(|entry| entry.root.clone())
             .collect::<BTreeSet<_>>();
+        // Re-discover the original entries after the editor closes so an unchanged repository
+        // that became available while the editor was open is still recognized as already tracked.
+        let original_discovered_roots =
+            crate::workspace::discover_valid_entries(original_entries.clone())
+                .into_iter()
+                .map(|entry| entry.repo.root)
+                .collect::<BTreeSet<_>>();
         let mut new_roots = BTreeSet::new();
         let new_repos = crate::workspace::discover_valid_entries(entries.clone())
             .into_iter()
             .filter_map(|entry| {
+                let configured_root = &entries[entry.source_index].root;
                 let root = entry.repo.root.clone();
-                (!old_roots.contains(&root) && new_roots.insert(root))
-                    .then(|| (entry.repo.clone(), Config::load(&entry.repo)))
+                (is_new_repository_entry(
+                    configured_root,
+                    &root,
+                    &original_configured_roots,
+                    &original_discovered_roots,
+                ) && new_roots.insert(root))
+                .then(|| (entry.repo.clone(), Config::load(&entry.repo)))
             })
             .collect::<Vec<_>>();
         for (repo, config) in &new_repos {
@@ -1015,6 +1037,31 @@ mod tests {
         assert!(!command_supports_prompt_transport(
             &repeated,
             PromptTransport::Argument
+        ));
+    }
+
+    #[test]
+    fn repository_addition_classification_uses_configured_and_discovered_identity() {
+        let original_configured_roots = BTreeSet::from([PathBuf::from("/repos/offline")]);
+        let original_discovered_roots = BTreeSet::from([PathBuf::from("/repos/canonical")]);
+
+        assert!(!is_new_repository_entry(
+            Path::new("/repos/offline"),
+            Path::new("/repos/offline"),
+            &original_configured_roots,
+            &original_discovered_roots,
+        ));
+        assert!(!is_new_repository_entry(
+            Path::new("/repos/alias"),
+            Path::new("/repos/canonical"),
+            &original_configured_roots,
+            &original_discovered_roots,
+        ));
+        assert!(is_new_repository_entry(
+            Path::new("/repos/new"),
+            Path::new("/repos/new"),
+            &original_configured_roots,
+            &original_discovered_roots,
         ));
     }
 
