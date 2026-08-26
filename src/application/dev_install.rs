@@ -59,7 +59,18 @@ enum CopyScope {
 
 pub(crate) fn prepare(source: &Path, destination: &Path) -> Result<DevStateSummary, String> {
     validate_roots(source, destination)?;
-    prepare_empty_destination(destination)?;
+    let destination_created = prepare_empty_destination(destination)?;
+    if let Err(error) = validate_roots(source, destination) {
+        if destination_created {
+            fs::remove_dir(destination).map_err(|cleanup_error| {
+                format!(
+                    "{error}; remove rejected development state destination {}: {cleanup_error}",
+                    destination.display()
+                )
+            })?;
+        }
+        return Err(error);
+    }
 
     if source.exists() {
         copy_tree(source, destination, CopyScope::Global, Path::new(""))?;
@@ -134,9 +145,21 @@ fn validate_roots(source: &Path, destination: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn prepare_empty_destination(destination: &Path) -> Result<(), String> {
-    fs::create_dir_all(destination)
-        .map_err(|error| format!("create {}: {error}", destination.display()))?;
+fn prepare_empty_destination(destination: &Path) -> Result<bool, String> {
+    if let Some(parent) = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("create {}: {error}", destination.display()))?;
+    }
+    let created = match fs::create_dir(destination) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(error) => {
+            return Err(format!("create {}: {error}", destination.display()));
+        }
+    };
     let mut entries = fs::read_dir(destination)
         .map_err(|error| format!("read {}: {error}", destination.display()))?;
     if entries
@@ -155,7 +178,8 @@ fn prepare_empty_destination(destination: &Path) -> Result<(), String> {
             destination.display()
         ));
     }
-    set_owner_only(destination)
+    set_owner_only(destination)?;
+    Ok(created)
 }
 
 fn copy_tree(
@@ -362,4 +386,32 @@ fn set_owner_only(path: &Path) -> Result<(), String> {
     permissions.set_mode(mode);
     fs::set_permissions(path, permissions)
         .map_err(|error| format!("set owner-only permissions on {}: {error}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prepare;
+    use crate::compact_runtime::CompactTempDir;
+    use std::fs;
+
+    #[test]
+    fn missing_destination_inside_source_is_rejected_and_removed() {
+        let temporary = CompactTempDir::new("nested-dev-state");
+        let source = temporary.path().join("source");
+        fs::create_dir(&source).expect("create source");
+        let destination = source.join(format!("nested-{}", "d".repeat(180)));
+
+        let error = prepare(&source, &destination).expect_err("reject nested destination");
+
+        assert!(
+            error.contains("must not be inside source"),
+            "unexpected error: {error}"
+        );
+        assert!(!destination.exists(), "rejected destination was retained");
+        assert_eq!(
+            fs::read_dir(&source).expect("read source").count(),
+            0,
+            "rejected copy changed the source"
+        );
+    }
 }
