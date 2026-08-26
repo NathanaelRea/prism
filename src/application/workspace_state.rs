@@ -323,6 +323,7 @@ pub struct AvailableControls {
     pub pause: bool,
     pub resume: bool,
     pub stop: bool,
+    pub retry: bool,
     pub recover: bool,
 }
 
@@ -384,6 +385,7 @@ pub enum ControlAction {
 pub struct ControlRequest {
     pub action: ControlAction,
     pub selector: Option<String>,
+    pub recovery_resolution: Option<crate::RecoveryResolution>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -396,7 +398,7 @@ pub struct ControlReceipt {
 #[derive(Clone, Debug)]
 pub struct RecoveryDecision {
     pub workflow: WorkflowIdentity,
-    pub restart: bool,
+    pub resolution: crate::RecoveryResolution,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -593,21 +595,28 @@ impl WorkspaceState {
             .await?;
         let target =
             self.resolve_workflow(&snapshot, request.selector.as_deref(), request.action)?;
+        let receipt_state =
+            control_receipt_state(request.action, request.recovery_resolution.as_ref())?;
         let command = match request.action {
             ControlAction::Pause => worker::PromptWorkflowControl::Pause,
             ControlAction::Resume => worker::PromptWorkflowControl::Resume,
-            ControlAction::Stop => worker::PromptWorkflowControl::Cancel,
-            ControlAction::Recover => worker::PromptWorkflowControl::Retry,
+            ControlAction::Stop => {
+                if target.lifecycle == WorkflowLifecycle::RecoveryRequired {
+                    worker::PromptWorkflowControl::Discard
+                } else {
+                    worker::PromptWorkflowControl::Cancel
+                }
+            }
+            ControlAction::Recover => worker::PromptWorkflowControl::Recover {
+                resolution: request.recovery_resolution.ok_or_else(|| {
+                    "recover requires an explicit outcome and authoritative evidence".to_string()
+                })?,
+            },
         };
         worker::command_prompt_workflow(&target.identity.run_id, command)?;
         Ok(ControlReceipt {
             workflow: target.identity.clone(),
-            state: match request.action {
-                ControlAction::Pause => "paused",
-                ControlAction::Resume | ControlAction::Recover => "runnable",
-                ControlAction::Stop => "cancelled",
-            }
-            .to_string(),
+            state: receipt_state.to_string(),
             warnings: Vec::new(),
         })
     }
@@ -618,17 +627,12 @@ impl WorkspaceState {
     ) -> Result<RecoveryBatchReceipt, String> {
         for decision in decisions {
             self.source_for_identity(&decision.workflow)?;
-            if decision.restart {
-                worker::command_prompt_workflow(
-                    &decision.workflow.run_id,
-                    worker::PromptWorkflowControl::Retry,
-                )?;
-            } else {
-                worker::command_prompt_workflow(
-                    &decision.workflow.run_id,
-                    worker::PromptWorkflowControl::Cancel,
-                )?;
-            }
+            worker::command_prompt_workflow(
+                &decision.workflow.run_id,
+                worker::PromptWorkflowControl::Recover {
+                    resolution: decision.resolution.clone(),
+                },
+            )?;
         }
         Ok(RecoveryBatchReceipt::default())
     }
@@ -1214,9 +1218,10 @@ fn controls_for(
                 || dispatch == Some(DispatchState::Paused))
             && dispatch != Some(DispatchState::RecoveryPending),
         stop: ownerless && !terminal,
+        retry: ownerless && lifecycle == WorkflowLifecycle::Failed,
         recover: ownerless
             && (dispatch == Some(DispatchState::RecoveryPending)
-                || lifecycle == WorkflowLifecycle::Failed),
+                || lifecycle == WorkflowLifecycle::RecoveryRequired),
     }
 }
 
@@ -1287,6 +1292,26 @@ fn validate_explicit_control(
             control_action_label(action),
             workflow.identity.display_id
         ))
+    }
+}
+
+fn control_receipt_state(
+    action: ControlAction,
+    recovery_resolution: Option<&crate::RecoveryResolution>,
+) -> Result<&'static str, String> {
+    match (action, recovery_resolution) {
+        (ControlAction::Pause, _) => Ok("paused"),
+        (ControlAction::Resume, _) => Ok("runnable"),
+        (ControlAction::Stop, _) => Ok("cancelled"),
+        (ControlAction::Recover, Some(crate::RecoveryResolution::RejectedBeforeEffect { .. })) => {
+            Ok("runnable")
+        }
+        (ControlAction::Recover, Some(crate::RecoveryResolution::Applied { .. })) => {
+            Ok("cancelled")
+        }
+        (ControlAction::Recover, None) => {
+            Err("recover requires an explicit outcome and authoritative evidence".to_string())
+        }
     }
 }
 
@@ -1385,4 +1410,49 @@ fn paths_equal(left: &Path, right: &Path) -> bool {
 }
 fn path_contains(root: &Path, selected: &Path) -> bool {
     selected.is_absolute() && absolute_path(selected).starts_with(absolute_path(root))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovery_receipt_matches_the_typed_resolution_lifecycle() {
+        let rejected = crate::RecoveryResolution::RejectedBeforeEffect {
+            evidence: "provider rejected the request".into(),
+        };
+        let applied = crate::RecoveryResolution::Applied {
+            evidence: "provider event confirms application".into(),
+        };
+        assert_eq!(
+            control_receipt_state(ControlAction::Recover, Some(&rejected)).unwrap(),
+            "runnable"
+        );
+        assert_eq!(
+            control_receipt_state(ControlAction::Recover, Some(&applied)).unwrap(),
+            "cancelled"
+        );
+        assert!(control_receipt_state(ControlAction::Recover, None).is_err());
+    }
+
+    #[test]
+    fn failed_workflow_advertises_retry_not_interruption_recovery() {
+        let failed = controls_for(
+            WorkflowLifecycle::Failed,
+            false,
+            Some(DispatchState::Terminal),
+            true,
+        );
+        let interrupted = controls_for(
+            WorkflowLifecycle::RecoveryRequired,
+            false,
+            Some(DispatchState::RecoveryPending),
+            true,
+        );
+
+        assert!(failed.retry);
+        assert!(!failed.recover);
+        assert!(!interrupted.retry);
+        assert!(interrupted.recover);
+    }
 }

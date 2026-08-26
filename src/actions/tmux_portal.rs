@@ -13,7 +13,7 @@ const TMUX_PORTAL_CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl Tui {
     pub(crate) fn poll_tmux_portal(&mut self) -> bool {
-        if !self.tui_tick_active && !self.routing_tui_jobs {
+        if !self.tui_tick_active && !self.background.is_routing() {
             self.route_tui_job_messages();
         }
         let target = self.selected_tmux_portal_target();
@@ -215,7 +215,7 @@ impl Tui {
     fn selected_tmux_portal_target(
         &mut self,
     ) -> Option<Result<TmuxPortalTarget, AgentSessionWarmupKey>> {
-        if self.focused_panel != crate::tui::PanelFocus::Worktrees {
+        if !self.is_worktree_session_panel() {
             return None;
         }
         let context = self.selected_worktree_context()?;

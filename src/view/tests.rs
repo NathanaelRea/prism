@@ -28,6 +28,7 @@ fn renders_wide_shell_with_sidebar_main_and_footer() {
     assert_region_contains(&buffer, 0..56, 0..30, "[1] Status");
     assert_region_contains(&buffer, 0..56, 0..30, "[2] Repos");
     assert_region_contains(&buffer, 0..56, 0..30, "[3] Worktrees");
+    assert_region_contains(&buffer, 0..56, 0..30, "[4] Merges");
     let (_, row) = sidebar_cell_containing(&buffer, "feature");
     assert_cell_style(
         &buffer,
@@ -40,6 +41,20 @@ fn renders_wide_shell_with_sidebar_main_and_footer() {
     assert_region_contains(&buffer, 56..120, 0..29, "Main");
     assert_region_contains(&buffer, 0..56, 0..30, "feature");
     assert!(!line_text(&buffer, 29).contains("normal"));
+}
+
+#[test]
+fn renders_merge_panel_rows_with_focus() {
+    let config = test_config();
+    let sessions = vec![test_session("merged-feature", AgentState::Idle)];
+    let mut model = test_model(&config, &sessions, PanelFocus::Merges, None, None);
+    model.merges = std::mem::take(&mut model.worktrees);
+
+    let buffer = render_to_buffer(&model, 120, 30);
+
+    assert_region_contains(&buffer, 0..56, 0..30, "[4] Merges");
+    let (branch_x, row) = sidebar_cell_containing(&buffer, "merged-feature");
+    assert_cell_style(&buffer, branch_x, row, selected_sidebar_row_style(true));
 }
 
 #[test]
@@ -80,7 +95,7 @@ fn sidebar_panel_heights_stay_stable_when_tmux_portal_is_hidden() {
     let without_portal = render_to_buffer(&without_portal, 120, 30);
     let with_portal = render_to_buffer(&with_portal, 120, 30);
 
-    for title in ["[1] Status", "[2] Repos", "[3] Worktrees"] {
+    for title in ["[1] Status", "[2] Repos", "[3] Worktrees", "[4] Merges"] {
         assert_eq!(
             find_line(&without_portal, title),
             find_line(&with_portal, title),
@@ -138,6 +153,24 @@ fn renders_tmux_portal_line_styles() {
             .bg(Color::Blue)
             .add_modifier(Modifier::BOLD),
     );
+}
+
+#[test]
+fn compact_sidebar_gives_the_focused_panel_the_remaining_height() {
+    let area = Rect::new(0, 0, 40, 11);
+
+    for (focus, expected_heights) in [
+        (PanelFocus::Status, [8, 1, 1, 1]),
+        (PanelFocus::Repos, [1, 8, 1, 1]),
+        (PanelFocus::Worktrees, [1, 1, 8, 1]),
+        (PanelFocus::Merges, [1, 1, 1, 8]),
+    ] {
+        let (status, repos, worktrees, merges) = sidebar_areas(area, focus);
+        assert_eq!(
+            [status.height, repos.height, worktrees.height, merges.height,],
+            expected_heights,
+        );
+    }
 }
 
 #[test]
@@ -798,6 +831,18 @@ fn renders_footer_status_message_and_leader_overlay() {
 }
 
 #[test]
+fn development_install_is_visible_in_the_footer() {
+    let config = test_config();
+    let sessions = vec![test_session("feature", AgentState::Idle)];
+    let mut model = test_model(&config, &sessions, PanelFocus::Status, None, None);
+    model.mode_label = "DEV";
+
+    let buffer = render_to_buffer(&model, 100, 20);
+
+    assert_line_contains(&buffer, 19, "[DEV] | Panels");
+}
+
+#[test]
 fn workflow_input_form_renders_types_defaults_and_enum_dropdown() {
     let config = test_config();
     let sessions = vec![test_session("feature", AgentState::Idle)];
@@ -1170,7 +1215,7 @@ fn prompt_dialog_geometry_is_stable_and_tail_truncates_input() {
 }
 
 #[test]
-fn worktree_main_panel_renders_five_agent_messages_without_indenting_user_message() {
+fn worktree_main_panel_omits_agent_and_user_messages() {
     let config = test_config();
     let mut session = test_session("feature", AgentState::Running);
     session.opencode_status = Some(OpencodeStatus {
@@ -1201,24 +1246,19 @@ fn worktree_main_panel_renders_five_agent_messages_without_indenting_user_messag
         .unwrap();
 
     assert!(lines[agent + 1].to_string().contains("● busy  bash"));
-    assert!(lines[agent + 2].to_string().contains("user"));
-    assert!(lines[agent + 2].to_string().starts_with("user please"));
-    assert!(
-        lines[agent + 2]
-            .to_string()
-            .contains("please update the panel")
-    );
-    assert_eq!(lines[agent + 2].spans[1].style.fg, Some(Color::White));
-    assert_eq!(lines[agent + 3].to_string(), "third message");
-    assert_eq!(lines[agent + 4].to_string(), "second message");
-    assert_eq!(lines[agent + 5].to_string(), "first message");
-    assert_eq!(lines[agent + 6].to_string(), "older message");
-    assert_eq!(lines[agent + 7].to_string(), "oldest message");
-    assert!(lines[agent + 8].to_string().is_empty());
+    let text = lines
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!text.contains("please update the panel"));
+    assert!(!text.contains("third message"));
+    assert!(!text.contains("oldest message"));
+    assert!(lines[agent + 2].to_string().is_empty());
 }
 
 #[test]
-fn worktree_main_panel_renders_idle_status_and_reserves_five_message_lines() {
+fn worktree_main_panel_does_not_reserve_message_lines() {
     let config = test_config();
     let sessions = vec![test_session("feature", AgentState::Idle)];
     let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
@@ -1229,12 +1269,8 @@ fn worktree_main_panel_renders_idle_status_and_reserves_five_message_lines() {
         .unwrap();
 
     assert!(lines[agent + 1].to_string().contains("○ idle"));
-    assert!(lines[agent + 2].to_string().contains("user"));
-    assert!(lines[agent + 3].to_string().is_empty());
-    assert!(lines[agent + 4].to_string().is_empty());
-    assert!(lines[agent + 5].to_string().is_empty());
-    assert!(lines[agent + 6].to_string().is_empty());
-    assert!(lines[agent + 7].to_string().is_empty());
+    assert_eq!(lines.len(), agent + 3);
+    assert!(lines[agent + 2].to_string().is_empty());
 }
 
 #[test]
@@ -1536,17 +1572,18 @@ fn worktree_main_panel_hides_pr_section_without_pr() {
     let config = test_config();
     let sessions = vec![test_session("feature", AgentState::Idle)];
     let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
-    let buffer = render_to_string(&model, 120, 30);
+    let buffer = render_to_buffer(&model, 120, 30);
+    let main = region_text(&buffer, 56..120, 0..29);
 
     for key in [
         "PR", "pr #", "name", "state", "next", "ci", "review", "merge", "policy",
     ] {
-        assert!(!buffer.contains(key), "unexpected PR key: {key}");
+        assert!(!main.contains(key), "unexpected PR key: {key}");
     }
-    assert!(!buffer.contains("No PR detected"));
-    assert!(!buffer.contains("Description"));
-    assert!(!buffer.contains("Activity"));
-    assert!(!buffer.contains("refreshed"));
+    assert!(!main.contains("No PR detected"));
+    assert!(!main.contains("Description"));
+    assert!(!main.contains("Activity"));
+    assert!(!main.contains("refreshed"));
 }
 
 #[test]
@@ -1554,7 +1591,12 @@ fn main_panel_applies_scroll_for_every_focus() {
     let config = test_config();
     let sessions = vec![test_session("feature", AgentState::Running)];
 
-    for focus in [PanelFocus::Status, PanelFocus::Repos, PanelFocus::Worktrees] {
+    for focus in [
+        PanelFocus::Status,
+        PanelFocus::Repos,
+        PanelFocus::Worktrees,
+        PanelFocus::Merges,
+    ] {
         let mut model = test_model(&config, &sessions, focus, None, None);
         let unscrolled = render_to_string(&model, 120, 6);
         model.main_scroll = 2;
@@ -1781,6 +1823,7 @@ fn test_model<'a>(
                 selected: index == 0,
             })
             .collect(),
+        merges: Vec::new(),
         repo_prs: sessions
             .iter()
             .filter_map(|session| {

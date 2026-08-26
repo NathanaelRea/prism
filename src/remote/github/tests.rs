@@ -1,18 +1,21 @@
 use super::*;
 use crate::config::Config;
+#[cfg(unix)]
+use crate::remote::coordinator::load_pr_cache_for_branch;
 use crate::remote::coordinator::{
-    PrCacheEligibility, PrCacheRepository, load_pr_cache_for_branch, pr_cache_pollable_for_session,
+    PrCacheEligibility, PrCacheRepository, pr_cache_pollable_for_session,
     pr_summary_matches_worktree, refresh_pr_summary_index_for_sessions,
     resolve_pr_summary_for_session,
 };
+#[cfg(unix)]
+use crate::remote::store::persist_pr_cache_snapshot;
 use crate::remote::store::{
-    load_pr_cache, load_pr_details_cache, load_repo_policy_cache_for_identity,
-    persist_pr_cache_snapshot, record_pr_summary, save_pr_cache, save_pr_details_cache,
-    save_pr_details_cache_for_association, save_repo_policy_cache,
+    load_pr_cache, load_pr_details_cache, load_repo_policy_cache_for_identity, record_pr_summary,
+    save_pr_cache, save_pr_details_cache, save_pr_details_cache_for_association,
+    save_repo_policy_cache,
 };
 use crate::session::Session;
-#[cfg(windows)]
-use crate::test_support::PermissionsExt;
+#[cfg(unix)]
 use crate::test_support::write_executable;
 use std::collections::BTreeMap;
 use std::fs;

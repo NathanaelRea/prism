@@ -1,16 +1,21 @@
 //! Production bridge from built-in Triggers to the shared provider request coordinator.
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use std::future::Future;
 use std::pin::Pin;
 
 use crate::remote::request_coordinator::{
-    CoordinatedRemoteOperation, ObservationFreshness, RemoteMutationRequest, RemoteMutationResult,
-    RemoteObservationKey, RemoteObservationResult, RemoteOperationExecutor, RemoteOperationFailure,
-    RemoteOperationOutput, RemotePriority, RemoteRequestCoordinator,
+    CoordinatedRemoteOperation, ObservationFreshness, RemoteMutationFailureDisposition,
+    RemoteMutationRequest, RemoteMutationResult, RemoteObservationKey, RemoteObservationResult,
+    RemoteOperationExecutor, RemoteOperationFailure, RemoteOperationOutput, RemotePriority,
+    RemoteRequestCoordinator,
 };
 
+pub(crate) use super::remote_operation::{
+    ResolveThreadsPayload, TuiRemoteCreatePreparation, TuiRemoteMergeOutcome, TuiRemoteMergeResult,
+    TuiRemotePushResult,
+};
 use super::standard_triggers::{
     ChangeRequestObservation, MergeRelation, Mergeability, RequiredCheck, RequiredCheckState,
     ReviewThreadObservation, StandardMutationResult, StandardObservationResult, StandardProvider,
@@ -149,7 +154,9 @@ impl StandardTriggerRemote for ProductionStandardTriggerRemote {
                         summary: wait.summary,
                         wake_at_unix_ms: wait.wake_at_unix_ms,
                     },
-                    RemoteMutationResult::Failed(reason) => StandardMutationResult::Fail(reason),
+                    RemoteMutationResult::Failed { reason, .. } => {
+                        StandardMutationResult::Fail(reason)
+                    }
                 },
             )
         })
@@ -247,12 +254,37 @@ impl RemoteOperationExecutor for PrismProviderExecutor {
 async fn execute_async(
     operation: CoordinatedRemoteOperation,
 ) -> Result<RemoteOperationOutput, RemoteOperationFailure> {
+    let operation = match operation {
+        CoordinatedRemoteOperation::Observe(request) => {
+            super::remote_operation::decode_observation(&request.key.operation, request.payload)
+                .map(TypedCoordinatedRemoteOperation::Observe)
+                .map_err(|error| permanent(format!("invalid coordinated observation: {error}")))?
+        }
+        CoordinatedRemoteOperation::Mutate(request) => {
+            super::remote_operation::decode_mutation(&request.operation, request.payload)
+                .map(Box::new)
+                .map(TypedCoordinatedRemoteOperation::Mutate)
+                .map_err(|error| permanent(format!("invalid coordinated mutation: {error}")))?
+        }
+    };
+    execute_typed(operation).await
+}
+
+enum TypedCoordinatedRemoteOperation {
+    Observe(super::remote_operation::RemoteObservationOperation),
+    Mutate(Box<super::remote_operation::RemoteMutationOperation>),
+}
+
+async fn execute_typed(
+    operation: TypedCoordinatedRemoteOperation,
+) -> Result<RemoteOperationOutput, RemoteOperationFailure> {
+    use super::remote_operation::{
+        RemoteMutationOperation as Mutation, RemoteObservationOperation as Observation,
+    };
     match operation {
-        CoordinatedRemoteOperation::Observe(request)
-            if request.key.operation == "change_request.stabilization" =>
-        {
-            let subject: TriggerSubject = serde_json::from_value(request.payload)
-                .map_err(|error| permanent(format!("invalid observation subject: {error}")))?;
+        TypedCoordinatedRemoteOperation::Observe(Observation::ChangeRequestStabilization(
+            subject,
+        )) => {
             let observation = observe_change_request(&subject)
                 .await
                 .map_err(classify_failure)?;
@@ -269,11 +301,7 @@ async fn execute_async(
                 rate_limit_reset_unix_ms: None,
             })
         }
-        CoordinatedRemoteOperation::Observe(request)
-            if request.key.operation == "tui.change_requests" =>
-        {
-            let payload: TuiRemoteListPayload = serde_json::from_value(request.payload)
-                .map_err(|error| permanent(format!("invalid TUI remote list request: {error}")))?;
+        TypedCoordinatedRemoteOperation::Observe(Observation::TuiChangeRequests(payload)) => {
             let repository = crate::repo::Repository {
                 root: payload.repository.clone(),
             };
@@ -284,11 +312,7 @@ async fn execute_async(
                     .map_err(classify_failure)?;
             output(summaries, "list")
         }
-        CoordinatedRemoteOperation::Observe(request)
-            if request.key.operation == "tui.repository_policy" =>
-        {
-            let payload: TuiRemoteListPayload = serde_json::from_value(request.payload)
-                .map_err(|error| permanent(format!("invalid TUI policy request: {error}")))?;
+        TypedCoordinatedRemoteOperation::Observe(Observation::TuiRepositoryPolicy(payload)) => {
             let repository = crate::repo::Repository {
                 root: payload.repository.clone(),
             };
@@ -302,13 +326,7 @@ async fn execute_async(
             .map_err(classify_failure)?;
             output(true, "policy")
         }
-        CoordinatedRemoteOperation::Observe(request)
-            if request.key.operation == "tui.remote_branch_head" =>
-        {
-            let payload: TuiRemoteBranchHeadPayload = serde_json::from_value(request.payload)
-                .map_err(|error| {
-                    permanent(format!("invalid TUI remote branch request: {error}"))
-                })?;
+        TypedCoordinatedRemoteOperation::Observe(Observation::TuiRemoteBranchHead(payload)) => {
             let repository = crate::repo::Repository {
                 root: payload.repository,
             };
@@ -323,11 +341,36 @@ async fn execute_async(
             .map_err(classify_failure)?;
             output(head, "remote-branch-head")
         }
-        CoordinatedRemoteOperation::Observe(request)
-            if request.key.operation == "tui.change_request_cache" =>
-        {
-            let payload: TuiRemoteCachePayload = serde_json::from_value(request.payload)
-                .map_err(|error| permanent(format!("invalid TUI remote cache request: {error}")))?;
+        TypedCoordinatedRemoteOperation::Observe(Observation::TuiPushBranchResult(payload)) => {
+            let result = tui_push_reconciliation_result(&payload)
+                .await
+                .map_err(classify_failure)?;
+            output(result, "push-result")
+        }
+        TypedCoordinatedRemoteOperation::Observe(Observation::TuiLocalBranchHead(payload)) => {
+            let repository = crate::repo::Repository {
+                root: payload.repository,
+            };
+            let config = crate::config::Config::load(&repository);
+            let output_value = crate::process::run_output_named(
+                crate::process::Command::new(config.tool("git"))
+                    .arg("-C")
+                    .arg(&payload.worktree)
+                    .args(["rev-parse", "--verify"])
+                    .arg(format!("refs/heads/{}^{{commit}}", payload.branch)),
+                crate::process::ProcessPolicy::Metadata,
+                crate::process::ProcessDescriptor::new("git.reconciliation_local_branch_head"),
+            )
+            .await
+            .map_err(classify_failure)?;
+            let head = output_value.status.success().then(|| {
+                String::from_utf8_lossy(&output_value.stdout)
+                    .trim()
+                    .to_string()
+            });
+            output(head, "local-branch-head")
+        }
+        TypedCoordinatedRemoteOperation::Observe(Observation::TuiChangeRequestCache(payload)) => {
             let repository = crate::repo::Repository {
                 root: payload.repository.clone(),
             };
@@ -352,258 +395,297 @@ async fn execute_async(
                 &revision,
             )
         }
-        CoordinatedRemoteOperation::Mutate(request)
-            if request.operation == "change_request.resolve_review_threads" =>
-        {
-            let payload: ResolveThreadsPayload =
-                serde_json::from_value(request.payload).map_err(|error| {
-                    permanent(format!("invalid review resolution request: {error}"))
-                })?;
-            resolve_threads(payload).await.map_err(classify_failure)?;
-            output(serde_json::json!({"resolved": true}), "mutation")
-        }
-        CoordinatedRemoteOperation::Mutate(request)
-            if request.operation == "tui.resolve_review_threads" =>
-        {
-            let payload: TuiRemoteResolvePayload = serde_json::from_value(request.payload)
-                .map_err(|error| permanent(format!("invalid TUI review resolution: {error}")))?;
-            let repository = crate::repo::Repository {
-                root: payload.repository.clone(),
-            };
-            let config = crate::config::Config::load(&repository);
-            for thread_id in &payload.thread_ids {
-                crate::remote::dispatcher::resolve_review_thread(
-                    &payload.worktree,
-                    &config,
-                    &payload.summary,
-                    thread_id,
-                )
-                .await
-                .map_err(classify_failure)?;
+        TypedCoordinatedRemoteOperation::Mutate(operation) => match *operation {
+            Mutation::ChangeRequestResolveReviewThreads(payload) => {
+                resolve_threads(payload).await.map_err(classify_failure)?;
+                output(serde_json::json!({"resolved": true}), "mutation")
             }
-            output(payload.thread_ids.len(), "mutation")
-        }
-        CoordinatedRemoteOperation::Mutate(request) if request.operation == "tui.push_branch" => {
-            let payload: TuiRemotePushPayload = serde_json::from_value(request.payload)
-                .map_err(|error| permanent(format!("invalid TUI push request: {error}")))?;
-            let repository = crate::repo::Repository {
-                root: payload.repository.clone(),
-            };
-            let config = crate::config::Config::load(&repository);
-            let current = crate::remote::dispatcher::prepare_push(
-                &payload.worktree,
-                &config,
-                &payload.branch,
-            )
-            .await
-            .map_err(classify_failure)?;
-            if !crate::remote::dispatcher::same_push_target(&payload.expected, &current) {
-                return Err(permanent(
-                    "push remote, branch, or HEAD changed during push preparation".into(),
-                ));
-            }
-            crate::lifecycle::push_branch(
-                &config,
-                &payload.worktree,
-                &payload.branch,
-                current.set_upstream,
-            )
-            .await
-            .map_err(classify_failure)?;
-            let pushed = crate::remote::dispatcher::prepare_push(
-                &payload.worktree,
-                &config,
-                &payload.branch,
-            )
-            .await
-            .map_err(classify_failure)?;
-            if !crate::remote::dispatcher::same_push_target(&current, &pushed) {
-                return Err(permanent("push destination changed while pushing".into()));
-            }
-            let mut cache = crate::remote::load_pr_cache(&repository, &payload.branch);
-            crate::remote::dispatcher::refresh_change_request_cache(
-                &repository,
-                &payload.branch,
-                &mut cache,
-                &payload.worktree,
-                &config,
-                false,
-            )
-            .await
-            .map_err(classify_failure)?;
-            let create = if cache.has_summary() {
-                None
-            } else {
-                let (origin_repository, upstream_repository) =
-                    crate::remote::dispatcher::create_change_request_targets(
+            Mutation::TuiResolveReviewThreads(payload) => {
+                let repository = crate::repo::Repository {
+                    root: payload.repository.clone(),
+                };
+                let config = crate::config::Config::load(&repository);
+                for thread_id in &payload.thread_ids {
+                    crate::remote::dispatcher::resolve_review_thread(
                         &payload.worktree,
                         &config,
+                        &payload.summary,
+                        thread_id,
                     )
                     .await
                     .map_err(classify_failure)?;
-                Some(TuiRemoteCreatePreparation {
-                    source_push: pushed,
-                    origin_repository,
-                    upstream_repository,
-                })
-            };
-            output(
-                TuiRemotePushResult {
-                    cache: crate::remote::WorkerPrCacheSnapshot::capture(&cache),
-                    create,
-                },
-                "mutation",
-            )
-        }
-        CoordinatedRemoteOperation::Mutate(request)
-            if request.operation == "tui.create_change_request" =>
-        {
-            let payload: TuiRemoteCreatePayload = serde_json::from_value(request.payload)
-                .map_err(|error| permanent(format!("invalid TUI create request: {error}")))?;
-            let repository = crate::repo::Repository {
-                root: payload.repository,
-            };
-            let config = crate::config::Config::load(&repository);
-            let mut cache = crate::remote::load_pr_cache(&repository, &payload.branch);
-            crate::remote::dispatcher::refresh_change_request_cache(
-                &repository,
-                &payload.branch,
-                &mut cache,
-                &payload.worktree,
-                &config,
-                false,
-            )
-            .await
-            .map_err(classify_failure)?;
-            if cache.has_summary() {
-                return output(
+                }
+                output(payload.thread_ids.len(), "mutation")
+            }
+            Mutation::TuiPushBranch(payload) => {
+                let repository = crate::repo::Repository {
+                    root: payload.repository.clone(),
+                };
+                let config = crate::config::Config::load(&repository);
+                let current = crate::remote::dispatcher::prepare_push(
+                    &payload.worktree,
+                    &config,
+                    &payload.branch,
+                )
+                .await
+                .map_err(classify_failure)?;
+                if !crate::remote::dispatcher::same_push_target(&payload.expected, &current) {
+                    return Err(permanent(
+                        "push remote, branch, or HEAD changed during push preparation".into(),
+                    ));
+                }
+                crate::lifecycle::push_branch(
+                    &config,
+                    &payload.worktree,
+                    &payload.branch,
+                    current.set_upstream,
+                )
+                .await
+                .map_err(classify_failure)?;
+                let result = tui_push_result(&payload).await.map_err(uncertain)?;
+                output(result, "mutation")
+            }
+            Mutation::TuiCreateChangeRequest(payload) => {
+                let repository = crate::repo::Repository {
+                    root: payload.repository,
+                };
+                let config = crate::config::Config::load(&repository);
+                let mut cache = crate::remote::load_pr_cache(&repository, &payload.branch);
+                crate::remote::dispatcher::refresh_change_request_cache(
+                    &repository,
+                    &payload.branch,
+                    &mut cache,
+                    &payload.worktree,
+                    &config,
+                    false,
+                )
+                .await
+                .map_err(classify_failure)?;
+                if cache.has_summary() {
+                    return output(
+                        crate::remote::WorkerPrCacheSnapshot::capture(&cache),
+                        "mutation",
+                    );
+                }
+                crate::remote::dispatcher::create_change_request(
+                    &repository,
+                    &config,
+                    &payload.worktree,
+                    crate::remote::dispatcher::CreateChangeRequestInput {
+                        branch: &payload.branch,
+                        body: &payload.body,
+                        target_repository: &payload.target_repository,
+                        source_push: &payload.source_push,
+                    },
+                    &mut cache,
+                )
+                .await
+                .map_err(classify_failure)?;
+                output(
                     crate::remote::WorkerPrCacheSnapshot::capture(&cache),
                     "mutation",
-                );
+                )
             }
-            let guard = crate::remote::dispatcher::prepare_create_change_request(
-                &payload.worktree,
-                &config,
-                &payload.branch,
-                &payload.target_repository,
-                &payload.source_push,
-            )
-            .await
-            .map_err(classify_failure)?;
-            crate::remote::dispatcher::create_change_request(
-                &repository,
-                &config,
-                &payload.worktree,
-                &payload.body,
-                &guard,
-                &mut cache,
-            )
-            .await
-            .map_err(classify_failure)?;
-            output(
-                crate::remote::WorkerPrCacheSnapshot::capture(&cache),
-                "mutation",
-            )
-        }
-        CoordinatedRemoteOperation::Mutate(request)
-            if request.operation == "tui.fetch_change_request" =>
-        {
-            let payload: TuiRemoteFetchPayload = serde_json::from_value(request.payload)
-                .map_err(|error| permanent(format!("invalid TUI fetch request: {error}")))?;
-            let repository = crate::repo::Repository {
-                root: payload.repository,
-            };
-            let config = crate::config::Config::load(&repository);
-            crate::remote::dispatcher::fetch_change_request_branch(
-                &payload.worktree,
-                &config,
-                &payload.summary,
-                &payload.branch,
-            )
-            .await
-            .map_err(classify_failure)?;
-            output(true, "mutation")
-        }
-        CoordinatedRemoteOperation::Mutate(request) if request.operation == "tui.submit_review" => {
-            let payload: TuiRemoteReviewPayload = serde_json::from_value(request.payload)
-                .map_err(|error| permanent(format!("invalid TUI review submission: {error}")))?;
-            let repository = crate::repo::Repository {
-                root: payload.repository,
-            };
-            let config = crate::config::Config::load(&repository);
-            crate::remote::dispatcher::submit_review(
-                &payload.worktree,
-                &config,
-                &payload.summary,
-                payload.kind,
-                payload.body,
-            )
-            .await
-            .map_err(classify_failure)?;
-            output(serde_json::json!({"submitted": true}), "mutation")
-        }
-        CoordinatedRemoteOperation::Mutate(request)
-            if request.operation == "tui.merge_change_request" =>
-        {
-            let payload: TuiRemoteMergePayload = serde_json::from_value(request.payload)
-                .map_err(|error| permanent(format!("invalid TUI merge request: {error}")))?;
-            let repository = crate::repo::Repository {
-                root: payload.repository,
-            };
-            let config = crate::config::Config::load(&repository);
-            let prepared = match crate::remote::dispatcher::prepare_merge_change_request(
-                &config,
-                &payload.worktree,
-                &payload.change_request,
-                payload.display_number,
-                &payload.expected_head_sha,
-            )
-            .await
-            {
-                Ok(prepared) => prepared,
-                Err(reason) => {
-                    return output(TuiRemoteMergeResult::Rejected { reason }, "mutation");
-                }
-            };
-            let result = match crate::remote::dispatcher::execute_guarded_merge_reconciled(
-                &config,
-                &payload.worktree,
-                &prepared,
-            )
-            .await
-            {
-                crate::remote::dispatcher::GuardedMergeExecution::Applied(result) => *result,
-                crate::remote::dispatcher::GuardedMergeExecution::Rejected(reason) => {
-                    return output(TuiRemoteMergeResult::Rejected { reason }, "mutation");
-                }
-                crate::remote::dispatcher::GuardedMergeExecution::Uncertain(reason) => {
-                    return Err(permanent(reason));
-                }
-            };
-            let outcome = match result.outcome {
-                crate::remote::MergeMutationOutcome::Merged => TuiRemoteMergeOutcome::Merged,
-                crate::remote::MergeMutationOutcome::Pending => TuiRemoteMergeOutcome::Pending,
-                crate::remote::MergeMutationOutcome::Uncertain => TuiRemoteMergeOutcome::Uncertain,
-            };
-            let summary = crate::remote::dispatcher::legacy_summary(result.summary)
+            Mutation::TuiFetchChangeRequest(payload) => {
+                let repository = crate::repo::Repository {
+                    root: payload.repository,
+                };
+                let config = crate::config::Config::load(&repository);
+                crate::remote::dispatcher::fetch_change_request_branch(
+                    &payload.worktree,
+                    &config,
+                    &payload.summary,
+                    &payload.branch,
+                )
+                .await
                 .map_err(classify_failure)?;
-            output(
-                TuiRemoteMergeResult::Accepted {
-                    outcome,
-                    summary: Box::new(summary),
-                },
-                "mutation",
-            )
-        }
-        CoordinatedRemoteOperation::Observe(request) => Err(permanent(format!(
-            "unsupported coordinated observation '{}'",
-            request.key.operation
-        ))),
-        CoordinatedRemoteOperation::Mutate(request) => Err(permanent(format!(
-            "unsupported coordinated mutation '{}'",
-            request.operation
-        ))),
+                output(true, "mutation")
+            }
+            Mutation::TuiSubmitReview(payload) => {
+                let repository = crate::repo::Repository {
+                    root: payload.repository,
+                };
+                let config = crate::config::Config::load(&repository);
+                crate::remote::dispatcher::submit_review(
+                    &payload.worktree,
+                    &config,
+                    &payload.summary,
+                    payload.kind,
+                    payload.body,
+                )
+                .await
+                .map_err(classify_failure)?;
+                output(serde_json::json!({"submitted": true}), "mutation")
+            }
+            Mutation::TuiMergeChangeRequest(payload) => {
+                let repository = crate::repo::Repository {
+                    root: payload.repository,
+                };
+                let config = crate::config::Config::load(&repository);
+                let prepared = match crate::remote::dispatcher::prepare_merge_change_request(
+                    &config,
+                    &payload.worktree,
+                    &payload.change_request,
+                    payload.display_number,
+                    &payload.expected_head_sha,
+                )
+                .await
+                {
+                    Ok(prepared) => prepared,
+                    Err(reason) => {
+                        return output(TuiRemoteMergeResult::Rejected { reason }, "mutation");
+                    }
+                };
+                let result = match crate::remote::dispatcher::execute_guarded_merge_reconciled(
+                    &config,
+                    &payload.worktree,
+                    &prepared,
+                )
+                .await
+                {
+                    crate::remote::dispatcher::GuardedMergeExecution::Applied(result) => *result,
+                    crate::remote::dispatcher::GuardedMergeExecution::Rejected(reason) => {
+                        return output(TuiRemoteMergeResult::Rejected { reason }, "mutation");
+                    }
+                    crate::remote::dispatcher::GuardedMergeExecution::Uncertain(reason) => {
+                        return Err(uncertain(reason));
+                    }
+                };
+                let outcome = match result.outcome {
+                    crate::remote::MergeMutationOutcome::Merged => TuiRemoteMergeOutcome::Merged,
+                    crate::remote::MergeMutationOutcome::Pending => TuiRemoteMergeOutcome::Pending,
+                    crate::remote::MergeMutationOutcome::Uncertain => {
+                        TuiRemoteMergeOutcome::Uncertain
+                    }
+                };
+                let summary = crate::remote::dispatcher::legacy_summary(result.summary)
+                    .map_err(classify_failure)?;
+                output(
+                    TuiRemoteMergeResult::Accepted {
+                        outcome,
+                        summary: Box::new(summary),
+                    },
+                    "mutation",
+                )
+            }
+        },
     }
+}
+
+async fn tui_push_result(
+    payload: &super::remote_operation::TuiRemotePushPayload,
+) -> Result<TuiRemotePushResult, String> {
+    let repository = crate::repo::Repository {
+        root: payload.repository.clone(),
+    };
+    let config = crate::config::Config::load(&repository);
+    let pushed =
+        crate::remote::dispatcher::prepare_push(&payload.worktree, &config, &payload.branch)
+            .await?;
+    if !crate::remote::dispatcher::same_push_target(&payload.expected, &pushed) {
+        return Err("push destination changed while pushing".into());
+    }
+    let mut cache = crate::remote::load_pr_cache(&repository, &payload.branch);
+    crate::remote::dispatcher::refresh_change_request_cache(
+        &repository,
+        &payload.branch,
+        &mut cache,
+        &payload.worktree,
+        &config,
+        false,
+    )
+    .await?;
+    let create = if cache.has_summary() {
+        None
+    } else {
+        let (origin_repository, upstream_repository) =
+            crate::remote::dispatcher::create_change_request_targets(&payload.worktree, &config)
+                .await?;
+        Some(TuiRemoteCreatePreparation {
+            source_push: pushed,
+            origin_repository,
+            upstream_repository,
+        })
+    };
+    Ok(TuiRemotePushResult {
+        cache: crate::remote::WorkerPrCacheSnapshot::capture(&cache),
+        create,
+    })
+}
+
+async fn tui_push_reconciliation_result(
+    payload: &super::remote_operation::TuiRemotePushPayload,
+) -> Result<TuiRemotePushResult, String> {
+    let repository = crate::repo::Repository {
+        root: payload.repository.clone(),
+    };
+    let config = crate::config::Config::load(&repository);
+    let current =
+        crate::remote::dispatcher::prepare_push(&payload.worktree, &config, &payload.branch)
+            .await?;
+    let expected = &payload.expected;
+    if current.repository != expected.repository
+        || current.remote != expected.remote
+        || current.remote_branch != expected.remote_branch
+        || current.local_branch != expected.local_branch
+    {
+        return Err("push destination changed before reconciliation".into());
+    }
+    let remote_head = crate::git::push_remote_branch_head_sha(
+        &payload.worktree,
+        &expected.remote,
+        &expected.remote_branch,
+        &config,
+    )
+    .await?;
+    let remote_head = remote_head
+        .ok_or_else(|| "pushed branch no longer exists on the authoritative remote".to_string())?;
+    if remote_head != expected.expected_head_sha {
+        let fetched_remote_head = crate::git::fetch_push_remote_branch_head_sha(
+            &payload.worktree,
+            &expected.remote,
+            &expected.remote_branch,
+            &remote_head,
+            &config,
+        )
+        .await?;
+        if !crate::git::commit_is_ancestor(
+            &payload.worktree,
+            &expected.expected_head_sha,
+            &fetched_remote_head,
+            &config,
+        )
+        .await?
+        {
+            return Err("pushed commit is not in the authoritative remote branch history".into());
+        }
+    }
+    let mut cache = crate::remote::load_pr_cache(&repository, &payload.branch);
+    crate::remote::dispatcher::refresh_change_request_cache(
+        &repository,
+        &payload.branch,
+        &mut cache,
+        &payload.worktree,
+        &config,
+        false,
+    )
+    .await?;
+    let create = if cache.has_summary() || current.expected_head_sha != expected.expected_head_sha {
+        None
+    } else {
+        let (origin_repository, upstream_repository) =
+            crate::remote::dispatcher::create_change_request_targets(&payload.worktree, &config)
+                .await?;
+        Some(TuiRemoteCreatePreparation {
+            source_push: current,
+            origin_repository,
+            upstream_repository,
+        })
+    };
+    Ok(TuiRemotePushResult {
+        cache: crate::remote::WorkerPrCacheSnapshot::capture(&cache),
+        create,
+    })
 }
 
 async fn observe_change_request(
@@ -789,16 +871,10 @@ fn capability_gap(
             "provider policy observation is unavailable: {error}"
         ));
     }
-    match provider {
-        crate::remote::ProviderKind::GitHub => None,
-        crate::remote::ProviderKind::GitLab if details.check_contexts.is_empty() => Some(
-            "GitLab required-check observations are not supported for this Change Request".into(),
-        ),
-        crate::remote::ProviderKind::Forgejo if details.check_contexts.is_empty() => Some(
-            "Forgejo required-check observations are not supported for this Change Request".into(),
-        ),
-        _ => None,
-    }
+    let _ = (provider, details);
+    // An authoritative empty observation means there are no checks, not that the provider lacks
+    // the capability. Unsupported or failed observations must carry explicit evidence.
+    None
 }
 
 fn output(
@@ -879,120 +955,6 @@ async fn resolve_threads(payload: ResolveThreadsPayload) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct TuiRemoteListPayload {
-    pub repository: std::path::PathBuf,
-    pub worktree: std::path::PathBuf,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct TuiRemoteBranchHeadPayload {
-    pub repository: std::path::PathBuf,
-    pub worktree: std::path::PathBuf,
-    pub remote: String,
-    pub branch: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct TuiRemoteCachePayload {
-    pub repository: std::path::PathBuf,
-    pub worktree: std::path::PathBuf,
-    pub branch: String,
-    pub force_details: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct TuiRemotePushPayload {
-    pub repository: std::path::PathBuf,
-    pub worktree: std::path::PathBuf,
-    pub branch: String,
-    pub expected: crate::remote::dispatcher::PushGuard,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct TuiRemotePushResult {
-    pub cache: crate::remote::WorkerPrCacheSnapshot,
-    pub create: Option<TuiRemoteCreatePreparation>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct TuiRemoteCreatePreparation {
-    pub source_push: crate::remote::dispatcher::PushGuard,
-    pub origin_repository: crate::remote::RemoteRepositoryId,
-    pub upstream_repository: Option<crate::remote::RemoteRepositoryId>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct TuiRemoteCreatePayload {
-    pub repository: std::path::PathBuf,
-    pub worktree: std::path::PathBuf,
-    pub branch: String,
-    pub body: String,
-    pub target_repository: crate::remote::RemoteRepositoryId,
-    pub source_push: crate::remote::dispatcher::PushGuard,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct TuiRemoteFetchPayload {
-    pub repository: std::path::PathBuf,
-    pub worktree: std::path::PathBuf,
-    pub branch: String,
-    pub summary: crate::remote::PrSummary,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct TuiRemoteResolvePayload {
-    pub repository: std::path::PathBuf,
-    pub worktree: std::path::PathBuf,
-    pub summary: crate::remote::PrSummary,
-    pub thread_ids: Vec<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct TuiRemoteReviewPayload {
-    pub repository: std::path::PathBuf,
-    pub worktree: std::path::PathBuf,
-    pub summary: crate::remote::PrSummary,
-    pub kind: crate::remote::ReviewSubmissionKind,
-    pub body: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct TuiRemoteMergePayload {
-    pub repository: std::path::PathBuf,
-    pub worktree: std::path::PathBuf,
-    pub change_request: crate::remote::CanonicalChangeRequestIdentity,
-    pub display_number: u64,
-    pub expected_head_sha: String,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum TuiRemoteMergeOutcome {
-    Merged,
-    Pending,
-    Uncertain,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "result", rename_all = "snake_case")]
-pub(crate) enum TuiRemoteMergeResult {
-    Accepted {
-        outcome: TuiRemoteMergeOutcome,
-        summary: Box<crate::remote::PrSummary>,
-    },
-    Rejected {
-        reason: String,
-    },
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct ResolveThreadsPayload {
-    subject: TriggerSubject,
-    observation_revision: String,
-    thread_ids: Vec<String>,
-}
-
 fn thread_revision(thread: &crate::remote::PrReviewComment) -> String {
     format!(
         "sha256:{:x}",
@@ -1028,20 +990,34 @@ fn classify_failure(reason: String) -> RemoteOperationFailure {
     let normalized = reason.to_ascii_lowercase();
     let retry_after_unix_ms = retry_after_delay_ms(&normalized)
         .map(|delay| crate::workflow::prompt_worker::now_unix_ms().saturating_add(delay));
-    let retryable = !normalized.contains("unsupported")
-        && !normalized.contains("not support")
-        && !normalized.contains("unauthorized")
-        && !normalized.contains("authentication")
-        && !normalized.contains("no open change request")
-        && !normalized.contains("different change request")
-        && !normalized.contains("change request head changed")
-        && !normalized.contains("detached head")
-        && !normalized.contains("configuration")
-        && !normalized.contains("canceled")
-        && !normalized.contains("cancelled");
+    // Dispatcher compatibility APIs still return display strings. Fail closed unless the retained
+    // classified metadata or a narrow transport allowlist explicitly proves the failure retryable.
+    let explicitly_retryable = normalized.contains("retry=retryable")
+        || normalized.contains("rate_limited")
+        || normalized.contains("timed out")
+        || normalized.contains("timeout")
+        || normalized.contains("transport");
+    let explicitly_permanent = normalized.contains("retry=not_retryable")
+        || normalized.contains("retry=unknown")
+        || normalized.contains("unsupported")
+        || normalized.contains("not support")
+        || normalized.contains("unauthorized")
+        || normalized.contains("authorization")
+        || normalized.contains("authentication")
+        || normalized.contains("validation")
+        || normalized.contains("conflict")
+        || normalized.contains("not_found")
+        || normalized.contains("no open change request")
+        || normalized.contains("different change request")
+        || normalized.contains("change request head changed")
+        || normalized.contains("detached head")
+        || normalized.contains("configuration");
     RemoteOperationFailure {
         reason,
-        retryable,
+        retryable: explicitly_retryable && !explicitly_permanent,
+        // Compatibility operations may perform more than one provider effect before returning an
+        // error. Without explicit pre-effect evidence, fail closed as uncertain for mutations.
+        mutation_disposition: RemoteMutationFailureDisposition::OutcomeUncertain,
         retry_after_unix_ms,
         rate_limit_reset_unix_ms: None,
     }
@@ -1058,6 +1034,17 @@ fn permanent(reason: String) -> RemoteOperationFailure {
     RemoteOperationFailure {
         reason,
         retryable: false,
+        mutation_disposition: RemoteMutationFailureDisposition::RejectedBeforeEffect,
+        retry_after_unix_ms: None,
+        rate_limit_reset_unix_ms: None,
+    }
+}
+
+fn uncertain(reason: String) -> RemoteOperationFailure {
+    RemoteOperationFailure {
+        reason,
+        retryable: false,
+        mutation_disposition: RemoteMutationFailureDisposition::OutcomeUncertain,
         retry_after_unix_ms: None,
         rate_limit_reset_unix_ms: None,
     }
@@ -1066,6 +1053,7 @@ fn permanent(reason: String) -> RemoteOperationFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workflow::remote_operation::TuiRemoteMergePayload;
 
     fn context(cycle: u64) -> TriggerContext {
         TriggerContext {
@@ -1134,6 +1122,15 @@ mod tests {
     }
 
     #[test]
+    fn post_effect_failures_are_classified_uncertain() {
+        let failure = uncertain("push destination changed while pushing".into());
+        assert_eq!(
+            failure.mutation_disposition,
+            RemoteMutationFailureDisposition::OutcomeUncertain
+        );
+    }
+
+    #[test]
     fn launch_head_is_checked_only_during_the_initial_observation_cycle() {
         assert_eq!(
             observation_subject(&context(1))
@@ -1159,6 +1156,20 @@ mod tests {
             !classify_failure("Change Request head changed before workflow observation".into())
                 .retryable
         );
+    }
+
+    #[test]
+    fn unclassified_failures_are_not_retried_without_positive_evidence() {
+        for reason in [
+            "provider authorization failed",
+            "validation failed",
+            "conflict",
+            "provider failed: retry=unknown",
+            "opaque provider failure",
+        ] {
+            assert!(!classify_failure(reason.into()).retryable, "{reason}");
+        }
+        assert!(classify_failure("provider transport timeout".into()).retryable);
     }
 
     #[test]

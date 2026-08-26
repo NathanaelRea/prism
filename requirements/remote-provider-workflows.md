@@ -100,9 +100,16 @@
 - **Behavior**: Merge uses squash by default and provider-enforced exact-head
   protection when available. If the provider cannot close the observation/
   mutation race, Prism refuses or requires an explicit risk decision.
-- **Behavior**: After provider-confirmed merge, local worktree cleanup remains an
-  explicit separate action. Automatic cleanup and remote branch deletion are not
-  part of stabilization.
+- **Behavior**: A provider-confirmed direct merge asks whether to delete the
+  exact Worktree Session immediately. Provider acceptance into a merge queue
+  asks whether to delete that session after a later provider-confirmed merge.
+  Declining either prompt keeps the worktree.
+- **Invariant**: Deferred cleanup is persisted for the exact Worktree Session and
+  only runs when its worktree path/incarnation, branch tip, and approved warning
+  set remain unchanged. Queue failure, failed CI, or provider queue removal
+  cancels deferred cleanup and returns the session to the active worktree list.
+  Remote branch deletion remains governed by the existing Worktrunk deletion
+  safety flow and is not a stabilization effect.
 
 ## Provider Exceptions
 

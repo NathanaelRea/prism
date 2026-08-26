@@ -105,7 +105,7 @@ impl Tui {
     }
 
     pub(crate) fn start_opencode_event_listeners(&mut self) {
-        if !self.tui_tick_active && !self.routing_tui_jobs {
+        if !self.tui_tick_active && !self.background.is_routing() {
             self.route_tui_job_messages();
         }
         let now = Instant::now();
@@ -242,12 +242,12 @@ impl Tui {
         &mut self,
         desired: &BTreeSet<OpencodeListenerKey>,
     ) -> BTreeSet<OpencodeListenerKey> {
-        for metadata in self.jobs.active_metadata() {
+        for metadata in self.background.active_metadata() {
             if metadata.kind == TuiJobKind::OpencodeListener
                 && let TuiJobKey::OpencodeListener(stream) = &metadata.key
                 && !desired.contains(stream)
             {
-                self.jobs.cancel(metadata.id);
+                self.background.cancel(metadata.id);
             }
         }
         desired
@@ -258,7 +258,7 @@ impl Tui {
     }
 
     pub(crate) fn poll_opencode_status(&mut self) -> bool {
-        if !self.tui_tick_active && !self.routing_tui_jobs {
+        if !self.tui_tick_active && !self.background.is_routing() {
             self.route_tui_job_messages();
         }
         let mut changed = false;
@@ -520,7 +520,7 @@ impl Tui {
 
     pub(crate) async fn abort_selected_opencode_session(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
         let Some(context) = self.selected_worktree_context() else {
             return Ok(());

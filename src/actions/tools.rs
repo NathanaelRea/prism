@@ -3,7 +3,7 @@ use super::*;
 impl Tui {
     pub(crate) async fn open_selected_repo_lazygit(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
         let context = self
             .selected_repo_context()
@@ -17,7 +17,7 @@ impl Tui {
 
     pub(crate) async fn open_selected_repo_terminal(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
         let context = self
             .selected_repo_context()

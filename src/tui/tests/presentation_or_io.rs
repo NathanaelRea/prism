@@ -50,6 +50,44 @@ async fn applying_pr_poll_result_does_no_io_on_tui_thread() {
     let repository = tui.repos[0].identity.clone();
     let session_key = tui.sessions[0].identity_key(&repository);
     let poll_started_at = Instant::now();
+    let mut marker_summary = test_pr_summary(false);
+    marker_summary.change_request_identity = Some(super::support::test_change_request_identity(
+        crate::remote::ProviderKind::GitHub,
+    ));
+    let marker_target = super::super::RemoteMutationTarget::Merge {
+        change_request: marker_summary.change_request_identity.clone().unwrap(),
+        expected_head_sha: marker_summary.head_sha.clone(),
+    };
+    let marker_operation =
+        crate::workflow::remote_operation::RemoteMutationOperation::TuiMergeChangeRequest(
+            crate::workflow::remote_operation::TuiRemoteMergePayload {
+                repository: temp.clone(),
+                worktree: temp.clone(),
+                change_request: marker_summary.change_request_identity.clone().unwrap(),
+                display_number: marker_summary.number,
+                expected_head_sha: marker_summary.head_sha.clone(),
+            },
+        );
+    tui.record_remote_mutation_reconciliation(
+        &super::super::TuiJobKey::Repository(repository.clone()),
+        99,
+        "uncertain remote mutation: test",
+        &marker_target,
+        Some(&super::super::RemoteMutationLedgerContext {
+            repository: temp.clone(),
+            worktree: temp.clone(),
+            request_id: "merge:test".to_string(),
+            operation: marker_operation,
+            subject: "test".to_string(),
+        }),
+    )
+    .unwrap();
+    let marker_persistence_deadline = Instant::now() + Duration::from_secs(1);
+    while tui.background.has_jobs() {
+        tui.route_tui_job_messages();
+        assert!(Instant::now() < marker_persistence_deadline);
+    }
+    marker_summary.merged = true;
     tui.sessions[0].pr.begin_summary_poll(poll_started_at);
     tui.repos[0].pr_summary_last_polled = Some(poll_started_at);
     tui.repos[0].pr_summary_poll_in_flight = true;
@@ -61,10 +99,10 @@ async fn applying_pr_poll_result_does_no_io_on_tui_thread() {
             capabilities: Some(crate::remote::Capabilities::for_provider(
                 crate::remote::ProviderKind::GitHub,
             )),
-            summaries: Ok(vec![test_pr_summary(false)]),
+            summaries: Ok(vec![marker_summary.clone()]),
             observations: Ok(vec![PrSummarySessionResult {
                 key: session_key,
-                summary: Some(test_pr_summary(false)),
+                summary: Some(marker_summary),
             }]),
             remote_branch_heads: BTreeMap::new(),
             refreshed: "now".to_string(),
@@ -378,7 +416,7 @@ async fn tmux_portal_resizes_once_for_unchanged_target_and_size() {
     let started = Instant::now();
     loop {
         tui.route_tui_job_messages_with_budget(1, Instant::now());
-        if tui.jobs.queue_stats().latest_depth == 1 {
+        if tui.background.queue_stats().latest_depth == 1 {
             break;
         }
         assert!(started.elapsed() < Duration::from_secs(1));

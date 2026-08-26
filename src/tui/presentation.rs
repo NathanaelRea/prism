@@ -2,14 +2,30 @@ use std::time::Instant;
 
 use crate::agent::AgentState;
 use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey};
-use crate::tui_runtime::TerminalRuntime;
+use crate::tui_runtime::TerminalDriver;
 use crate::view;
 use crate::workspace_state::CiState;
 
 use super::{GitAction, LeaderHint, PanelFocus, Tui, choice_list, worktree_updated_label};
 
+fn workflow_phase_label(phase: crate::PromptStepPhase) -> &'static str {
+    match phase {
+        crate::PromptStepPhase::Pending => "pending",
+        crate::PromptStepPhase::Checking => "checking",
+        crate::PromptStepPhase::Preparing | crate::PromptStepPhase::Prepared => "preparing",
+        crate::PromptStepPhase::RunningAgent => "running Agent",
+        crate::PromptStepPhase::AgentSucceeded | crate::PromptStepPhase::Finalizing => "finalizing",
+        crate::PromptStepPhase::Waiting => "waiting",
+        crate::PromptStepPhase::Satisfied => "satisfied",
+        crate::PromptStepPhase::Completed => "completed",
+        crate::PromptStepPhase::Failed => "failed",
+        crate::PromptStepPhase::Cancelled => "cancelled",
+        crate::PromptStepPhase::RecoveryRequired => "recovery required",
+    }
+}
+
 impl Tui {
-    pub(crate) fn draw(&mut self, runtime: &mut TerminalRuntime) -> Result<(), String> {
+    pub(crate) fn draw(&mut self, runtime: &mut dyn TerminalDriver) -> Result<(), String> {
         let input = crate::flight_recorder::take_input_for_frame();
         let started = Instant::now();
         self.tmux_portal_size =
@@ -60,71 +76,77 @@ impl Tui {
                 })
             })
             .collect::<Vec<_>>();
-        let worktrees = self
-            .visible_session_indices()
-            .into_iter()
-            .filter_map(|index| {
-                let session = self.sessions.get(index)?;
-                let repo_root = self
-                    .repos
-                    .get(session.repo_index)
-                    .map(|repo| repo.repo.root.display().to_string())
-                    .unwrap_or_default();
-                let repo_label = self
-                    .repos
-                    .get(session.repo_index)
-                    .map(|repo| repo.label.clone())
-                    .unwrap_or_else(|| session.repo_label.clone());
-                let snapshot_status = self
-                    .repos
-                    .get(session.repo_index)
-                    .and_then(|managed| self.workspace_repositories.get(&managed.identity))
-                    .and_then(|repository| {
-                        repository
-                            .worktrees
-                            .iter()
-                            .find(|worktree| worktree.identity.path == session.path)
-                    })
-                    .map(|worktree| worktree.git.label());
-                Some(view::WorktreeRow {
-                    session_index: index,
-                    repo_label,
-                    repo_root,
-                    worktree_path: session.path_display.clone(),
-                    branch: session.branch.clone(),
-                    visibility: session.visibility,
-                    kind: if self
+        let worktree_rows = |indices: Vec<usize>| {
+            indices
+                .into_iter()
+                .filter_map(|index| {
+                    let session = self.sessions.get(index)?;
+                    let repo_root = self
                         .repos
                         .get(session.repo_index)
-                        .is_some_and(|repo| repo.config.is_default_branch(&session.branch))
-                    {
-                        view::WorktreeKind::DefaultBranch
-                    } else if session.branch == "(detached)" {
-                        view::WorktreeKind::Detached
-                    } else {
-                        view::WorktreeKind::FeatureWorktree
-                    },
-                    agent_state: session.agent_state,
-                    status_label: snapshot_status.unwrap_or_else(|| session.status_label.clone()),
-                    pr: session.pr.clone(),
-                    wt_columns: session.wt_columns.clone(),
-                    development: self.repos.get(session.repo_index).and_then(|managed| {
-                        let key = session.identity_key(&managed.identity);
-                        let dev_server = managed.wt_facts.get(&key)?.dev_server.as_ref()?;
-                        Some(view::DevelopmentEnvironment {
-                            url: dev_server.url.clone(),
-                            listening: dev_server.listening,
-                            quality: view::DevelopmentEnvironmentQuality::from(&managed.wt_quality),
+                        .map(|repo| repo.repo.root.display().to_string())
+                        .unwrap_or_default();
+                    let repo_label = self
+                        .repos
+                        .get(session.repo_index)
+                        .map(|repo| repo.label.clone())
+                        .unwrap_or_else(|| session.repo_label.clone());
+                    let snapshot_status = self
+                        .repos
+                        .get(session.repo_index)
+                        .and_then(|managed| self.workspace_repositories.get(&managed.identity))
+                        .and_then(|repository| {
+                            repository
+                                .worktrees
+                                .iter()
+                                .find(|worktree| worktree.identity.path == session.path)
                         })
-                    }),
-                    updated_label: worktree_updated_label(session),
-                    unseen_comments: session.unseen_comments,
-                    prompt_summary: session.prompt_summary.clone(),
-                    classification: session.classification,
-                    selected: Some(index) == self.selected_worktree_index(),
+                        .map(|worktree| worktree.git.label());
+                    Some(view::WorktreeRow {
+                        session_index: index,
+                        repo_label,
+                        repo_root,
+                        worktree_path: session.path_display.clone(),
+                        branch: session.branch.clone(),
+                        visibility: session.visibility,
+                        kind: if self
+                            .repos
+                            .get(session.repo_index)
+                            .is_some_and(|repo| repo.config.is_default_branch(&session.branch))
+                        {
+                            view::WorktreeKind::DefaultBranch
+                        } else if session.branch == "(detached)" {
+                            view::WorktreeKind::Detached
+                        } else {
+                            view::WorktreeKind::FeatureWorktree
+                        },
+                        agent_state: session.agent_state,
+                        status_label: snapshot_status
+                            .unwrap_or_else(|| session.status_label.clone()),
+                        pr: session.pr.clone(),
+                        wt_columns: session.wt_columns.clone(),
+                        development: self.repos.get(session.repo_index).and_then(|managed| {
+                            let key = session.identity_key(&managed.identity);
+                            let dev_server = managed.wt_facts.get(&key)?.dev_server.as_ref()?;
+                            Some(view::DevelopmentEnvironment {
+                                url: dev_server.url.clone(),
+                                listening: dev_server.listening,
+                                quality: view::DevelopmentEnvironmentQuality::from(
+                                    &managed.wt_quality,
+                                ),
+                            })
+                        }),
+                        updated_label: worktree_updated_label(session),
+                        unseen_comments: session.unseen_comments,
+                        prompt_summary: session.prompt_summary.clone(),
+                        classification: session.classification,
+                        selected: Some(index) == self.selected_worktree_index(),
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
+                .collect::<Vec<_>>()
+        };
+        let worktrees = worktree_rows(self.visible_worktree_indices());
+        let merges = worktree_rows(self.visible_merge_indices());
         let selected_pr_identity = self.selected_repo_pr_identity();
         let repo_pr_summaries = self.current_repo_change_request_summaries();
         let repo_prs = self
@@ -172,6 +194,7 @@ impl Tui {
             status: self.status_rows(),
             repos,
             worktrees,
+            merges,
             repo_prs,
             current_repo_index: self.current_repo,
             selected_repo_label,
@@ -183,7 +206,11 @@ impl Tui {
             main_scroll: self.main_scroll,
             repo_main_view: self.repo_main_view,
             worktree_list_mode: self.worktree_list_mode,
-            mode_label: "normal",
+            mode_label: if std::env::var_os("PRISM_DEV").is_some() {
+                "DEV"
+            } else {
+                "normal"
+            },
             status_message: self.status_message.as_deref(),
             repo_filter: &self.repo_filter,
             worktree_filter: &self.worktree_filter,
@@ -266,7 +293,7 @@ impl Tui {
             can_pause: workflow.available_controls.pause,
             can_resume: workflow.available_controls.resume,
             can_cancel: workflow.available_controls.stop,
-            can_retry: workflow.available_controls.recover,
+            can_retry: workflow.available_controls.retry,
         })
     }
 
@@ -311,7 +338,7 @@ impl Tui {
     }
 
     pub(super) fn move_workflow_step_selection(&mut self, direction: isize) -> bool {
-        if self.focused_panel != PanelFocus::Worktrees {
+        if !self.is_worktree_session_panel() {
             return false;
         }
         let Some(dashboard) = self.current_workflow_dashboard() else {
@@ -334,12 +361,117 @@ impl Tui {
         true
     }
 
-    pub(super) fn handle_workflow_enter(&mut self) -> bool {
-        false
+    pub(super) fn handle_workflow_enter(
+        &mut self,
+        runtime: &mut dyn TerminalDriver,
+    ) -> Result<bool, String> {
+        if !self.main_focused || self.focused_panel != PanelFocus::Worktrees {
+            return Ok(false);
+        }
+        let Some(dashboard) = self.current_workflow_dashboard() else {
+            return Ok(false);
+        };
+        let Some(run) = dashboard.detail else {
+            return Ok(false);
+        };
+        let Some(selected) = dashboard.selected_step else {
+            return Ok(false);
+        };
+        let Some(step) = run.steps.iter().find(|step| step.key == selected) else {
+            return Ok(false);
+        };
+        let mut lines = vec![
+            view::DialogLine {
+                text: format!("workflow: {}", run.workflow_name),
+                attention: false,
+            },
+            view::DialogLine {
+                text: format!("run: {}", run.id),
+                attention: false,
+            },
+            view::DialogLine {
+                text: format!("status: {}", dashboard.status),
+                attention: false,
+            },
+            view::DialogLine {
+                text: format!(
+                    "progress: {}/{} steps",
+                    dashboard.completed_steps, dashboard.total_steps
+                ),
+                attention: false,
+            },
+            view::DialogLine {
+                text: format!(
+                    "Agent runs: {}/{}",
+                    run.agent_runs_consumed, run.max_agent_runs
+                ),
+                attention: false,
+            },
+            view::DialogLine {
+                text: String::new(),
+                attention: false,
+            },
+            view::DialogLine {
+                text: format!("stage: {}", step.key),
+                attention: false,
+            },
+            view::DialogLine {
+                text: format!("phase: {}", workflow_phase_label(step.phase)),
+                attention: matches!(
+                    step.phase,
+                    crate::PromptStepPhase::Failed | crate::PromptStepPhase::RecoveryRequired
+                ),
+            },
+        ];
+        if let Some(summary) = step.summary.as_deref() {
+            lines.push(view::DialogLine {
+                text: format!("summary: {summary}"),
+                attention: false,
+            });
+        }
+        if step.explicit_dependencies {
+            lines.push(view::DialogLine {
+                text: if step.dependencies.is_empty() {
+                    "dependencies: root".to_string()
+                } else {
+                    format!("dependencies: {}", step.dependencies.join(", "))
+                },
+                attention: false,
+            });
+        }
+        if let Some(wake) = step.wake_at_unix_ms {
+            lines.push(view::DialogLine {
+                text: format!("next check: {wake}"),
+                attention: false,
+            });
+        }
+        if let Some(error) = step
+            .attempts
+            .iter()
+            .rev()
+            .find_map(|attempt| attempt.error.as_deref())
+        {
+            lines.push(view::DialogLine {
+                text: format!("error: {error}"),
+                attention: true,
+            });
+        }
+        if let Some(final_text) = step.final_text() {
+            lines.push(view::DialogLine {
+                text: String::new(),
+                attention: false,
+            });
+            lines.push(view::DialogLine {
+                text: final_text.to_string(),
+                attention: false,
+            });
+        }
+        self.notice_dialog(runtime, "Workflow Details", lines)?;
+        Ok(true)
     }
 
     pub(super) fn tmux_portal_model(&self) -> Option<view::TmuxPortalModel<'_>> {
-        if self.focused_panel != PanelFocus::Worktrees {
+        if !self.is_worktree_session_panel() {
             return None;
         }
         let session = self.sessions.get(self.selected_worktree_index()?)?;
@@ -592,17 +724,19 @@ impl Tui {
                     view::KeyChoice::new("space/enter", "open default tmux"),
                 ],
             }),
-            (Some(LeaderHint::Root), PanelFocus::Worktrees) => Some(choice_list(
-                "Shortcuts",
-                &[
-                    ("g", "git actions"),
-                    ("w", "workflow actions"),
-                    ("c", "configuration"),
-                    ("0", "focus main"),
-                    ("enter", "terminal"),
-                    ("space", "agent if valid"),
-                ],
-            )),
+            (Some(LeaderHint::Root), PanelFocus::Worktrees | PanelFocus::Merges) => {
+                Some(choice_list(
+                    "Shortcuts",
+                    &[
+                        ("g", "git actions"),
+                        ("w", "workflow actions"),
+                        ("c", "configuration"),
+                        ("0", "focus main"),
+                        ("enter", "terminal"),
+                        ("space", "agent if valid"),
+                    ],
+                ))
+            }
             (Some(LeaderHint::Workflow), _) => Some(choice_list(
                 "Workflow Actions",
                 &[("a", "AI one-off"), ("w", "workflow picker")],
@@ -623,18 +757,20 @@ impl Tui {
                     view::KeyChoice::new("p", "pull default branch"),
                 ],
             }),
-            (Some(LeaderHint::Git), PanelFocus::Worktrees) => Some(view::ChoiceList {
-                title: "Git Actions".to_string(),
-                choices: vec![
-                    self.git_choice(GitAction::LazyGit, "g", "lazygit"),
-                    self.git_choice(GitAction::Push, "P", "push branch"),
-                    self.git_choice(GitAction::OpenPr, "o", "open PR"),
-                    self.git_choice(GitAction::Merge, "M", "merge via provider"),
-                    self.git_choice(GitAction::CiFix, "c", "CI repair"),
-                    self.git_choice(GitAction::ReviewFix, "f", "review repair"),
-                    self.git_choice(GitAction::ResolveAllComments, "R", "resolve all comments"),
-                ],
-            }),
+            (Some(LeaderHint::Git), PanelFocus::Worktrees | PanelFocus::Merges) => {
+                Some(view::ChoiceList {
+                    title: "Git Actions".to_string(),
+                    choices: vec![
+                        self.git_choice(GitAction::LazyGit, "g", "lazygit"),
+                        self.git_choice(GitAction::Push, "P", "push branch"),
+                        self.git_choice(GitAction::OpenPr, "o", "open PR"),
+                        self.git_choice(GitAction::Merge, "M", "merge via provider"),
+                        self.git_choice(GitAction::CiFix, "c", "CI repair"),
+                        self.git_choice(GitAction::ReviewFix, "f", "review repair"),
+                        self.git_choice(GitAction::ResolveAllComments, "R", "resolve all comments"),
+                    ],
+                })
+            }
             (None, _) => None,
         }
     }

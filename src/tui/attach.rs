@@ -4,7 +4,7 @@ use std::time::Instant;
 use crate::config::Config;
 use crate::session::Session;
 use crate::tmux::TmuxWindow;
-use crate::tui_runtime::TerminalRuntime;
+use crate::tui_runtime::TerminalDriver;
 use crate::view;
 
 use super::Tui;
@@ -66,7 +66,7 @@ impl Tui {
 
     pub(super) async fn enter_agent_mode(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
     ) -> Result<(), String> {
         if self.selected_worktree_context().is_none() {
             return Ok(());
@@ -79,7 +79,7 @@ impl Tui {
 
     pub(crate) async fn enter_agent_mode_for_index(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
         index: usize,
     ) -> Result<(), String> {
         self.prepare_worktree_harness_for_open(runtime, index)
@@ -112,7 +112,7 @@ impl Tui {
 
     pub(super) async fn prepare_worktree_harness_for_open(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
         index: usize,
     ) -> Result<(), String> {
         let Some(session) = self
@@ -218,7 +218,7 @@ impl Tui {
 
     pub(super) async fn open_tmux_window(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
         window: TmuxWindow,
     ) -> Result<(), String> {
         if self.selected >= self.sessions.len() {

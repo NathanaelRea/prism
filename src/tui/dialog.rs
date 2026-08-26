@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::process::{Command, ProcessPolicy, Stdin};
-use crate::tui_runtime::{RuntimeEvent, TerminalRuntime};
+use crate::tui_runtime::{RuntimeEvent, TerminalDriver};
 use crate::view;
 use crate::workspace_state::{InspectRequest, WorkspaceContext, WorkspaceState};
 
@@ -311,7 +311,7 @@ async fn pick_workflow_file(
 impl Tui {
     pub(super) fn show_keybindings_dialog(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
     ) -> Result<(), String> {
         let items = [
             "1 / 2 / 3    focus status / repos / worktrees sidebars; 3 toggles repo/all worktrees",
@@ -423,7 +423,7 @@ impl Tui {
 
     pub(crate) fn confirm_archive_dialog(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
         branch: &str,
         path: &str,
         warnings: &[String],
@@ -466,7 +466,7 @@ impl Tui {
 
     pub(crate) fn confirm_delete_dialog(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
         branch: &str,
         path: &str,
         warnings: &[String],
@@ -504,9 +504,58 @@ impl Tui {
         )
     }
 
+    pub(crate) fn confirm_deferred_merge_cleanup_dialog(
+        &mut self,
+        runtime: &mut dyn TerminalDriver,
+        branch: &str,
+        path: &str,
+        warnings: &[String],
+    ) -> Result<bool, String> {
+        let mut lines = vec![
+            view::DialogLine {
+                text: format!("branch: {branch}"),
+                attention: false,
+            },
+            view::DialogLine {
+                text: format!("path: {path}"),
+                attention: false,
+            },
+            view::DialogLine {
+                text: "Prism will wait for provider-confirmed merge before deleting.".to_string(),
+                attention: false,
+            },
+        ];
+        if warnings.is_empty() {
+            lines.push(view::DialogLine {
+                text: "No warnings detected.".to_string(),
+                attention: false,
+            });
+        } else {
+            for warning in warnings {
+                lines.push(view::DialogLine {
+                    text: warning.clone(),
+                    attention: true,
+                });
+            }
+        }
+        lines.push(view::DialogLine {
+            text:
+                "Deletion is canceled if the worktree, branch tip, or warnings change before merge."
+                    .to_string(),
+            attention: false,
+        });
+        self.confirm_dialog(
+            runtime,
+            "Delete After Merge",
+            lines,
+            "Delete this worktree after it merges?",
+            false,
+        )
+    }
+
     pub(crate) fn prompt_line_dialog(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
         title: &str,
         prompt: &str,
         initial: &str,
@@ -564,7 +613,7 @@ impl Tui {
 
     pub(crate) fn prompt_create_session_form(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
         catalog: &crate::harness::AgentSelectionOptions,
     ) -> Result<Option<CreateSessionInput>, String> {
         let mut fields = create_session_fields(catalog);
@@ -742,7 +791,7 @@ impl Tui {
 
     pub(crate) async fn prompt_workflow_input_form(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
         workflow: &crate::CompiledWorkflow,
         worktree: &Path,
         fzf: &str,
@@ -1012,7 +1061,7 @@ impl Tui {
 
     pub(crate) fn prompt_choice_dialog(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
         choices: view::ChoiceList,
     ) -> Result<Option<String>, String> {
         self.dialog = Some(view::DialogModel::Choice {
@@ -1060,7 +1109,7 @@ impl Tui {
 
     pub(crate) fn ordered_toggle_dialog(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
         title: &str,
         mut items: Vec<view::OrderedToggleItem>,
     ) -> Result<Option<Vec<String>>, String> {
@@ -1129,13 +1178,13 @@ impl Tui {
 
     pub(super) fn recovery_selection_dialog(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
         mut items: Vec<view::OrderedToggleItem>,
     ) -> Result<Option<Vec<String>>, String> {
         let mut selected = 0usize;
         loop {
             self.dialog = Some(view::DialogModel::OrderedToggle {
-                title: "Restart interrupted work".to_string(),
+                title: "Resolve interrupted work (selected = reconcile)".to_string(),
                 items: items.clone(),
                 selected,
                 reorderable: false,
@@ -1185,7 +1234,7 @@ impl Tui {
 
     pub(super) async fn offer_interrupted_run_recovery(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
     ) -> Result<(), String> {
         let state = WorkspaceState::open(WorkspaceContext {
             repo: None,
@@ -1250,16 +1299,44 @@ impl Tui {
             return Ok(());
         };
         let selected = selected.into_iter().collect::<BTreeSet<_>>();
-        let decisions = candidates
-            .iter()
-            .enumerate()
-            .map(
-                |(index, (_, workflow))| crate::workspace_state::RecoveryDecision {
-                    workflow: workflow.identity.clone(),
-                    restart: selected.contains(&index.to_string()),
-                },
-            )
-            .collect::<Vec<_>>();
+        let mut decisions = Vec::with_capacity(selected.len());
+        for (index, (_, workflow)) in candidates.iter().enumerate() {
+            if !selected.contains(&index.to_string()) {
+                continue;
+            }
+            let choices = view::ChoiceList {
+                title: format!("Recovery outcome for {}", workflow.identity.display_id),
+                choices: vec![
+                    view::KeyChoice::new("r", "rejected before effect; safely retry"),
+                    view::KeyChoice::new("a", "effect applied; close without replay"),
+                ],
+            };
+            let Some(outcome) = self.prompt_choice_dialog(runtime, choices)? else {
+                return Ok(());
+            };
+            let Some(evidence) = self.prompt_line_dialog(
+                runtime,
+                "Authoritative recovery evidence",
+                "Provider/event evidence: ",
+                "",
+            )?
+            else {
+                return Ok(());
+            };
+            if evidence.trim().is_empty() {
+                self.show_message("authoritative recovery evidence cannot be empty")?;
+                return Ok(());
+            }
+            let resolution = if outcome == "r" {
+                crate::RecoveryResolution::RejectedBeforeEffect { evidence }
+            } else {
+                crate::RecoveryResolution::Applied { evidence }
+            };
+            decisions.push(crate::workspace_state::RecoveryDecision {
+                workflow: workflow.identity.clone(),
+                resolution,
+            });
+        }
         let receipt = state.recover_batch(&decisions)?;
         if !receipt.warnings.is_empty() {
             self.show_message(&receipt.warnings.join("; "))?;
@@ -1269,7 +1346,7 @@ impl Tui {
 
     pub(crate) fn show_loading_dialog(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
         title: &str,
         message: &str,
     ) -> Result<(), String> {
@@ -1284,7 +1361,7 @@ impl Tui {
 
     pub(crate) fn wait_for_dialog_job<T>(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
         title: &str,
         message: &str,
         receiver: std::sync::mpsc::Receiver<T>,
@@ -1324,7 +1401,7 @@ impl Tui {
 
     pub(crate) fn confirm_dialog(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
         title: &str,
         lines: Vec<view::DialogLine>,
         prompt: &str,
@@ -1394,7 +1471,7 @@ impl Tui {
 
     pub(crate) fn confirm_action_dialog(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
         title: &str,
         message: &str,
         default: bool,
@@ -1404,7 +1481,7 @@ impl Tui {
 
     pub(crate) fn notice_dialog(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
         title: &str,
         lines: Vec<view::DialogLine>,
     ) -> Result<(), String> {

@@ -36,7 +36,7 @@ fn editor_command(path: &Path) -> Result<Command, String> {
 impl Tui {
     pub(crate) async fn select_default_harness(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
         let config = self.config.clone();
         let entries = harness_choice_entries(&config);
@@ -113,7 +113,7 @@ impl Tui {
 
     fn prompt_generic_harness(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
         config: &Config,
     ) -> Result<Option<(String, HarnessConfig)>, String> {
         let Some(id) = self.prompt_line_dialog(
@@ -239,7 +239,7 @@ impl Tui {
 
     pub(crate) async fn edit_config(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
         let context = self
             .selected_repo_context()
@@ -265,7 +265,7 @@ impl Tui {
 
     pub(crate) async fn edit_user_config(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
         let path = self
             .repos
@@ -301,7 +301,7 @@ impl Tui {
 
     pub(crate) async fn edit_worktrunk_user_config(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
         let context = self
             .selected_repo_context()
@@ -349,7 +349,7 @@ impl Tui {
                     title: "Worktrunk Configuration",
                     message: "Creating Worktrunk user config",
                     abandon_cancelable: false,
-                    mutation: None,
+                    effect: crate::tui::RemoteActionEffect::LocalMutation,
                 },
                 move |_| async move {
                     crate::worktrunk::create_user_config(&repo, &config)
@@ -381,7 +381,7 @@ impl Tui {
 
     fn discover_worktrunk_user_config(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
         context: &SelectedRepoContext,
     ) -> Result<crate::worktrunk::UserConfigLocation, String> {
         let repo = context.repo.clone();
@@ -395,7 +395,7 @@ impl Tui {
                 title: "Worktrunk Configuration",
                 message: "Locating Worktrunk user config",
                 abandon_cancelable: true,
-                mutation: None,
+                effect: crate::tui::RemoteActionEffect::ReadOnly,
             },
             move |_| async move {
                 crate::worktrunk::discover_user_config(&repo, &config)
@@ -412,7 +412,7 @@ impl Tui {
 
     pub(crate) fn edit_worktree_columns(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
         let context = self
             .selected_repo_context()
@@ -446,7 +446,7 @@ impl Tui {
 
     pub(crate) async fn add_repository(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
         let old_roots = self
             .repos
@@ -479,7 +479,7 @@ impl Tui {
 
     pub(crate) async fn edit_repositories(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
         let path = crate::workspace::repos_path();
         if !path.exists() {
@@ -535,7 +535,7 @@ impl Tui {
 
     pub(crate) async fn reorder_repositories(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
         let entries = crate::workspace::load_entries()?;
         let items = repository_order_choices(&entries);
@@ -591,7 +591,7 @@ impl Tui {
 
     pub(super) async fn offer_worktrunk_approval_if_pending(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
         repo: &Repository,
         config: &Config,
     ) -> Result<(), String> {
@@ -626,7 +626,7 @@ impl Tui {
 
     pub(super) async fn offer_worktrunk_approval(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
         repo: &Repository,
         config: &Config,
     ) -> Result<bool, String> {
@@ -676,6 +676,13 @@ impl Tui {
             repos.push(managed);
         }
         self.repos = repos;
+        self.background.retain_repositories(
+            &self
+                .repos
+                .iter()
+                .map(|managed| managed.identity.clone())
+                .collect(),
+        );
         crate::flight_recorder::register_repositories(
             self.repos.iter().map(|managed| &managed.repo),
         );
@@ -686,6 +693,7 @@ impl Tui {
             .map(|repo| repo.repo.root.clone());
         self.refresh_sessions().await?;
         self.sync_selected_repo_context();
+        self.load_remote_mutation_reconciliation_markers();
         Ok(())
     }
 }

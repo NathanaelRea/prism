@@ -41,6 +41,69 @@ pub(crate) struct DrawTiming {
     pub terminal: Duration,
 }
 
+/// Terminal interaction seam used by the dashboard controller.
+///
+/// Production uses [`TerminalRuntime`]. Tests can supply a scripted adapter to
+/// drive semantic commands without owning the process terminal.
+pub(crate) trait TerminalDriver {
+    fn draw(&mut self, model: &view::FrameModel<'_>) -> Result<DrawTiming, String>;
+    fn area(&self) -> Result<Rect, String>;
+    fn poll_event(&mut self, timeout: Duration) -> Result<Option<RuntimeEvent>, String>;
+    fn suspend(&mut self) -> Result<(), String>;
+    fn resume(&mut self) -> Result<(), String>;
+}
+
+pub(crate) fn suspend_for<T>(
+    runtime: &mut dyn TerminalDriver,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    runtime.suspend()?;
+    let away_started = Instant::now();
+    let result = operation();
+    let away = away_started.elapsed();
+    let resume_result = runtime.resume();
+    crate::flight_recorder::record(
+        "lifecycle",
+        "suspended_operation",
+        Some(away),
+        vec![
+            crate::flight_recorder::boolean("operation_success", result.is_ok()),
+            crate::flight_recorder::boolean("resume_success", resume_result.is_ok()),
+        ],
+    );
+    resume_result?;
+    result
+}
+
+impl dyn TerminalDriver + '_ {
+    pub(crate) async fn suspend_for_async<T, F>(&mut self, future: F) -> Result<T, String>
+    where
+        F: std::future::Future<Output = Result<T, String>>,
+    {
+        self.suspend()?;
+        let away_started = Instant::now();
+        let mut restore = AsyncRestore::new(self, resume_terminal_driver);
+        let result = future.await;
+        let away = away_started.elapsed();
+        let resume_result = restore.resume();
+        crate::flight_recorder::record(
+            "lifecycle",
+            "suspended_operation",
+            Some(away),
+            vec![
+                crate::flight_recorder::boolean("operation_success", result.is_ok()),
+                crate::flight_recorder::boolean("resume_success", resume_result.is_ok()),
+            ],
+        );
+        resume_result?;
+        result
+    }
+}
+
+fn resume_terminal_driver(runtime: &mut (dyn TerminalDriver + '_)) -> Result<(), String> {
+    runtime.resume()
+}
+
 impl TerminalRuntime {
     pub(crate) fn enter() -> Result<Self, String> {
         let backend = CrosstermBackend::new(io::stdout());
@@ -165,51 +228,6 @@ impl TerminalRuntime {
         result
     }
 
-    pub(crate) fn suspend_for<T>(
-        &mut self,
-        f: impl FnOnce() -> Result<T, String>,
-    ) -> Result<T, String> {
-        self.suspend()?;
-        let away_started = Instant::now();
-        let result = f();
-        let away = away_started.elapsed();
-        let resume_result = self.resume();
-        crate::flight_recorder::record(
-            "lifecycle",
-            "suspended_operation",
-            Some(away),
-            vec![
-                crate::flight_recorder::boolean("operation_success", result.is_ok()),
-                crate::flight_recorder::boolean("resume_success", resume_result.is_ok()),
-            ],
-        );
-        resume_result?;
-        result
-    }
-
-    pub(crate) async fn suspend_for_async<T, F>(&mut self, future: F) -> Result<T, String>
-    where
-        F: std::future::Future<Output = Result<T, String>>,
-    {
-        self.suspend()?;
-        let away_started = Instant::now();
-        let mut restore = AsyncRestore::new(self, TerminalRuntime::resume);
-        let result = future.await;
-        let away = away_started.elapsed();
-        let resume_result = restore.resume();
-        crate::flight_recorder::record(
-            "lifecycle",
-            "suspended_operation",
-            Some(away),
-            vec![
-                crate::flight_recorder::boolean("operation_success", result.is_ok()),
-                crate::flight_recorder::boolean("resume_success", resume_result.is_ok()),
-            ],
-        );
-        resume_result?;
-        result
-    }
-
     fn activate_terminal(&mut self, clear: bool) -> Result<(), String> {
         if self.active || self.keyboard_enhancement_active || self.raw_mode_active {
             self.leave_active_terminal(false)?;
@@ -296,13 +314,13 @@ impl TerminalRuntime {
     }
 }
 
-struct AsyncRestore<'a, T> {
+struct AsyncRestore<'a, T: ?Sized> {
     target: &'a mut T,
     restore: fn(&mut T) -> Result<(), String>,
     armed: bool,
 }
 
-impl<'a, T> AsyncRestore<'a, T> {
+impl<'a, T: ?Sized> AsyncRestore<'a, T> {
     fn new(target: &'a mut T, restore: fn(&mut T) -> Result<(), String>) -> Self {
         Self {
             target,
@@ -320,11 +338,33 @@ impl<'a, T> AsyncRestore<'a, T> {
     }
 }
 
-impl<T> Drop for AsyncRestore<'_, T> {
+impl<T: ?Sized> Drop for AsyncRestore<'_, T> {
     fn drop(&mut self) {
         if self.armed {
             let _ = (self.restore)(self.target);
         }
+    }
+}
+
+impl TerminalDriver for TerminalRuntime {
+    fn draw(&mut self, model: &view::FrameModel<'_>) -> Result<DrawTiming, String> {
+        TerminalRuntime::draw(self, model)
+    }
+
+    fn area(&self) -> Result<Rect, String> {
+        TerminalRuntime::area(self)
+    }
+
+    fn poll_event(&mut self, timeout: Duration) -> Result<Option<RuntimeEvent>, String> {
+        TerminalRuntime::poll_event(self, timeout)
+    }
+
+    fn suspend(&mut self) -> Result<(), String> {
+        TerminalRuntime::suspend(self)
+    }
+
+    fn resume(&mut self) -> Result<(), String> {
+        TerminalRuntime::resume(self)
     }
 }
 

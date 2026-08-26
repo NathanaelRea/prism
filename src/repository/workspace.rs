@@ -73,7 +73,7 @@ pub fn load_entries() -> Result<Vec<RepoEntry>, String> {
     load_entries_from_path(&repos_path())
 }
 
-fn load_entries_from_path(path: &Path) -> Result<Vec<RepoEntry>, String> {
+pub(crate) fn load_entries_from_path(path: &Path) -> Result<Vec<RepoEntry>, String> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),

@@ -67,7 +67,7 @@ fn test_config_dir(root: &Path) -> Option<PathBuf> {
     test_config_dirs().lock().ok()?.get(root).cloned()
 }
 
-fn prism_repo_dir(root: &Path, config_dir: &Path) -> PathBuf {
+pub(crate) fn prism_repo_dir(root: &Path, config_dir: &Path) -> PathBuf {
     let repo_name = root
         .file_name()
         .and_then(|name| name.to_str())

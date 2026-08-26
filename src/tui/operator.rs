@@ -4,7 +4,7 @@ use crate::process::{Command, ProcessPolicy, Stdin};
 
 use crossterm::event::{KeyCode, KeyEventKind};
 
-use crate::tui_runtime::{RuntimeEvent, TerminalRuntime};
+use crate::tui_runtime::{RuntimeEvent, TerminalDriver};
 use crate::view;
 
 use super::Tui;
@@ -18,7 +18,7 @@ struct WorkflowControlRequest {
 impl Tui {
     pub(super) async fn create_ai_workflow(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
     ) -> Result<(), String> {
         let Some(session_index) = self.selected_worktree_index() else {
             return self
@@ -214,7 +214,7 @@ impl Tui {
 
     pub(super) async fn control_selected_workflow(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
         requested: &str,
     ) -> Result<bool, String> {
         let Some(dashboard) = self.current_workflow_dashboard() else {
@@ -256,24 +256,22 @@ impl Tui {
     /// Open one flat, hot-discovered Workflow picker. Enter runs and Ctrl-E edits.
     pub(super) async fn launch_workflow(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
     ) -> Result<(), String> {
         let global = crate::util::prism_config_dir();
         let local = self.repo.root.join(".prism");
-        let repository_trusted =
-            crate::repository_resources_are_trusted(&global, &self.repo.root, &local)
-                .map_err(|error| error.to_string())?;
-        let catalog = runtime.suspend_for(|| {
-            crate::PromptWorkflowCatalog::discover(&global, Some(&local), repository_trusted)
+        let snapshot = crate::RepositoryResourceSnapshot::capture(&local)
+            .map_err(|error| error.to_string())?;
+        let repository_has_resources = !snapshot.is_empty();
+        let repository = crate::trusted_repository_resources(&global, &self.repo.root, snapshot)
+            .map_err(|error| error.to_string())?;
+        let catalog = crate::tui_runtime::suspend_for(runtime, || {
+            crate::PromptWorkflowCatalog::discover(&global, repository.as_ref())
                 .map_err(format_diagnostics)
         })?;
         let candidates = catalog.list();
         if candidates.is_empty() {
-            if !repository_trusted
-                && crate::repository_resource_revision(&local)
-                    .map_err(|error| error.to_string())?
-                    .is_some()
-            {
+            if repository.is_none() && repository_has_resources {
                 return self.show_message(
                     "repository Workflow resources are untrusted; preview `prism workflow trust-repository` before applying trust",
                 );
@@ -336,7 +334,7 @@ impl Tui {
 
     pub(super) async fn launch_stabilization_workflow(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
     ) -> Result<(), String> {
         let executable = std::env::current_exe().map_err(|error| error.to_string())?;
         let (worktree, change_request) = self.selected_workflow_subject();
@@ -355,7 +353,7 @@ impl Tui {
 
     pub(super) async fn show_configuration_tree(
         &mut self,
-        runtime: &mut TerminalRuntime,
+        runtime: &mut dyn TerminalDriver,
     ) -> Result<(), String> {
         let choices = view::ChoiceList {
             title: "Configuration".into(),
@@ -384,7 +382,7 @@ impl Tui {
 }
 
 async fn edit_draft_source(
-    runtime: &mut TerminalRuntime,
+    runtime: &mut dyn TerminalDriver,
     draft_path: &std::path::Path,
     source: &mut String,
 ) -> Result<(), String> {

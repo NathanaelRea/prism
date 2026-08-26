@@ -264,6 +264,7 @@ pub(crate) async fn spawn_streaming_configured(
         stdout_capture.clone(),
         stderr_capture.clone(),
         descriptor,
+        true,
     )
     .await?;
     Ok(StreamingProcess {
@@ -301,6 +302,7 @@ pub async fn spawn_owned(
         stdout,
         stderr,
         descriptor,
+        false,
     )
     .await
 }
@@ -315,10 +317,27 @@ async fn start_actor(
     stdout: BoundedCapture,
     stderr: BoundedCapture,
     descriptor: ProcessDescriptor,
+    pump_output: bool,
 ) -> Result<ProcessControl, String> {
     let started = Instant::now();
     let program = command.program().to_string_lossy().into_owned();
-    let process = match command.start().await {
+    // Keep the containment group separate from the live handle so the actor can
+    // tear down surviving descendants as soon as the leader exits, before
+    // inherited stdout/stderr descriptors are drained.
+    let group = match processkit::ProcessGroup::new() {
+        Ok(group) => group,
+        Err(error) => {
+            if let Some(forwarder) = cancellation_forwarder {
+                forwarder.abort();
+                let _ = forwarder.await;
+            }
+            return Err(format!(
+                "create {} process group for '{program}': {error}",
+                descriptor.name
+            ));
+        }
+    };
+    let process = match group.start(&command).await {
         Ok(process) => process,
         Err(error) => {
             if let Some(forwarder) = cancellation_forwarder {
@@ -367,7 +386,41 @@ async fn start_actor(
     let finish_sender = completion_sender.clone();
     let finish_termination = Arc::clone(&termination);
     tokio::spawn(async move {
-        let result = process.finish().await;
+        let mut process = process;
+        // `events` starts bounded pumps for both output streams and arms the
+        // command deadline. `wait_any` then observes the leader's exit without
+        // waiting for descendant-held pipe descriptors. Once the leader is
+        // reaped, kill the remaining private group before joining the pumps.
+        let result = if pump_output {
+            match process.events() {
+                Ok(events) => {
+                    let leader = processkit::wait_any(&mut [&mut process]).await;
+                    let killed = group.kill_all();
+                    drop(events);
+                    match killed {
+                        Ok(()) => match (leader, process.finish().await) {
+                            (Err(error), _) => Err(error),
+                            (Ok(_), finished) => finished,
+                        },
+                        Err(error) => Err(error),
+                    }
+                }
+                Err(error) => {
+                    let _ = group.kill_all();
+                    Err(error)
+                }
+            }
+        } else {
+            // Owned processes need no output pumps. Let ProcessKit enforce the
+            // configured deadline/cancellation while waiting for the leader,
+            // then tear down any surviving members of the private group.
+            let finished = process.finish().await;
+            let killed = group.kill_all();
+            match (finished, killed) {
+                (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+                (Ok(finished), Ok(())) => Ok(finished),
+            }
+        };
         if let Some(forwarder) = cancellation_forwarder {
             forwarder.abort();
             let _ = forwarder.await;

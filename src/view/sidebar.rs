@@ -5,10 +5,11 @@ pub(super) fn render_sidebar(
     area: Rect,
     model: &crate::view::FrameModel<'_>,
 ) {
-    let (status, repos, worktrees) = sidebar_areas(area);
+    let (status, repos, worktrees, merges) = sidebar_areas(area, model.focus);
     render_status(frame, status, model);
     render_repos(frame, repos, model);
     render_worktrees(frame, worktrees, model);
+    render_merges(frame, merges, model);
 }
 
 pub(super) fn render_status(
@@ -193,24 +194,65 @@ const WORKTREE_BRANCH_MIN_WIDTH: usize = 12;
 const WORKTREE_BRANCH_MAX_WIDTH: usize = 32;
 const WORKTREE_FIXED_WIDTH: usize = 20;
 
+struct WorktreePanelSpec {
+    focus: PanelFocus,
+    key: &'static str,
+    label: &'static str,
+    empty: &'static str,
+    no_match: &'static str,
+}
+
+const WORKTREES_PANEL: WorktreePanelSpec = WorktreePanelSpec {
+    focus: PanelFocus::Worktrees,
+    key: "3",
+    label: "Worktrees",
+    empty: "no worktrees",
+    no_match: "no worktree matches",
+};
+
+const MERGES_PANEL: WorktreePanelSpec = WorktreePanelSpec {
+    focus: PanelFocus::Merges,
+    key: "4",
+    label: "Merges",
+    empty: "no merges",
+    no_match: "no merge matches",
+};
+
 pub(super) fn render_worktrees(
     frame: &mut Frame<'_>,
     area: Rect,
     model: &crate::view::FrameModel<'_>,
 ) {
-    let rows = if model.worktrees.is_empty() {
+    render_worktree_panel(frame, area, model, &model.worktrees, &WORKTREES_PANEL);
+}
+
+pub(super) fn render_merges(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    model: &crate::view::FrameModel<'_>,
+) {
+    render_worktree_panel(frame, area, model, &model.merges, &MERGES_PANEL);
+}
+
+fn render_worktree_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    model: &crate::view::FrameModel<'_>,
+    worktrees: &[crate::view::WorktreeRow],
+    panel: &WorktreePanelSpec,
+) {
+    let rows = if worktrees.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
             if model.worktree_filter.is_empty() {
-                "no worktrees"
+                panel.empty
             } else {
-                "no worktree matches"
+                panel.no_match
             },
             muted_style(),
         )))]
     } else {
         let repo_mode = model.worktree_list_mode == WorktreeListMode::Repo;
-        let repo_width = model
-            .worktrees
+        let repo_width = worktrees
             .iter()
             .map(|worktree| worktree.repo_label.chars().count())
             .max()
@@ -230,7 +272,7 @@ pub(super) fn render_worktrees(
             branch_width,
             &configured_column_widths,
         )];
-        rows.extend(model.worktrees.iter().map(|worktree| {
+        rows.extend(worktrees.iter().map(|worktree| {
             let mut spans = Vec::new();
             if !repo_mode {
                 spans.push(Span::styled(
@@ -266,7 +308,7 @@ pub(super) fn render_worktrees(
                     ));
                 }
             }
-            let focused = model.focus == PanelFocus::Worktrees && !model.main_focused;
+            let focused = model.focus == panel.focus && !model.main_focused;
             ListItem::new(Line::from(spans)).style(if worktree.selected {
                 selected_sidebar_row_style(focused)
             } else {
@@ -275,8 +317,8 @@ pub(super) fn render_worktrees(
         }));
         rows
     };
-    let focused = model.focus == PanelFocus::Worktrees && !model.main_focused;
-    let mut title = panel_title("3", "Worktrees", focused);
+    let focused = model.focus == panel.focus && !model.main_focused;
+    let mut title = panel_title(panel.key, panel.label, focused);
     title.push_span(Span::raw(" "));
     for (index, (mode, label)) in [
         (WorktreeListMode::Global, "all"),
@@ -303,8 +345,7 @@ pub(super) fn render_worktrees(
             muted_style(),
         ));
     }
-    let selected_row = model
-        .worktrees
+    let selected_row = worktrees
         .iter()
         .position(|worktree| worktree.selected)
         .map(|row| row as u16 + 1);

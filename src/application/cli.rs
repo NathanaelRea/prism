@@ -1,6 +1,7 @@
+use super::dev_install;
 use crate::args::{
     self, AgentCommand, Args, CommandKind, ConfigCommand, DaemonCommand, DbCommand, DebugCommand,
-    InspectOptions, StatusOptions, WorkerCommand,
+    InspectOptions, RecoverOptions, StatusOptions, WorkerCommand,
 };
 use crate::config::Config;
 use crate::observability::{self, LogLevel, ObserverOptions};
@@ -20,7 +21,28 @@ pub fn run() -> Pin<Box<dyn Future<Output = Result<(), String>>>> {
 }
 
 async fn run_inner() -> Result<(), String> {
+    let _dev_install_reader = dev_install::reader_lease_from_environment()?;
     let args = Args::parse(std::env::args_os().skip(1))?;
+    if let CommandKind::PrepareDevState {
+        source,
+        destination,
+    } = &args.command
+    {
+        let summary = dev_install::prepare(source, destination)?;
+        println!(
+            "Prepared development state at {}: {} repository database(s) ({} copied), Workflow database {}, {} nonterminal Workflow run(s) omitted",
+            destination.display(),
+            summary.repository_databases,
+            summary.copied_repository_databases,
+            if summary.copied_workflow_database {
+                "copied"
+            } else {
+                "created"
+            },
+            summary.removed_nonterminal_workflows,
+        );
+        return Ok(());
+    }
     if let CommandKind::Debug(DebugCommand::Record(options)) = &args.command {
         let repo = load_integrity_repo_context(args.repo.as_deref()).await?;
         eprintln!(
@@ -93,18 +115,19 @@ async fn run_inner() -> Result<(), String> {
             run_db_command(command, &repo).await
         }
         CommandKind::Worker(command) => run_worker_command(command).await,
+        CommandKind::PrepareDevState { .. } => unreachable!("handled before logging setup"),
         CommandKind::List(options) => run_list_command(args.repo.as_deref(), options).await,
         CommandKind::Status(options) => run_status_command(args.repo.as_deref(), options).await,
         CommandKind::Pause(selector) => {
-            run_control_command(args.repo.as_deref(), ControlAction::Pause, selector).await
+            run_control_command(args.repo.as_deref(), ControlAction::Pause, selector, None).await
         }
         CommandKind::Resume(selector) => {
-            run_control_command(args.repo.as_deref(), ControlAction::Resume, selector).await
+            run_control_command(args.repo.as_deref(), ControlAction::Resume, selector, None).await
         }
         CommandKind::Stop(selector) => {
-            run_control_command(args.repo.as_deref(), ControlAction::Stop, selector).await
+            run_control_command(args.repo.as_deref(), ControlAction::Stop, selector, None).await
         }
-        CommandKind::Recover(selector) => run_recover_command(args.repo.as_deref(), selector).await,
+        CommandKind::Recover(options) => run_recover_command(args.repo.as_deref(), options).await,
         CommandKind::Daemon(command) => run_daemon_command(command),
         CommandKind::Tui => run_tui(args.repo.as_deref()).await,
     };
@@ -297,10 +320,15 @@ async fn run_control_command(
     repo: Option<&std::path::Path>,
     action: ControlAction,
     selector: Option<String>,
+    recovery_resolution: Option<crate::RecoveryResolution>,
 ) -> Result<(), String> {
     let receipt = workspace_state(repo)
         .await?
-        .control(ControlRequest { action, selector })
+        .control(ControlRequest {
+            action,
+            selector,
+            recovery_resolution,
+        })
         .await?;
     println!(
         "workflow = {}\nstate = {}",
@@ -314,10 +342,20 @@ async fn run_control_command(
 
 async fn run_recover_command(
     repo: Option<&std::path::Path>,
-    selector: Option<String>,
+    options: RecoverOptions,
 ) -> Result<(), String> {
-    if selector.is_some() {
-        return run_control_command(repo, ControlAction::Recover, selector).await;
+    if options.selector.is_some() {
+        let resolution = recovery_resolution(options.outcome, options.evidence)?;
+        return run_control_command(
+            repo,
+            ControlAction::Recover,
+            options.selector,
+            Some(resolution),
+        )
+        .await;
+    }
+    if options.outcome.is_some() || options.evidence.is_some() {
+        return Err("recover outcome and evidence require a workflow selector".to_string());
     }
     let snapshot = workspace_state(repo)
         .await?
@@ -352,6 +390,25 @@ async fn run_recover_command(
         }
     }
     Ok(())
+}
+
+fn recovery_resolution(
+    outcome: Option<String>,
+    evidence: Option<String>,
+) -> Result<crate::RecoveryResolution, String> {
+    let evidence = evidence
+        .filter(|evidence| !evidence.trim().is_empty())
+        .ok_or_else(|| "recover requires --evidence <authoritative-evidence>".to_string())?;
+    match outcome.as_deref() {
+        Some("rejected-before-effect") => {
+            Ok(crate::RecoveryResolution::RejectedBeforeEffect { evidence })
+        }
+        Some("applied") => Ok(crate::RecoveryResolution::Applied { evidence }),
+        Some(other) => Err(format!(
+            "unknown recovery outcome '{other}'; expected rejected-before-effect or applied"
+        )),
+        None => Err("recover requires --outcome rejected-before-effect|applied".to_string()),
+    }
 }
 
 fn run_daemon_command(command: DaemonCommand) -> Result<(), String> {
@@ -576,10 +633,11 @@ fn print_subject(snapshot: &WorkspaceSnapshot, subject: &Subject) {
                 println!("step = {} ({})", step.label, step.state.label());
             }
             println!(
-                "controls = pause:{} resume:{} stop:{} recover:{}",
+                "controls = pause:{} resume:{} stop:{} retry:{} recover:{}",
                 workflow.available_controls.pause,
                 workflow.available_controls.resume,
                 workflow.available_controls.stop,
+                workflow.available_controls.retry,
                 workflow.available_controls.recover
             );
         }

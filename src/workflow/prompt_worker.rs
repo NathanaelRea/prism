@@ -4,18 +4,20 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::remote::request_coordinator::{
-    ObservationFreshness, RemoteCoordinatorConfig, RemoteMutationRequest, RemoteMutationResult,
-    RemoteObservationKey, RemoteObservationResult, RemotePriority, RemoteRequestCoordinator,
-    SystemRemoteClock,
+    ObservationFreshness, RemoteCoordinatorConfig, RemoteMutationReconciliation,
+    RemoteMutationRequest, RemoteMutationResult, RemoteObservationKey, RemoteObservationResult,
+    RemotePriority, RemoteRequestCoordinator, SystemRemoteClock,
 };
 
 use crate::persistence::remote_coordinator::SqliteRemoteCoordinatorStore;
+use crate::persistence::workflow_kernel::DurableWorkflowRunStore;
 
 use super::agent_phase::HarnessAgentExecutor;
 use super::kernel::{
-    DurableWorkflowRunStore, SchedulerProgress, StartPromptWorkflow, WorkflowKernelError,
+    RecoveryResolution, SchedulerProgress, StartPromptWorkflow, WorkflowKernelError,
     WorkflowRunState, WorkflowRunStore, WorkflowScheduler,
 };
+use super::remote_operation::{RemoteMutationOperation, RemoteObservationOperation};
 use super::source::CompiledWorkflow;
 use super::standard_remote::{PrismProviderExecutor, ProductionStandardTriggerRemote};
 use super::standard_triggers::{
@@ -139,13 +141,21 @@ impl PromptWorkflowService {
         &self,
         repository: &Path,
         worktree: &Path,
-        operation: String,
+        operation: RemoteObservationOperation,
         subject: String,
-        payload: serde_json::Value,
     ) -> Result<RemoteObservationResult<serde_json::Value>, String> {
-        let lane = super::standard_remote::lane_for_remote_paths(repository, worktree).await?;
-        let key = RemoteObservationKey::new(lane, operation, subject)
-            .map_err(|error| error.to_string())?;
+        let (repository, worktree) = super::remote_operation::validate_envelope_paths(
+            repository,
+            worktree,
+            operation.paths(),
+        )
+        .await?;
+        let lane = super::standard_remote::lane_for_remote_paths(&repository, &worktree).await?;
+        let label = operation.label();
+        let payload =
+            serde_json::to_value(&operation).map_err(|error| error.to_string())?["payload"].clone();
+        let key =
+            RemoteObservationKey::new(lane, label, subject).map_err(|error| error.to_string())?;
         self.coordinator
             .observe(
                 key,
@@ -162,20 +172,73 @@ impl PromptWorkflowService {
         repository: &Path,
         worktree: &Path,
         request_id: String,
-        operation: String,
+        operation: RemoteMutationOperation,
         subject: String,
-        payload: serde_json::Value,
     ) -> Result<RemoteMutationResult<serde_json::Value>, String> {
-        let lane = super::standard_remote::lane_for_remote_paths(repository, worktree).await?;
+        let (repository, worktree) = super::remote_operation::validate_envelope_paths(
+            repository,
+            worktree,
+            operation.paths(),
+        )
+        .await?;
+        let lane = super::standard_remote::lane_for_remote_paths(&repository, &worktree).await?;
+        let request_id = super::remote_operation::namespaced_mutation_request_id(
+            &repository,
+            &subject,
+            &request_id,
+        );
+        let label = operation.label();
+        let payload =
+            serde_json::to_value(&operation).map_err(|error| error.to_string())?["payload"].clone();
         self.coordinator
             .mutate(RemoteMutationRequest {
                 lane,
                 request_id,
-                operation,
+                operation: label.to_string(),
                 subject,
                 priority: RemotePriority::InteractiveMutation,
                 payload,
             })
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) async fn reconcile_remote_mutation(
+        &self,
+        repository: &Path,
+        worktree: &Path,
+        request_id: String,
+        operation: RemoteMutationOperation,
+        subject: String,
+        reconciliation: RemoteMutationReconciliation,
+    ) -> Result<(), String> {
+        let (repository, worktree) = super::remote_operation::validate_envelope_paths(
+            repository,
+            worktree,
+            operation.paths(),
+        )
+        .await?;
+        let lane = super::standard_remote::lane_for_remote_paths(&repository, &worktree).await?;
+        let request_id = super::remote_operation::namespaced_mutation_request_id(
+            &repository,
+            &subject,
+            &request_id,
+        );
+        let label = operation.label();
+        let payload =
+            serde_json::to_value(&operation).map_err(|error| error.to_string())?["payload"].clone();
+        self.coordinator
+            .reconcile_mutation(
+                &RemoteMutationRequest {
+                    lane,
+                    request_id,
+                    operation: label.to_string(),
+                    subject,
+                    priority: RemotePriority::InteractiveMutation,
+                    payload,
+                },
+                reconciliation,
+            )
             .await
             .map_err(|error| error.to_string())
     }
@@ -232,6 +295,21 @@ impl PromptWorkflowService {
         self.store.list_runs(repository, limit).await
     }
 
+    pub(crate) async fn list_page(
+        &self,
+        repository: Option<&Path>,
+        page_size: usize,
+        cursor: Option<&crate::persistence::workflow_kernel::WorkflowRunCursor>,
+    ) -> Result<crate::persistence::workflow_kernel::WorkflowRunPage, WorkflowKernelError> {
+        self.store
+            .list_runs_page(repository, page_size, cursor)
+            .await
+    }
+
+    pub(crate) async fn active_count(&self) -> Result<usize, WorkflowKernelError> {
+        self.store.active_run_count().await
+    }
+
     pub async fn inspect(
         &self,
         run_id: &str,
@@ -253,6 +331,19 @@ impl PromptWorkflowService {
 
     pub async fn retry(&self, run_id: &str, now: i64) -> Result<(), WorkflowKernelError> {
         self.scheduler.retry(run_id, now).await
+    }
+
+    pub async fn recover(
+        &self,
+        run_id: &str,
+        now: i64,
+        resolution: RecoveryResolution,
+    ) -> Result<(), WorkflowKernelError> {
+        self.scheduler.recover(run_id, now, resolution).await
+    }
+
+    pub async fn discard(&self, run_id: &str, now: i64) -> Result<(), WorkflowKernelError> {
+        self.scheduler.discard(run_id, now).await
     }
 
     pub fn database_path() -> PathBuf {
@@ -320,7 +411,7 @@ mod tests {
         std::fs::create_dir_all(root.join("triggers")).unwrap();
         let executable = root.join("triggers/custom");
         std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
-        let triggers = super::super::source::TriggerCatalog::discover(&root, None, false).unwrap();
+        let triggers = super::super::source::TriggerCatalog::discover(&root, None).unwrap();
         let workflow = super::super::source::compile_workflow(
             std::path::Path::new("custom.toml"),
             "[[step]]\ntrigger='custom'\nprompt='run'\n",

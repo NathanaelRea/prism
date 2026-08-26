@@ -479,6 +479,14 @@ impl TriggerSnapshotStore {
 
     pub fn retain(&self, executable: &Path) -> Result<TriggerExecutableSnapshot, TriggerError> {
         let bytes = std::fs::read(executable).map_err(TriggerError::Io)?;
+        self.retain_bytes(executable, &bytes)
+    }
+
+    pub fn retain_bytes(
+        &self,
+        executable: &Path,
+        bytes: &[u8],
+    ) -> Result<TriggerExecutableSnapshot, TriggerError> {
         #[cfg(unix)]
         if !bytes.starts_with(b"#!") {
             return Err(TriggerError::Protocol(format!(
@@ -497,7 +505,7 @@ impl TriggerSnapshotStore {
                 executable.display()
             )));
         }
-        let digest = format!("sha256:{:x}", Sha256::digest(&bytes));
+        let digest = format!("sha256:{:x}", Sha256::digest(bytes));
         #[cfg(unix)]
         let path = self.root.join(digest.trim_start_matches("sha256:"));
         #[cfg(windows)]
@@ -517,12 +525,15 @@ impl TriggerSnapshotStore {
             #[cfg(windows)]
             crate::system::windows_security::secure_path(&self.root, true)
                 .map_err(TriggerError::Io)?;
+            static TEMPORARY_SEQUENCE: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(1);
             let temporary = self.root.join(format!(
-                ".{}-{}.tmp",
+                ".{}-{}-{}.tmp",
                 digest.trim_start_matches("sha256:"),
-                std::process::id()
+                std::process::id(),
+                TEMPORARY_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ));
-            std::fs::write(&temporary, &bytes).map_err(TriggerError::Io)?;
+            std::fs::write(&temporary, bytes).map_err(TriggerError::Io)?;
             #[cfg(unix)]
             std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o700))
                 .map_err(TriggerError::Io)?;
@@ -565,7 +576,11 @@ pub fn pin_workflow_triggers(
         let Some(executable) = &trigger.executable else {
             continue;
         };
-        let snapshot = store.retain(executable)?;
+        let snapshot = if let Some(bytes) = trigger.captured_bytes.take() {
+            store.retain_bytes(executable, &bytes)?
+        } else {
+            store.retain(executable)?
+        };
         if snapshot.digest != trigger.digest {
             return Err(TriggerError::Protocol(format!(
                 "Trigger '{}' changed while the Workflow snapshot was being retained",
@@ -716,7 +731,14 @@ impl std::fmt::Display for TriggerError {
     }
 }
 
-impl std::error::Error for TriggerError {}
+impl std::error::Error for TriggerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 impl From<std::io::Error> for TriggerError {
     fn from(value: std::io::Error) -> Self {
@@ -821,6 +843,44 @@ mod tests {
             trigger.should_run_step(&context()).await.unwrap(),
             TriggerDecision::Fail { .. }
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_trigger_timeout_covers_blocked_stdin_delivery() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = std::env::temp_dir().join(format!(
+            "prism-blocked-trigger-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let executable = root.join("trigger");
+        std::fs::write(&executable, "#!/bin/sh\nsleep 10\n").unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        let trigger = ExternalTrigger::new(
+            &executable,
+            ExternalTriggerLimits {
+                timeout: Duration::from_millis(50),
+                ..ExternalTriggerLimits::default()
+            },
+        );
+        let mut request = TriggerPhaseRequest::check(context());
+        if let TriggerPhaseBody::Check { context } = &mut request.body {
+            context.subject.change_request = Some("x".repeat(1024 * 1024));
+        }
+        let error = tokio::time::timeout(Duration::from_secs(2), trigger.invoke(request))
+            .await
+            .expect("Trigger timeout supervision must not hang")
+            .unwrap_err();
+        assert!(matches!(error, TriggerError::Timeout { .. }));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]

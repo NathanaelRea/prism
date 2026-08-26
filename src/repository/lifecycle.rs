@@ -717,6 +717,32 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
+    async fn check_worktrunk_approval_status_treats_missing_project_config_as_approved() {
+        let temp = unique_temp_dir("prism-wt-no-project-approval-status-test");
+        fs::create_dir_all(&temp).unwrap();
+        let wt = temp.join("wt");
+        write_executable(
+            &wt,
+            "#!/bin/sh\nprintf '%s\\n' '✗ No project configuration found' >&2\nprintf '%s\\n' '↳ Create a config file at: /repo/.config/wt.toml' >&2\nexit 1\n",
+        );
+
+        let mut config = test_config();
+        config
+            .tools
+            .insert("wt".to_string(), wt.display().to_string());
+        let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
+
+        let status = check_worktrunk_approval_status(&repo, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(status, WorktrunkApprovalStatus::Approved);
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn create_worktree_session_adds_worktrunk_approval_hint() {
         let temp = unique_temp_dir("prism-create-wt-approval-hint-test");
         fs::create_dir_all(&temp).unwrap();

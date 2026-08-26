@@ -227,7 +227,7 @@ pub(crate) fn key_is_current(
     generations: &BTreeMap<AgentSessionSlot, u64>,
     key: &AgentSessionWarmupKey,
 ) -> bool {
-    generations.get(&key.slot).copied() == Some(key.generation)
+    generations.get(&key.slot).copied().unwrap_or_default() == key.generation
 }
 
 pub(crate) fn reconcile_worktree_sessions(

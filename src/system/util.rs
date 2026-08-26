@@ -61,21 +61,61 @@ pub fn home_dir() -> Option<PathBuf> {
 }
 
 pub fn prism_config_dir() -> PathBuf {
+    let prism_home = env::var_os("PRISM_HOME").map(PathBuf::from);
     #[cfg(windows)]
-    if let Some(path) = env::var_os("APPDATA") {
-        return PathBuf::from(path).join("Prism");
+    {
+        prism_windows_config_dir_from(
+            prism_home,
+            env::var_os("APPDATA").map(PathBuf::from),
+            home_dir(),
+            env::temp_dir(),
+        )
     }
     #[cfg(not(windows))]
-    if let Some(path) = env::var_os("XDG_CONFIG_HOME") {
-        return PathBuf::from(path).join("prism");
+    prism_config_dir_from(
+        prism_home,
+        env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+        home_dir(),
+        env::temp_dir(),
+    )
+}
+
+#[cfg(not(windows))]
+fn prism_config_dir_from(
+    prism_home: Option<PathBuf>,
+    xdg_config_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+    temporary: PathBuf,
+) -> PathBuf {
+    if let Some(path) = prism_home.filter(|path| !path.as_os_str().is_empty()) {
+        return path;
     }
-    if let Some(home) = home_dir() {
-        #[cfg(windows)]
-        return home.join("AppData/Roaming/Prism");
-        #[cfg(not(windows))]
+    if let Some(path) = xdg_config_home.filter(|path| !path.as_os_str().is_empty()) {
+        return path.join("prism");
+    }
+    if let Some(home) = home.filter(|path| !path.as_os_str().is_empty()) {
         return home.join(".config/prism");
     }
-    env::temp_dir().join("prism")
+    temporary.join("prism")
+}
+
+#[cfg(windows)]
+fn prism_windows_config_dir_from(
+    prism_home: Option<PathBuf>,
+    appdata: Option<PathBuf>,
+    home: Option<PathBuf>,
+    temporary: PathBuf,
+) -> PathBuf {
+    if let Some(path) = prism_home.filter(|path| !path.as_os_str().is_empty()) {
+        return path;
+    }
+    if let Some(path) = appdata.filter(|path| !path.as_os_str().is_empty()) {
+        return path.join("Prism");
+    }
+    if let Some(home) = home.filter(|path| !path.as_os_str().is_empty()) {
+        return home.join("AppData/Roaming/Prism");
+    }
+    temporary.join("prism")
 }
 
 pub fn stable_hash(path: &Path) -> u64 {
@@ -200,7 +240,11 @@ pub fn yes(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    #[cfg(not(windows))]
+    use std::path::PathBuf;
 
+    #[cfg(not(windows))]
+    use super::prism_config_dir_from;
     use super::{
         safe_path_component, single_line, stable_hash, status_count, strip_ansi, truncate_line,
         windows_safe_component,
@@ -229,6 +273,29 @@ mod tests {
         assert_eq!(status_count("dirty 2 ahead 3 behind 1", "dirty"), Some(2));
         assert_eq!(status_count("dirty 2 ahead 3 behind 1", "ahead"), Some(3));
         assert_eq!(status_count("clean", "dirty"), None);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn prism_home_overrides_xdg_without_changing_its_shape() {
+        assert_eq!(
+            prism_config_dir_from(
+                Some(PathBuf::from("/dev/prism")),
+                Some(PathBuf::from("/xdg")),
+                Some(PathBuf::from("/home/me")),
+                PathBuf::from("/tmp"),
+            ),
+            PathBuf::from("/dev/prism")
+        );
+        assert_eq!(
+            prism_config_dir_from(
+                Some(PathBuf::new()),
+                Some(PathBuf::from("/xdg")),
+                Some(PathBuf::from("/home/me")),
+                PathBuf::from("/tmp"),
+            ),
+            PathBuf::from("/xdg/prism")
+        );
     }
 
     #[test]

@@ -102,10 +102,10 @@ impl Tui {
 
     pub(crate) fn show_selected_worktrunk_logs(
         &mut self,
-        runtime: &mut crate::tui_runtime::TerminalRuntime,
+        runtime: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
-        if self.focused_panel != crate::tui::PanelFocus::Worktrees {
-            return Err("focus worktrees to inspect hook logs".to_string());
+        if !self.is_worktree_session_panel() {
+            return Err("focus worktrees or merges to inspect hook logs".to_string());
         }
         let context = self
             .selected_worktree_context()

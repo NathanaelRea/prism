@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "delete from deferred_merge_cleanup where branch = ?\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "327fdf0d936b72f6ff27666fb1f0790edaac762b66f2b3aa32d3b7454c8cb8af"
+}

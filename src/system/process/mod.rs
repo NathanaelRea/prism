@@ -1,6 +1,8 @@
 //! Async process execution built directly on ProcessKit.
 
 mod capture;
+#[cfg(unix)]
+mod detached;
 mod execution;
 mod identity;
 mod interactive;
@@ -12,6 +14,8 @@ use std::env;
 use std::future::Future;
 use std::path::Path;
 
+#[cfg(unix)]
+pub(crate) use detached::{VerifiedDetachedProcess, spawn_verified_detached};
 #[cfg(all(test, unix))]
 pub use execution::run_output;
 pub use execution::{

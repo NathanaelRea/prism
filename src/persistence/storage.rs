@@ -1,9 +1,4 @@
-#![allow(
-    dead_code,
-    reason = "storage diagnostics are available to optional debug surfaces"
-)]
-
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt;
@@ -16,7 +11,8 @@ use sqlx::{Connection, Row, SqliteConnection};
 
 pub const WRITER_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-static VALIDATED_DATABASES: OnceLock<Mutex<HashSet<DatabaseIdentity>>> = OnceLock::new();
+#[cfg(unix)]
+static VALIDATED_DATABASES: OnceLock<Mutex<BTreeMap<PathBuf, ValidatedDatabase>>> = OnceLock::new();
 static WAL_WARNING_BUCKETS: OnceLock<Mutex<BTreeMap<PathBuf, u64>>> = OnceLock::new();
 
 const WAL_WARNING_BYTES: u64 = 64 * 1024 * 1024;
@@ -30,7 +26,7 @@ const SQLITE_CANTOPEN: i32 = 14;
 const SQLITE_CONSTRAINT: i32 = 19;
 const SQLITE_NOTADB: i32 = 26;
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct DatabaseIdentity {
     path: PathBuf,
     native: NativeDatabaseIdentity,
@@ -45,6 +41,12 @@ struct NativeDatabaseIdentity {
 
 #[cfg(windows)]
 type NativeDatabaseIdentity = file_id::FileId;
+
+#[cfg(unix)]
+struct ValidatedDatabase {
+    identity: DatabaseIdentity,
+    _file: fs::File,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StorageErrorKind {
@@ -299,7 +301,10 @@ fn open_writable_inner(path: &Path) -> Result<SqliteConnection, StorageError> {
     #[cfg(unix)]
     let initialized = match database_identity(path)?.as_ref() {
         Some(identity) => database_identity_is_validated(identity)?,
-        None => false,
+        None => {
+            evict_database_validation(path)?;
+            false
+        }
     };
     // A path identity sampled before sqlite opens is not handle-bound on Windows. Another
     // process can replace the path in between, so never use that sample to skip initialization.
@@ -437,9 +442,17 @@ fn database_identity(path: &Path) -> Result<Option<DatabaseIdentity>, StorageErr
 #[cfg(unix)]
 fn database_identity_is_validated(identity: &DatabaseIdentity) -> Result<bool, StorageError> {
     VALIDATED_DATABASES
-        .get_or_init(|| Mutex::new(HashSet::new()))
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
         .lock()
-        .map(|validated| validated.contains(identity))
+        .map(|mut validated| {
+            let matches = validated
+                .get(&identity.path)
+                .is_some_and(|existing| existing.identity == *identity);
+            if !matches {
+                validated.remove(&identity.path);
+            }
+            matches
+        })
         .map_err(|_| {
             StorageError::policy(
                 "validated database identity cache poisoned",
@@ -448,15 +461,59 @@ fn database_identity_is_validated(identity: &DatabaseIdentity) -> Result<bool, S
         })
 }
 
+#[cfg(unix)]
 fn mark_database_validated(identity: Option<DatabaseIdentity>) -> Result<(), StorageError> {
     let Some(identity) = identity else {
         return Ok(());
     };
+    let file = fs::File::open(&identity.path).map_err(|error| {
+        StorageError::from_io(
+            format!("retain validated database {}", identity.path.display()),
+            error,
+        )
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        StorageError::from_io(
+            format!("identify validated database {}", identity.path.display()),
+            error,
+        )
+    })?;
+    use std::os::unix::fs::MetadataExt;
+    if metadata.dev() != identity.native.device || metadata.ino() != identity.native.inode {
+        return evict_database_validation(&identity.path);
+    }
     VALIDATED_DATABASES
-        .get_or_init(|| Mutex::new(HashSet::new()))
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
         .lock()
         .map(|mut validated| {
-            validated.insert(identity);
+            validated.insert(
+                identity.path.clone(),
+                ValidatedDatabase {
+                    identity,
+                    _file: file,
+                },
+            );
+        })
+        .map_err(|_| {
+            StorageError::policy(
+                "validated database identity cache poisoned",
+                StorageErrorKind::Other,
+            )
+        })
+}
+
+#[cfg(windows)]
+fn mark_database_validated(_identity: Option<DatabaseIdentity>) -> Result<(), StorageError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn evict_database_validation(path: &Path) -> Result<(), StorageError> {
+    VALIDATED_DATABASES
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .map(|mut validated| {
+            validated.remove(path);
         })
         .map_err(|_| {
             StorageError::policy(
@@ -778,6 +835,55 @@ mod tests {
         assert_eq!(integer_pragma(&mut reader, "busy_timeout"), 0);
         assert_eq!(integer_pragma(&mut reader, "query_only"), 1);
         drop(reader);
+        remove_database(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normal_database_writes_preserve_the_validated_identity() {
+        let path = test_path("in-place-write");
+        drop(open_writable(&path).unwrap());
+        let before = database_identity(&path).unwrap().unwrap();
+
+        crate::persistence::database::upsert_metadata(&path, "test-key", "test-value").unwrap();
+
+        let after = database_identity(&path).unwrap().unwrap();
+        assert_eq!(before, after);
+        assert!(database_identity_is_validated(&after).unwrap());
+        remove_database(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_replacement_at_same_path_is_revalidated() {
+        let path = test_path("replacement");
+        drop(open_writable(&path).unwrap());
+        remove_database(&path);
+
+        // A valid but unknown old schema must be rejected after inode replacement rather than
+        // inheriting validation from the database that previously occupied this pathname.
+        let options = crate::persistence::pools::options(&path, true, false).unwrap();
+        let mut replacement = run_sqlx(SqliteConnection::connect_with(&options)).unwrap();
+        run_sqlx(sqlx::query("create table legacy_only(value text)").execute(&mut replacement))
+            .unwrap();
+        run_sqlx(replacement.close()).unwrap();
+        let replacement_identity = database_identity(&path).unwrap().unwrap();
+        assert!(!database_identity_is_validated(&replacement_identity).unwrap());
+        assert!(
+            !VALIDATED_DATABASES
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .contains_key(&path)
+        );
+        let error = open_writable(&path).unwrap_err();
+        assert!(error.to_string().contains("unknown historical schema"));
+
+        remove_database(&path);
+        fs::write(&path, b"not a sqlite database").unwrap();
+        let error = open_writable(&path).unwrap_err();
+        assert_eq!(error.kind(), StorageErrorKind::Corruption);
         remove_database(&path);
     }
 

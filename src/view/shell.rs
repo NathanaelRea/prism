@@ -20,7 +20,15 @@ pub(super) fn render_footer(
     area: Rect,
     model: &crate::view::FrameModel<'_>,
 ) {
-    let mut spans = footer_action_spans(footer_actions(model.focus));
+    let mut spans = if model.mode_label == "normal" {
+        Vec::new()
+    } else {
+        vec![
+            Span::styled(format!("[{}]", model.mode_label), attention_style()),
+            Span::styled(" | ", muted_style()),
+        ]
+    };
+    spans.extend(footer_action_spans(footer_actions(model.focus)));
     if let Some(message) = model.status_message {
         spans.push(Span::styled(format!(" | {message}"), attention_style()));
     }
@@ -63,7 +71,7 @@ fn footer_actions(focus: PanelFocus) -> &'static [(&'static str, &'static str)] 
     match focus {
         PanelFocus::Status => STATUS_FOOTER_ACTIONS,
         PanelFocus::Repos => REPOS_FOOTER_ACTIONS,
-        PanelFocus::Worktrees => WORKTREES_FOOTER_ACTIONS,
+        PanelFocus::Worktrees | PanelFocus::Merges => WORKTREES_FOOTER_ACTIONS,
     }
 }
 

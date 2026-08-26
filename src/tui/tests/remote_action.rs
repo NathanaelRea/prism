@@ -8,14 +8,237 @@ use crate::remote::{PrCache, PrDetails, PrReview, PrReviewComment};
 use crate::repo::Repository;
 
 use super::super::{
-    RemoteActionDelivery, RemoteActionReconciliationContext, RemoteActionValue,
-    RemoteMutationTarget, Tui, TuiJobKey, TuiJobKind, TuiJobPayload,
-    remote_action_abandon_requested, remote_action_timeout, remote_mutation_targets_overlap,
+    RemoteActionDelivery, RemoteActionValue, RemoteMutationTarget, Tui, TuiJobKey, TuiJobKind,
+    TuiJobPayload, remote_action_abandon_requested, remote_action_timeout,
+    remote_mutation_targets_overlap,
 };
 use super::support::{
     test_change_request_identity, test_config, test_pr_summary, test_session, test_tui,
     unique_temp_dir,
 };
+
+fn unknown_marker_target(id: &str) -> RemoteMutationTarget {
+    RemoteMutationTarget::Unknown {
+        marker_id: id.to_string(),
+    }
+}
+
+fn wait_for_background(tui: &mut Tui) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while tui.background.has_jobs() {
+        tui.route_tui_job_messages();
+        assert!(Instant::now() < deadline, "background work did not finish");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    while tui.route_tui_job_messages() > 0 {}
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn coordinated_mutations_are_blocked_until_startup_markers_are_loaded() {
+    let temp = unique_temp_dir("prism-tui-marker-startup-admission");
+    fs::create_dir_all(&temp).unwrap();
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let session = test_session(0, &temp.join("worktree").display().to_string(), "feature");
+    let mut tui = Tui::new_single(repo, test_config(), vec![session]);
+    let key = TuiJobKey::Worktree(tui.sessions[0].identity_key(&tui.repos[0].identity));
+    let target = unknown_marker_target("startup-admission");
+
+    assert!(tui.remote_action_reconciliation_blocked(&key, &target));
+    wait_for_background(&mut tui);
+    assert!(!tui.remote_action_reconciliation_blocked(&key, &target));
+
+    drop(tui);
+    fs::remove_dir_all(temp).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn corrupt_startup_marker_fails_closed_and_marks_sessions_untrusted() {
+    let temp = unique_temp_dir("prism-tui-corrupt-startup-marker");
+    fs::create_dir_all(&temp).unwrap();
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    crate::persistence::database::upsert_metadata(
+        &crate::observability::db_path(&repo),
+        super::super::REMOTE_MUTATION_RECONCILIATION_KEY,
+        "not valid marker json",
+    )
+    .unwrap();
+    let session = test_session(0, &temp.join("worktree").display().to_string(), "feature");
+    let mut tui = Tui::new_single(repo, test_config(), vec![session]);
+    let key = TuiJobKey::Worktree(tui.sessions[0].identity_key(&tui.repos[0].identity));
+    let target = unknown_marker_target("after-load-error");
+
+    wait_for_background(&mut tui);
+
+    assert_eq!(tui.background.marker_count(&temp), 1);
+    assert!(tui.remote_action_reconciliation_blocked(&key, &target));
+    assert!(tui.sessions[0].pr.trusted_summary().is_err());
+    assert_eq!(tui.background.take_shutdown_errors().len(), 1);
+
+    drop(tui);
+    fs::remove_dir_all(temp).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_marker_load_error_does_not_block_a_new_repository_incarnation() {
+    let temp = unique_temp_dir("prism-tui-stale-marker-load-error");
+    fs::create_dir_all(&temp).unwrap();
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let session = test_session(0, &temp.join("worktree").display().to_string(), "feature");
+    let mut tui = Tui::new_single(repo.clone(), test_config(), vec![session]);
+    wait_for_background(&mut tui);
+    let stale_repository = tui.repos[0].identity.clone();
+    let current_repository = crate::session::WorktreeRepositoryKey::new(temp.clone());
+    tui.repos[0].identity = current_repository.clone();
+    let key = TuiJobKey::Worktree(tui.sessions[0].identity_key(&current_repository));
+    let target = unknown_marker_target("new-incarnation");
+
+    tui.apply_loaded_remote_mutation_markers(
+        super::super::remote_action::LoadedRemoteMutationMarkers {
+            repositories: std::collections::BTreeSet::from([stale_repository.clone()]),
+            markers: BTreeMap::new(),
+            errors: vec![super::super::remote_action::RemoteMutationMarkerLoadError {
+                repository: stale_repository,
+                database_path: crate::observability::db_path(&repo),
+                message: "stale load error".to_string(),
+            }],
+        },
+    );
+
+    assert!(tui.remote_action_reconciliation_blocked(&key, &target));
+    wait_for_background(&mut tui);
+    assert_eq!(tui.background.marker_count(&temp), 0);
+    assert!(!tui.remote_action_reconciliation_blocked(&key, &target));
+    assert!(tui.sessions[0].pr.trusted_summary().is_ok());
+    assert!(tui.background.take_shutdown_errors().is_empty());
+
+    drop(tui);
+    fs::remove_dir_all(temp).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn startup_marker_load_survives_session_generation_change() {
+    let temp = unique_temp_dir("prism-tui-marker-generation-race");
+    fs::create_dir_all(&temp).unwrap();
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let database = crate::observability::db_path(&repo);
+    let marker = super::super::remote_action::RemoteMutationReconciliationMarker {
+        target: unknown_marker_target("startup-race"),
+        ledger: None,
+        database_path: std::path::PathBuf::new(),
+        job_id: 7,
+        reason: "uncertain".into(),
+        recorded_unix_ms: 11,
+    };
+    crate::persistence::database::upsert_metadata(
+        &database,
+        super::super::REMOTE_MUTATION_RECONCILIATION_KEY,
+        &serde_json::to_string(&vec![marker]).unwrap(),
+    )
+    .unwrap();
+
+    let session = test_session(0, &temp.join("worktree").display().to_string(), "feature");
+    let mut tui = Tui::new_single(repo, test_config(), vec![session]);
+    tui.session_inventory_generation += 1;
+    wait_for_background(&mut tui);
+    assert_eq!(tui.background.marker_count(&temp), 1);
+    fs::remove_dir_all(temp).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn marker_persistence_remains_admitted_after_general_shutdown_cutoff() {
+    let temp = unique_temp_dir("prism-tui-marker-after-cutoff");
+    fs::create_dir_all(&temp).unwrap();
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let session = test_session(0, &temp.join("worktree").display().to_string(), "feature");
+    let mut tui = Tui::new_single(repo.clone(), test_config(), vec![session]);
+    wait_for_background(&mut tui);
+    tui.background.begin_shutdown();
+    tui.background.stop_admission_for_shutdown();
+    let target = unknown_marker_target("after-cutoff");
+    let key = TuiJobKey::Worktree(tui.sessions[0].identity_key(&tui.repos[0].identity));
+    tui.record_remote_mutation_reconciliation(&key, 9, "late uncertainty", &target, None)
+        .unwrap();
+    wait_for_background(&mut tui);
+    drop(tui);
+
+    let session = test_session(0, &temp.join("worktree").display().to_string(), "feature");
+    let mut restarted = Tui::new_single(repo, test_config(), vec![session]);
+    wait_for_background(&mut restarted);
+    assert_eq!(restarted.background.marker_count(&temp), 1);
+    fs::remove_dir_all(temp).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn marker_writer_retries_repeated_start_failures_and_survives_restart() {
+    let temp = unique_temp_dir("prism-tui-marker-spawn-retry");
+    fs::create_dir_all(&temp).unwrap();
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let session = test_session(0, &temp.join("worktree").display().to_string(), "feature");
+    let mut tui = Tui::new_single(repo.clone(), test_config(), vec![session]);
+    wait_for_background(&mut tui);
+    tui.background.fail_marker_writer_spawns(4);
+    let target = unknown_marker_target("spawn-retry");
+    let key = TuiJobKey::Worktree(tui.sessions[0].identity_key(&tui.repos[0].identity));
+    tui.record_remote_mutation_reconciliation(&key, 13, "uncertain", &target, None)
+        .unwrap();
+    wait_for_background(&mut tui);
+    drop(tui);
+
+    let session = test_session(0, &temp.join("worktree").display().to_string(), "feature");
+    let mut restarted = Tui::new_single(repo, test_config(), vec![session]);
+    wait_for_background(&mut restarted);
+    assert_eq!(restarted.background.marker_count(&temp), 1);
+    assert!(restarted.background.take_shutdown_errors().is_empty());
+    fs::remove_dir_all(temp).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn marker_writer_retries_repeated_write_failures_and_survives_restart() {
+    let temp = unique_temp_dir("prism-tui-marker-write-retry");
+    fs::create_dir_all(&temp).unwrap();
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let session = test_session(0, &temp.join("worktree").display().to_string(), "feature");
+    let mut tui = Tui::new_single(repo.clone(), test_config(), vec![session]);
+    wait_for_background(&mut tui);
+    tui.background.fail_marker_writes(4);
+    let target = unknown_marker_target("write-retry");
+    let key = TuiJobKey::Worktree(tui.sessions[0].identity_key(&tui.repos[0].identity));
+    tui.record_remote_mutation_reconciliation(&key, 14, "uncertain", &target, None)
+        .unwrap();
+    wait_for_background(&mut tui);
+    drop(tui);
+
+    let session = test_session(0, &temp.join("worktree").display().to_string(), "feature");
+    let mut restarted = Tui::new_single(repo, test_config(), vec![session]);
+    wait_for_background(&mut restarted);
+    assert_eq!(restarted.background.marker_count(&temp), 1);
+    assert!(restarted.background.take_shutdown_errors().is_empty());
+    fs::remove_dir_all(temp).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn permanent_marker_write_failure_makes_shutdown_explicitly_unsuccessful() {
+    let temp = unique_temp_dir("prism-tui-marker-permanent-failure");
+    fs::create_dir_all(&temp).unwrap();
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let session = test_session(0, &temp.join("worktree").display().to_string(), "feature");
+    let mut tui = Tui::new_single(repo, test_config(), vec![session]);
+    wait_for_background(&mut tui);
+    tui.background.fail_marker_writes(usize::MAX);
+    let target = unknown_marker_target("permanent-write-failure");
+    let key = TuiJobKey::Worktree(tui.sessions[0].identity_key(&tui.repos[0].identity));
+    tui.record_remote_mutation_reconciliation(&key, 15, "uncertain", &target, None)
+        .unwrap();
+
+    let error = tui
+        .cleanup_tui_jobs(super::super::ShutdownReason::UserQuit)
+        .await
+        .unwrap_err();
+    assert!(error.contains("shutdown durability failure"), "{error}");
+    assert!(error.contains("remain unacknowledged"), "{error}");
+    assert_eq!(tui.background.unresolved_marker_persistence(), 1);
+    fs::remove_dir_all(temp).unwrap();
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn empty_list_retains_persisted_create_marker_until_matching_summary_is_observed() {
@@ -55,8 +278,18 @@ async fn empty_list_retains_persisted_create_marker_until_matching_summary_is_ob
         7,
         "shutdown bound exceeded",
         &target,
+        None,
     )
     .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while tui.background.has_jobs() {
+        tui.route_tui_job_messages();
+        assert!(
+            Instant::now() < deadline,
+            "marker persistence did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
     drop(tui);
 
     let mut session = test_session(0, &temp.join("worktree").display().to_string(), "feature");
@@ -68,38 +301,249 @@ async fn empty_list_retains_persisted_create_marker_until_matching_summary_is_ob
     let mut restarted = Tui::new_single(repo.clone(), test_config(), vec![session]);
     let repository = restarted.repos[0].identity.clone();
     let key = TuiJobKey::Worktree(restarted.sessions[0].identity_key(&repository));
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while restarted.background.has_jobs() {
+        restarted.route_tui_job_messages();
+        assert!(Instant::now() < deadline, "marker loading did not finish");
+        std::thread::sleep(Duration::from_millis(2));
+    }
 
     assert!(restarted.remote_action_reconciliation_blocked(&key, &target));
     assert!(restarted.sessions[0].pr.trusted_summary().is_err());
 
-    restarted.reconcile_remote_mutation_summaries(&repository, &[], &BTreeMap::new());
+    restarted.enqueue_summary_reconciliation(&repository, &[], &BTreeMap::new());
     assert!(restarted.remote_action_reconciliation_blocked(&key, &target));
 
     let mut wrong_base = observed.clone();
     wrong_base.base_ref = "release".to_string();
-    restarted.reconcile_remote_mutation_summaries(&repository, &[wrong_base], &BTreeMap::new());
+    restarted.enqueue_summary_reconciliation(&repository, &[wrong_base], &BTreeMap::new());
     assert!(restarted.remote_action_reconciliation_blocked(&key, &target));
 
-    restarted.reconcile_remote_mutation_summaries(&repository, &[observed], &BTreeMap::new());
+    restarted.enqueue_summary_reconciliation(&repository, &[observed], &BTreeMap::new());
 
-    assert!(!restarted.remote_action_reconciliation_blocked(&key, &target));
+    // Legacy markers intentionally remain blocked: exact durable request identity cannot be
+    // inferred safely from only the presentation target.
+    assert!(restarted.remote_action_reconciliation_blocked(&key, &target));
     let marker = crate::persistence::database::load_metadata(
         &crate::observability::db_path(&repo),
         super::super::REMOTE_MUTATION_RECONCILIATION_KEY,
     )
     .unwrap();
-    assert!(marker.is_none());
+    assert!(marker.is_some());
 
     fs::remove_dir_all(temp).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn reconciliation_clears_only_markers_with_matched_authoritative_evidence() {
+async fn typed_push_and_create_markers_select_authoritative_result_observations_after_push_advances()
+ {
+    let provider = crate::remote::ProviderKind::GitHub;
+    let repository_id = crate::remote::RemoteRepositoryId::new(
+        provider,
+        crate::remote::HostIdentity::new("github.com", None).unwrap(),
+        "example/repo",
+    )
+    .unwrap();
+    let push = crate::remote::dispatcher::PushGuard {
+        repository: repository_id.clone(),
+        remote: "origin".into(),
+        remote_branch: "feature".into(),
+        local_branch: "feature".into(),
+        expected_head_sha: "abc123".into(),
+        set_upstream: false,
+    };
+    let repository = crate::session::WorktreeRepositoryKey::new("/repo".into());
+    let push_operation = crate::workflow::remote_operation::RemoteMutationOperation::TuiPushBranch(
+        crate::workflow::remote_operation::TuiRemotePushPayload {
+            repository: "/repo".into(),
+            worktree: "/repo/worktree".into(),
+            branch: "feature".into(),
+            expected: push.clone(),
+        },
+    );
+    let create_operation =
+        crate::workflow::remote_operation::RemoteMutationOperation::TuiCreateChangeRequest(
+            crate::workflow::remote_operation::TuiRemoteCreatePayload {
+                repository: "/repo".into(),
+                worktree: "/repo/worktree".into(),
+                branch: "feature".into(),
+                body: "description".into(),
+                target_repository: repository_id,
+                source_push: push,
+            },
+        );
+    let marker = |job_id, target, operation| {
+        super::super::remote_action::RemoteMutationReconciliationMarker {
+            target,
+            ledger: Some(crate::tui::RemoteMutationLedgerContext {
+                repository: "/repo".into(),
+                worktree: "/repo/worktree".into(),
+                request_id: format!("request-{job_id}"),
+                operation,
+                subject: "/repo:feature".into(),
+            }),
+            database_path: std::path::PathBuf::new(),
+            job_id,
+            reason: "uncertain".into(),
+            recorded_unix_ms: job_id,
+        }
+    };
+    let markers = vec![
+        marker(
+            1,
+            RemoteMutationTarget::Push {
+                remote: "origin".into(),
+                branch: "feature".into(),
+                expected_head_sha: "abc123".into(),
+                repository_provider: Some(provider),
+                repository_host: "github.com".into(),
+                repository_project: "example/repo".into(),
+            },
+            push_operation,
+        ),
+        marker(
+            2,
+            RemoteMutationTarget::Create {
+                source_provider: provider,
+                source_host: "github.com".into(),
+                source_project: "example/repo".into(),
+                source_branch: "feature".into(),
+                expected_head_sha: "abc123".into(),
+                target_provider: Some(provider),
+                target_host: "github.com".into(),
+                target_project: "example/repo".into(),
+                target_branch: "main".into(),
+                expected_base_sha: "base123".into(),
+            },
+            create_operation,
+        ),
+    ];
+    let mut summary = test_pr_summary(false);
+    summary.change_request_identity = Some(test_change_request_identity(provider));
+    let commands = super::super::remote_reconciliation::classify_summary_evidence(
+        &repository,
+        &markers,
+        &[summary],
+        // The branch may advance after the uncertain push. Seeing any authoritative head should
+        // schedule reconciliation; the worker separately proves that the expected push is in its
+        // ancestry before clearing the marker.
+        &BTreeMap::from([(
+            ("origin".to_string(), "feature".to_string()),
+            "def456".to_string(),
+        )]),
+    );
+
+    assert_eq!(commands.len(), 2);
+    assert!(matches!(
+        commands[0].observation,
+        Some(super::super::remote_reconciliation::ReconciliationObservation::PushResult(_))
+    ));
+    assert!(matches!(
+        commands[1].observation,
+        Some(super::super::remote_reconciliation::ReconciliationObservation::Cache(_))
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_reconciliation_releases_the_marker_for_retry() {
+    let temp = unique_temp_dir("prism-tui-reconciliation-retry");
+    fs::create_dir_all(&temp).unwrap();
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let session = test_session(0, &temp.join("worktree").display().to_string(), "feature");
+    let mut tui = Tui::new_single(repo, test_config(), vec![session]);
+    wait_for_background(&mut tui);
+    let repository = tui.repos[0].identity.clone();
+    let key = TuiJobKey::Worktree(tui.sessions[0].identity_key(&repository));
+    let identity = test_change_request_identity(crate::remote::ProviderKind::GitHub);
+    let target = RemoteMutationTarget::Review {
+        change_request: identity.clone(),
+        expected_state: "APPROVED".to_string(),
+        expected_body: "looks good".to_string(),
+        prior_review_ids: Vec::new(),
+    };
+    tui.record_remote_mutation_reconciliation(&key, 77, "uncertain", &target, None)
+        .unwrap();
+    wait_for_background(&mut tui);
+    let marker = tui.background.markers(&repository.root).unwrap()[0].clone();
+    let marker_key = (
+        repository.root.clone(),
+        marker.recorded_unix_ms,
+        marker.job_id,
+    );
+    let mut summary = test_pr_summary(false);
+    summary.change_request_identity = Some(identity);
+    let details = PrDetails {
+        reviews: vec![PrReview {
+            id: "review-1".to_string(),
+            state: "APPROVED".to_string(),
+            body: "looks good".to_string(),
+            ..PrReview::default()
+        }],
+        ..PrDetails::default()
+    };
+
+    tui.enqueue_details_reconciliation(&repository, &PrCache::observed(summary, Some(details)));
+    wait_for_background(&mut tui);
+
+    assert_eq!(tui.background.marker_count(&repository.root), 1);
+    assert!(tui.background.begin_reconciliation(marker_key));
+    tui.background.finish_reconciliation(
+        &repository.root,
+        marker.recorded_unix_ms,
+        marker.job_id,
+        &target,
+        false,
+    );
+
+    drop(tui);
+    fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
+fn merged_evidence_from_a_different_head_does_not_reconcile() {
+    let repository = crate::session::WorktreeRepositoryKey::new("/repo".into());
+    let identity = test_change_request_identity(crate::remote::ProviderKind::GitHub);
+    let marker = super::super::remote_action::RemoteMutationReconciliationMarker {
+        target: RemoteMutationTarget::Merge {
+            change_request: identity.clone(),
+            expected_head_sha: "abc123".into(),
+        },
+        ledger: None,
+        database_path: std::path::PathBuf::new(),
+        job_id: 1,
+        reason: "uncertain".into(),
+        recorded_unix_ms: 1,
+    };
+    let mut summary = test_pr_summary(true);
+    summary.change_request_identity = Some(identity);
+    summary.head_sha = "def456".into();
+
+    let commands = super::super::remote_reconciliation::classify_summary_evidence(
+        &repository,
+        std::slice::from_ref(&marker),
+        std::slice::from_ref(&summary),
+        &BTreeMap::new(),
+    );
+    assert!(commands.is_empty());
+
+    summary.head_sha = "abc123".into();
+    let commands = super::super::remote_reconciliation::classify_summary_evidence(
+        &repository,
+        &[marker],
+        &[summary],
+        &BTreeMap::new(),
+    );
+    assert_eq!(commands.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reconciliation_clears_legacy_merge_marker_with_authoritative_evidence_only() {
     let temp = unique_temp_dir("prism-tui-matched-mutation-evidence-test");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
     let session = test_session(0, &temp.join("worktree").display().to_string(), "feature");
     let mut tui = Tui::new_single(repo, test_config(), vec![session]);
+    wait_for_background(&mut tui);
     let repository = tui.repos[0].identity.clone();
     let key = TuiJobKey::Worktree(tui.sessions[0].identity_key(&repository));
     let identity = test_change_request_identity(crate::remote::ProviderKind::GitHub);
@@ -140,27 +584,31 @@ async fn reconciliation_clears_only_markers_with_matched_authoritative_evidence(
         },
     ];
     for (job_id, target) in targets.iter().enumerate() {
-        tui.record_remote_mutation_reconciliation(&key, job_id as u64 + 1, "uncertain", target)
-            .unwrap();
+        tui.record_remote_mutation_reconciliation(
+            &key,
+            job_id as u64 + 1,
+            "uncertain",
+            target,
+            None,
+        )
+        .unwrap();
     }
+    wait_for_background(&mut tui);
 
-    tui.reconcile_remote_mutation_summaries(&repository, &[], &BTreeMap::new());
+    tui.enqueue_summary_reconciliation(&repository, &[], &BTreeMap::new());
     let mut empty_summary = test_pr_summary(false);
     empty_summary.change_request_identity = Some(identity.clone());
-    tui.reconcile_remote_mutation_details(
+    tui.enqueue_details_reconciliation(
         &repository,
         &PrCache::observed(empty_summary, Some(PrDetails::default())),
     );
-    assert_eq!(
-        tui.remote_mutations_requiring_reconciliation[&repository.root].len(),
-        5
-    );
+    assert_eq!(tui.background.marker_count(&repository.root), 5);
 
     let mut create = test_pr_summary(false);
     create.change_request_identity = Some(identity.clone());
     let mut pending_merge = create.clone();
     pending_merge.queue_state = "AWAITING_CHECKS".to_string();
-    tui.reconcile_remote_mutation_summaries(
+    tui.enqueue_summary_reconciliation(
         &repository,
         &[create, pending_merge.clone()],
         &BTreeMap::from([(
@@ -168,10 +616,7 @@ async fn reconciliation_clears_only_markers_with_matched_authoritative_evidence(
             "abc123".to_string(),
         )]),
     );
-    assert_eq!(
-        tui.remote_mutations_requiring_reconciliation[&repository.root].len(),
-        2
-    );
+    assert_eq!(tui.background.marker_count(&repository.root), 5);
 
     let details = PrDetails {
         reviews: vec![PrReview {
@@ -187,15 +632,32 @@ async fn reconciliation_clears_only_markers_with_matched_authoritative_evidence(
         }],
         ..PrDetails::default()
     };
-    tui.reconcile_remote_mutation_details(
+    tui.enqueue_details_reconciliation(
         &repository,
         &PrCache::observed(pending_merge, Some(details)),
     );
-    assert!(
-        !tui.remote_mutations_requiring_reconciliation
-            .contains_key(&repository.root)
+    wait_for_background(&mut tui);
+    assert_eq!(
+        tui.background.marker_count(&repository.root),
+        4,
+        "fresh provider evidence should retire only the legacy merge marker"
     );
-    fs::remove_dir_all(temp).unwrap();
+    assert!(
+        tui.background
+            .markers(&repository.root)
+            .unwrap()
+            .iter()
+            .all(|marker| !matches!(marker.target, RemoteMutationTarget::Merge { .. }))
+    );
+    drop(tui);
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while fs::remove_dir_all(&temp).is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "background marker persistence did not stop"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -238,16 +700,41 @@ async fn cleanup_applies_a_mutation_payload_routed_before_shutdown_started() {
             ))))
         },
     );
-    tui.remote_actions_requiring_reconciliation.insert(id);
-    tui.remote_action_reconciliation_contexts.insert(
+    // This regression covers a result routed before shutdown, not an in-flight coordinated
+    // mutation. Route it to the delivery channel before cleanup so the shutdown path persists it
+    // without treating it as unfinished provider work.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        tui.route_tui_job_messages();
+        if let Some(delivery) = tui.background.receive_remote_action() {
+            tui.background.deliver_remote_action(delivery);
+            break;
+        }
+        assert!(Instant::now() < deadline);
+    }
+    tui.background.track_remote_action(
         id,
-        RemoteActionReconciliationContext {
+        super::super::remote_action::RemoteActionReconciliationContext {
             key: job_key,
             target,
+            ledger: crate::tui::RemoteMutationLedgerContext {
+                repository: repo.root.clone(),
+                worktree: temp.join("worktree"),
+                request_id: "shutdown-test".to_string(),
+                operation: crate::workflow::remote_operation::RemoteMutationOperation::TuiFetchChangeRequest(
+                    crate::workflow::remote_operation::TuiRemoteFetchPayload {
+                        repository: repo.root.clone(),
+                        worktree: temp.join("worktree"),
+                        branch: branch.to_string(),
+                        summary: test_pr_summary(false),
+                    },
+                ),
+                subject: "shutdown-test".to_string(),
+            },
         },
     );
     let deadline = Instant::now() + Duration::from_secs(1);
-    while tui.jobs.has_jobs() {
+    while tui.background.has_jobs() {
         tui.route_tui_job_messages();
         assert!(Instant::now() < deadline);
     }
@@ -257,7 +744,7 @@ async fn cleanup_applies_a_mutation_payload_routed_before_shutdown_started() {
         .await
         .unwrap();
 
-    assert!(tui.remote_actions_requiring_reconciliation.is_empty());
+    assert!(tui.background.tracked_remote_action_ids().is_empty());
     assert_eq!(
         crate::remote::load_pr_cache(&repo, branch)
             .summary()
@@ -332,14 +819,21 @@ async fn push_remote_action_cannot_be_abandoned_and_reconciles_after_generation_
         },
     );
     if !abandon_cancelable {
-        tui.remote_actions_requiring_reconciliation.insert(id);
+        tui.background.track_remote_action(id, super::super::remote_action::RemoteActionReconciliationContext {
+            key: TuiJobKey::Repository(tui.repos[0].identity.clone()),
+            target: RemoteMutationTarget::Unknown { marker_id: "test".into() },
+            ledger: crate::tui::RemoteMutationLedgerContext {
+                repository: tui.repo.root.clone(), worktree: tui.repo.root.clone(), request_id: "test".into(),
+                operation: crate::workflow::remote_operation::RemoteMutationOperation::TuiFetchChangeRequest(crate::workflow::remote_operation::TuiRemoteFetchPayload { repository: tui.repo.root.clone(), worktree: tui.repo.root.clone(), branch: "branch".into(), summary: test_pr_summary(false) }), subject: "test".into()
+            }
+        });
     }
     tui.session_inventory_generation += 1;
 
     let deadline = Instant::now() + Duration::from_secs(1);
     let delivery = loop {
         tui.route_tui_job_messages();
-        if let Ok(delivery) = tui.remote_action_rx.try_recv() {
+        if let Some(delivery) = tui.background.receive_remote_action() {
             break delivery;
         }
         assert!(Instant::now() < deadline, "push result was discarded");
@@ -348,7 +842,7 @@ async fn push_remote_action_cannot_be_abandoned_and_reconciles_after_generation_
 
     assert_eq!(delivery.id, id);
     assert!(matches!(delivery.result, Ok(RemoteActionValue::Complete)));
-    tui.remote_actions_requiring_reconciliation.remove(&id);
+    tui.background.finish_remote_action(id);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -376,8 +870,8 @@ async fn queued_remote_timing_updates_the_visible_progress_dialog() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn merge_summary_refresh_preserves_matching_details() {
+#[tokio::test(flavor = "multi_thread")]
+async fn merge_summary_refresh_preserves_matching_details() {
     let summary = test_pr_summary(false);
     let details = PrDetails {
         comments: vec![crate::remote::PrComment {
@@ -396,8 +890,8 @@ fn merge_summary_refresh_preserves_matching_details() {
     assert_eq!(cache.details().unwrap().comments.len(), 1);
 }
 
-#[test]
-fn uncertain_merge_summary_remains_untrusted_until_reobserved() {
+#[tokio::test(flavor = "multi_thread")]
+async fn uncertain_merge_summary_remains_untrusted_until_reobserved() {
     let mut cache = PrCache::observed(test_pr_summary(false), None);
     cache.require_reconciliation(
         "provider merge outcome is uncertain; authoritative re-observation required",
@@ -406,8 +900,18 @@ fn uncertain_merge_summary_remains_untrusted_until_reobserved() {
     assert!(cache.trusted_summary().is_err());
 }
 
-#[test]
-fn uncertain_merge_result_requires_authoritative_reconciliation() {
+#[tokio::test(flavor = "multi_thread")]
+async fn uncertain_merge_result_requires_authoritative_reconciliation() {
+    assert!(
+        super::super::uncertain_remote_mutation_error(&Err("provider rejected the request".into()))
+            .is_none()
+    );
+    assert!(
+        super::super::uncertain_remote_mutation_error(&Err(
+            "uncertain remote mutation: provider outcome unknown".into()
+        ))
+        .is_some()
+    );
     let rejected = Ok(RemoteActionValue::MergeRejected(
         "provider policy does not currently authorize merge".into(),
     ));
@@ -435,8 +939,8 @@ fn uncertain_merge_result_requires_authoritative_reconciliation() {
     }
 }
 
-#[test]
-fn applying_remote_action_results_performs_no_provider_or_database_io() {
+#[tokio::test(flavor = "multi_thread")]
+async fn applying_remote_action_results_performs_no_provider_or_database_io() {
     let temp = unique_temp_dir("prism-tui-remote-action-result-test");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -458,7 +962,7 @@ fn applying_remote_action_results_performs_no_provider_or_database_io() {
     });
 
     assert_eq!(tui.sessions[0].pr.summary().unwrap().number, 1);
-    let delivery = tui.remote_action_rx.try_recv().unwrap();
+    let delivery = tui.background.receive_remote_action().unwrap();
     assert_eq!(delivery.id, 42);
     assert!(matches!(delivery.result, Ok(RemoteActionValue::Complete)));
     let _ = fs::remove_dir_all(temp);

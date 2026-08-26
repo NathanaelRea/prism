@@ -66,28 +66,8 @@ impl GitLabAdapter {
     }
 
     pub(super) fn capabilities(&self) -> Capabilities {
-        let mut capabilities = Capabilities {
-            list_change_requests: SupportLevel::Supported,
-            change_request_details: SupportLevel::Supported,
-            review_threads: SupportLevel::Supported,
-            resolve_review_thread: SupportLevel::Supported,
-            check_rollup: SupportLevel::Supported,
-            ci_logs: SupportLevel::Supported,
-            changed_files: SupportLevel::Supported,
-            repository_policy: SupportLevel::Conditional,
-            fetch_change_request: SupportLevel::Supported,
-            create_change_request: SupportLevel::Supported,
-            submit_review: SupportLevel::Unsupported,
-            guarded_merge: SupportLevel::Supported,
-            guarded_merge_reason: None,
-            merge_queue: SupportLevel::Conditional,
-            issue_discovery: SupportLevel::Unsupported,
-            provider_events: SupportLevel::Unsupported,
-            issue_labels: SupportLevel::Unsupported,
-            issue_assignment: SupportLevel::Unsupported,
-            issue_comments: SupportLevel::Unsupported,
-            issue_lifecycle: SupportLevel::Unsupported,
-        };
+        let mut capabilities = Capabilities::for_provider(ProviderKind::GitLab);
+        capabilities.guarded_merge = SupportLevel::Supported;
         if self.merge_method == crate::config::MergeMethod::Rebase {
             capabilities.guarded_merge = SupportLevel::Unsupported;
             capabilities.guarded_merge_reason =

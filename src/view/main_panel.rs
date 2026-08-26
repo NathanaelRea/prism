@@ -21,7 +21,7 @@ pub(super) fn render_main(frame: &mut Frame<'_>, area: Rect, model: &crate::view
     let lines = match model.focus {
         PanelFocus::Status => status_dashboard_lines(model),
         PanelFocus::Repos => repo_overview_lines(model, width, content_area),
-        PanelFocus::Worktrees => {
+        PanelFocus::Worktrees | PanelFocus::Merges => {
             let mut lines = worktree_detail_lines(model);
             lines.push(Line::from(""));
             lines.extend(workflow_dashboard_lines(model));

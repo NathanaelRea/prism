@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+
+from _common import log_event, private_env, reject, root
+
+args = sys.argv[1:]
+log_event("wt", args)
+if args == ["--version"]:
+    print("worktrunk 0.58.0")
+    raise SystemExit(0)
+
+if len(args) < 3 or args[0] != "-C":
+    reject("wt", args, "expected -C REPOSITORY")
+repo = pathlib.Path(args[1])
+command = args[2:]
+real_git = (root() / "state" / "real-git").read_text(encoding="utf-8")
+environment = private_env()
+
+
+def git(*git_args, capture=False):
+    # Worktrunk's machine-readable stdout must contain JSON only. Capture Git's
+    # human output for every delegated operation rather than leaking it.
+    return subprocess.run(
+        [real_git, "-C", str(repo), *git_args],
+        env=environment,
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+
+
+def worktrees():
+    output = git("worktree", "list", "--porcelain", capture=True).stdout
+    records = []
+    current = {}
+    for line in output.splitlines() + [""]:
+        if not line:
+            if current:
+                records.append(current)
+                current = {}
+            continue
+        key, _, value = line.partition(" ")
+        if key == "worktree":
+            current["path"] = value
+        elif key == "branch":
+            current["branch"] = value.removeprefix("refs/heads/")
+    return records
+
+
+if command == ["list", "--format=json"]:
+    print(json.dumps(worktrees()))
+    raise SystemExit(0)
+
+if command == ["config", "approvals", "add"]:
+    raise SystemExit(0)
+
+if command == ["config", "state", "logs", "--format=json"]:
+    print(json.dumps({"hook_output": []}))
+    raise SystemExit(0)
+
+if command == ["config", "show", "--format=json"]:
+    print(json.dumps({"user": {"path": str(root() / "config/worktrunk/config.toml"), "exists": True, "config": {}}, "project": {}}))
+    raise SystemExit(0)
+
+if command == ["config", "create"]:
+    config = root() / "config/worktrunk/config.toml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.touch()
+    raise SystemExit(0)
+
+if command and command[0] == "switch":
+    if len(command) < 6 or command[1:4] != ["--create", "--no-cd", "--format=json"]:
+        reject("wt", args, "unsupported switch flags")
+    rest = command[4:]
+    base = "main"
+    if rest[:1] == ["--base"] and len(rest) >= 3:
+        base, rest = rest[1], rest[2:]
+    if len(rest) != 1 or rest[0].startswith("-"):
+        reject("wt", args, "expected exactly one branch")
+    branch = rest[0]
+    safe = re.sub(r"[^A-Za-z0-9._-]", "-", branch)
+    path = root() / "worktrees" / safe
+    git("worktree", "add", "-b", branch, str(path), base)
+    print(json.dumps({"action": "created", "path": str(path), "branch": branch, "created_branch": True}))
+    raise SystemExit(0)
+
+if command[:6] == ["remove", "--foreground", "--force", "--no-delete-branch", "--format=json", "--"] and len(command) == 7:
+    path = pathlib.Path(command[6])
+    branch = next((item.get("branch", "") for item in worktrees() if pathlib.Path(item.get("path", "")) == path), "")
+    git("worktree", "remove", "--force", str(path))
+    print(json.dumps([{"kind": "worktree", "path": str(path), "branch": branch, "branch_deleted": False}]))
+    raise SystemExit(0)
+
+reject("wt", args)

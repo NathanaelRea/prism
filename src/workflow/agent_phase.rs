@@ -371,7 +371,14 @@ impl std::fmt::Display for AgentExecutionError {
     }
 }
 
-impl std::error::Error for AgentExecutionError {}
+impl std::error::Error for AgentExecutionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 fn single_line(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -597,6 +604,90 @@ mod tests {
             task.await.unwrap(),
             Err(AgentExecutionError::Cancelled)
         ));
+    }
+
+    #[tokio::test]
+    async fn timeout_covers_blocked_stdin_delivery() {
+        let invocation = crate::harness::Invocation {
+            argv: vec!["/bin/sh".into(), "-c".into(), "sleep 10".into()],
+            environment: std::collections::BTreeMap::new(),
+            stdin: Some("x".repeat(1024 * 1024)),
+            prompt_file: None,
+            structured_events: true,
+            attach: false,
+        };
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            execute_invocation(
+                invocation,
+                AgentRequest {
+                    run_id: "run".into(),
+                    step_key: "step".into(),
+                    attempt_id: "attempt".into(),
+                    repository: "/tmp".into(),
+                    worktree: "/tmp".into(),
+                    harness: Some("pi".into()),
+                    model: None,
+                    variant: None,
+                    prompt: "prompt".into(),
+                    resume_session_id: None,
+                    require_resumable_session: false,
+                    cancellation: AgentCancellation::default(),
+                },
+                "pi".into(),
+                Duration::from_millis(50),
+                1024,
+                1024,
+            ),
+        )
+        .await
+        .expect("Agent timeout supervision must not hang")
+        .unwrap_err();
+        assert!(matches!(error, AgentExecutionError::Timeout(_)));
+    }
+
+    #[tokio::test]
+    async fn successful_leader_cleans_up_descendants_before_output_drain() {
+        let invocation = crate::harness::Invocation {
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "sleep 30 & printf '%s\\n' '{\"result\":\"done\"}'".into(),
+            ],
+            environment: std::collections::BTreeMap::new(),
+            stdin: None,
+            prompt_file: None,
+            structured_events: true,
+            attach: false,
+        };
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            execute_invocation(
+                invocation,
+                AgentRequest {
+                    run_id: "run".into(),
+                    step_key: "step".into(),
+                    attempt_id: "attempt".into(),
+                    repository: "/tmp".into(),
+                    worktree: "/tmp".into(),
+                    harness: Some("pi".into()),
+                    model: None,
+                    variant: None,
+                    prompt: "prompt".into(),
+                    resume_session_id: None,
+                    require_resumable_session: false,
+                    cancellation: AgentCancellation::default(),
+                },
+                "pi".into(),
+                Duration::from_secs(5),
+                1024,
+                1024,
+            ),
+        )
+        .await
+        .expect("descendant cleanup must close inherited pipes")
+        .unwrap();
+        assert_eq!(outcome.final_text, "done");
     }
 
     #[test]

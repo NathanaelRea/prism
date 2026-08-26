@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
+use std::os::fd::AsRawFd as _;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -14,7 +16,7 @@ use std::os::unix::net::{UnixListener as NativeListener, UnixStream as NativeStr
 use std::os::windows::fs::OpenOptionsExt as _;
 
 #[cfg(windows)]
-use interprocess::local_socket::traits::{Listener as _, Stream as _};
+use interprocess::local_socket::traits::{Listener as _, Stream as _, StreamCommon as _};
 #[cfg(windows)]
 use interprocess::local_socket::{
     GenericNamespaced, Listener as NativeListener, ListenerNonblockingMode, ListenerOptions,
@@ -87,6 +89,10 @@ impl WorkerEndpoint {
 
     pub(super) fn secret_path(&self) -> PathBuf {
         self.runtime.join("worker.secret")
+    }
+
+    pub(super) fn owner_path(&self) -> PathBuf {
+        self.runtime.join("worker.lock")
     }
 
     pub(super) fn connect(&self) -> io::Result<WorkerStream> {
@@ -176,6 +182,63 @@ pub(super) fn set_listener_nonblocking(listener: &WorkerListener) -> io::Result<
 
 pub(super) fn set_stream_nonblocking(stream: &WorkerStream, nonblocking: bool) -> io::Result<()> {
     stream.set_nonblocking(nonblocking)
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn peer_process_id(stream: &WorkerStream) -> io::Result<u32> {
+    let mut credentials = unsafe { std::mem::zeroed::<libc::ucred>() };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: the output buffer and its length match `libc::ucred`, and the
+    // stream owns a live local-socket file descriptor for this call.
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credentials as *mut libc::ucred).cast(),
+            &mut length,
+        )
+    };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    u32::try_from(credentials.pid)
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| io::Error::other("socket peer returned an invalid process ID"))
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn peer_process_id(stream: &WorkerStream) -> io::Result<u32> {
+    let mut pid = 0 as libc::pid_t;
+    let mut length = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    // SAFETY: the output buffer and its length match `libc::pid_t`, and the
+    // stream owns a live local-socket file descriptor for this call.
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut length,
+        )
+    };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    u32::try_from(pid)
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| io::Error::other("socket peer returned an invalid process ID"))
+}
+
+#[cfg(windows)]
+pub(super) fn peer_process_id(stream: &WorkerStream) -> io::Result<u32> {
+    stream
+        .peer_creds()?
+        .pid()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| io::Error::other("named-pipe peer returned no process ID"))
 }
 
 pub(super) fn prepare_runtime(runtime: &Path) -> Result<(), String> {

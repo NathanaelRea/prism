@@ -1,5 +1,34 @@
 use super::*;
 
+const MERGE_STOPPED_CLEANUP_MESSAGE: &str =
+    "queued merge stopped; deferred worktree deletion was canceled";
+const CHANGE_REQUEST_ABSENT_CLEANUP_MESSAGE: &str =
+    "pull request closed or disappeared; deferred worktree deletion was canceled";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DeferredMergeCleanupAction {
+    Preserve,
+    Wait,
+    Cancel(&'static str),
+    Inspect,
+}
+
+pub(super) fn deferred_merge_cleanup_action(
+    observation: &Result<Option<crate::remote::PrSummary>, String>,
+) -> DeferredMergeCleanupAction {
+    match observation {
+        Err(_) => DeferredMergeCleanupAction::Preserve,
+        Ok(None) => DeferredMergeCleanupAction::Cancel(CHANGE_REQUEST_ABSENT_CLEANUP_MESSAGE),
+        Ok(Some(summary)) => match summary.merge_progress() {
+            crate::remote::PrMergeProgress::Active => {
+                DeferredMergeCleanupAction::Cancel(MERGE_STOPPED_CLEANUP_MESSAGE)
+            }
+            crate::remote::PrMergeProgress::Queued => DeferredMergeCleanupAction::Wait,
+            crate::remote::PrMergeProgress::Merged => DeferredMergeCleanupAction::Inspect,
+        },
+    }
+}
+
 pub(super) fn archive_choice_keys() -> Vec<String> {
     ('1'..='9')
         .chain('a'..='z')
@@ -20,8 +49,8 @@ pub(super) fn archived_picker_overflow_message(
 
 impl Tui {
     pub(crate) async fn open_selected_development_url(&mut self) -> Result<(), String> {
-        if self.focused_panel != crate::tui::PanelFocus::Worktrees {
-            return Err("focus worktrees to open a development URL".to_string());
+        if !self.is_worktree_session_panel() {
+            return Err("focus worktrees or merges to open a development URL".to_string());
         }
         let context = self
             .selected_worktree_context()
@@ -170,7 +199,7 @@ impl Tui {
     }
 
     pub(crate) fn poll_session_refresh(&mut self) -> bool {
-        if !self.tui_tick_active && !self.routing_tui_jobs {
+        if !self.tui_tick_active && !self.background.is_routing() {
             self.route_tui_job_messages();
         }
         let mut changed = false;
@@ -238,7 +267,6 @@ impl Tui {
                 self.tmux_generations.entry(slot).or_insert(generation);
             }
             self.session_inventory_generation = self.session_inventory_generation.saturating_add(1);
-            self.request_workflow_maintenance();
             changed = true;
         }
         if restart {
@@ -288,7 +316,6 @@ impl Tui {
         self.reconcile_session_inventory();
         self.worktree_harness_configs =
             crate::tui::load_worktree_harness_configs(&self.repos, &self.sessions);
-        self.request_workflow_maintenance();
         Ok(())
     }
 
@@ -340,7 +367,7 @@ impl Tui {
 
     pub(crate) async fn create_session(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<bool, String> {
         let context = self
             .selected_repo_context()
@@ -470,14 +497,20 @@ impl Tui {
             .await?;
             self.show_message("submitted initial prompt to agent session")?;
         } else {
-            self.start_tmux_agent_warmup();
+            let session = self.sessions[index].background_job_snapshot();
+            let use_ = crate::agent_session::session_use(
+                &self.repos,
+                &mut self.tmux_generations,
+                &session,
+            );
+            self.start_tmux_agent_warmup_for_key(use_.warmup_key, Duration::ZERO);
         }
         Ok(true)
     }
 
     pub(super) async fn ensure_default_branch_ready_for_create(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
         let context = self
             .selected_repo_context()
@@ -513,7 +546,7 @@ impl Tui {
 
     pub(crate) async fn pull_default_branch(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
         let context = self
             .selected_repo_context()
@@ -553,7 +586,7 @@ impl Tui {
 
     pub(crate) async fn archive_session(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
         let Some(context) = self.selected_worktree_context() else {
             return Ok(());
@@ -589,7 +622,7 @@ impl Tui {
 
     pub(crate) async fn unarchive_session(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
         let context = self
             .selected_repo_context()
@@ -682,48 +715,259 @@ impl Tui {
 
     pub(crate) async fn delete_session(
         &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
-        let Some(context) = self.selected_worktree_context() else {
+        let Some(selected) = self.selected_worktree_index() else {
             return Ok(());
         };
-        let selected = context.session_index;
-        let branch = self.sessions[selected].branch.clone();
-        if self.sessions[selected].is_default_branch(&context.config) {
+        self.confirm_and_delete_session(raw, selected)
+            .await
+            .map(|_| ())
+    }
+
+    pub(crate) async fn confirm_and_delete_session(
+        &mut self,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
+        selected: usize,
+    ) -> Result<bool, String> {
+        let session = self
+            .sessions
+            .get(selected)
+            .ok_or_else(|| "worktree session disappeared".to_string())?;
+        let managed = self
+            .repos
+            .get(session.repo_index)
+            .ok_or_else(|| "repository disappeared".to_string())?;
+        let repo = managed.repo.clone();
+        let config = managed.config.clone();
+        let branch = session.branch.clone();
+        if session.is_default_branch(&config) {
             self.show_message("default branch worktree cannot be deleted from Prism")?;
-            return Ok(());
+            return Ok(false);
         }
-        let path = self.sessions[selected].path.clone();
-        let path_display = self.sessions[selected].path_display.clone();
-        let removal_complete = crate::session::worktree_removal_is_complete(
-            &context.repo,
-            &path,
-            &branch,
-            &self.sessions[selected].incarnation,
-        )?;
-        let warnings = self.sessions[selected].deletion_warnings();
+        let path = session.path.clone();
+        let path_display = session.path_display.clone();
+        let incarnation = session.incarnation.clone();
+        let warnings = session.deletion_warnings();
+        let removal_complete =
+            crate::session::worktree_removal_is_complete(&repo, &path, &branch, &incarnation)?;
         if !self.confirm_delete_dialog(raw, &branch, &path_display, &warnings, false)? {
-            return Ok(());
+            return Ok(false);
         }
-        if !removal_complete
-            && check_worktrunk_approval_status(&context.repo, &context.config).await?
-                == WorktrunkApprovalStatus::Pending
+        if !self
+            .ensure_worktrunk_deletion_approved(raw, &repo, &config, removal_complete)
+            .await?
         {
-            if !self
-                .offer_worktrunk_approval(raw, &context.repo, &context.config)
-                .await?
-            {
-                return Ok(());
+            return Ok(false);
+        }
+        self.start_delete_worktree_session(repo, config, path, branch)?;
+        Ok(true)
+    }
+
+    async fn ensure_worktrunk_deletion_approved(
+        &mut self,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
+        repo: &Repository,
+        config: &Config,
+        removal_complete: bool,
+    ) -> Result<bool, String> {
+        if removal_complete
+            || check_worktrunk_approval_status(repo, config).await?
+                != WorktrunkApprovalStatus::Pending
+        {
+            return Ok(true);
+        }
+        if !self.offer_worktrunk_approval(raw, repo, config).await? {
+            return Ok(false);
+        }
+        if check_worktrunk_approval_status(repo, config).await? == WorktrunkApprovalStatus::Pending
+        {
+            self.show_message("Worktrunk approvals still pending; deletion was not scheduled")?;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    pub(crate) async fn offer_deferred_merge_cleanup(
+        &mut self,
+        raw: &mut dyn crate::tui_runtime::TerminalDriver,
+        selected: usize,
+    ) -> Result<bool, String> {
+        let session = self
+            .sessions
+            .get(selected)
+            .ok_or_else(|| "worktree session disappeared".to_string())?;
+        let managed = self
+            .repos
+            .get(session.repo_index)
+            .ok_or_else(|| "repository disappeared".to_string())?;
+        let repo = managed.repo.clone();
+        let config = managed.config.clone();
+        let branch = session.branch.clone();
+        let path = session.path_display.clone();
+        let warnings = crate::session::deferred_merge_cleanup_warnings(&config, session).await;
+        if !self.confirm_deferred_merge_cleanup_dialog(raw, &branch, &path, &warnings)? {
+            return Ok(false);
+        }
+        if !self
+            .ensure_worktrunk_deletion_approved(raw, &repo, &config, false)
+            .await?
+        {
+            return Ok(false);
+        }
+        crate::session::schedule_deferred_merge_cleanup(
+            &repo,
+            &config,
+            &self.sessions[selected],
+            &warnings,
+        )
+        .await?;
+        self.show_message("worktree will be deleted after the provider confirms the merge")?;
+        Ok(true)
+    }
+
+    pub(super) fn start_deferred_merge_cleanup_reconciliation(
+        &mut self,
+        selected: usize,
+        action: DeferredMergeCleanupAction,
+    ) {
+        if matches!(
+            action,
+            DeferredMergeCleanupAction::Preserve | DeferredMergeCleanupAction::Wait
+        ) {
+            return;
+        }
+        let Some(session) = self.sessions.get(selected) else {
+            return;
+        };
+        if session.hidden {
+            return;
+        }
+        let Some(managed) = self.repos.get(session.repo_index) else {
+            return;
+        };
+        let repo = managed.repo.clone();
+        let config = managed.config.clone();
+        let worktree = session.identity_key(&managed.identity);
+        let generation = self
+            .worktree_generations
+            .get(&worktree)
+            .copied()
+            .unwrap_or_default();
+        let key = DeleteSessionKey {
+            worktree,
+            generation,
+        };
+        if !self.deferred_merge_cleanups_in_flight.insert(key.clone()) {
+            return;
+        }
+        let session = session.background_job_snapshot();
+        let branch = session.branch.clone();
+        let job_key = key.clone();
+        self.spawn_tui_job(
+            TuiJobKind::DeferredMergeCleanup,
+            TuiJobKey::Delete(key),
+            generation,
+            Some(TUI_ACTION_JOB_TIMEOUT),
+            format!("prism-deferred-merge-cleanup-{branch}"),
+            move |_| async move {
+                let result = match action {
+                    DeferredMergeCleanupAction::Cancel(message) => {
+                        if crate::session::cancel_deferred_merge_cleanup(&repo, &session.branch)? {
+                            Ok(DeferredMergeCleanupOutcome::Canceled(message.to_string()))
+                        } else {
+                            Ok(DeferredMergeCleanupOutcome::NotScheduled)
+                        }
+                    }
+                    DeferredMergeCleanupAction::Inspect => {
+                        match crate::session::deferred_merge_cleanup_status(
+                            &repo, &config, &session,
+                        )
+                        .await?
+                        {
+                            crate::session::DeferredMergeCleanupStatus::NotScheduled => {
+                                Ok(DeferredMergeCleanupOutcome::NotScheduled)
+                            }
+                            crate::session::DeferredMergeCleanupStatus::Safe => {
+                                Ok(DeferredMergeCleanupOutcome::Ready)
+                            }
+                            crate::session::DeferredMergeCleanupStatus::Unsafe(reason) => {
+                                crate::session::cancel_deferred_merge_cleanup(
+                                    &repo,
+                                    &session.branch,
+                                )?;
+                                Ok(DeferredMergeCleanupOutcome::Unsafe(reason))
+                            }
+                        }
+                    }
+                    DeferredMergeCleanupAction::Preserve | DeferredMergeCleanupAction::Wait => {
+                        unreachable!("non-actionable cleanup evidence was queued")
+                    }
+                };
+                Ok(Some(TuiJobPayload::DeferredMergeCleanup(
+                    DeferredMergeCleanupResult {
+                        key: job_key,
+                        result,
+                    },
+                )))
+            },
+        );
+    }
+
+    pub(crate) fn apply_deferred_merge_cleanup_result(
+        &mut self,
+        result: DeferredMergeCleanupResult,
+    ) {
+        self.deferred_merge_cleanups_in_flight.remove(&result.key);
+        if self.worktree_generations.get(&result.key.worktree).copied()
+            != Some(result.key.generation)
+        {
+            return;
+        }
+        let Some(selected) = self.sessions.iter().position(|session| {
+            self.repos.get(session.repo_index).is_some_and(|managed| {
+                session.identity_key(&managed.identity) == result.key.worktree
+            })
+        }) else {
+            return;
+        };
+        match result.result {
+            Ok(DeferredMergeCleanupOutcome::NotScheduled) => {}
+            Ok(DeferredMergeCleanupOutcome::Canceled(message)) => {
+                let _ = self.show_message(&message);
             }
-            if check_worktrunk_approval_status(&context.repo, &context.config).await?
-                == WorktrunkApprovalStatus::Pending
-            {
-                self.show_message("Worktrunk approvals still pending; deletion was not started")?;
-                return Ok(());
+            Ok(DeferredMergeCleanupOutcome::Ready) => {
+                let merge_is_still_authoritative = self.sessions[selected]
+                    .pr
+                    .trusted_summary()
+                    .is_ok_and(|summary| {
+                        summary.is_some_and(|summary| {
+                            summary.merge_progress() == crate::remote::PrMergeProgress::Merged
+                        })
+                    });
+                if !merge_is_still_authoritative {
+                    return;
+                }
+                let session = self.sessions[selected].background_job_snapshot();
+                let managed = &self.repos[session.repo_index];
+                if let Err(error) = self.start_deferred_merge_cleanup(
+                    managed.repo.clone(),
+                    managed.config.clone(),
+                    session,
+                ) {
+                    let _ =
+                        self.show_message(&format!("deferred worktree deletion failed: {error}"));
+                }
+            }
+            Ok(DeferredMergeCleanupOutcome::Unsafe(reason)) => {
+                let _ = self.show_message(&format!(
+                    "merged, but deferred worktree deletion was canceled: {reason}"
+                ));
+            }
+            Err(error) => {
+                let _ = self.show_message(&format!("deferred worktree deletion failed: {error}"));
             }
         }
-        self.start_delete_worktree_session(context.repo, context.config, path, branch)?;
-        Ok(())
     }
 
     pub(crate) fn start_delete_worktree_session(
@@ -732,6 +976,28 @@ impl Tui {
         config: Config,
         path: PathBuf,
         branch: String,
+    ) -> Result<(), String> {
+        self.start_delete_worktree_session_with_guard(repo, config, path, branch, None)
+    }
+
+    fn start_deferred_merge_cleanup(
+        &mut self,
+        repo: Repository,
+        config: Config,
+        session: crate::session::Session,
+    ) -> Result<(), String> {
+        let path = session.path.clone();
+        let branch = session.branch.clone();
+        self.start_delete_worktree_session_with_guard(repo, config, path, branch, Some(session))
+    }
+
+    fn start_delete_worktree_session_with_guard(
+        &mut self,
+        repo: Repository,
+        config: Config,
+        path: PathBuf,
+        branch: String,
+        deferred_session: Option<crate::session::Session>,
     ) -> Result<(), String> {
         let repository = self
             .repos
@@ -780,14 +1046,21 @@ impl Tui {
             Some(TUI_ACTION_JOB_TIMEOUT),
             format!("prism-delete-{}", branch),
             move |context| async move {
-                let result = crate::session::delete_worktree_session_if_current(
-                    &repo,
-                    &config,
-                    &path,
-                    &branch_for_job,
-                    Some(&key.worktree.incarnation),
-                )
-                .await;
+                let result = if let Some(session) = deferred_session {
+                    crate::session::delete_deferred_merge_cleanup_if_current(
+                        &repo, &config, &session,
+                    )
+                    .await
+                } else {
+                    crate::session::delete_worktree_session_if_current(
+                        &repo,
+                        &config,
+                        &path,
+                        &branch_for_job,
+                        Some(&key.worktree.incarnation),
+                    )
+                    .await
+                };
                 Ok(Some(TuiJobPayload::DeleteSession(DeleteSessionResult {
                     key: job_key,
                     delivery_id: context.id(),
@@ -799,11 +1072,12 @@ impl Tui {
     }
 
     pub(crate) fn poll_delete_sessions(&mut self) -> bool {
-        if !self.tui_tick_active && !self.routing_tui_jobs {
+        if !self.tui_tick_active && !self.background.is_routing() {
             self.route_tui_job_messages();
         }
         let mut changed = false;
         while let Ok(result) = self.delete_session_rx.try_recv() {
+            self.delete_sessions_in_flight.remove(&result.key);
             let Some(current_generation) =
                 self.worktree_generations.get(&result.key.worktree).copied()
             else {

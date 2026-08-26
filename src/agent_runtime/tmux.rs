@@ -993,18 +993,14 @@ fn tmux_output_result(output: crate::process::ProcessOutput) -> Result<String, S
     }
 }
 
-#[cfg(not(windows))]
-async fn run_tmux_daemonizing_status(command: Command) -> Result<(), String> {
-    run_tmux_status(command).await
-}
-
-#[cfg(windows)]
 async fn run_tmux_daemonizing_status(command: Command) -> Result<(), String> {
     use processkit::StdioMode;
 
-    // ProcessKit intentionally places descendants in a kill-on-drop Job Object.
-    // psmux's first `new-session` command launches its persistent server as a
-    // descendant, so this one daemonizing invocation must run outside that job.
+    // ProcessKit intentionally contains descendants in a kill-on-drop group
+    // (a Job Object on Windows and, where available, a cgroup on Linux). A
+    // tmux-compatible client's first `new-session` command launches its
+    // persistent server as a descendant, so this one daemonizing invocation
+    // must run outside that containment on every platform.
     let display = crate::observability::sanitize_command_text(&command.command_line());
     let mut command = command
         .stdout(StdioMode::Piped)
@@ -1012,13 +1008,22 @@ async fn run_tmux_daemonizing_status(command: Command) -> Result<(), String> {
         .to_tokio_command()
         .map_err(|error| format!("{display}: {error}"))?;
     command.kill_on_drop(true);
-    let output = tokio::time::timeout(
-        ProcessPolicy::TmuxPoll.settings().deadline,
-        command.output(),
-    )
-    .await
-    .map_err(|_| format!("{display}: deadline exceeded"))?
-    .map_err(|error| format!("{display}: {error}"))?;
+    let cancellation = crate::process::current_cancellation();
+    let canceled = async {
+        match cancellation {
+            Some(token) => token.cancelled().await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::pin!(canceled);
+    let deadline = tokio::time::sleep(ProcessPolicy::TmuxPoll.settings().deadline);
+    tokio::pin!(deadline);
+    let output = tokio::select! {
+        biased;
+        () = &mut canceled => return Err(format!("{display}: subprocess canceled")),
+        () = &mut deadline => return Err(format!("{display}: deadline exceeded")),
+        result = command.output() => result.map_err(|error| format!("{display}: {error}"))?,
+    };
     if output.status.success() {
         return Ok(());
     }
@@ -1373,8 +1378,53 @@ mod tests {
         attach_or_create_window, capture_agent_pane, create_configured_agent_session,
         ensure_agent_session, latest_agent_session_generation, migrate_legacy_agent_sessions,
         pane_command_matches_agent, pane_start_command_matches_agent, paste_agent_prompt,
-        session_exists,
+        run_tmux_daemonizing_status, session_exists,
     };
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn daemonizing_tmux_client_observes_task_local_cancellation() {
+        let temp = unique_temp_dir("prism-tmux-daemonizing-cancel");
+        fs::create_dir_all(&temp).unwrap();
+        let pid_path = temp.join("client.pid");
+        let command = crate::process::Command::new("sh")
+            .arg("-c")
+            .arg("printf '%s\\n' \"$$\" > \"$1\"; exec sleep 30")
+            .arg("tmux-daemonizing-fixture")
+            .arg(&pid_path);
+        let cancellation = crate::process::CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let task = tokio::spawn(crate::process::with_cancellation(
+            task_cancellation,
+            run_tmux_daemonizing_status(command),
+        ));
+        let ready = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !pid_path.exists() {
+            assert!(std::time::Instant::now() < ready, "fixture did not start");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let pid = fs::read_to_string(&pid_path)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        let recorded = crate::process::record_process(pid).unwrap();
+
+        cancellation.cancel();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("daemonizing client ignored cancellation")
+            .unwrap()
+            .unwrap_err();
+        assert!(crate::process::is_cancellation_error(&error), "{error}");
+        let gone = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while crate::process::observe_process(recorded).unwrap()
+            != crate::process::ProcessObservation::Missing
+        {
+            assert!(std::time::Instant::now() < gone, "canceled client survived");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        fs::remove_dir_all(temp).unwrap();
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn tmux_session_names_are_stable_and_safe() {

@@ -29,13 +29,24 @@ pub enum CommandKind {
     Debug(DebugCommand),
     Db(DbCommand),
     Worker(WorkerCommand),
+    PrepareDevState {
+        source: PathBuf,
+        destination: PathBuf,
+    },
     List(InspectOptions),
     Status(StatusOptions),
     Pause(Option<String>),
     Resume(Option<String>),
     Stop(Option<String>),
-    Recover(Option<String>),
+    Recover(RecoverOptions),
     Daemon(DaemonCommand),
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RecoverOptions {
+    pub selector: Option<String>,
+    pub outcome: Option<String>,
+    pub evidence: Option<String>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -254,6 +265,25 @@ impl Args {
                     }
                     break;
                 }
+                "__prepare-dev-state" => {
+                    let source = iter.next().ok_or_else(|| {
+                        "__prepare-dev-state requires <source> <destination>".to_string()
+                    })?;
+                    let destination = iter.next().ok_or_else(|| {
+                        "__prepare-dev-state requires <source> <destination>".to_string()
+                    })?;
+                    if let Some(extra) = iter.next() {
+                        return Err(format!(
+                            "unknown __prepare-dev-state argument: {}",
+                            extra.to_string_lossy()
+                        ));
+                    }
+                    command = CommandKind::PrepareDevState {
+                        source: PathBuf::from(source),
+                        destination: PathBuf::from(destination),
+                    };
+                    break;
+                }
                 "worker" => {
                     let subcommand = iter
                         .next()
@@ -318,6 +348,8 @@ impl Args {
                 "pause" | "resume" | "stop" | "recover" => {
                     let name = text.into_owned();
                     let mut selector = None;
+                    let mut outcome = None;
+                    let mut evidence = None;
                     while let Some(value) = iter.next() {
                         let value = value.to_string_lossy().to_string();
                         if value == "--repo" && repo.is_none() {
@@ -327,6 +359,26 @@ impl Args {
                             ));
                         } else if value == "--repo" {
                             return Err("--repo accepts only one path".to_string());
+                        } else if name == "recover" && value == "--outcome" {
+                            if outcome.is_some() {
+                                return Err("--outcome accepts only one value".to_string());
+                            }
+                            outcome = Some(
+                                iter.next()
+                                    .ok_or_else(|| "--outcome requires a value".to_string())?
+                                    .to_string_lossy()
+                                    .to_string(),
+                            );
+                        } else if name == "recover" && value == "--evidence" {
+                            if evidence.is_some() {
+                                return Err("--evidence accepts only one value".to_string());
+                            }
+                            evidence = Some(
+                                iter.next()
+                                    .ok_or_else(|| "--evidence requires text".to_string())?
+                                    .to_string_lossy()
+                                    .to_string(),
+                            );
                         } else if selector.is_none() {
                             selector = Some(value);
                         } else {
@@ -337,7 +389,11 @@ impl Args {
                         "pause" => CommandKind::Pause(selector),
                         "resume" => CommandKind::Resume(selector),
                         "stop" => CommandKind::Stop(selector),
-                        _ => CommandKind::Recover(selector),
+                        _ => CommandKind::Recover(RecoverOptions {
+                            selector,
+                            outcome,
+                            evidence,
+                        }),
                     };
                     break;
                 }
@@ -490,6 +546,33 @@ mod tests {
     }
 
     #[test]
+    fn internal_dev_state_command_requires_exact_paths() {
+        assert_eq!(
+            parse(&["__prepare-dev-state", "/live", "/dev"]),
+            CommandKind::PrepareDevState {
+                source: PathBuf::from("/live"),
+                destination: PathBuf::from("/dev"),
+            }
+        );
+        assert!(
+            Args::parse([
+                OsString::from("__prepare-dev-state"),
+                OsString::from("/live"),
+            ])
+            .is_err()
+        );
+        assert!(
+            Args::parse([
+                OsString::from("__prepare-dev-state"),
+                OsString::from("/live"),
+                OsString::from("/dev"),
+                OsString::from("extra"),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn internal_worker_command_parses() {
         for (name, expected) in [
             ("serve", WorkerCommand::Serve),
@@ -526,7 +609,25 @@ mod tests {
             parse(&["stop", "w:run-1"]),
             CommandKind::Stop(Some("w:run-1".to_string()))
         );
-        assert_eq!(parse(&["recover"]), CommandKind::Recover(None));
+        assert_eq!(
+            parse(&["recover"]),
+            CommandKind::Recover(RecoverOptions::default())
+        );
+        assert_eq!(
+            parse(&[
+                "recover",
+                "w:run-1",
+                "--outcome",
+                "rejected-before-effect",
+                "--evidence",
+                "provider rejected request R-17"
+            ]),
+            CommandKind::Recover(RecoverOptions {
+                selector: Some("w:run-1".to_string()),
+                outcome: Some("rejected-before-effect".to_string()),
+                evidence: Some("provider rejected request R-17".to_string()),
+            })
+        );
     }
 
     #[test]

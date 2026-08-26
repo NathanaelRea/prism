@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+import json
+import os
+import pathlib
+import signal
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import unquote, urlparse
+
+from _common import log_event, reject, root
+
+args = sys.argv[1:]
+log_event("opencode", args)
+if args == ["--version"]:
+    print("opencode 1.2.10")
+    raise SystemExit(0)
+
+if args[:1] == ["attach"] and len(args) == 2:
+    print(f"PRISM_E2E_OPENCODE_ATTACHED {args[1]}", flush=True)
+    signal.pause()
+    raise SystemExit(0)
+
+if args[:1] != ["serve"]:
+    reject("opencode", args)
+try:
+    hostname = args[args.index("--hostname") + 1]
+    port = int(args[args.index("--port") + 1])
+except (ValueError, IndexError):
+    reject("opencode", args, "serve requires --hostname and --port")
+if len(args) != 5:
+    reject("opencode", args, "unsupported serve flags")
+
+sessions_path = root() / "state" / f"opencode-sessions-{port}.json"
+
+def read_sessions():
+    try:
+        return json.loads(sessions_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+
+
+def write_sessions(sessions):
+    temporary = sessions_path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(sessions), encoding="utf-8")
+    os.replace(temporary, sessions_path)
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *_args):
+        return
+
+    def respond(self, status, value, content_type="application/json"):
+        body = value if isinstance(value, bytes) else json.dumps(value).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def body(self):
+        length = int(self.headers.get("Content-Length") or "0")
+        raw = self.rfile.read(length).decode() if length else "{}"
+        return raw, json.loads(raw or "{}")
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        log_event("opencode-http", ["GET", path])
+        sessions = read_sessions()
+        if path == "/global/health":
+            return self.respond(200, {"healthy": True, "version": "1.2.10"})
+        if path == "/session":
+            return self.respond(200, sessions)
+        if path == "/session/status":
+            return self.respond(200, {item["id"]: {"type": "idle"} for item in sessions})
+        if path == "/event":
+            body = b"event: message\ndata: {\"type\":\"server.connected\"}\n\n"
+            return self.respond(200, body, "text/event-stream")
+        if path.startswith("/session/"):
+            session_id = unquote(path.split("/")[2])
+            session = next((item for item in sessions if item["id"] == session_id), None)
+            if path.endswith("/message"):
+                return self.respond(200, [])
+            if path.endswith("/todo"):
+                return self.respond(200, [])
+            return self.respond(200 if session else 404, session or {"error": "not found"})
+        log_event("opencode-http", ["GET", path], unsupported=True)
+        return self.respond(404, {"error": f"unsupported path {path}"})
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        raw, body = self.body()
+        log_event("opencode-http", ["POST", path], stdin=raw)
+        sessions = read_sessions()
+        if path == "/session":
+            session = {
+                "id": f"ses_e2e_{len(sessions) + 1}",
+                "directory": body.get("directory") or os.getcwd(),
+                "title": body.get("title") or "Prism E2E",
+                "time": {"created": 1, "updated": 1},
+            }
+            sessions.append(session)
+            write_sessions(sessions)
+            return self.respond(200, session)
+        if path in ("/tui/append-prompt", "/tui/submit-prompt") or path.endswith("/abort") or path.endswith("/prompt_async"):
+            return self.respond(200, True)
+        log_event("opencode-http", ["POST", path], stdin=raw, unsupported=True)
+        return self.respond(404, {"error": f"unsupported path {path}"})
+
+
+ready = root() / "state" / f"opencode-{port}.ready"
+ready.write_text(f"pid={os.getpid()}\n", encoding="utf-8")
+ThreadingHTTPServer((hostname, port), Handler).serve_forever()
