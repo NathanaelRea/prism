@@ -815,6 +815,18 @@ fn renders_footer_status_message_and_leader_overlay() {
 }
 
 #[test]
+fn development_install_is_visible_in_the_footer() {
+    let config = test_config();
+    let sessions = vec![test_session("feature", AgentState::Idle)];
+    let mut model = test_model(&config, &sessions, PanelFocus::Status, None, None);
+    model.mode_label = "DEV";
+
+    let buffer = render_to_buffer(&model, 100, 20);
+
+    assert_line_contains(&buffer, 19, "[DEV] | Panels");
+}
+
+#[test]
 fn workflow_input_form_renders_types_defaults_and_enum_dropdown() {
     let config = test_config();
     let sessions = vec![test_session("feature", AgentState::Idle)];

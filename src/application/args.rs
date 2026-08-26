@@ -29,6 +29,10 @@ pub enum CommandKind {
     Debug(DebugCommand),
     Db(DbCommand),
     Worker(WorkerCommand),
+    PrepareDevState {
+        source: PathBuf,
+        destination: PathBuf,
+    },
     List(InspectOptions),
     Status(StatusOptions),
     Pause(Option<String>),
@@ -252,6 +256,25 @@ impl Args {
                     } else {
                         command = CommandKind::Db(DbCommand::Query(parts.join(" ")));
                     }
+                    break;
+                }
+                "__prepare-dev-state" => {
+                    let source = iter.next().ok_or_else(|| {
+                        "__prepare-dev-state requires <source> <destination>".to_string()
+                    })?;
+                    let destination = iter.next().ok_or_else(|| {
+                        "__prepare-dev-state requires <source> <destination>".to_string()
+                    })?;
+                    if let Some(extra) = iter.next() {
+                        return Err(format!(
+                            "unknown __prepare-dev-state argument: {}",
+                            extra.to_string_lossy()
+                        ));
+                    }
+                    command = CommandKind::PrepareDevState {
+                        source: PathBuf::from(source),
+                        destination: PathBuf::from(destination),
+                    };
                     break;
                 }
                 "worker" => {
@@ -487,6 +510,33 @@ mod tests {
         assert!(help.contains("prism [--repo <path>] db\n"));
         assert!(help.contains("prism [--repo <path>] db path"));
         assert!(help.contains("prism [--repo <path>] db <read-only-sql>"));
+    }
+
+    #[test]
+    fn internal_dev_state_command_requires_exact_paths() {
+        assert_eq!(
+            parse(&["__prepare-dev-state", "/live", "/dev"]),
+            CommandKind::PrepareDevState {
+                source: PathBuf::from("/live"),
+                destination: PathBuf::from("/dev"),
+            }
+        );
+        assert!(
+            Args::parse([
+                OsString::from("__prepare-dev-state"),
+                OsString::from("/live"),
+            ])
+            .is_err()
+        );
+        assert!(
+            Args::parse([
+                OsString::from("__prepare-dev-state"),
+                OsString::from("/live"),
+                OsString::from("/dev"),
+                OsString::from("extra"),
+            ])
+            .is_err()
+        );
     }
 
     #[test]
