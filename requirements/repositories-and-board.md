@@ -4,7 +4,10 @@
 
 - **Behavior**: Users can add a repository by selecting a path within its Git
   working tree; Prism resolves and tracks the repository root without duplicating
-  an existing entry.
+  an existing entry. Before committing the first add, Prism creates the Worktrunk
+  user config when needed and adds an empty entry for Worktrunk's project
+  identifier; a setup failure leaves the repository untracked, and Prism does not
+  create a repository-owned `.config/wt.toml`.
 - **Behavior**: Users can reorder tracked repositories and remove them from
   tracking. Removing tracking does not delete the repository, and requires
   confirmation before the new ordering is saved.

@@ -322,13 +322,37 @@ pub fn update<T>(
     update_with_fault(path, options, transform, |_| Ok(()))
 }
 
+/// Updates `path` while serializing on a caller-selected lock file.
+///
+/// The explicit lock is acquired before resolving a final symlink so this
+/// operation can coordinate with an external writer that locks the configured
+/// path rather than its resolved target.
+pub fn update_with_lock_path<T>(
+    path: &Path,
+    lock_path: &Path,
+    options: UpdateOptions,
+    transform: impl FnOnce(FileContents) -> Result<(T, Option<Vec<u8>>), BoxError>,
+) -> Result<T, PersistenceError> {
+    update_with_lock_path_and_fault(path, Some(lock_path), options, transform, |_| Ok(()))
+}
+
 fn update_with_fault<T>(
     path: &Path,
     options: UpdateOptions,
     transform: impl FnOnce(FileContents) -> Result<(T, Option<Vec<u8>>), BoxError>,
     fault: impl FnMut(Stage) -> io::Result<()>,
 ) -> Result<T, PersistenceError> {
-    let result = update_inner_with_fault(path, options, transform, fault);
+    update_with_lock_path_and_fault(path, None, options, transform, fault)
+}
+
+fn update_with_lock_path_and_fault<T>(
+    path: &Path,
+    lock_path: Option<&Path>,
+    options: UpdateOptions,
+    transform: impl FnOnce(FileContents) -> Result<(T, Option<Vec<u8>>), BoxError>,
+    fault: impl FnMut(Stage) -> io::Result<()>,
+) -> Result<T, PersistenceError> {
+    let result = update_inner_with_fault(path, lock_path, options, transform, fault);
     match result {
         Ok((value, committed)) => {
             crate::observability::emit_deferred(crate::observability::EventInput {
@@ -388,6 +412,7 @@ fn update_with_fault<T>(
 
 fn update_inner_with_fault<T>(
     path: &Path,
+    explicit_lock_path: Option<&Path>,
     options: UpdateOptions,
     transform: impl FnOnce(FileContents) -> Result<(T, Option<Vec<u8>>), BoxError>,
     mut fault: impl FnMut(Stage) -> io::Result<()>,
@@ -404,25 +429,49 @@ fn update_inner_with_fault<T>(
             .map_err(|error| PersistenceError::new(Stage::CreateParent, parent, false, error))?;
     }
 
-    let target = resolve_final_symlink(path)?;
+    let (target, _lock_guard) = if let Some(lock_path) = explicit_lock_path {
+        let lock_parent = lock_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        fs::create_dir_all(lock_parent).map_err(|error| {
+            PersistenceError::new(Stage::CreateParent, lock_parent, false, error)
+        })?;
+        #[cfg(windows)]
+        if lock_parent != Path::new(".") {
+            crate::system::windows_security::secure_path(lock_parent, true).map_err(|error| {
+                PersistenceError::new(Stage::CreateParent, lock_parent, false, error)
+            })?;
+        }
+        let lock = open_lock(lock_path)?;
+        acquire_lock(&lock, lock_path, options.lock_timeout)?;
+        (resolve_final_symlink(path)?, lock)
+    } else {
+        let target = resolve_final_symlink(path)?;
+        let lock_path = adjacent_lock_path(&target);
+        let lock = open_lock(&lock_path)?;
+        acquire_lock(&lock, &lock_path, options.lock_timeout)?;
+        (target, lock)
+    };
     let target_parent = target
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     #[cfg(windows)]
-    if target.exists() {
-        crate::system::windows_security::secure_path(&target, false).map_err(|error| {
-            PersistenceError::new(Stage::InspectPermissions, &target, false, error)
-        })?;
-    }
-    let lock_path = adjacent_lock_path(&target);
-    let lock = open_lock(&lock_path)?;
-    acquire_lock(&lock, &lock_path, options.lock_timeout)?;
+    secure_existing_target(&target)?;
 
     let contents = match fs::read(&target) {
         Ok(bytes) => FileContents::Present(bytes),
         Err(error) if error.kind() == io::ErrorKind::NotFound => FileContents::Missing,
         Err(error) => return Err(PersistenceError::new(Stage::Read, &target, false, error)),
+    };
+    let transformed = transform(contents);
+    #[cfg(windows)]
+    secure_existing_target(&target)?;
+    let (value, replacement) = transformed
+        .map_err(|error| PersistenceError::boxed(Stage::Transform, &target, false, error))?;
+    let Some(replacement) = replacement else {
+        return Ok((value, false));
     };
     let permissions = match fs::metadata(&target) {
         Ok(metadata) => Some(metadata.permissions()),
@@ -435,11 +484,6 @@ fn update_inner_with_fault<T>(
                 error,
             ));
         }
-    };
-    let (value, replacement) = transform(contents)
-        .map_err(|error| PersistenceError::boxed(Stage::Transform, &target, false, error))?;
-    let Some(replacement) = replacement else {
-        return Ok((value, false));
     };
 
     let (mut staging_file, staging_path) = create_staging(&target, target_parent)?;
@@ -519,6 +563,21 @@ fn update_inner_with_fault<T>(
     fault(Stage::SyncParent)
         .map_err(|error| PersistenceError::new(Stage::SyncParent, target_parent, true, error))?;
     Ok((value, true))
+}
+
+#[cfg(windows)]
+fn secure_existing_target(path: &Path) -> Result<(), PersistenceError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => crate::system::windows_security::secure_path(path, false)
+            .map_err(|error| PersistenceError::new(Stage::InspectPermissions, path, false, error)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(PersistenceError::new(
+            Stage::InspectPermissions,
+            path,
+            false,
+            error,
+        )),
+    }
 }
 
 fn resolve_final_symlink(path: &Path) -> Result<PathBuf, PersistenceError> {
@@ -871,6 +930,35 @@ mod tests {
         assert_eq!(error.durability(), Some(options.durability));
         drop(lock);
         assert!(lock_path.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn explicit_lock_path_coordinates_before_following_a_final_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir("explicit-lock");
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("managed.toml");
+        let link = dir.join("config.toml");
+        let lock_path = link.with_extension("toml.lock");
+        fs::write(&target, "value = 'old'\n").unwrap();
+        symlink(&target, &link).unwrap();
+        let lock = open_lock(&lock_path).unwrap();
+        lock.try_lock().unwrap();
+        let mut options = UpdateOptions::important_toml();
+        options.lock_timeout = Duration::from_millis(20);
+
+        let error = update_with_lock_path(&link, &lock_path, options, |_| {
+            Ok(((), Some(b"value = 'new'\n".to_vec())))
+        })
+        .unwrap_err();
+
+        assert_eq!(error.stage(), Stage::AcquireLock);
+        assert_eq!(error.path(), lock_path.as_path());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "value = 'old'\n");
+        drop(lock);
         fs::remove_dir_all(dir).unwrap();
     }
 

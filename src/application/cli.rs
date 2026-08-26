@@ -817,10 +817,24 @@ fn observer_options(args: &Args) -> ObserverOptions {
 }
 
 async fn run_tui(repo_arg: Option<&std::path::Path>) -> Result<(), String> {
-    let (entries, selected_repo) = observability::phase_async("load_workspace", || {
-        workspace::ensure_entries_for_tui(repo_arg)
-    })
-    .await?;
+    let requested_repo =
+        observability::phase_async("discover_requested_repository", || async move {
+            match repo_arg {
+                Some(path) => Repository::discover(Some(path)).await.map(Some),
+                None => Ok(None),
+            }
+        })
+        .await?;
+    if let Some(repo) = requested_repo.as_ref() {
+        let config = Config::load(repo);
+        observability::phase_async("register_worktrunk_project", || {
+            crate::worktrunk::ensure_user_project_config(repo, &config)
+        })
+        .await?;
+    }
+    let (entries, selected_repo) = observability::phase("load_workspace", || {
+        workspace::ensure_entries_for_tui(requested_repo.as_ref())
+    })?;
     let (entries, selected_repo) = observability::phase("reconcile_workspace", || {
         workspace::remove_missing_entries(entries, selected_repo)
     })?;

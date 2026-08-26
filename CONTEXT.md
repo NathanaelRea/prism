@@ -22,9 +22,12 @@ A tracked repository is a repository listed in `~/.config/prism/repos.toml`.
 Tracked repositories appear in the repos panel, keep their configured order, and
 may have a single-character key used by `Space <key>` shortcuts.
 
-Adding a repository through `--repo <path>` or the TUI discovers the Git root and
-adds it to `repos.toml` if it is not already tracked. Removing a repository from
-`repos.toml` stops Prism from tracking it; it does not delete the repository.
+Adding a repository through `--repo <path>` or the TUI discovers the Git root,
+registers its Worktrunk identifier in the Worktrunk user config, and only then
+adds it to `repos.toml` if it is not already tracked. This user-owned registration
+does not create or modify the repository's `.config/wt.toml`. Removing a
+repository from `repos.toml` stops Prism from tracking it; it does not delete the
+repository or its Worktrunk user entry.
 
 ### Worktree Session
 
