@@ -1336,7 +1336,7 @@ pub(crate) fn create_change_request(
         .create_change_request(&request)
         .map_err(|error| error.to_string())?;
     super::store::record_pr_summary(repo, &guard.local_branch, cache, legacy_summary(summary)?);
-    Ok(())
+    cache.refresh_result()
 }
 
 pub(crate) fn merge_change_request(
