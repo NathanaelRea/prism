@@ -266,7 +266,7 @@ impl Tui {
             can_pause: workflow.available_controls.pause,
             can_resume: workflow.available_controls.resume,
             can_cancel: workflow.available_controls.stop,
-            can_retry: workflow.available_controls.recover,
+            can_retry: workflow.available_controls.retry,
         })
     }
 
