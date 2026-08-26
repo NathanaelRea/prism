@@ -68,8 +68,11 @@ pub(crate) fn prepare(source: &Path, destination: &Path) -> Result<DevStateSumma
     let entries = workspace::load_entries_from_path(&source.join("repos.toml"))?;
     let mut copied_repository_databases = 0;
     for entry in &entries {
-        let source_repo_dir = prism_repo_dir(&entry.root, source);
-        let destination_repo_dir = prism_repo_dir(&entry.root, destination);
+        // Repository discovery resolves path aliases (for example, macOS /var to
+        // /private/var), so use the same physical root when locating its state.
+        let storage_root = fs::canonicalize(&entry.root).unwrap_or_else(|_| entry.root.clone());
+        let source_repo_dir = prism_repo_dir(&storage_root, source);
+        let destination_repo_dir = prism_repo_dir(&storage_root, destination);
         if source_repo_dir.exists() {
             copy_tree(
                 &source_repo_dir,

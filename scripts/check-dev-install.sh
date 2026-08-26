@@ -64,12 +64,15 @@ repository_previous=$((repository_latest - 1))
 workflow_previous=$((workflow_latest - 1))
 
 temporary="$(mktemp -d "${TMPDIR:-/tmp}/prism-dev-install.XXXXXX")"
+temporary_alias="${temporary}.alias"
 runtime_temporary="$(mktemp -d /tmp/prism-dev-runtime.XXXXXX)"
+ln -s "$temporary" "$temporary_alias"
 cleanup() {
 	if [ -x "$temporary/bin/prism-dev" ]; then
 		"$temporary/bin/prism-dev" daemon stop >/dev/null 2>&1 || true
 	fi
 	rm -rf "$temporary" "$runtime_temporary"
+	rm -f "$temporary_alias"
 }
 trap cleanup EXIT
 live_home="$temporary/live"
@@ -77,7 +80,8 @@ dev_home="$temporary/dev"
 live_runtime="$runtime_temporary/live"
 dev_runtime="$runtime_temporary/dev"
 install_dir="$temporary/bin"
-test_repo="$temporary/repo"
+# Exercise the same configured-path versus physical-path split as macOS /var.
+test_repo="$temporary_alias/repo"
 mkdir -p "$live_home" "$live_runtime" "$dev_runtime" "$install_dir" "$test_repo"
 chmod 700 "$live_runtime" "$dev_runtime"
 
