@@ -197,6 +197,7 @@ mod tests {
             [
                 (1, "C72EACE717551A3E3EAA63642B38BDFC9EBCD840B940686BECE9C81BC7AC3C2B24518C4F4AA7239654345D4FEA4B7D2F".into()),
                 (2, "5EDB6152EA6D11D90A7CE3A1E2239674C6F6DAE299F631EE30F894137694BD6D532A8B5F8CFBBE57FF8981C35B2C6C3C".into()),
+                (3, "F7C834FB7660F6AEDB29597CD63F9257E836C693B759990D9506D9B50B88AD59120AF8144CCD70ED6C6D7C7EAFC8925F".into()),
             ]
         );
         let preserved: String =
@@ -226,6 +227,60 @@ mod tests {
             assert_released_sqlx_upgrade(2).await;
         })
         .unwrap();
+    }
+
+    #[test]
+    fn reopens_repository_with_deferred_merge_cleanup_history() {
+        let path = database_path("deferred-merge-cleanup-history");
+        crate::async_runtime::block_on(async {
+            let mut connection = open_connection(&path).await;
+            sqlx::raw_sql(include_str!(
+                "../../migrations/repository/0001_initial.sql"
+            ))
+            .execute(&mut connection)
+            .await
+            .unwrap();
+            sqlx::raw_sql(include_str!(
+                "../../migrations/repository/0002_drop_legacy_workflows.sql"
+            ))
+            .execute(&mut connection)
+            .await
+            .unwrap();
+            sqlx::raw_sql(include_str!(
+                "../../migrations/repository/0003_deferred_merge_cleanup.sql"
+            ))
+            .execute(&mut connection)
+            .await
+            .unwrap();
+            sqlx::raw_sql(
+                "CREATE TABLE _sqlx_migrations (version bigint primary key, description text not null, installed_on timestamp not null default current_timestamp, success boolean not null, checksum blob not null, execution_time bigint not null);\
+                 INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES\
+                   (1, 'initial', 1, X'C72EACE717551A3E3EAA63642B38BDFC9EBCD840B940686BECE9C81BC7AC3C2B24518C4F4AA7239654345D4FEA4B7D2F', 0),\
+                   (2, 'drop legacy workflows', 1, X'5EDB6152EA6D11D90A7CE3A1E2239674C6F6DAE299F631EE30F894137694BD6D532A8B5F8CFBBE57FF8981C35B2C6C3C', 0),\
+                   (3, 'deferred merge cleanup', 1, X'F7C834FB7660F6AEDB29597CD63F9257E836C693B759990D9506D9B50B88AD59120AF8144CCD70ED6C6D7C7EAFC8925F', 0);",
+            )
+            .execute(&mut connection)
+            .await
+            .unwrap();
+            sqlx::query("insert into metadata (key, value) values ('preserved', 'yes')")
+                .execute(&mut connection)
+                .await
+                .unwrap();
+            connection.close().await.unwrap();
+
+            initialize_repository_database(&path).await.unwrap();
+
+            let mut connection = open_connection(&path).await;
+            let preserved: String =
+                sqlx::query_scalar("select value from metadata where key = 'preserved'")
+                    .fetch_one(&mut connection)
+                    .await
+                    .unwrap();
+            assert_eq!(preserved, "yes");
+            connection.close().await.unwrap();
+        })
+        .unwrap();
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
