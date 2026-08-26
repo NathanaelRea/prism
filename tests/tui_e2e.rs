@@ -5,7 +5,7 @@ mod support;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use support::{E2eSandbox, capture_pane, read_events, run_tmux, wait_until};
 
@@ -292,9 +292,39 @@ fn dashboard_attaches_pushes_merges_and_quits_from_physical_keys() {
         .expect("guarded gh merge invocation");
     assert_eq!(merge_event["argv"][4], "--match-head-commit");
     assert_eq!(merge_event["argv"][5], head);
-    wait_until(Duration::from_secs(8), "merge confirmation", || {
-        runtime_log_contains(sandbox.root(), "pull request merged").then_some(())
+    wait_until(Duration::from_secs(8), "post-merge cleanup prompt", || {
+        capture_pane(&sandbox.real_tmux, &controller_socket, "controller:0")
+            .contains("Delete Session")
+            .then_some(())
     });
+    let keep_worktree = run_tmux(
+        &sandbox.real_tmux,
+        &controller_socket,
+        &["send-keys", "-t", "controller:0", "n", "Enter"],
+    );
+    assert!(keep_worktree.status.success());
+    wait_until(Duration::from_secs(8), "merge confirmation", || {
+        runtime_log_contains(sandbox.root(), "pull request merged; worktree kept").then_some(())
+    });
+
+    // The merge invalidates remote observations while an older provider refresh may
+    // still be draining. Quitting during that refresh correctly reports an
+    // unsuccessful shutdown, so wait for provider traffic to become quiescent.
+    let mut latest_gh_sequence = latest_tool_sequence(&sandbox.events_path(), "gh");
+    let mut gh_quiet_since = Instant::now();
+    wait_until(
+        Duration::from_secs(15),
+        "post-merge provider refresh to settle",
+        || {
+            let latest = latest_tool_sequence(&sandbox.events_path(), "gh");
+            if latest != latest_gh_sequence {
+                latest_gh_sequence = latest;
+                gh_quiet_since = Instant::now();
+                return None;
+            }
+            (gh_quiet_since.elapsed() >= Duration::from_secs(3)).then_some(())
+        },
+    );
 
     let quit = run_tmux(
         &sandbox.real_tmux,
@@ -326,4 +356,12 @@ fn runtime_log_contains(root: &Path, needle: &str) -> bool {
     entries.filter_map(Result::ok).any(|entry| {
         fs::read_to_string(entry.path().join("runtime.log")).is_ok_and(|log| log.contains(needle))
     })
+}
+
+fn latest_tool_sequence(events_path: &Path, tool: &str) -> Option<u64> {
+    read_events(events_path)
+        .into_iter()
+        .filter(|event| event["tool"] == tool)
+        .filter_map(|event| event["sequence"].as_u64())
+        .max()
 }
