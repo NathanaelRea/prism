@@ -26,8 +26,16 @@ for observability.
 
 We will not fork or vendor Worktrunk and will not add a Worktrunk Rust crate.
 Using the executable ensures Prism and standalone `wt list` consume the same
-user and project configuration. A backend trait is not introduced until a
-second concrete adapter exists.
+user and project configuration. When a repository first becomes tracked, Prism
+uses `wt config show` to discover Worktrunk's user-config path and canonical
+project identifier and `wt config create` when the user file is absent. Creation
+and the comment-preserving atomic insertion of the missing empty user-level
+`[projects."<identifier>"]` table share Worktrunk's user-config lock path, so
+concurrent Prism registrations merge rather than overwrite one another. Prism
+completes registration before committing a new tracked-repository entry; edits
+made directly through its repository-list editor are rolled back if registration
+fails. It never synthesizes or modifies the repository-owned `.config/wt.toml`.
+A backend trait is not introduced until a second concrete adapter exists.
 
 Git's live worktree inventory remains authoritative for physical existence and
 the attached branch. Worktrunk owns physical path policy and lifecycle effects,

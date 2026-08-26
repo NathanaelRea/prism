@@ -109,27 +109,26 @@ pub fn replace_entries(
     })
 }
 
-pub fn ensure_repo_entry(path: &Path) -> Result<(Repository, usize, Vec<RepoEntry>), String> {
-    let repo = Repository::discover(Some(path))?;
-    let root = repo.root.clone();
-    let (index, entries) = ensure_repo_root(&repos_path(), root)?;
-    Ok((repo, index, entries))
+pub fn ensure_repo_entry(repo: &Repository) -> Result<(usize, Vec<RepoEntry>, bool), String> {
+    ensure_repo_root(&repos_path(), repo.root.clone())
 }
 
-fn ensure_repo_root(path: &Path, root: PathBuf) -> Result<(usize, Vec<RepoEntry>), String> {
+fn ensure_repo_root(path: &Path, root: PathBuf) -> Result<(usize, Vec<RepoEntry>, bool), String> {
     update_entries(path, move |entries, _| {
         if let Some(index) = entries.iter().position(|entry| entry.root == root) {
-            return Ok(((index, entries.clone()), false));
+            return Ok(((index, entries.clone(), false), false));
         }
         let key = next_key(entries);
         entries.push(RepoEntry { root, key });
-        Ok(((entries.len() - 1, entries.clone()), true))
+        Ok(((entries.len() - 1, entries.clone(), true), true))
     })
 }
 
-pub fn ensure_entries_for_tui(repo_arg: Option<&Path>) -> Result<(Vec<RepoEntry>, usize), String> {
-    if let Some(path) = repo_arg {
-        let (_, index, entries) = ensure_repo_entry(path)?;
+pub fn ensure_entries_for_tui(
+    requested_repo: Option<&Repository>,
+) -> Result<(Vec<RepoEntry>, usize), String> {
+    if let Some(repo) = requested_repo {
+        let (index, entries, _) = ensure_repo_entry(repo)?;
         return Ok((entries, index));
     }
 
@@ -439,6 +438,25 @@ key = "8"
         assert_eq!(retained.len(), 2);
         assert_eq!(selected_index, 1);
         let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn repository_addition_reports_only_the_first_insert_as_added() {
+        let temp = unique_temp_dir("prism-workspace-added-result-test");
+        fs::create_dir_all(&temp).unwrap();
+        let path = temp.join("repos.toml");
+        let root = PathBuf::from("/repo");
+
+        let (first_index, first_entries, first_added) =
+            ensure_repo_root(&path, root.clone()).unwrap();
+        let (second_index, second_entries, second_added) = ensure_repo_root(&path, root).unwrap();
+
+        assert_eq!(first_index, 0);
+        assert_eq!(second_index, 0);
+        assert!(first_added);
+        assert!(!second_added);
+        assert_eq!(first_entries, second_entries);
+        fs::remove_dir_all(temp).unwrap();
     }
 
     #[test]

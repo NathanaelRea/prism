@@ -64,7 +64,8 @@ if command == ["config", "state", "logs", "--format=json"]:
     raise SystemExit(0)
 
 if command == ["config", "show", "--format=json"]:
-    print(json.dumps({"user": {"path": str(root() / "config/worktrunk/config.toml"), "exists": True, "config": {}}, "project": {}}))
+    config = root() / "config/worktrunk/config.toml"
+    print(json.dumps({"user": {"path": str(config), "exists": config.exists(), "config": {}}, "project": {"identifier": "github.com/prism-e2e/project"}}))
     raise SystemExit(0)
 
 if command == ["config", "create"]:
