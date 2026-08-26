@@ -199,7 +199,11 @@ impl Tui {
             main_scroll: self.main_scroll,
             repo_main_view: self.repo_main_view,
             worktree_list_mode: self.worktree_list_mode,
-            mode_label: "normal",
+            mode_label: if std::env::var_os("PRISM_DEV").is_some() {
+                "DEV"
+            } else {
+                "normal"
+            },
             status_message: self.status_message.as_deref(),
             repo_filter: &self.repo_filter,
             worktree_filter: &self.worktree_filter,

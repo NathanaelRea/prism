@@ -10,6 +10,9 @@ export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
 export PRISM_CHECK_SQLX_METADATA=1
 "$repo_root/scripts/check.sh"
 
+printf '\n==> scripts/check-dev-install.sh\n'
+"$repo_root/scripts/check-dev-install.sh"
+
 # Controller-tmux black-box tests are intentionally excluded from the routine
 # gate and run only in the exhaustive platform gate.
 cd "$repo_root"

@@ -1,3 +1,4 @@
+use super::dev_install;
 use crate::args::{
     self, AgentCommand, Args, CommandKind, ConfigCommand, DaemonCommand, DbCommand, DebugCommand,
     InspectOptions, StatusOptions, WorkerCommand,
@@ -14,7 +15,28 @@ use crate::{agent_session, config, session, setup, tui, ui_state, workspace};
 use std::process::Command as ProcessCommand;
 
 pub fn run() -> Result<(), String> {
+    let _dev_install_reader = dev_install::reader_lease_from_environment()?;
     let args = Args::parse(std::env::args_os().skip(1))?;
+    if let CommandKind::PrepareDevState {
+        source,
+        destination,
+    } = &args.command
+    {
+        let summary = dev_install::prepare(source, destination)?;
+        println!(
+            "Prepared development state at {}: {} repository database(s) ({} copied), Workflow database {}, {} nonterminal Workflow run(s) omitted",
+            destination.display(),
+            summary.repository_databases,
+            summary.copied_repository_databases,
+            if summary.copied_workflow_database {
+                "copied"
+            } else {
+                "created"
+            },
+            summary.removed_nonterminal_workflows,
+        );
+        return Ok(());
+    }
     if let CommandKind::Debug(DebugCommand::Record(options)) = &args.command {
         let repo = load_integrity_repo_context(args.repo.as_deref())?;
         eprintln!(
@@ -87,6 +109,7 @@ pub fn run() -> Result<(), String> {
             run_db_command(command, &repo)
         }
         CommandKind::Worker(command) => run_worker_command(command),
+        CommandKind::PrepareDevState { .. } => unreachable!("handled before logging setup"),
         CommandKind::List(options) => run_list_command(args.repo.as_deref(), options),
         CommandKind::Status(options) => run_status_command(args.repo.as_deref(), options),
         CommandKind::Pause(selector) => {

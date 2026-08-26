@@ -58,6 +58,7 @@ export CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-always}"
 
 run scripts/check-lint-policy.sh
 run scripts/check-workflow-cutover.sh
+run scripts/check-migrations.sh
 
 isolated_tmux_dir="$(mktemp -d "${TMPDIR:-/tmp}/prism-check-tmux.XXXXXX")"
 sqlx_database="$(mktemp "${TMPDIR:-/tmp}/prism-check-sqlx.XXXXXX")"
