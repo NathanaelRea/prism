@@ -161,6 +161,9 @@ impl Tui {
             PanelFocus::Merges => PanelFocus::Status,
         };
         self.main_focused = false;
+        if self.is_worktree_session_panel() {
+            self.restore_selected_worktree_for_repo();
+        }
     }
 
     pub(super) fn focus_previous_panel(&mut self) {
@@ -172,6 +175,9 @@ impl Tui {
             PanelFocus::Merges => PanelFocus::Worktrees,
         };
         self.main_focused = false;
+        if self.is_worktree_session_panel() {
+            self.restore_selected_worktree_for_repo();
+        }
     }
 
     pub(crate) fn focus_status(&mut self) {
@@ -461,8 +467,10 @@ impl Tui {
             .iter()
             .enumerate()
             .filter_map(|(index, session)| {
-                let merge_finishing = session.pr.summary().is_some_and(|summary| {
-                    summary.merge_progress() != crate::remote::PrMergeProgress::Active
+                let merge_finishing = session.pr.trusted_summary().is_ok_and(|summary| {
+                    summary.is_some_and(|summary| {
+                        summary.merge_progress() != crate::remote::PrMergeProgress::Active
+                    })
                 });
                 (!session.hidden
                     && merge_finishing == finishing

@@ -28,11 +28,12 @@ use crate::session::{
 };
 use crate::tmux::TmuxWindow;
 use crate::tui::{
-    DefaultBranchPollResult, DeleteSessionKey, DeleteSessionResult, ManagedRepo,
-    OpencodeEventResult, OpencodeListenerKey, OpencodePollKey, OpencodePollResult,
-    PrPersistenceRequest, PrPollKey, PrPollResult, PrSummarySessionResult, RemoteActionValue,
-    SelectedRepoContext, SessionRefreshResult, SessionRefreshSnapshot, TUI_ACTION_JOB_TIMEOUT, Tui,
-    TuiJobKey, TuiJobKind, TuiJobPayload, WtObservation, WtPollResult,
+    DefaultBranchPollResult, DeferredMergeCleanupOutcome, DeferredMergeCleanupResult,
+    DeleteSessionKey, DeleteSessionResult, ManagedRepo, OpencodeEventResult, OpencodeListenerKey,
+    OpencodePollKey, OpencodePollResult, PrPersistenceRequest, PrPollKey, PrPollResult,
+    PrSummarySessionResult, RemoteActionValue, SelectedRepoContext, SessionRefreshResult,
+    SessionRefreshSnapshot, TUI_ACTION_JOB_TIMEOUT, Tui, TuiJobKey, TuiJobKind, TuiJobPayload,
+    WtObservation, WtPollResult,
 };
 use crate::tui_jobs::CoalescedFacet;
 

@@ -59,7 +59,6 @@ pub(super) fn status_label_with_behind(label: &str, behind: usize) -> String {
 impl Tui {
     pub(crate) fn poll_pull_requests(&mut self, force: bool) -> bool {
         let mut changed = self.drain_pr_poll_results();
-        changed |= self.reconcile_deferred_merge_cleanups();
         for repo_index in 0..self.repos.len() {
             let interval = if repo_index == self.current_repo {
                 PR_SUMMARY_POLL_INTERVAL
@@ -306,6 +305,7 @@ impl Tui {
                         .map(|session| pr_cache_comment_count(&session.pr))
                         .collect::<Vec<_>>();
                     let mut persistence = Vec::new();
+                    let mut deferred_cleanups = Vec::new();
                     if let Some(repo) = self.repos.get_mut(repo_index) {
                         repo.remote_capabilities = capabilities;
                         repo.remote_capability_error = if github_remote_configured {
@@ -358,6 +358,8 @@ impl Tui {
                                 continue;
                             };
                             let before_summary = self.sessions[index].pr.summary().cloned();
+                            let cleanup_action =
+                                super::worktrees::deferred_merge_cleanup_action(&observation);
                             if apply_pr_summary_poll_result(
                                 &mut self.sessions[index].pr,
                                 poll_started_at,
@@ -368,11 +370,15 @@ impl Tui {
                                     index,
                                     before_summary != self.sessions[index].pr.summary().cloned(),
                                 ));
+                                deferred_cleanups.push((index, cleanup_action));
                             }
                         }
                     }
                     for (index, remote_update) in persistence {
                         self.queue_pr_persistence(index, false, remote_update);
+                    }
+                    for (index, action) in deferred_cleanups {
+                        self.start_deferred_merge_cleanup_reconciliation(index, action);
                     }
                     if let Some(summaries) = summary_evidence {
                         self.enqueue_summary_reconciliation(

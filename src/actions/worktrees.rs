@@ -1,5 +1,34 @@
 use super::*;
 
+const MERGE_STOPPED_CLEANUP_MESSAGE: &str =
+    "queued merge stopped; deferred worktree deletion was canceled";
+const CHANGE_REQUEST_ABSENT_CLEANUP_MESSAGE: &str =
+    "pull request closed or disappeared; deferred worktree deletion was canceled";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DeferredMergeCleanupAction {
+    Preserve,
+    Wait,
+    Cancel(&'static str),
+    Inspect,
+}
+
+pub(super) fn deferred_merge_cleanup_action(
+    observation: &Result<Option<crate::remote::PrSummary>, String>,
+) -> DeferredMergeCleanupAction {
+    match observation {
+        Err(_) => DeferredMergeCleanupAction::Preserve,
+        Ok(None) => DeferredMergeCleanupAction::Cancel(CHANGE_REQUEST_ABSENT_CLEANUP_MESSAGE),
+        Ok(Some(summary)) => match summary.merge_progress() {
+            crate::remote::PrMergeProgress::Active => {
+                DeferredMergeCleanupAction::Cancel(MERGE_STOPPED_CLEANUP_MESSAGE)
+            }
+            crate::remote::PrMergeProgress::Queued => DeferredMergeCleanupAction::Wait,
+            crate::remote::PrMergeProgress::Merged => DeferredMergeCleanupAction::Inspect,
+        },
+    }
+}
+
 pub(super) fn archive_choice_keys() -> Vec<String> {
     ('1'..='9')
         .chain('a'..='z')
@@ -774,66 +803,146 @@ impl Tui {
         Ok(true)
     }
 
-    pub(crate) fn reconcile_deferred_merge_cleanups(&mut self) -> bool {
-        let mut changed = false;
-        for selected in 0..self.sessions.len() {
-            let Some(summary) = self.sessions[selected].pr.trusted_summary().ok().flatten() else {
-                continue;
-            };
-            let progress = summary.merge_progress();
-            let session = &self.sessions[selected];
-            if session.hidden {
-                continue;
-            }
-            let Some(managed) = self.repos.get(session.repo_index) else {
-                continue;
-            };
-            let repo = managed.repo.clone();
-            let config = managed.config.clone();
-            match progress {
-                crate::remote::PrMergeProgress::Queued => {}
-                crate::remote::PrMergeProgress::Active => {
-                    if crate::session::cancel_deferred_merge_cleanup(&repo, &session.branch)
-                        .unwrap_or(false)
-                    {
-                        changed = true;
-                        let _ = self.show_message(
-                            "queued merge stopped; deferred worktree deletion was canceled",
-                        );
+    pub(super) fn start_deferred_merge_cleanup_reconciliation(
+        &mut self,
+        selected: usize,
+        action: DeferredMergeCleanupAction,
+    ) {
+        if matches!(
+            action,
+            DeferredMergeCleanupAction::Preserve | DeferredMergeCleanupAction::Wait
+        ) {
+            return;
+        }
+        let Some(session) = self.sessions.get(selected) else {
+            return;
+        };
+        if session.hidden {
+            return;
+        }
+        let Some(managed) = self.repos.get(session.repo_index) else {
+            return;
+        };
+        let repo = managed.repo.clone();
+        let config = managed.config.clone();
+        let worktree = session.identity_key(&managed.identity);
+        let generation = self
+            .worktree_generations
+            .get(&worktree)
+            .copied()
+            .unwrap_or_default();
+        let key = DeleteSessionKey {
+            worktree,
+            generation,
+        };
+        if !self.deferred_merge_cleanups_in_flight.insert(key.clone()) {
+            return;
+        }
+        let session = session.background_job_snapshot();
+        let branch = session.branch.clone();
+        let job_key = key.clone();
+        self.spawn_tui_job(
+            TuiJobKind::DeferredMergeCleanup,
+            TuiJobKey::Delete(key),
+            generation,
+            Some(TUI_ACTION_JOB_TIMEOUT),
+            format!("prism-deferred-merge-cleanup-{branch}"),
+            move |_| {
+                let result = (|| match action {
+                    DeferredMergeCleanupAction::Cancel(message) => {
+                        if crate::session::cancel_deferred_merge_cleanup(&repo, &session.branch)? {
+                            Ok(DeferredMergeCleanupOutcome::Canceled(message.to_string()))
+                        } else {
+                            Ok(DeferredMergeCleanupOutcome::NotScheduled)
+                        }
                     }
-                }
-                crate::remote::PrMergeProgress::Merged => {
-                    match crate::session::deferred_merge_cleanup_status(&repo, &config, session) {
-                        Ok(crate::session::DeferredMergeCleanupStatus::NotScheduled) => {}
-                        Ok(crate::session::DeferredMergeCleanupStatus::Safe) => {
-                            let session = session.background_job_snapshot();
-                            if self
-                                .start_deferred_merge_cleanup(repo, config, session)
-                                .is_ok()
-                            {
-                                changed = true;
+                    DeferredMergeCleanupAction::Inspect => {
+                        match crate::session::deferred_merge_cleanup_status(
+                            &repo, &config, &session,
+                        )? {
+                            crate::session::DeferredMergeCleanupStatus::NotScheduled => {
+                                Ok(DeferredMergeCleanupOutcome::NotScheduled)
+                            }
+                            crate::session::DeferredMergeCleanupStatus::Safe => {
+                                Ok(DeferredMergeCleanupOutcome::Ready)
+                            }
+                            crate::session::DeferredMergeCleanupStatus::Unsafe(reason) => {
+                                crate::session::cancel_deferred_merge_cleanup(
+                                    &repo,
+                                    &session.branch,
+                                )?;
+                                Ok(DeferredMergeCleanupOutcome::Unsafe(reason))
                             }
                         }
-                        Ok(crate::session::DeferredMergeCleanupStatus::Unsafe(reason)) => {
-                            let _ = crate::session::cancel_deferred_merge_cleanup(
-                                &repo,
-                                &session.branch,
-                            );
-                            let _ = self.show_message(&format!(
-                                "merged, but deferred worktree deletion was canceled: {reason}"
-                            ));
-                            changed = true;
-                        }
-                        Err(error) => {
-                            let _ = self.show_message(&format!(
-                                "deferred worktree deletion failed: {error}"
-                            ));
-                        }
                     }
+                    DeferredMergeCleanupAction::Preserve | DeferredMergeCleanupAction::Wait => {
+                        unreachable!("non-actionable cleanup evidence was queued")
+                    }
+                })();
+                Ok(Some(TuiJobPayload::DeferredMergeCleanup(
+                    DeferredMergeCleanupResult {
+                        key: job_key,
+                        result,
+                    },
+                )))
+            },
+        );
+    }
+
+    pub(crate) fn apply_deferred_merge_cleanup_result(
+        &mut self,
+        result: DeferredMergeCleanupResult,
+    ) {
+        self.deferred_merge_cleanups_in_flight.remove(&result.key);
+        if self.worktree_generations.get(&result.key.worktree).copied()
+            != Some(result.key.generation)
+        {
+            return;
+        }
+        let Some(selected) = self.sessions.iter().position(|session| {
+            self.repos.get(session.repo_index).is_some_and(|managed| {
+                session.identity_key(&managed.identity) == result.key.worktree
+            })
+        }) else {
+            return;
+        };
+        match result.result {
+            Ok(DeferredMergeCleanupOutcome::NotScheduled) => {}
+            Ok(DeferredMergeCleanupOutcome::Canceled(message)) => {
+                let _ = self.show_message(&message);
+            }
+            Ok(DeferredMergeCleanupOutcome::Ready) => {
+                let merge_is_still_authoritative = self.sessions[selected]
+                    .pr
+                    .trusted_summary()
+                    .is_ok_and(|summary| {
+                        summary.is_some_and(|summary| {
+                            summary.merge_progress() == crate::remote::PrMergeProgress::Merged
+                        })
+                    });
+                if !merge_is_still_authoritative {
+                    return;
+                }
+                let session = self.sessions[selected].background_job_snapshot();
+                let managed = &self.repos[session.repo_index];
+                if let Err(error) = self.start_deferred_merge_cleanup(
+                    managed.repo.clone(),
+                    managed.config.clone(),
+                    session,
+                ) {
+                    let _ =
+                        self.show_message(&format!("deferred worktree deletion failed: {error}"));
                 }
             }
+            Ok(DeferredMergeCleanupOutcome::Unsafe(reason)) => {
+                let _ = self.show_message(&format!(
+                    "merged, but deferred worktree deletion was canceled: {reason}"
+                ));
+            }
+            Err(error) => {
+                let _ = self.show_message(&format!("deferred worktree deletion failed: {error}"));
+            }
         }
-        changed
     }
 
     pub(crate) fn start_delete_worktree_session(

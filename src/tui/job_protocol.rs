@@ -90,6 +90,18 @@ pub(crate) struct DeleteSessionResult {
     pub result: Result<crate::session::DeleteWorktreeOutcome, String>,
 }
 
+pub(crate) enum DeferredMergeCleanupOutcome {
+    NotScheduled,
+    Canceled(String),
+    Ready,
+    Unsafe(String),
+}
+
+pub(crate) struct DeferredMergeCleanupResult {
+    pub key: DeleteSessionKey,
+    pub result: Result<DeferredMergeCleanupOutcome, String>,
+}
+
 impl PrPollKey {
     pub(crate) fn for_repository_session_generation(
         repository: &WorktreeRepositoryKey,

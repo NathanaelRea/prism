@@ -66,6 +66,21 @@ fn merge_panel_separates_authoritative_merge_progress_from_active_worktrees() {
 }
 
 #[test]
+fn stale_merge_evidence_remains_in_active_worktrees() {
+    let mut tui = test_tui();
+    tui.worktree_list_mode = WorktreeListMode::Global;
+    let mut queued = test_pr_summary(false);
+    queued.queue_state = "queued".to_string();
+    queued.check_status = "successful".to_string();
+    tui.sessions[1].pr = PrCache::observed(queued, None);
+    tui.sessions[1].pr.mark_preserved_stale();
+
+    assert!(tui.sessions[1].pr.trusted_summary().is_err());
+    assert!(tui.visible_worktree_indices().contains(&1));
+    assert!(!tui.visible_merge_indices().contains(&1));
+}
+
+#[test]
 fn failed_queued_merge_returns_to_active_worktrees() {
     let mut tui = test_tui();
     tui.worktree_list_mode = WorktreeListMode::Global;
@@ -248,6 +263,29 @@ fn mouse_wheel_scrolls_only_when_pointer_is_over_main_panel() {
 
     assert!(!tui.handle_mouse_event(mouse(MouseEventKind::ScrollDown, 10), area));
     assert_eq!(tui.main_scroll, 0);
+}
+
+#[test]
+fn panel_traversal_restores_selection_for_each_worktree_list() {
+    let mut tui = test_tui();
+    tui.worktree_list_mode = WorktreeListMode::Global;
+    tui.sessions[1].pr = PrCache::observed(test_pr_summary(true), None);
+
+    tui.focus_repos();
+    tui.focus_next_panel();
+    assert_eq!(tui.focused_panel, PanelFocus::Worktrees);
+    assert_eq!(tui.selected_worktree_index(), Some(3));
+    tui.focus_next_panel();
+    assert_eq!(tui.focused_panel, PanelFocus::Merges);
+    assert_eq!(tui.selected_worktree_index(), Some(1));
+
+    tui.focus_status();
+    tui.focus_previous_panel();
+    assert_eq!(tui.focused_panel, PanelFocus::Merges);
+    assert_eq!(tui.selected_worktree_index(), Some(1));
+    tui.focus_previous_panel();
+    assert_eq!(tui.focused_panel, PanelFocus::Worktrees);
+    assert_eq!(tui.selected_worktree_index(), Some(3));
 }
 
 #[test]
