@@ -302,19 +302,31 @@ fn dashboard_attaches_pushes_merges_and_quits_from_physical_keys() {
         &["send-keys", "-t", "controller:0", "q"],
     );
     assert!(quit.status.success());
-    let _ = run_tmux(
-        &sandbox.real_tmux,
-        &controller_socket,
-        &["send-keys", "-t", "controller:0", "y"],
-    );
-    wait_until(Duration::from_secs(8), "dashboard process exit", || {
+    // tmux 3.4 can retain a successful dead pane while clients keep polling
+    // and does not always populate pane_dead_status. Observe pane death
+    // directly and validate the exit status when tmux reports one.
+    let exit_status = wait_until(Duration::from_secs(8), "dashboard process exit", || {
         let output = run_tmux(
             &sandbox.real_tmux,
             &controller_socket,
-            &["has-session", "-t", "controller"],
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                "controller:0",
+                "#{pane_dead}:#{pane_dead_status}",
+            ],
         );
-        (!output.status.success()).then_some(())
+        if !output.status.success() {
+            return Some(None);
+        }
+        let pane = String::from_utf8_lossy(&output.stdout);
+        let (dead, status) = pane.trim().split_once(':')?;
+        (dead == "1").then(|| status.parse::<i32>().ok())
     });
+    if let Some(status) = exit_status {
+        assert_eq!(status, 0, "dashboard exited unsuccessfully");
+    }
 
     sandbox.assert_clean_adapters();
 }
