@@ -554,10 +554,11 @@ fn print_subject(snapshot: &WorkspaceSnapshot, subject: &Subject) {
                 println!("step = {} ({})", step.label, step.state.label());
             }
             println!(
-                "controls = pause:{} resume:{} stop:{} recover:{}",
+                "controls = pause:{} resume:{} stop:{} retry:{} recover:{}",
                 workflow.available_controls.pause,
                 workflow.available_controls.resume,
                 workflow.available_controls.stop,
+                workflow.available_controls.retry,
                 workflow.available_controls.recover
             );
         }

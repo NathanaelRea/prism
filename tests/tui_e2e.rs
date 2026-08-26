@@ -9,6 +9,10 @@ use std::time::Duration;
 
 use support::{E2eSandbox, capture_pane, read_events, run_tmux, wait_until};
 
+// Cold startup hashes the debug executable and boots the Worker before the
+// first frame. macOS CI can take longer than the ordinary UI transition bound.
+const COLD_START_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[test]
 #[ignore = "full-gate controller tmux test"]
 fn dashboard_attaches_pushes_merges_and_quits_from_physical_keys() {
@@ -103,15 +107,11 @@ fn dashboard_attaches_pushes_merges_and_quits_from_physical_keys() {
         .unwrap();
     assert!(prism_started.success());
 
-    wait_until(
-        Duration::from_secs(8),
-        "repository onboarding prompt",
-        || {
-            capture_pane(&sandbox.real_tmux, &controller_socket, "controller:0")
-                .contains("Base/main path")
-                .then_some(())
-        },
-    );
+    wait_until(COLD_START_TIMEOUT, "repository onboarding prompt", || {
+        capture_pane(&sandbox.real_tmux, &controller_socket, "controller:0")
+            .contains("Base/main path")
+            .then_some(())
+    });
     let path = run_tmux(
         &sandbox.real_tmux,
         &controller_socket,

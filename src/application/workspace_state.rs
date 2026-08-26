@@ -323,6 +323,7 @@ pub struct AvailableControls {
     pub pause: bool,
     pub resume: bool,
     pub stop: bool,
+    pub retry: bool,
     pub recover: bool,
 }
 
@@ -1208,9 +1209,10 @@ fn controls_for(
                 || dispatch == Some(DispatchState::Paused))
             && dispatch != Some(DispatchState::RecoveryPending),
         stop: ownerless && !terminal,
+        retry: ownerless && lifecycle == WorkflowLifecycle::Failed,
         recover: ownerless
             && (dispatch == Some(DispatchState::RecoveryPending)
-                || lifecycle == WorkflowLifecycle::Failed),
+                || lifecycle == WorkflowLifecycle::RecoveryRequired),
     }
 }
 
@@ -1379,4 +1381,30 @@ fn paths_equal(left: &Path, right: &Path) -> bool {
 }
 fn path_contains(root: &Path, selected: &Path) -> bool {
     selected.is_absolute() && absolute_path(selected).starts_with(absolute_path(root))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_workflow_advertises_retry_not_interruption_recovery() {
+        let failed = controls_for(
+            WorkflowLifecycle::Failed,
+            false,
+            Some(DispatchState::Terminal),
+            true,
+        );
+        let interrupted = controls_for(
+            WorkflowLifecycle::RecoveryRequired,
+            false,
+            Some(DispatchState::RecoveryPending),
+            true,
+        );
+
+        assert!(failed.retry);
+        assert!(!failed.recover);
+        assert!(!interrupted.retry);
+        assert!(interrupted.recover);
+    }
 }

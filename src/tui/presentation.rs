@@ -8,6 +8,22 @@ use crate::workspace_state::CiState;
 
 use super::{GitAction, LeaderHint, PanelFocus, Tui, choice_list, worktree_updated_label};
 
+fn workflow_phase_label(phase: crate::PromptStepPhase) -> &'static str {
+    match phase {
+        crate::PromptStepPhase::Pending => "pending",
+        crate::PromptStepPhase::Checking => "checking",
+        crate::PromptStepPhase::Preparing | crate::PromptStepPhase::Prepared => "preparing",
+        crate::PromptStepPhase::RunningAgent => "running Agent",
+        crate::PromptStepPhase::AgentSucceeded | crate::PromptStepPhase::Finalizing => "finalizing",
+        crate::PromptStepPhase::Waiting => "waiting",
+        crate::PromptStepPhase::Satisfied => "satisfied",
+        crate::PromptStepPhase::Completed => "completed",
+        crate::PromptStepPhase::Failed => "failed",
+        crate::PromptStepPhase::Cancelled => "cancelled",
+        crate::PromptStepPhase::RecoveryRequired => "recovery required",
+    }
+}
+
 impl Tui {
     pub(crate) fn draw(&mut self, runtime: &mut dyn TerminalDriver) -> Result<(), String> {
         let input = crate::flight_recorder::take_input_for_frame();
@@ -273,7 +289,7 @@ impl Tui {
             can_pause: workflow.available_controls.pause,
             can_resume: workflow.available_controls.resume,
             can_cancel: workflow.available_controls.stop,
-            can_retry: workflow.available_controls.recover,
+            can_retry: workflow.available_controls.retry,
         })
     }
 
@@ -341,8 +357,113 @@ impl Tui {
         true
     }
 
-    pub(super) fn handle_workflow_enter(&mut self) -> bool {
-        false
+    pub(super) fn handle_workflow_enter(
+        &mut self,
+        runtime: &mut dyn TerminalDriver,
+    ) -> Result<bool, String> {
+        if !self.main_focused || self.focused_panel != PanelFocus::Worktrees {
+            return Ok(false);
+        }
+        let Some(dashboard) = self.current_workflow_dashboard() else {
+            return Ok(false);
+        };
+        let Some(run) = dashboard.detail else {
+            return Ok(false);
+        };
+        let Some(selected) = dashboard.selected_step else {
+            return Ok(false);
+        };
+        let Some(step) = run.steps.iter().find(|step| step.key == selected) else {
+            return Ok(false);
+        };
+        let mut lines = vec![
+            view::DialogLine {
+                text: format!("workflow: {}", run.workflow_name),
+                attention: false,
+            },
+            view::DialogLine {
+                text: format!("run: {}", run.id),
+                attention: false,
+            },
+            view::DialogLine {
+                text: format!("status: {}", dashboard.status),
+                attention: false,
+            },
+            view::DialogLine {
+                text: format!(
+                    "progress: {}/{} steps",
+                    dashboard.completed_steps, dashboard.total_steps
+                ),
+                attention: false,
+            },
+            view::DialogLine {
+                text: format!(
+                    "Agent runs: {}/{}",
+                    run.agent_runs_consumed, run.max_agent_runs
+                ),
+                attention: false,
+            },
+            view::DialogLine {
+                text: String::new(),
+                attention: false,
+            },
+            view::DialogLine {
+                text: format!("stage: {}", step.key),
+                attention: false,
+            },
+            view::DialogLine {
+                text: format!("phase: {}", workflow_phase_label(step.phase)),
+                attention: matches!(
+                    step.phase,
+                    crate::PromptStepPhase::Failed | crate::PromptStepPhase::RecoveryRequired
+                ),
+            },
+        ];
+        if let Some(summary) = step.summary.as_deref() {
+            lines.push(view::DialogLine {
+                text: format!("summary: {summary}"),
+                attention: false,
+            });
+        }
+        if step.explicit_dependencies {
+            lines.push(view::DialogLine {
+                text: if step.dependencies.is_empty() {
+                    "dependencies: root".to_string()
+                } else {
+                    format!("dependencies: {}", step.dependencies.join(", "))
+                },
+                attention: false,
+            });
+        }
+        if let Some(wake) = step.wake_at_unix_ms {
+            lines.push(view::DialogLine {
+                text: format!("next check: {wake}"),
+                attention: false,
+            });
+        }
+        if let Some(error) = step
+            .attempts
+            .iter()
+            .rev()
+            .find_map(|attempt| attempt.error.as_deref())
+        {
+            lines.push(view::DialogLine {
+                text: format!("error: {error}"),
+                attention: true,
+            });
+        }
+        if let Some(final_text) = step.final_text() {
+            lines.push(view::DialogLine {
+                text: String::new(),
+                attention: false,
+            });
+            lines.push(view::DialogLine {
+                text: final_text.to_string(),
+                attention: false,
+            });
+        }
+        self.notice_dialog(runtime, "Workflow Details", lines)?;
+        Ok(true)
     }
 
     pub(super) fn tmux_portal_model(&self) -> Option<view::TmuxPortalModel<'_>> {

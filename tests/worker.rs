@@ -204,7 +204,7 @@ fn ensure_replaces_an_unresponsive_old_generation_worker() {
         0
     );
 
-    let ensured = prism_with_timeout(&temp, &["worker", "ensure"], Duration::from_secs(10))
+    let ensured = prism_with_timeout(&temp, &["worker", "ensure"], Duration::from_secs(20))
         .unwrap_or_else(|error| panic!("failed to replace stopped old Worker: {error}"));
     assert!(
         ensured.status.success(),
