@@ -184,7 +184,7 @@ impl Tui {
             DashboardCommand::OpenTmuxSession => {
                 self.clear_leader_hint();
                 state.pending_g = false;
-                if self.handle_workflow_enter() {
+                if self.handle_workflow_enter(runtime)? {
                     self.draw(runtime)?;
                     return Ok(CommandOutcome::Continue);
                 }
