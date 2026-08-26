@@ -39,17 +39,12 @@ pub(crate) fn classify_summary_evidence(
     markers
         .iter()
         .filter_map(|marker| {
-            let ledger = marker.ledger.as_ref()?;
+            let ledger = marker.ledger.as_ref();
             let (applied, observation) = match &marker.target {
-                RemoteMutationTarget::Push {
-                    remote,
-                    branch,
-                    expected_head_sha,
-                    ..
-                } if remote_branch_heads.get(&(remote.clone(), branch.clone()))
-                    == Some(expected_head_sha) =>
+                RemoteMutationTarget::Push { remote, branch, .. }
+                    if remote_branch_heads.contains_key(&(remote.clone(), branch.clone())) =>
                 {
-                    let operation = match &ledger.operation {
+                    let operation = match &ledger?.operation {
                         crate::workflow::remote_operation::RemoteMutationOperation::TuiPushBranch(
                             payload,
                         ) => payload,
@@ -72,7 +67,7 @@ pub(crate) fn classify_summary_evidence(
                     target_branch,
                     ..
                 } => {
-                    let operation = match &ledger.operation {
+                    let operation = match &ledger?.operation {
                         crate::workflow::remote_operation::RemoteMutationOperation::TuiCreateChangeRequest(payload) => payload,
                         _ => return None,
                     };
@@ -127,8 +122,9 @@ pub(crate) fn classify_summary_evidence(
                 } => {
                     let summary = summaries.iter().find(|summary| {
                         summary.change_request_identity.as_ref() == Some(change_request)
-                            && summary.head_sha == *expected_head_sha
-                            && (summary.merged || summary.merge_is_authoritatively_pending())
+                            && (summary.merged
+                                || (summary.head_sha == *expected_head_sha
+                                    && summary.merge_is_authoritatively_pending()))
                     })?;
                     let outcome = if summary.merged {
                         crate::workflow::remote_operation::TuiRemoteMergeOutcome::Merged
@@ -151,7 +147,7 @@ pub(crate) fn classify_summary_evidence(
                     expected_head_sha,
                     ..
                 } => {
-                    let operation = match &ledger.operation {
+                    let operation = match &ledger?.operation {
                         crate::workflow::remote_operation::RemoteMutationOperation::TuiFetchChangeRequest(payload) => payload,
                         _ => return None,
                     };
@@ -348,15 +344,21 @@ impl Tui {
                             }
                             None => {}
                         }
-                        let ledger = command.marker.ledger.as_ref().ok_or_else(|| "remote reconciliation marker has no durable ledger identity".to_string())?;
-                        crate::worker::reconcile_remote_mutation(
-                            &ledger.repository,
-                            &ledger.worktree,
-                            &ledger.request_id,
-                            ledger.operation.clone(),
-                            &ledger.subject,
-                            crate::RemoteMutationReconciliation::Applied(applied),
-                        )?;
+                        if let Some(ledger) = command.marker.ledger.as_ref() {
+                            crate::worker::reconcile_remote_mutation(
+                                &ledger.repository,
+                                &ledger.worktree,
+                                &ledger.request_id,
+                                ledger.operation.clone(),
+                                &ledger.subject,
+                                crate::RemoteMutationReconciliation::Applied(applied),
+                            )?;
+                        } else if !matches!(target, RemoteMutationTarget::Merge { .. }) {
+                            return Err(
+                                "remote reconciliation marker has no durable ledger identity"
+                                    .to_string(),
+                            );
+                        }
                         update_persisted_remote_mutation_markers(
                             &command.marker.database_path,
                             |markers| {

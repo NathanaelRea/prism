@@ -505,6 +505,55 @@ impl Tui {
         )
     }
 
+    pub(crate) fn confirm_deferred_merge_cleanup_dialog(
+        &mut self,
+        runtime: &mut dyn TerminalDriver,
+        branch: &str,
+        path: &str,
+        warnings: &[String],
+    ) -> Result<bool, String> {
+        let mut lines = vec![
+            view::DialogLine {
+                text: format!("branch: {branch}"),
+                attention: false,
+            },
+            view::DialogLine {
+                text: format!("path: {path}"),
+                attention: false,
+            },
+            view::DialogLine {
+                text: "Prism will wait for provider-confirmed merge before deleting.".to_string(),
+                attention: false,
+            },
+        ];
+        if warnings.is_empty() {
+            lines.push(view::DialogLine {
+                text: "No warnings detected.".to_string(),
+                attention: false,
+            });
+        } else {
+            for warning in warnings {
+                lines.push(view::DialogLine {
+                    text: warning.clone(),
+                    attention: true,
+                });
+            }
+        }
+        lines.push(view::DialogLine {
+            text:
+                "Deletion is canceled if the worktree, branch tip, or warnings change before merge."
+                    .to_string(),
+            attention: false,
+        });
+        self.confirm_dialog(
+            runtime,
+            "Delete After Merge",
+            lines,
+            "Delete this worktree after it merges?",
+            false,
+        )
+    }
+
     pub(crate) fn prompt_line_dialog(
         &mut self,
         runtime: &mut dyn TerminalDriver,

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "insert into deferred_merge_cleanup (\n  branch, worktree_path, worktree_incarnation, branch_oid, warnings_json, updated_unix_ms\n) values (?, ?, ?, ?, ?, ?)\non conflict(branch) do update set\n  worktree_path = excluded.worktree_path,\n  worktree_incarnation = excluded.worktree_incarnation,\n  branch_oid = excluded.branch_oid,\n  warnings_json = excluded.warnings_json,\n  updated_unix_ms = excluded.updated_unix_ms\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "2ff96a39a0c80d40abca05a008b71d2348afbebf5883a07dcc3e63e40c24df7e"
+}

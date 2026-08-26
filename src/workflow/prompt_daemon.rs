@@ -1,7 +1,7 @@
 //! On-demand user-wide Worker and socket transport for prompt Workflows.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+use std::io::{BufRead as _, BufReader, Read as _, Seek as _, Write as _};
 use std::os::fd::AsRawFd as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
@@ -23,6 +23,15 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(6);
 const SOCKET_PATH_BUDGET: usize = 103;
 const SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_CONNECTIONS: usize = 16;
+const WORKER_OWNER_RECORD_LIMIT: u64 = 4 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+struct WorkerOwnerRecord {
+    protocol_version: u32,
+    pid: u32,
+    process_identity: Option<u64>,
+    binary_generation: String,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -78,18 +87,31 @@ pub fn probe_health() -> Result<DaemonHealth, String> {
         }
         Err(error) => return Err(format!("connect to Prism worker: {error}")),
     };
-    parse_health(&request_stream(stream, "health")?)
+    parse_health(&request_stream_with_timeout(
+        stream,
+        "health",
+        SOCKET_IO_TIMEOUT,
+    )?)
 }
 
 pub fn ensure_running() -> Result<(), String> {
     let generation = binary_generation()?;
-    let health = probe_health()?;
-    if worker_matches_generation(&health, &generation) {
-        return Ok(());
-    }
-    if health.state != DaemonState::Stopped {
-        let _ = request("shutdown");
-        wait_stopped(TRANSITION_TIMEOUT)?;
+    match probe_health() {
+        Ok(health) if worker_matches_generation(&health, &generation) => return Ok(()),
+        Ok(health) if health.state == DaemonState::Stopped => {}
+        Ok(_) => {
+            let _ = request_with_timeout("shutdown", SOCKET_IO_TIMEOUT);
+            if let Err(error) = wait_stopped(TRANSITION_TIMEOUT)
+                && !terminate_old_generation_worker(&generation)?
+            {
+                return Err(error);
+            }
+        }
+        Err(error) => {
+            if !terminate_old_generation_worker(&generation)? {
+                return Err(error);
+            }
+        }
     }
     let executable = std::env::current_exe()
         .map_err(|error| format!("resolve Prism worker executable: {error}"))?;
@@ -192,6 +214,166 @@ fn worker_lock_is_available() -> Result<bool, String> {
     }
 }
 
+fn write_worker_owner(lock: &mut File, generation: &str) -> Result<(), String> {
+    let process = crate::process::record_process(std::process::id())
+        .map_err(|error| format!("record Prism worker process identity: {error}"))?;
+    let owner = WorkerOwnerRecord {
+        protocol_version: PROTOCOL_VERSION,
+        pid: process.pid,
+        process_identity: process.identity.map(|identity| identity.stored_value()),
+        binary_generation: generation.to_string(),
+    };
+    lock.set_len(0)
+        .map_err(|error| format!("truncate Prism worker ownership record: {error}"))?;
+    lock.rewind()
+        .map_err(|error| format!("rewind Prism worker ownership record: {error}"))?;
+    serde_json::to_writer(&mut *lock, &owner)
+        .map_err(|error| format!("write Prism worker ownership record: {error}"))?;
+    lock.write_all(b"\n")
+        .map_err(|error| format!("finish Prism worker ownership record: {error}"))?;
+    lock.flush()
+        .map_err(|error| format!("flush Prism worker ownership record: {error}"))
+}
+
+fn read_worker_owner() -> Result<Option<WorkerOwnerRecord>, String> {
+    let path = runtime_dir().join("worker.lock");
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("open Prism worker ownership record: {error}")),
+    };
+    let mut bytes = Vec::new();
+    file.take(WORKER_OWNER_RECORD_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read Prism worker ownership record: {error}"))?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    if bytes.len() as u64 > WORKER_OWNER_RECORD_LIMIT {
+        return Err("Prism worker ownership record is too large".into());
+    }
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| format!("parse Prism worker ownership record: {error}"))
+}
+
+fn terminate_old_generation_worker(generation: &str) -> Result<bool, String> {
+    let registered = read_worker_owner()?;
+    let Some(owner) = registered
+        .clone()
+        .map_or_else(discover_legacy_worker_owner, |owner| Ok(Some(owner)))?
+    else {
+        return Ok(false);
+    };
+    if owner.binary_generation == generation {
+        return Ok(false);
+    }
+    let Some(identity) = owner.process_identity else {
+        return Err(format!(
+            "cannot safely replace old Prism worker {}: process identity is unavailable",
+            owner.pid
+        ));
+    };
+    let latest = read_worker_owner()?;
+    if registered.as_ref().map_or_else(
+        || latest.is_some(),
+        |registered| latest.as_ref() != Some(registered),
+    ) {
+        return Err("Prism worker ownership changed during replacement".into());
+    }
+    let recorded = crate::process::RecordedProcess::from_stored(owner.pid, Some(identity));
+    match crate::process::terminate_recorded_process(recorded, Duration::from_secs(1))
+        .map_err(|error| format!("replace old Prism worker {}: {error}", owner.pid))?
+    {
+        crate::process::TerminationOutcome::Terminated
+        | crate::process::TerminationOutcome::AlreadyExited => {
+            wait_stopped(TRANSITION_TIMEOUT)?;
+            Ok(true)
+        }
+        crate::process::TerminationOutcome::IdentityReused => Err(format!(
+            "refusing to replace old Prism worker {}: PID identity was reused",
+            owner.pid
+        )),
+        crate::process::TerminationOutcome::Unverifiable => Err(format!(
+            "refusing to replace old Prism worker {}: process identity cannot be verified",
+            owner.pid
+        )),
+    }
+}
+
+fn discover_legacy_worker_owner() -> Result<Option<WorkerOwnerRecord>, String> {
+    if worker_lock_is_available()? {
+        return Ok(None);
+    }
+    let path = validated_socket_path()?;
+    let stream = UnixStream::connect(&path)
+        .map_err(|error| format!("connect to legacy Prism worker: {error}"))?;
+    let pid = peer_process_id(&stream)
+        .map_err(|error| format!("identify legacy Prism worker socket peer: {error}"))?;
+    let arguments = crate::process::process_arguments(pid)
+        .map_err(|error| format!("inspect legacy Prism worker {pid}: {error}"))?;
+    if !matches!(
+        arguments.as_deref(),
+        Some([_, worker, serve]) if worker == "worker" && serve == "serve"
+    ) {
+        return Err(format!(
+            "refusing to replace unregistered Prism worker socket peer {pid}: unexpected process arguments"
+        ));
+    }
+    let process = crate::process::record_process(pid)
+        .map_err(|error| format!("record legacy Prism worker {pid} identity: {error}"))?;
+    Ok(Some(WorkerOwnerRecord {
+        protocol_version: 0,
+        pid,
+        process_identity: process.identity.map(|identity| identity.stored_value()),
+        binary_generation: "legacy-unregistered".into(),
+    }))
+}
+
+#[cfg(target_os = "linux")]
+fn peer_process_id(stream: &UnixStream) -> std::io::Result<u32> {
+    let mut credentials = unsafe { std::mem::zeroed::<libc::ucred>() };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credentials as *mut libc::ucred).cast(),
+            &mut length,
+        )
+    };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    u32::try_from(credentials.pid)
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| std::io::Error::other("socket peer returned an invalid process ID"))
+}
+
+#[cfg(target_os = "macos")]
+fn peer_process_id(stream: &UnixStream) -> std::io::Result<u32> {
+    let mut pid = 0 as libc::pid_t;
+    let mut length = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut length,
+        )
+    };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    u32::try_from(pid)
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| std::io::Error::other("socket peer returned an invalid process ID"))
+}
+
 fn is_worker_transition_error(error: &str) -> bool {
     error.contains("Connection reset by peer")
         || error.contains("Broken pipe")
@@ -209,7 +391,8 @@ pub fn serve() -> Result<(), String> {
     secure_runtime_directory(&directory)?;
     // Exclusivity must cover stale socket removal and storage opening because opening may replace
     // a pre-cutover database. The ownership lock, not socket path existence, is authoritative.
-    let lock = acquire_lock(&directory.join("worker.lock"))?;
+    let mut lock = acquire_lock(&directory.join("worker.lock"))?;
+    write_worker_owner(&mut lock, &generation)?;
     remove_owned_socket(&validated_socket_path()?)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -939,18 +1122,31 @@ where
 }
 
 fn request(command: &str) -> Result<String, String> {
+    request_with_timeout(command, Duration::from_secs(30))
+}
+
+fn request_with_timeout(command: &str, timeout: Duration) -> Result<String, String> {
     let path = validated_socket_path()?;
     let stream =
         UnixStream::connect(&path).map_err(|error| format!("connect to Prism worker: {error}"))?;
-    request_stream(stream, command)
+    request_stream_with_timeout(stream, command, timeout)
 }
 
-fn request_stream(mut stream: UnixStream, command: &str) -> Result<String, String> {
+#[cfg(test)]
+fn request_stream(stream: UnixStream, command: &str) -> Result<String, String> {
+    request_stream_with_timeout(stream, command, Duration::from_secs(30))
+}
+
+fn request_stream_with_timeout(
+    mut stream: UnixStream,
+    command: &str,
+    timeout: Duration,
+) -> Result<String, String> {
     stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
+        .set_read_timeout(Some(timeout))
         .map_err(|error| format!("configure Prism worker socket read timeout: {error}"))?;
     stream
-        .set_write_timeout(Some(Duration::from_secs(30)))
+        .set_write_timeout(Some(timeout))
         .map_err(|error| format!("configure Prism worker socket write timeout: {error}"))?;
     stream
         .write_all(format!("{command}\n").as_bytes())

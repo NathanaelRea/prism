@@ -334,7 +334,7 @@ fn empty_list_retains_persisted_create_marker_until_matching_summary_is_observed
 }
 
 #[test]
-fn typed_push_and_create_markers_select_authoritative_result_observations() {
+fn typed_push_and_create_markers_select_authoritative_result_observations_after_push_advances() {
     let provider = crate::remote::ProviderKind::GitHub;
     let repository_id = crate::remote::RemoteRepositoryId::new(
         provider,
@@ -422,9 +422,12 @@ fn typed_push_and_create_markers_select_authoritative_result_observations() {
         &repository,
         &markers,
         &[summary],
+        // The branch may advance after the uncertain push. Seeing any authoritative head should
+        // schedule reconciliation; the worker separately proves that the expected push is in its
+        // ancestry before clearing the marker.
         &BTreeMap::from([(
             ("origin".to_string(), "feature".to_string()),
-            "abc123".to_string(),
+            "def456".to_string(),
         )]),
     );
 
@@ -495,12 +498,13 @@ fn failed_reconciliation_releases_the_marker_for_retry() {
 }
 
 #[test]
-fn reconciliation_clears_only_markers_with_matched_authoritative_evidence() {
+fn reconciliation_clears_legacy_merge_marker_with_authoritative_evidence_only() {
     let temp = unique_temp_dir("prism-tui-matched-mutation-evidence-test");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
     let session = test_session(0, &temp.join("worktree").display().to_string(), "feature");
     let mut tui = Tui::new_single(repo, test_config(), vec![session]);
+    wait_for_background(&mut tui);
     let repository = tui.repos[0].identity.clone();
     let key = TuiJobKey::Worktree(tui.sessions[0].identity_key(&repository));
     let identity = test_change_request_identity(crate::remote::ProviderKind::GitHub);
@@ -550,6 +554,7 @@ fn reconciliation_clears_only_markers_with_matched_authoritative_evidence() {
         )
         .unwrap();
     }
+    wait_for_background(&mut tui);
 
     tui.enqueue_summary_reconciliation(&repository, &[], &BTreeMap::new());
     let mut empty_summary = test_pr_summary(false);
@@ -592,10 +597,18 @@ fn reconciliation_clears_only_markers_with_matched_authoritative_evidence() {
         &repository,
         &PrCache::observed(pending_merge, Some(details)),
     );
+    wait_for_background(&mut tui);
     assert_eq!(
         tui.background.marker_count(&repository.root),
-        5,
-        "legacy markers without exact ledger identity must not be inferred or cleared"
+        4,
+        "fresh provider evidence should retire only the legacy merge marker"
+    );
+    assert!(
+        tui.background
+            .markers(&repository.root)
+            .unwrap()
+            .iter()
+            .all(|marker| !matches!(marker.target, RemoteMutationTarget::Merge { .. }))
     );
     drop(tui);
     let deadline = Instant::now() + Duration::from_secs(1);

@@ -7,12 +7,12 @@ use crate::session::{WorktreeRepositoryKey, WorktreeSessionKey};
 use crate::tui_jobs::{JobContext, JobId, JobMessage, JobMetadata, JobOutcome};
 
 use super::{
-    DefaultBranchPollResult, DeleteSessionKey, DeleteSessionResult, OpencodeEventResult,
-    OpencodeListenerKey, OpencodePollKey, OpencodePollResult, PrPollKey, PrPollResult,
-    RemoteActionDelivery, RemoteActionValue, SessionRefreshResult, TUI_JOB_SHUTDOWN_GRACE,
-    TUI_MUTATION_SHUTDOWN_BOUND, TUI_TICK_ITEM_BUDGET, TUI_TICK_TIME_BUDGET, TmuxPortalResult, Tui,
-    TuiBackgroundChanges, WorkflowPollResult, WtHookLogPollResult, WtPollResult,
-    uncertain_remote_mutation_error,
+    DefaultBranchPollResult, DeferredMergeCleanupResult, DeleteSessionKey, DeleteSessionResult,
+    OpencodeEventResult, OpencodeListenerKey, OpencodePollKey, OpencodePollResult, PrPollKey,
+    PrPollResult, RemoteActionDelivery, RemoteActionValue, SessionRefreshResult,
+    TUI_JOB_SHUTDOWN_GRACE, TUI_MUTATION_SHUTDOWN_BOUND, TUI_TICK_ITEM_BUDGET,
+    TUI_TICK_TIME_BUDGET, TmuxPortalResult, Tui, TuiBackgroundChanges, WorkflowPollResult,
+    WtHookLogPollResult, WtPollResult, uncertain_remote_mutation_error,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -22,6 +22,7 @@ pub(crate) enum TuiJobKind {
     PrSummary,
     PrDetails,
     PrPersistence,
+    DeferredMergeCleanup,
     WorkflowPoll,
     DeleteSession,
     TmuxWarmup,
@@ -43,6 +44,7 @@ impl TuiJobKind {
             Self::PrSummary => "pr_summary",
             Self::PrDetails => "pr_details",
             Self::PrPersistence => "pr_persistence",
+            Self::DeferredMergeCleanup => "deferred_merge_cleanup",
             Self::WorkflowPoll => "workflow_poll",
             Self::DeleteSession => "delete_session",
             Self::TmuxWarmup => "tmux_warmup",
@@ -100,6 +102,7 @@ impl ShutdownReason {
 pub(crate) enum TuiJobPayload {
     SessionRefresh(SessionRefreshResult),
     PrPoll(PrPollResult),
+    DeferredMergeCleanup(DeferredMergeCleanupResult),
     WorkflowPoll(WorkflowPollResult),
     DeleteSession(DeleteSessionResult),
     TmuxWarmup(AgentSessionWarmupResult),
@@ -253,7 +256,9 @@ impl Tui {
             // be observed one tick before the coalesced payload.
             let state_payload_pending = matches!(
                 metadata.kind,
-                TuiJobKind::DeleteSession | TuiJobKind::TmuxPortal
+                TuiJobKind::DeferredMergeCleanup
+                    | TuiJobKind::DeleteSession
+                    | TuiJobKind::TmuxPortal
             ) && matches!(&outcome, JobOutcome::Completed)
                 && self.job_generation_is_current(&metadata);
             if !state_payload_pending {
@@ -588,6 +593,9 @@ impl Tui {
             TuiJobPayload::PrPoll(result) => {
                 let _ = self.pr_poll_tx.send(result);
             }
+            TuiJobPayload::DeferredMergeCleanup(result) => {
+                self.apply_deferred_merge_cleanup_result(result);
+            }
             TuiJobPayload::WorkflowPoll(result) => {
                 let _ = self.workflow_poll_tx.send(result);
             }
@@ -662,6 +670,9 @@ impl Tui {
             }
             (TuiJobKind::PrPersistence, TuiJobKey::PrPersistence(key)) => {
                 self.pr_persistence_in_flight.remove(key);
+            }
+            (TuiJobKind::DeferredMergeCleanup, TuiJobKey::Delete(key)) => {
+                self.deferred_merge_cleanups_in_flight.remove(key);
             }
             (TuiJobKind::WorkflowPoll, TuiJobKey::WorkflowRepository(repository)) => {
                 self.workflow_polls_in_flight.remove(repository);

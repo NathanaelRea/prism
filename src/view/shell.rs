@@ -71,7 +71,7 @@ fn footer_actions(focus: PanelFocus) -> &'static [(&'static str, &'static str)] 
     match focus {
         PanelFocus::Status => STATUS_FOOTER_ACTIONS,
         PanelFocus::Repos => REPOS_FOOTER_ACTIONS,
-        PanelFocus::Worktrees => WORKTREES_FOOTER_ACTIONS,
+        PanelFocus::Worktrees | PanelFocus::Merges => WORKTREES_FOOTER_ACTIONS,
     }
 }
 

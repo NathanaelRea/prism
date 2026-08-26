@@ -619,8 +619,24 @@ fn tui_push_reconciliation_result(
         &expected.remote_branch,
         &config,
     )?;
-    if remote_head.as_deref() != Some(expected.expected_head_sha.as_str()) {
-        return Err("pushed branch no longer has the expected authoritative head".into());
+    let remote_head = remote_head
+        .ok_or_else(|| "pushed branch no longer exists on the authoritative remote".to_string())?;
+    if remote_head != expected.expected_head_sha {
+        let fetched_remote_head = crate::git::fetch_push_remote_branch_head_sha(
+            &payload.worktree,
+            &expected.remote,
+            &expected.remote_branch,
+            &remote_head,
+            &config,
+        )?;
+        if !crate::git::commit_is_ancestor(
+            &payload.worktree,
+            &expected.expected_head_sha,
+            &fetched_remote_head,
+            &config,
+        )? {
+            return Err("pushed commit is not in the authoritative remote branch history".into());
+        }
     }
     let mut cache = crate::remote::load_pr_cache(&repository, &payload.branch);
     crate::remote::dispatcher::refresh_change_request_cache(

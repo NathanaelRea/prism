@@ -560,6 +560,109 @@ pub(crate) fn push_remote_branch_head_sha(
     Ok(Some(sha.to_string()))
 }
 
+pub(crate) fn fetch_push_remote_branch_head_sha(
+    path: &std::path::Path,
+    remote: &str,
+    branch: &str,
+    observed_head: &str,
+    config: &Config,
+) -> Result<String, String> {
+    let branch = branch.trim();
+    if branch.is_empty() || branch == "(detached)" {
+        return Err("cannot fetch an empty or detached push branch name".to_string());
+    }
+    let push_url = single_push_remote_url(path, remote, config)?;
+    static NEXT_TEMPORARY_REF: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let nonce = NEXT_TEMPORARY_REF.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let identity = crate::util::stable_hash(std::path::Path::new(&push_url))
+        ^ crate::util::stable_hash(std::path::Path::new(branch))
+        ^ crate::util::stable_hash(std::path::Path::new(observed_head));
+    let temporary_ref = format!(
+        "refs/prism/push-reconciliation/{identity:016x}-{}-{nonce}",
+        std::process::id()
+    );
+    let refspec = format!("+refs/heads/{branch}:{temporary_ref}");
+    let fetch = run_status_named(
+        Command::new(config.tool("git"))
+            .arg("-C")
+            .arg(path)
+            .args([
+                "fetch",
+                "--no-tags",
+                "--no-write-fetch-head",
+                "--force",
+                "--",
+            ])
+            .arg(&push_url)
+            .arg(refspec),
+        ProcessPolicy::NetworkQuery,
+        ProcessDescriptor::new("git.fetch"),
+    );
+    if let Err(error) = fetch {
+        let _ = run_status_named(
+            Command::new(config.tool("git")).arg("-C").arg(path).args([
+                "update-ref",
+                "-d",
+                &temporary_ref,
+            ]),
+            ProcessPolicy::LocalMutation,
+            ProcessDescriptor::new("git.update_ref"),
+        );
+        return Err(error);
+    }
+
+    let inspected = (|| {
+        let fetched_head = run_capture(
+            Command::new(config.tool("git"))
+                .arg("-C")
+                .arg(path)
+                .args(["rev-parse", "--verify"])
+                .arg(format!("{temporary_ref}^{{commit}}")),
+            ProcessPolicy::Metadata,
+        )?;
+        let fetched_head = fetched_head.trim();
+        if fetched_head != observed_head {
+            return Err("push branch changed while its authoritative head was fetched".to_string());
+        }
+        Ok(fetched_head.to_string())
+    })();
+    let cleanup = run_status_named(
+        Command::new(config.tool("git")).arg("-C").arg(path).args([
+            "update-ref",
+            "-d",
+            &temporary_ref,
+        ]),
+        ProcessPolicy::LocalMutation,
+        ProcessDescriptor::new("git.update_ref"),
+    );
+    inspected.and(cleanup.map(|()| observed_head.to_string()))
+}
+
+pub(crate) fn commit_is_ancestor(
+    path: &std::path::Path,
+    ancestor: &str,
+    descendant: &str,
+    config: &Config,
+) -> Result<bool, String> {
+    let output = run_output_allow_failure(
+        Command::new(config.tool("git")).arg("-C").arg(path).args([
+            "merge-base",
+            "--is-ancestor",
+            ancestor,
+            descendant,
+        ]),
+        ProcessPolicy::Metadata,
+    )?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(format!(
+            "inspect commit ancestry {ancestor}..{descendant}: {}",
+            output.stderr.trim()
+        )),
+    }
+}
+
 pub(crate) fn single_push_remote_url(
     path: &std::path::Path,
     remote: &str,
@@ -811,6 +914,113 @@ mod tests {
         assert_eq!(result.branch, "feature");
         assert!(result.set_upstream);
         assert!(has_upstream(&work, &test_config()).unwrap());
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn fetch_push_head_makes_an_authoritative_descendant_available_locally() {
+        let temp = unique_temp_dir("prism-fetch-push-head-test");
+        let origin = temp.join("origin.git");
+        let wrong_fetch = temp.join("wrong-fetch.git");
+        let local = temp.join("local");
+        let advancing = temp.join("advancing");
+        fs::create_dir_all(&temp).unwrap();
+        run(Command::new("git").args(["init", "--bare"]).arg(&origin));
+        run(Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&wrong_fetch));
+        run(Command::new("git").arg("init").arg(&local));
+        configure_user(&local);
+        run_git(&local, &["switch", "-c", "feature"]);
+        fs::write(local.join("tracked.txt"), "expected\n").unwrap();
+        run_git(&local, &["add", "tracked.txt"]);
+        run_git(&local, &["commit", "-m", "expected"]);
+        let expected = current_head_sha(&local, &test_config()).unwrap();
+        run_git(
+            &local,
+            &["remote", "add", "origin", wrong_fetch.to_str().unwrap()],
+        );
+        run_git(
+            &local,
+            &[
+                "remote",
+                "set-url",
+                "--push",
+                "origin",
+                origin.to_str().unwrap(),
+            ],
+        );
+        run_git(&local, &["push", "-u", "origin", "feature"]);
+
+        run(Command::new("git")
+            .args(["clone", "--branch", "feature"])
+            .arg(&origin)
+            .arg(&advancing));
+        configure_user(&advancing);
+        fs::write(advancing.join("tracked.txt"), "descendant\n").unwrap();
+        run_git(&advancing, &["commit", "-am", "descendant"]);
+        let descendant = current_head_sha(&advancing, &test_config()).unwrap();
+        run_git(&advancing, &["push", "origin", "feature"]);
+
+        let observed = push_remote_branch_head_sha(&local, "origin", "feature", &test_config())
+            .unwrap()
+            .unwrap();
+        assert_eq!(observed, descendant);
+        assert!(commit_is_ancestor(&local, &expected, &descendant, &test_config()).is_err());
+        let fetch_head_before = fs::read(local.join(".git/FETCH_HEAD")).ok();
+
+        let fetched = fetch_push_remote_branch_head_sha(
+            &local,
+            "origin",
+            "feature",
+            &observed,
+            &test_config(),
+        )
+        .unwrap();
+
+        assert_eq!(fetched, descendant);
+        assert!(commit_is_ancestor(&local, &expected, &fetched, &test_config()).unwrap());
+        assert_eq!(
+            remote_branch_head_sha_on(&local, "origin", "feature", &test_config()).unwrap(),
+            Some(expected)
+        );
+        assert_eq!(
+            fs::read(local.join(".git/FETCH_HEAD")).ok(),
+            fetch_head_before
+        );
+        assert!(
+            run_capture(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&local)
+                    .args(["for-each-ref", "refs/prism/push-reconciliation"]),
+                ProcessPolicy::Metadata,
+            )
+            .unwrap()
+            .trim()
+            .is_empty()
+        );
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn commit_ancestry_accepts_descendants_but_not_ancestors() {
+        let temp = unique_temp_dir("prism-commit-ancestry-test");
+        fs::create_dir_all(&temp).unwrap();
+        run(Command::new("git").arg("init").arg(&temp));
+        configure_user(&temp);
+        fs::write(temp.join("tracked.txt"), "base\n").unwrap();
+        run_git(&temp, &["add", "tracked.txt"]);
+        run_git(&temp, &["commit", "-m", "base"]);
+        let base = current_head_sha(&temp, &test_config()).unwrap();
+        fs::write(temp.join("tracked.txt"), "next\n").unwrap();
+        run_git(&temp, &["commit", "-am", "next"]);
+        let next = current_head_sha(&temp, &test_config()).unwrap();
+
+        assert!(commit_is_ancestor(&temp, &base, &next, &test_config()).unwrap());
+        assert!(!commit_is_ancestor(&temp, &next, &base, &test_config()).unwrap());
 
         let _ = fs::remove_dir_all(temp);
     }

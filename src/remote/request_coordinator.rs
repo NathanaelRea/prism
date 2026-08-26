@@ -1516,7 +1516,9 @@ fn notify_subscribers(state: &mut CoordinatorState, key: &RemoteObservationKey) 
     if should_remove {
         state.subscriptions.remove(key);
     } else if let Some(sender) = state.subscriptions.get(key) {
-        let _ = sender.send(sender.borrow().saturating_add(1));
+        // Drop the read guard before `send` takes the same watch channel's write lock.
+        let revision = sender.borrow().saturating_add(1);
+        let _ = sender.send(revision);
     }
 }
 
@@ -2484,6 +2486,51 @@ mod tests {
                 .unwrap(),
             RemoteObservationResult::Fresh(_)
         ));
+    }
+
+    #[test]
+    fn completed_observation_notifies_live_subscriber_without_deadlock() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let executor = Arc::new(RecordingExecutor::default());
+                let clock = Arc::new(FakeRemoteClock::new(100));
+                let coordinator = coordinator(
+                    executor,
+                    clock,
+                    Arc::new(MemoryRemoteCoordinatorStore::default()),
+                )
+                .await;
+                let subscription_key = key("subscription");
+                let subscription = coordinator.subscribe(&subscription_key).await;
+
+                assert!(matches!(
+                    coordinator
+                        .observe::<serde_json::Value>(
+                            subscription_key,
+                            ObservationFreshness::any(0),
+                            RemotePriority::WorkflowObservation,
+                            serde_json::Value::Null,
+                        )
+                        .await
+                        .unwrap(),
+                    RemoteObservationResult::Fresh(_)
+                ));
+                assert!(subscription.has_changed().unwrap());
+            });
+            done_tx.send(()).unwrap();
+        });
+
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .is_ok(),
+            "observation completion must not deadlock while notifying a subscriber"
+        );
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@ use super::*;
 
 pub(super) const MIN_MAIN_WIDTH: u16 = 20;
 
-pub(crate) fn sidebar_areas(area: Rect, focus: PanelFocus) -> (Rect, Rect, Rect) {
+pub(crate) fn sidebar_areas(area: Rect, focus: PanelFocus) -> (Rect, Rect, Rect, Rect) {
     const STATUS_HEIGHT: u16 = 6;
     const MIN_REPOS_HEIGHT: u16 = 3;
     const MIN_EXPANDED_HEIGHT: u16 = (STATUS_HEIGHT + MIN_REPOS_HEIGHT) * 2;
@@ -13,13 +13,22 @@ pub(crate) fn sidebar_areas(area: Rect, focus: PanelFocus) -> (Rect, Rect, Rect)
                 Constraint::Min(1),
                 Constraint::Length(1),
                 Constraint::Length(1),
+                Constraint::Length(1),
             ],
             PanelFocus::Repos => [
                 Constraint::Length(1),
                 Constraint::Min(1),
                 Constraint::Length(1),
+                Constraint::Length(1),
             ],
             PanelFocus::Worktrees => [
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ],
+            PanelFocus::Merges => [
+                Constraint::Length(1),
                 Constraint::Length(1),
                 Constraint::Length(1),
                 Constraint::Min(1),
@@ -29,7 +38,7 @@ pub(crate) fn sidebar_areas(area: Rect, focus: PanelFocus) -> (Rect, Rect, Rect)
             .direction(Direction::Vertical)
             .constraints(constraints)
             .split(area);
-        return (areas[0], areas[1], areas[2]);
+        return (areas[0], areas[1], areas[2], areas[3]);
     }
 
     let halves = Layout::default()
@@ -41,7 +50,11 @@ pub(crate) fn sidebar_areas(area: Rect, focus: PanelFocus) -> (Rect, Rect, Rect)
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(status_height), Constraint::Min(1)])
         .split(halves[0]);
-    (upper[0], upper[1], halves[1])
+    let worktree_panels = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(halves[1]);
+    (upper[0], upper[1], worktree_panels[0], worktree_panels[1])
 }
 
 pub(crate) fn tmux_portal_size(

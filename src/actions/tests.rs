@@ -8,11 +8,13 @@ use crate::repo::Repository;
 use crate::session::{DeleteWorktreeOutcome, Session};
 use crate::tui::{
     DefaultBranchPollResult, DeleteSessionKey, DeleteSessionResult, OpencodeEventResult,
-    OpencodeListenerKey, OpencodePollKey, OpencodePollResult, PanelFocus, PrPollKey, Tui,
-    TuiJobKey, TuiJobKind, WtObservation, WtPollResult,
+    OpencodeListenerKey, OpencodePollKey, OpencodePollResult, PanelFocus, PrPollKey, PrPollResult,
+    PrSummarySessionResult, Tui, TuiJobKey, TuiJobKind, WtObservation, WtPollResult,
 };
 
-use super::worktrees::development_url_opened_message;
+use super::worktrees::{
+    DeferredMergeCleanupAction, deferred_merge_cleanup_action, development_url_opened_message,
+};
 use super::{
     apply_bulk_review_resolution, archived_picker_overflow_message, create_change_request_id,
     discover_wt_columns, open_http_url_in_browser, pr_target_choice_list, push_request_id,
@@ -1152,6 +1154,116 @@ exit 0
     assert_eq!(pending.status_label, "deletion pending");
     assert_eq!(tui.visible_session_indices(), vec![0]);
 
+    let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
+fn deferred_merge_cleanup_classification_distinguishes_absence_from_errors() {
+    let mut queued = phase_1_pr_summary("queued-head");
+    queued.queue_state = "queued".to_string();
+    let mut merged = phase_1_pr_summary("merged-head");
+    merged.merged = true;
+
+    assert_eq!(
+        deferred_merge_cleanup_action(&Err("provider unavailable".to_string())),
+        DeferredMergeCleanupAction::Preserve
+    );
+    assert!(matches!(
+        deferred_merge_cleanup_action(&Ok(None)),
+        DeferredMergeCleanupAction::Cancel(_)
+    ));
+    assert!(matches!(
+        deferred_merge_cleanup_action(&Ok(Some(phase_1_pr_summary("active-head")))),
+        DeferredMergeCleanupAction::Cancel(_)
+    ));
+    assert_eq!(
+        deferred_merge_cleanup_action(&Ok(Some(queued))),
+        DeferredMergeCleanupAction::Wait
+    );
+    assert_eq!(
+        deferred_merge_cleanup_action(&Ok(Some(merged))),
+        DeferredMergeCleanupAction::Inspect
+    );
+}
+
+#[test]
+fn authoritative_pr_absence_cancels_deferred_cleanup_but_errors_preserve_it() {
+    let temp = unique_temp_dir("prism-deferred-cleanup-observation-test");
+    fs::create_dir_all(&temp).unwrap();
+    let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
+    let mut config = test_config();
+    crate::test_support::install_tool(
+        &mut config,
+        &temp,
+        "git",
+        "#!/bin/sh\ncase \"$*\" in\n  *rev-parse*) echo oid-one ;;\n  *status*) echo '## feature' ;;\n  *) exit 1 ;;\nesac\n",
+    );
+    let session = test_session(temp.join("worktree"), "feature");
+    let warnings = crate::session::deferred_merge_cleanup_warnings(&config, &session);
+    crate::session::schedule_deferred_merge_cleanup(&repo, &config, &session, &warnings).unwrap();
+    let persisted_session = session.background_job_snapshot();
+    let mut tui = Tui::new_single(repo.clone(), config.clone(), vec![session]);
+    let repository = tui.repos[0].identity.clone();
+    let session_key = tui.sessions[0].identity_key(&repository);
+    let poll_started_at = Instant::now();
+    tui.sessions[0].pr.begin_summary_poll(poll_started_at);
+    tui.pr_poll_tx
+        .send(PrPollResult::Summary {
+            repository: repository.clone(),
+            sessions: vec![session_key.clone()],
+            github_remote_configured: true,
+            capabilities: None,
+            summaries: Ok(Vec::new()),
+            observations: Ok(vec![PrSummarySessionResult {
+                key: session_key.clone(),
+                summary: None,
+            }]),
+            remote_branch_heads: BTreeMap::new(),
+            refreshed: "absent".to_string(),
+            poll_started_at,
+        })
+        .unwrap();
+
+    tui.drain_pr_poll_results();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !tui.deferred_merge_cleanups_in_flight.is_empty() {
+        tui.drain_pr_poll_results();
+        assert!(Instant::now() < deadline, "cleanup cancellation timed out");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        crate::session::deferred_merge_cleanup_status(&repo, &config, &persisted_session).unwrap(),
+        crate::session::DeferredMergeCleanupStatus::NotScheduled
+    );
+
+    crate::session::schedule_deferred_merge_cleanup(&repo, &config, &persisted_session, &warnings)
+        .unwrap();
+    let failed_poll_started_at = Instant::now();
+    tui.sessions[0]
+        .pr
+        .begin_summary_poll(failed_poll_started_at);
+    tui.pr_poll_tx
+        .send(PrPollResult::Summary {
+            repository,
+            sessions: vec![session_key],
+            github_remote_configured: true,
+            capabilities: None,
+            summaries: Err("provider unavailable".to_string()),
+            observations: Err("provider unavailable".to_string()),
+            remote_branch_heads: BTreeMap::new(),
+            refreshed: "failed".to_string(),
+            poll_started_at: failed_poll_started_at,
+        })
+        .unwrap();
+
+    tui.drain_pr_poll_results();
+    assert!(tui.deferred_merge_cleanups_in_flight.is_empty());
+    assert_eq!(
+        crate::session::deferred_merge_cleanup_status(&repo, &config, &persisted_session).unwrap(),
+        crate::session::DeferredMergeCleanupStatus::Safe
+    );
+
+    drop(tui);
     let _ = fs::remove_dir_all(temp);
 }
 

@@ -60,9 +60,10 @@ use job_orchestration::ShutdownReason;
 pub(crate) use job_orchestration::{TuiJobKey, TuiJobKind, TuiJobPayload};
 use job_protocol::pr_delivery_key;
 pub(crate) use job_protocol::{
-    DefaultBranchPollResult, DeleteSessionKey, DeleteSessionResult, OpencodeEventResult,
-    OpencodeListenerKey, OpencodePollKey, OpencodePollResult, PrDeliveryKey, PrPersistenceRequest,
-    PrPollKey, PrPollResult, PrSummarySessionResult, SessionRefreshResult, SessionRefreshSnapshot,
+    DefaultBranchPollResult, DeferredMergeCleanupOutcome, DeferredMergeCleanupResult,
+    DeleteSessionKey, DeleteSessionResult, OpencodeEventResult, OpencodeListenerKey,
+    OpencodePollKey, OpencodePollResult, PrDeliveryKey, PrPersistenceRequest, PrPollKey,
+    PrPollResult, PrSummarySessionResult, SessionRefreshResult, SessionRefreshSnapshot,
     TmuxPortalCapture, TmuxPortalResult, TmuxPortalSnapshot, TmuxPortalTarget, WorkflowPollResult,
     WorkflowPollSnapshot, WtHookLogObservation, WtHookLogPollResult, WtObservation, WtPollResult,
 };
@@ -122,6 +123,7 @@ pub struct Tui {
     pub(crate) pr_persistence_in_flight: BTreeSet<PrPollKey>,
     pub(crate) pr_persistence_pending: BTreeMap<PrPollKey, PrPersistenceRequest>,
     pub(crate) pr_persistence_versions: BTreeMap<PrPollKey, u64>,
+    pub(crate) deferred_merge_cleanups_in_flight: BTreeSet<DeleteSessionKey>,
     pub(crate) background: BackgroundRuntime,
     pub(crate) delete_session_tx: LatestSender<(DeleteSessionKey, u64), DeleteSessionResult>,
     pub(crate) delete_session_rx: LatestReceiver<(DeleteSessionKey, u64), DeleteSessionResult>,
@@ -327,6 +329,7 @@ impl Tui {
             pr_persistence_in_flight: BTreeSet::new(),
             pr_persistence_pending: BTreeMap::new(),
             pr_persistence_versions: BTreeMap::new(),
+            deferred_merge_cleanups_in_flight: BTreeSet::new(),
             background: BackgroundRuntime::default(),
             delete_session_tx,
             delete_session_rx,

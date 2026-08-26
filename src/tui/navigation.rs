@@ -15,6 +15,7 @@ pub(crate) enum PanelFocus {
     Status,
     Repos,
     Worktrees,
+    Merges,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,6 +79,13 @@ fn point_in_rect(x: u16, y: u16, rect: Rect) -> bool {
 }
 
 impl Tui {
+    pub(crate) fn is_worktree_session_panel(&self) -> bool {
+        matches!(
+            self.focused_panel,
+            PanelFocus::Worktrees | PanelFocus::Merges
+        )
+    }
+
     pub(super) fn move_down(&mut self) {
         if self.main_focused {
             if self.move_workflow_step_selection(1) {
@@ -94,7 +102,7 @@ impl Tui {
         match self.focused_panel {
             PanelFocus::Status => {}
             PanelFocus::Repos => self.move_repo_selection(1),
-            PanelFocus::Worktrees => self.move_worktree_selection(1),
+            PanelFocus::Worktrees | PanelFocus::Merges => self.move_worktree_selection(1),
         }
     }
 
@@ -114,7 +122,7 @@ impl Tui {
         match self.focused_panel {
             PanelFocus::Status => {}
             PanelFocus::Repos => self.move_repo_selection(-1),
-            PanelFocus::Worktrees => self.move_worktree_selection(-1),
+            PanelFocus::Worktrees | PanelFocus::Merges => self.move_worktree_selection(-1),
         }
     }
 
@@ -127,7 +135,7 @@ impl Tui {
             PanelFocus::Repos => {
                 self.repo_main_view = view::RepoMainView::ChangeRequests;
             }
-            PanelFocus::Worktrees => {}
+            PanelFocus::Worktrees | PanelFocus::Merges => {}
         }
     }
 
@@ -140,7 +148,7 @@ impl Tui {
             PanelFocus::Repos => {
                 self.repo_main_view = view::RepoMainView::Kanban;
             }
-            PanelFocus::Worktrees => {}
+            PanelFocus::Worktrees | PanelFocus::Merges => {}
         }
     }
 
@@ -149,19 +157,27 @@ impl Tui {
         self.focused_panel = match self.focused_panel {
             PanelFocus::Status => PanelFocus::Repos,
             PanelFocus::Repos => PanelFocus::Worktrees,
-            PanelFocus::Worktrees => PanelFocus::Status,
+            PanelFocus::Worktrees => PanelFocus::Merges,
+            PanelFocus::Merges => PanelFocus::Status,
         };
         self.main_focused = false;
+        if self.is_worktree_session_panel() {
+            self.restore_selected_worktree_for_repo();
+        }
     }
 
     pub(super) fn focus_previous_panel(&mut self) {
         self.main_scroll = 0;
         self.focused_panel = match self.focused_panel {
-            PanelFocus::Status => PanelFocus::Worktrees,
+            PanelFocus::Status => PanelFocus::Merges,
             PanelFocus::Repos => PanelFocus::Status,
             PanelFocus::Worktrees => PanelFocus::Repos,
+            PanelFocus::Merges => PanelFocus::Worktrees,
         };
         self.main_focused = false;
+        if self.is_worktree_session_panel() {
+            self.restore_selected_worktree_for_repo();
+        }
     }
 
     pub(crate) fn focus_status(&mut self) {
@@ -180,13 +196,18 @@ impl Tui {
         self.main_scroll = 0;
         self.focused_panel = PanelFocus::Worktrees;
         self.main_focused = false;
-        if self.worktree_list_mode == WorktreeListMode::Repo {
-            self.restore_selected_worktree_for_repo();
-        }
+        self.restore_selected_worktree_for_repo();
+    }
+
+    pub(crate) fn focus_merges(&mut self) {
+        self.main_scroll = 0;
+        self.focused_panel = PanelFocus::Merges;
+        self.main_focused = false;
+        self.restore_selected_worktree_for_repo();
     }
 
     pub(super) fn switch_worktree_list_mode(&mut self, mode: WorktreeListMode) {
-        if self.focused_panel != PanelFocus::Worktrees || self.worktree_list_mode == mode {
+        if !self.is_worktree_session_panel() || self.worktree_list_mode == mode {
             return;
         }
         let selected = self.selected_worktree_index();
@@ -231,7 +252,7 @@ impl Tui {
                     OpenTmuxSessionTarget::Blocked("selected repository has no default worktree")
                 }
             }
-            PanelFocus::Worktrees => {
+            PanelFocus::Worktrees | PanelFocus::Merges => {
                 if self.selected_worktree_context().is_none() {
                     return OpenTmuxSessionTarget::Blocked(
                         "selected repository has no visible worktrees",
@@ -378,7 +399,7 @@ impl Tui {
                     self.select_repo(index);
                 }
             }
-            PanelFocus::Worktrees => {
+            PanelFocus::Worktrees | PanelFocus::Merges => {
                 if let Some(index) = self.visible_session_indices().first().copied() {
                     self.select_worktree(index);
                 }
@@ -397,7 +418,7 @@ impl Tui {
                     self.select_repo(index);
                 }
             }
-            PanelFocus::Worktrees => {
+            PanelFocus::Worktrees | PanelFocus::Merges => {
                 if let Some(index) = self.visible_session_indices().last().copied() {
                     self.select_worktree(index);
                 }
@@ -427,13 +448,32 @@ impl Tui {
     }
 
     pub(crate) fn visible_session_indices(&self) -> Vec<usize> {
+        let finishing = self.focused_panel == PanelFocus::Merges;
+        self.visible_session_indices_for(finishing)
+    }
+
+    pub(crate) fn visible_worktree_indices(&self) -> Vec<usize> {
+        self.visible_session_indices_for(false)
+    }
+
+    pub(crate) fn visible_merge_indices(&self) -> Vec<usize> {
+        self.visible_session_indices_for(true)
+    }
+
+    fn visible_session_indices_for(&self, finishing: bool) -> Vec<usize> {
         let filter = self.worktree_filter.trim().to_ascii_lowercase();
         let mut indices = self
             .sessions
             .iter()
             .enumerate()
             .filter_map(|(index, session)| {
+                let merge_finishing = session.pr.trusted_summary().is_ok_and(|summary| {
+                    summary.is_some_and(|summary| {
+                        summary.merge_progress() != crate::remote::PrMergeProgress::Active
+                    })
+                });
                 (!session.hidden
+                    && merge_finishing == finishing
                     && (self.worktree_list_mode == WorktreeListMode::Global
                         || session.repo_index == self.current_repo)
                     && !self
@@ -589,7 +629,7 @@ impl Tui {
     }
 
     pub(super) fn move_comment_selection(&mut self, direction: isize) -> bool {
-        if self.focused_panel != PanelFocus::Worktrees {
+        if !self.is_worktree_session_panel() {
             return false;
         }
         let rows = self.selected_comment_rows();
@@ -611,7 +651,7 @@ impl Tui {
         &mut self,
         runtime: &mut dyn TerminalDriver,
     ) -> Result<bool, String> {
-        if !self.main_focused || self.focused_panel != PanelFocus::Worktrees {
+        if !self.main_focused || !self.is_worktree_session_panel() {
             return Ok(false);
         }
         let rows = self.selected_comment_rows();
@@ -762,7 +802,7 @@ impl Tui {
                 self.repo_filter = input;
                 self.ensure_navigation_valid();
             }
-            PanelFocus::Worktrees => {
+            PanelFocus::Worktrees | PanelFocus::Merges => {
                 let initial = self.worktree_filter.clone();
                 let Some(input) = self.prompt_line_dialog(
                     runtime,
@@ -820,7 +860,7 @@ impl Tui {
             view::sidebar_width_for(area.width, self.config.layout.sidebar_width),
             body_height,
         );
-        let (_, repos, worktrees) = view::sidebar_areas(sidebar, self.focused_panel);
+        let (_, repos, worktrees, merges) = view::sidebar_areas(sidebar, self.focused_panel);
         if point_in_rect(x, y, repos) {
             let row = y.saturating_sub(repos.y).saturating_sub(1) as usize;
             if let Some(index) = self.visible_repo_indices().get(row).copied() {
@@ -831,9 +871,17 @@ impl Tui {
         }
         if point_in_rect(x, y, worktrees) {
             let row = y.saturating_sub(worktrees.y).saturating_sub(2) as usize;
-            if let Some(index) = self.visible_session_indices().get(row).copied() {
+            if let Some(index) = self.visible_worktree_indices().get(row).copied() {
                 self.select_worktree(index);
                 self.focus_worktrees();
+            }
+            return;
+        }
+        if point_in_rect(x, y, merges) {
+            let row = y.saturating_sub(merges.y).saturating_sub(2) as usize;
+            if let Some(index) = self.visible_merge_indices().get(row).copied() {
+                self.select_worktree(index);
+                self.focus_merges();
             }
         }
     }

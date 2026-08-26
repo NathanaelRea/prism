@@ -250,7 +250,7 @@ impl Tui {
         session: &Session,
         use_: &crate::agent_session::AgentSessionUse,
     ) {
-        if self.focused_panel != crate::tui::PanelFocus::Worktrees {
+        if !self.is_worktree_session_panel() {
             return;
         }
         let Some((width, height)) = self.tmux_portal_size else {
