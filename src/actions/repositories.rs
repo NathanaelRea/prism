@@ -30,9 +30,7 @@ pub(super) fn ensure_user_config_file(path: &Path) -> Result<(), String> {
 fn editor_command(path: &Path) -> Result<Command, String> {
     let argv = crate::terminal::editor_argv_from_env()?
         .ok_or_else(|| "no editor found; set VISUAL or EDITOR".to_string())?;
-    let mut command = Command::new(&argv[0]);
-    command.args(&argv[1..]).arg(path);
-    Ok(command)
+    Ok(Command::new(&argv[0]).args(&argv[1..]).arg(path))
 }
 
 fn repository_edit_failure(
@@ -59,7 +57,7 @@ fn is_new_repository_entry(
 }
 
 impl Tui {
-    pub(crate) fn select_default_harness(
+    pub(crate) async fn select_default_harness(
         &mut self,
         raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
@@ -126,7 +124,7 @@ impl Tui {
         };
 
         self.config = Config::load(&self.repo);
-        self.refresh_sessions()?;
+        self.refresh_sessions().await?;
         self.sync_selected_repo_context();
         self.start_tmux_agent_warmup();
         self.start_wt_column_poll();
@@ -262,7 +260,7 @@ impl Tui {
         Ok(Some((id, harness)))
     }
 
-    pub(crate) fn edit_config(
+    pub(crate) async fn edit_config(
         &mut self,
         raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
@@ -270,8 +268,9 @@ impl Tui {
             .selected_repo_context()
             .ok_or_else(|| "no selected repository".to_string())?;
         ensure_repo_config_file(&context.config.repo_config_path, false)?;
-        let mut editor = editor_command(&context.config.repo_config_path)?;
-        crate::tui_runtime::suspend_for(raw, || crate::process::run_status_inherited(&mut editor))?;
+        let editor = editor_command(&context.config.repo_config_path)?;
+        raw.suspend_for_async(crate::process::run_status_inherited(editor))
+            .await?;
         let config = crate::config::Config::load(&context.repo);
         if !config.config_errors.is_empty() {
             return Err(config.config_errors.join("\n"));
@@ -280,14 +279,14 @@ impl Tui {
             repo.config = config.clone();
         }
         self.sync_selected_repo_context();
-        self.refresh_sessions()?;
+        self.refresh_sessions().await?;
         self.start_tmux_agent_warmup();
         self.start_wt_column_poll();
         self.show_message("config reloaded")?;
         Ok(())
     }
 
-    pub(crate) fn edit_user_config(
+    pub(crate) async fn edit_user_config(
         &mut self,
         raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
@@ -297,8 +296,9 @@ impl Tui {
             .map(|repo| repo.config.user_path.clone())
             .ok_or_else(|| "no selected repository".to_string())?;
         ensure_user_config_file(&path)?;
-        let mut editor = editor_command(&path)?;
-        crate::tui_runtime::suspend_for(raw, || crate::process::run_status_inherited(&mut editor))?;
+        let editor = editor_command(&path)?;
+        raw.suspend_for_async(crate::process::run_status_inherited(editor))
+            .await?;
         let configs = self
             .repos
             .iter()
@@ -315,14 +315,14 @@ impl Tui {
             repo.config = config;
         }
         self.sync_selected_repo_context();
-        self.refresh_sessions()?;
+        self.refresh_sessions().await?;
         self.start_tmux_agent_warmup();
         self.start_wt_column_poll();
         self.show_message("user config reloaded")?;
         Ok(())
     }
 
-    pub(crate) fn edit_worktrunk_user_config(
+    pub(crate) async fn edit_worktrunk_user_config(
         &mut self,
         raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
@@ -373,8 +373,9 @@ impl Tui {
                 location.path.display()
             ));
         }
-        let mut editor = editor_command(&location.path)?;
-        crate::tui_runtime::suspend_for(raw, || crate::process::run_status_inherited(&mut editor))?;
+        let editor = editor_command(&location.path)?;
+        raw.suspend_for_async(crate::process::run_status_inherited(editor))
+            .await?;
         for repo_index in 0..self.repos.len() {
             self.request_worktrunk_refreshes(repo_index);
         }
@@ -400,8 +401,9 @@ impl Tui {
                 abandon_cancelable: true,
                 effect: crate::tui::RemoteActionEffect::ReadOnly,
             },
-            move |_| {
+            move |_| async move {
                 crate::worktrunk::discover_user_config(&repo, &config)
+                    .await
                     .map(RemoteActionValue::WorktrunkUserConfig)
                     .map_err(|error| error.to_string())
             },
@@ -446,7 +448,7 @@ impl Tui {
         Ok(())
     }
 
-    pub(crate) fn add_repository(
+    pub(crate) async fn add_repository(
         &mut self,
         raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
@@ -458,14 +460,15 @@ impl Tui {
         if path.is_empty() {
             return Ok(());
         }
-        let repo = Repository::discover(Some(Path::new(path)))?;
+        let repo = Repository::discover(Some(Path::new(path))).await?;
         let config = Config::load(&repo);
         self.ensure_worktrunk_user_project(raw, &repo, &config, TuiJobKey::System)?;
         let (index, entries, added) = crate::workspace::ensure_repo_entry(&repo)?;
-        self.reload_repositories(entries)?;
+        self.reload_repositories(entries).await?;
         self.select_repo(index);
         if added && let Some(context) = self.selected_repo_context() {
-            self.offer_worktrunk_approval_if_pending(raw, &context.repo, &context.config)?;
+            self.offer_worktrunk_approval_if_pending(raw, &context.repo, &context.config)
+                .await?;
         }
         self.start_tmux_agent_warmup();
         self.start_wt_column_poll();
@@ -474,7 +477,7 @@ impl Tui {
         Ok(())
     }
 
-    pub(crate) fn edit_repositories(
+    pub(crate) async fn edit_repositories(
         &mut self,
         raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
@@ -491,8 +494,9 @@ impl Tui {
             crate::workspace::initialize_entries(&entries)?;
         }
         let original_entries = crate::workspace::load_entries()?;
-        let mut editor = editor_command(&path)?;
-        crate::tui_runtime::suspend_for(raw, || crate::process::run_status_inherited(&mut editor))?;
+        let editor = editor_command(&path)?;
+        raw.suspend_for_async(crate::process::run_status_inherited(editor))
+            .await?;
         let entries = crate::workspace::load_entries()?;
         if entries.is_empty() {
             return Err(repository_edit_failure(
@@ -509,11 +513,13 @@ impl Tui {
         // that became available while the editor was open is still recognized as already tracked.
         let original_discovered_roots =
             crate::workspace::discover_valid_entries(original_entries.clone())
+                .await
                 .into_iter()
                 .map(|entry| entry.repo.root)
                 .collect::<BTreeSet<_>>();
         let mut new_roots = BTreeSet::new();
         let new_repos = crate::workspace::discover_valid_entries(entries.clone())
+            .await
             .into_iter()
             .filter_map(|entry| {
                 let configured_root = &entries[entry.source_index].root;
@@ -538,7 +544,7 @@ impl Tui {
             .selected_repo_context()
             .map(|context| context.repo.root)
             .unwrap_or_else(|| self.repo.root.clone());
-        self.reload_repositories(entries)?;
+        self.reload_repositories(entries).await?;
         let index = self
             .repos
             .iter()
@@ -549,13 +555,14 @@ impl Tui {
         self.start_wt_column_poll();
         self.start_default_branch_status_poll(true);
         for (repo, config) in new_repos {
-            self.offer_worktrunk_approval_if_pending(raw, &repo, &config)?;
+            self.offer_worktrunk_approval_if_pending(raw, &repo, &config)
+                .await?;
         }
         self.show_message("repositories reloaded")?;
         Ok(())
     }
 
-    pub(crate) fn reorder_repositories(
+    pub(crate) async fn reorder_repositories(
         &mut self,
         raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
@@ -599,7 +606,7 @@ impl Tui {
             .selected_repo_context()
             .map(|context| context.repo.root);
         let updated = crate::workspace::replace_entries(&entries, &updated)?;
-        self.reload_repositories(updated)?;
+        self.reload_repositories(updated).await?;
         let index = current_root
             .and_then(|root| self.repos.iter().position(|repo| repo.repo.root == root))
             .unwrap_or_else(|| self.current_repo.min(self.repos.len().saturating_sub(1)));
@@ -631,8 +638,8 @@ impl Tui {
                 abandon_cancelable: false,
                 effect: crate::tui::RemoteActionEffect::LocalMutation,
             },
-            move |_| {
-                crate::worktrunk::ensure_user_project_config(&repo, &config)?;
+            move |_| async move {
+                crate::worktrunk::ensure_user_project_config(&repo, &config).await?;
                 Ok(RemoteActionValue::Complete)
             },
         )?
@@ -642,13 +649,13 @@ impl Tui {
         Ok(())
     }
 
-    pub(super) fn offer_worktrunk_approval_if_pending(
+    pub(super) async fn offer_worktrunk_approval_if_pending(
         &mut self,
         raw: &mut dyn crate::tui_runtime::TerminalDriver,
         repo: &Repository,
         config: &Config,
     ) -> Result<(), String> {
-        let status = match check_worktrunk_approval_status(repo, config) {
+        let status = match check_worktrunk_approval_status(repo, config).await {
             Ok(status) => status,
             Err(error) => {
                 let _ = append_runtime_message(
@@ -660,8 +667,8 @@ impl Tui {
         };
         match status {
             WorktrunkApprovalStatus::Pending => {
-                if self.offer_worktrunk_approval(raw, repo, config)? {
-                    match check_worktrunk_approval_status(repo, config)? {
+                if self.offer_worktrunk_approval(raw, repo, config).await? {
+                    match check_worktrunk_approval_status(repo, config).await? {
                         WorktrunkApprovalStatus::Pending => {
                             self.show_message("Worktrunk approvals still pending")?;
                         }
@@ -677,7 +684,7 @@ impl Tui {
         Ok(())
     }
 
-    pub(super) fn offer_worktrunk_approval(
+    pub(super) async fn offer_worktrunk_approval(
         &mut self,
         raw: &mut dyn crate::tui_runtime::TerminalDriver,
         repo: &Repository,
@@ -703,11 +710,12 @@ impl Tui {
         )? {
             return Ok(false);
         }
-        crate::tui_runtime::suspend_for(raw, || run_worktrunk_approval_prompt(repo, config))?;
+        raw.suspend_for_async(run_worktrunk_approval_prompt(repo, config))
+            .await?;
         Ok(true)
     }
 
-    pub(super) fn reload_repositories(
+    pub(super) async fn reload_repositories(
         &mut self,
         entries: Vec<crate::workspace::RepoEntry>,
     ) -> Result<(), String> {
@@ -717,7 +725,7 @@ impl Tui {
             .map(|managed| (managed.repo.root.clone(), managed.identity.clone()))
             .collect::<BTreeMap<_, _>>();
         let mut repos = Vec::new();
-        for entry in crate::workspace::discover_valid_entries(entries) {
+        for entry in crate::workspace::discover_valid_entries(entries).await {
             let repo = entry.repo;
             crate::observability::attach_run_repo(&repo)?;
             let config = crate::config::Config::load(&repo);
@@ -743,7 +751,7 @@ impl Tui {
             .repos
             .get(self.current_repo)
             .map(|repo| repo.repo.root.clone());
-        self.refresh_sessions()?;
+        self.refresh_sessions().await?;
         self.sync_selected_repo_context();
         self.load_remote_mutation_reconciliation_markers();
         Ok(())

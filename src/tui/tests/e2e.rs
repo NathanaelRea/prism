@@ -66,7 +66,7 @@ fn e2e_config(sandbox: &E2eSandbox) -> Config {
     config
 }
 
-fn e2e_tui(sandbox: &E2eSandbox) -> Tui {
+async fn e2e_tui(sandbox: &E2eSandbox) -> Tui {
     let repo =
         Repository::with_config_dir_for_test(sandbox.repo.clone(), sandbox.state.join("prism"));
     fs::create_dir_all(repo.prism_dir()).unwrap();
@@ -76,20 +76,23 @@ fn e2e_tui(sandbox: &E2eSandbox) -> Tui {
     )
     .unwrap();
     let config = e2e_config(sandbox);
-    let sessions = crate::session::discover_sessions(&repo, &config).unwrap();
+    let sessions = crate::session::discover_sessions(&repo, &config)
+        .await
+        .unwrap();
     Tui::new_single(repo, config, sessions)
 }
 
-#[test]
-fn create_command_uses_real_git_worktree_and_warms_the_selected_harness() {
+#[tokio::test(flavor = "multi_thread")]
+async fn create_command_uses_real_git_worktree_and_warms_the_selected_harness() {
     let sandbox = E2eSandbox::new("create-command");
-    let mut tui = e2e_tui(&sandbox);
+    let mut tui = e2e_tui(&sandbox).await;
     let mut terminal = ScriptedTerminal::default();
     terminal.queue_text_dialog("feature/e2e-create");
     terminal.queue_create_session_form("");
     let mut state = CommandState::default();
 
     tui.dispatch_command(&mut terminal, DashboardCommand::Create, &mut state)
+        .await
         .unwrap();
 
     let created = sandbox.worktrees.join("feature-e2e-create");
@@ -156,15 +159,16 @@ fn create_command_uses_real_git_worktree_and_warms_the_selected_harness() {
     sandbox.assert_clean_adapters();
 }
 
-#[test]
-fn permanent_delete_removes_only_selected_worktree_branch_and_tmux_session() {
+#[tokio::test(flavor = "multi_thread")]
+async fn permanent_delete_removes_only_selected_worktree_branch_and_tmux_session() {
     let sandbox = E2eSandbox::new("delete-command");
-    let mut tui = e2e_tui(&sandbox);
+    let mut tui = e2e_tui(&sandbox).await;
     let mut terminal = ScriptedTerminal::default();
     terminal.queue_text_dialog("feature/e2e-delete");
     terminal.queue_create_session_form("");
     let mut state = CommandState::default();
     tui.dispatch_command(&mut terminal, DashboardCommand::Create, &mut state)
+        .await
         .unwrap();
 
     wait_until(Duration::from_secs(30), "created session warmup", || {
@@ -203,6 +207,7 @@ fn permanent_delete_removes_only_selected_worktree_branch_and_tmux_session() {
 
     terminal.queue_confirmation(true);
     tui.dispatch_command(&mut terminal, DashboardCommand::DeletePermanent, &mut state)
+        .await
         .unwrap();
     wait_until(Duration::from_secs(8), "permanent deletion", || {
         tui.tick_tui_action_jobs();
@@ -227,10 +232,10 @@ fn permanent_delete_removes_only_selected_worktree_branch_and_tmux_session() {
     sandbox.assert_clean_adapters();
 }
 
-#[test]
-fn create_with_multiline_prompt_delivers_literal_input_once_to_generic_harness() {
+#[tokio::test(flavor = "multi_thread")]
+async fn create_with_multiline_prompt_delivers_literal_input_once_to_generic_harness() {
     let sandbox = E2eSandbox::new("create-prompt");
-    let mut tui = e2e_tui(&sandbox);
+    let mut tui = e2e_tui(&sandbox).await;
     let mut terminal = ScriptedTerminal::default();
     terminal.queue_text_dialog("feature/e2e-prompt");
     let marker = sandbox.state.join("shell-evaluated");
@@ -242,6 +247,7 @@ fn create_with_multiline_prompt_delivers_literal_input_once_to_generic_harness()
     let mut state = CommandState::default();
 
     tui.dispatch_command(&mut terminal, DashboardCommand::Create, &mut state)
+        .await
         .unwrap();
 
     let event = wait_until(Duration::from_secs(30), "generic harness prompt", || {
@@ -297,8 +303,8 @@ fn create_with_multiline_prompt_delivers_literal_input_once_to_generic_harness()
     sandbox.assert_clean_adapters();
 }
 
-#[test]
-fn scripted_terminal_supports_lifecycle_failures_and_frame_summaries() {
+#[tokio::test(flavor = "multi_thread")]
+async fn scripted_terminal_supports_lifecycle_failures_and_frame_summaries() {
     let mut tui = super::support::test_tui();
     let mut terminal = ScriptedTerminal::with_size(90, 24);
     terminal.push_focus_lost();
@@ -308,6 +314,7 @@ fn scripted_terminal_supports_lifecycle_failures_and_frame_summaries() {
     let mut state = CommandState::default();
 
     tui.dispatch_command(&mut terminal, DashboardCommand::Help, &mut state)
+        .await
         .unwrap();
     assert!(terminal.frames.iter().any(|frame| {
         frame.dialog_title.as_deref() == Some("Help") && frame.focus == PanelFocus::Repos
@@ -325,6 +332,7 @@ fn scripted_terminal_supports_lifecycle_failures_and_frame_summaries() {
     draw_failure.push_key(KeyCode::Enter);
     let error = tui
         .dispatch_command(&mut draw_failure, DashboardCommand::Help, &mut state)
+        .await
         .unwrap_err();
     assert_eq!(error, "injected draw failure");
 
@@ -332,6 +340,7 @@ fn scripted_terminal_supports_lifecycle_failures_and_frame_summaries() {
     poll_failure.fail_next_poll("injected poll failure");
     let error = tui
         .dispatch_command(&mut poll_failure, DashboardCommand::Help, &mut state)
+        .await
         .unwrap_err();
     assert_eq!(error, "injected poll failure");
 }

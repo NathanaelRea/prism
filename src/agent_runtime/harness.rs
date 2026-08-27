@@ -4,9 +4,10 @@
 )]
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+
+use crate::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const BUILTIN_HARNESS_IDS: [&str; 4] = ["opencode", "codex", "claude", "pi"];
@@ -384,19 +385,10 @@ impl Invocation {
             .argv
             .split_first()
             .ok_or_else(|| "harness invocation is empty".to_string())?;
-        let mut command = Command::new(program);
-        command
+        Ok(Command::new(program)
             .args(args)
             .current_dir(cwd)
-            .envs(&self.environment)
-            .stdin(if self.stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        Ok(command)
+            .envs(&self.environment))
     }
 
     pub fn cleanup(&self) {
@@ -405,80 +397,35 @@ impl Invocation {
         }
     }
 
-    pub fn spawn(&self, cwd: &Path) -> Result<crate::process::SupervisedChild, String> {
+    pub async fn spawn(&self, cwd: &Path) -> Result<crate::process::StreamingProcess, String> {
         self.spawn_with_policy(cwd, crate::process::ProcessPolicy::WorkflowStep)
+            .await
     }
 
-    fn spawn_with_policy(
+    async fn spawn_with_policy(
         &self,
         cwd: &Path,
         policy: crate::process::ProcessPolicy,
-    ) -> Result<crate::process::SupervisedChild, String> {
-        crate::process::SupervisedChild::spawn_named(
-            &mut self.command(cwd)?,
-            Some(policy),
-            self.stdin.as_ref().map(|input| input.as_bytes().to_vec()),
+    ) -> Result<crate::process::StreamingProcess, String> {
+        crate::process::spawn_streaming(
+            self.command(cwd)?,
+            policy,
+            self.stdin
+                .as_deref()
+                .map_or(crate::process::ProcessInput::Null, |input| {
+                    crate::process::ProcessInput::Bytes(input.as_bytes())
+                }),
             crate::process::ProcessDescriptor::new("harness.run"),
+            WORKFLOW_OUTPUT_CHANNEL_CAPACITY,
+            MAX_OUTPUT_LINE_BYTES,
         )
+        .await
         .map_err(|error| format!("start harness '{}': {error}", self.argv[0]))
     }
 }
 
 pub const MAX_OUTPUT_LINE_BYTES: usize = 1024 * 1024;
 pub(crate) const WORKFLOW_OUTPUT_CHANNEL_CAPACITY: usize = 16;
-
-pub fn read_bounded_lines(
-    reader: impl Read,
-    mut emit: impl FnMut(String) -> bool,
-) -> Result<(), String> {
-    let mut reader = BufReader::new(reader);
-    let mut line = Vec::new();
-    let mut truncated = false;
-    loop {
-        let available = reader
-            .fill_buf()
-            .map_err(|error| format!("read harness output: {error}"))?;
-        if available.is_empty() {
-            if !line.is_empty() || truncated {
-                let mut text = String::from_utf8_lossy(&line).into_owned();
-                if truncated {
-                    text.push_str(" [line truncated]");
-                }
-                let _ = emit(text);
-            }
-            return Ok(());
-        }
-        let consumed = available
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map_or(available.len(), |index| index + 1);
-        let chunk = &available[..consumed];
-        let content = chunk.strip_suffix(b"\n").unwrap_or(chunk);
-        if line.len() < MAX_OUTPUT_LINE_BYTES {
-            let remaining = MAX_OUTPUT_LINE_BYTES - line.len();
-            line.extend_from_slice(&content[..content.len().min(remaining)]);
-            truncated |= content.len() > remaining;
-        } else if !content.is_empty() {
-            truncated = true;
-        }
-        let complete = chunk.ends_with(b"\n");
-        reader.consume(consumed);
-        if complete {
-            if line.ends_with(b"\r") {
-                line.pop();
-            }
-            let mut text = String::from_utf8_lossy(&line).into_owned();
-            if truncated {
-                text.push_str(" [line truncated]");
-            }
-            if !emit(text) {
-                return Ok(());
-            }
-            line.clear();
-            truncated = false;
-        }
-    }
-}
 
 pub struct Harness<'a> {
     id: String,
@@ -770,44 +717,40 @@ impl<'a> Harness<'a> {
         )
     }
 
-    pub fn selection_options(&self) -> AgentSelectionOptions {
-        let mut options = self.discover_selection_options().unwrap_or_default();
+    pub async fn selection_options(&self) -> AgentSelectionOptions {
+        let mut options = self.discover_selection_options().await.unwrap_or_default();
         if options.models.is_empty() {
             options.variants = fallback_variants(&self.config.adapter);
         }
         options
     }
 
-    fn discover_selection_options(&self) -> Option<AgentSelectionOptions> {
-        let mut command = Command::new(self.config.interactive_command.first()?);
-        command.args(self.config.interactive_command.iter().skip(1));
-        command.args(&self.config.arguments);
-        match self.config.adapter.as_str() {
-            "opencode" => {
-                command.args(["models", "--verbose"]);
-            }
-            "codex" => {
-                command.args(["debug", "models", "--bundled"]);
-            }
-            "pi" => {
-                command.arg("--list-models");
-            }
+    async fn discover_selection_options(&self) -> Option<AgentSelectionOptions> {
+        let mut command = Command::new(self.config.interactive_command.first()?)
+            .args(self.config.interactive_command.iter().skip(1))
+            .args(&self.config.arguments);
+        command = match self.config.adapter.as_str() {
+            "opencode" => command.args(["models", "--verbose"]),
+            "codex" => command.args(["debug", "models", "--bundled"]),
+            "pi" => command.arg("--list-models"),
             _ => return None,
-        }
-        command.envs(&self.config.environment);
+        };
+        command = command.envs(&self.config.environment);
         let output = crate::process::run_output_allow_failure(
-            &mut command,
+            command,
             crate::process::ProcessPolicy::Metadata,
         )
+        .await
         .ok()?;
         if !output.status.success() || output.stdout_truncated {
             return None;
         }
+        let stdout = String::from_utf8_lossy(&output.stdout);
         let options = match self.config.adapter.as_str() {
-            "opencode" => parse_opencode_options(&output.stdout),
-            "codex" => parse_codex_options(&output.stdout),
+            "opencode" => parse_opencode_options(&stdout),
+            "codex" => parse_codex_options(&stdout),
             "pi" => AgentSelectionOptions {
-                models: parse_pi_models(&output.stdout),
+                models: parse_pi_models(&stdout),
                 variants: Vec::new(),
             },
             _ => AgentSelectionOptions::default(),
@@ -1014,7 +957,7 @@ impl<'a> Harness<'a> {
         argv
     }
 
-    pub fn prepare_server(
+    pub async fn prepare_server(
         &self,
         repo: &crate::repo::Repository,
         config: &crate::config::Config,
@@ -1032,10 +975,11 @@ impl<'a> Harness<'a> {
         crate::opencode::ensure_opencode_server_with_program(
             repo, config, &self.id, branch, worktree, program,
         )
+        .await
         .map(Some)
     }
 
-    pub fn prepare_session(
+    pub async fn prepare_session(
         &self,
         repo: &crate::repo::Repository,
         config: &crate::config::Config,
@@ -1053,6 +997,7 @@ impl<'a> Harness<'a> {
         crate::opencode::ensure_opencode_session_with_program(
             repo, config, &self.id, branch, worktree, program,
         )
+        .await
         .map(Some)
     }
 }
@@ -1114,11 +1059,13 @@ pub fn cancel_native_session(session: &SessionRef) -> Result<bool, String> {
     }
 }
 
-pub fn terminate_active_process(child: &mut crate::process::SupervisedChild) -> Result<(), String> {
-    child
-        .terminate()
-        .map(|_| ())
-        .map_err(|error| format!("terminate harness process {}: {error}", child.id()))
+pub async fn terminate_active_process(
+    control: &crate::process::ProcessControl,
+) -> Result<(), String> {
+    control
+        .shutdown()
+        .await
+        .map_err(|error| format!("terminate harness process {}: {error}", control.pid()))
 }
 
 fn invocation_from_template(
@@ -1176,11 +1123,18 @@ fn temporary_prompt_file(prompt: &str) -> Result<PathBuf, String> {
         ));
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
         match options.open(&path) {
             Ok(mut file) => {
+                #[cfg(windows)]
+                crate::system::windows_security::secure_path(&path, false)
+                    .map_err(|error| format!("secure prompt file: {error}"))?;
                 file.write_all(prompt.as_bytes())
+                    .and_then(|()| file.sync_all())
                     .map_err(|error| format!("write prompt file: {error}"))?;
                 return Ok(path);
             }
@@ -1598,21 +1552,6 @@ provider/model-c
     }
 
     #[test]
-    fn output_reader_bounds_individual_lines() {
-        let input = format!("{}\nnext\n", "x".repeat(MAX_OUTPUT_LINE_BYTES + 10));
-        let mut lines = Vec::new();
-        read_bounded_lines(input.as_bytes(), |line| {
-            lines.push(line);
-            true
-        })
-        .unwrap();
-        assert_eq!(lines.len(), 2);
-        assert!(lines[0].ends_with(" [line truncated]"));
-        assert!(lines[0].len() <= MAX_OUTPUT_LINE_BYTES + " [line truncated]".len());
-        assert_eq!(lines[1], "next");
-    }
-
-    #[test]
     fn temporary_file_transport_writes_and_cleans_up_prompt() {
         let config = generic(
             vec!["agent", "run", "{prompt_file}"],
@@ -1674,9 +1613,9 @@ provider/model-c
         );
     }
 
-    #[test]
+    #[tokio::test]
     #[cfg(unix)]
-    fn large_stdin_to_non_reading_term_ignoring_child_is_deadline_bounded() {
+    async fn large_stdin_to_non_reading_term_ignoring_child_is_deadline_bounded() {
         let invocation = Invocation {
             argv: vec![
                 "sh".to_string(),
@@ -1690,19 +1629,19 @@ provider/model-c
             attach: false,
         };
         let started = std::time::Instant::now();
-        let mut child = invocation
+        let child = invocation
             .spawn_with_policy(Path::new("/tmp"), crate::process::ProcessPolicy::Test)
+            .await
             .unwrap();
 
         assert!(started.elapsed() < std::time::Duration::from_millis(200));
-        while !child.deadline_exceeded() {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let process_id = child.id();
+        let process_id = child.pid();
         let recorded = crate::process::record_process(process_id).unwrap();
-        let stage = child.terminate().unwrap();
+        assert!(matches!(
+            child.wait().await,
+            crate::process::LiveProcessCompletion::Exited(crate::process::Outcome::TimedOut)
+        ));
 
-        assert_eq!(stage, crate::process::TerminationStage::Kill);
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
         assert_eq!(
             crate::process::observe_process(recorded).unwrap(),
@@ -1711,9 +1650,9 @@ provider/model-c
         );
     }
 
-    #[test]
+    #[tokio::test]
     #[cfg(unix)]
-    fn named_adapter_shims_receive_prompt_exactly_once() {
+    async fn named_adapter_shims_receive_prompt_exactly_once() {
         use std::os::unix::fs::PermissionsExt;
 
         let path = std::env::temp_dir().join(format!(
@@ -1742,11 +1681,12 @@ provider/model-c
                     false,
                 )
                 .unwrap();
-            let output = invocation
-                .command(Path::new("/tmp"))
-                .unwrap()
-                .output()
-                .unwrap();
+            let output = crate::process::run_output(
+                invocation.command(Path::new("/tmp")).unwrap(),
+                crate::process::ProcessPolicy::Test,
+            )
+            .await
+            .unwrap();
             assert!(output.status.success());
             let stdout = String::from_utf8_lossy(&output.stdout);
             assert_eq!(
@@ -1762,11 +1702,12 @@ provider/model-c
                     Path::new("/tmp"),
                 )
                 .unwrap();
-            let output = interactive
-                .command(Path::new("/tmp"))
-                .unwrap()
-                .output()
-                .unwrap();
+            let output = crate::process::run_output(
+                interactive.command(Path::new("/tmp")).unwrap(),
+                crate::process::ProcessPolicy::Test,
+            )
+            .await
+            .unwrap();
             let stdout = String::from_utf8_lossy(&output.stdout);
             assert_eq!(
                 stdout.matches("interactive prompt $HOME").count(),

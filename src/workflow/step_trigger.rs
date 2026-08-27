@@ -2,8 +2,8 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
-use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::process::Command;
+
+use crate::process::{Command, ProcessCompletion, ProcessInput};
 
 pub const TRIGGER_PROTOCOL_VERSION: u32 = 1;
 
@@ -244,112 +244,51 @@ impl ExternalTrigger {
         request: TriggerPhaseRequest,
     ) -> Result<TriggerPhaseResponse, TriggerError> {
         let metadata = std::fs::metadata(&self.executable).map_err(TriggerError::Io)?;
-        if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+        #[cfg(unix)]
+        let executable = metadata.is_file() && metadata.permissions().mode() & 0o111 != 0;
+        #[cfg(windows)]
+        let executable = metadata.is_file();
+        if !executable {
             return Err(TriggerError::Protocol(format!(
                 "trigger {} is not executable",
                 self.executable.display()
             )));
         }
-        let mut command = Command::new(&self.executable);
-        command.as_std_mut().process_group(0);
-        let mut child = command
-            .kill_on_drop(true)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(TriggerError::Io)?;
-        let process_id = child.id();
-        let mut process_group = process_id.map(ProcessGroupGuard::new);
-        let body = serde_json::to_vec(&request)
+        let mut body = serde_json::to_vec(&request)
             .map_err(|error| TriggerError::Protocol(error.to_string()))?;
-        let mut stdin = child.stdin.take().ok_or_else(|| {
-            TriggerError::Protocol("external trigger stdin was not captured".into())
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            TriggerError::Protocol("external trigger stdout was not captured".into())
-        })?;
-        let stderr = child.stderr.take().ok_or_else(|| {
-            TriggerError::Protocol("external trigger stderr was not captured".into())
-        })?;
-        let stdout_limit = self.limits.stdout_bytes;
-        let stderr_limit = self.limits.stderr_bytes;
-        let stdout_task = tokio::spawn(read_bounded(stdout, stdout_limit));
-        let stderr_task = tokio::spawn(read_bounded(stderr, stderr_limit));
-        let mut stdin_task = tokio::spawn(async move {
-            stdin.write_all(&body).await.map_err(TriggerError::Io)?;
-            stdin.write_all(b"\n").await.map_err(TriggerError::Io)
-        });
-        let status = match tokio::time::timeout(self.limits.timeout, async {
-            let status = child.wait().await.map_err(TriggerError::Io)?;
-            (&mut stdin_task).await.map_err(|error| {
-                TriggerError::Protocol(format!("join trigger stdin: {error}"))
-            })??;
-            Ok::<_, TriggerError>(status)
-        })
+        body.push(b'\n');
+        let output = crate::process::execute_prefix_bounded(
+            Command::new(&self.executable),
+            crate::process::ProcessPolicy::WorkflowStep,
+            self.limits.timeout,
+            self.limits.stdout_bytes,
+            self.limits.stderr_bytes,
+            ProcessInput::Bytes(&body),
+            None,
+            crate::process::ProcessDescriptor::new("workflow.trigger.external"),
+        )
         .await
-        {
-            Ok(status) => status?,
-            Err(_) => {
-                if let Some(process_id) = process_id {
-                    let _ = crate::system::process::send_process_group_signal(
-                        process_id,
-                        libc::SIGKILL,
-                    );
-                }
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                stdin_task.abort();
-                let _ = stdin_task.await;
-                if let Some(process_group) = &mut process_group {
-                    process_group.disarm();
-                }
-                stdout_task.abort();
-                stderr_task.abort();
-                let _ = stdout_task.await;
-                let _ = stderr_task.await;
-                let stderr = String::new();
-                return Err(TriggerError::Timeout {
-                    executable: self.executable.clone(),
-                    diagnostic: stderr,
-                });
-            }
-        };
-        if let Some(process_id) = process_id {
-            let _ = crate::system::process::send_process_group_signal(process_id, libc::SIGKILL);
-        }
-        let drain_timeout = self.limits.timeout.min(Duration::from_secs(5));
-        let (stdout, stderr) = match tokio::time::timeout(drain_timeout, async {
-            let stdout = stdout_task.await.map_err(|error| {
-                TriggerError::Protocol(format!("join trigger stdout: {error}"))
-            })??;
-            let stderr = stderr_task.await.map_err(|error| {
-                TriggerError::Protocol(format!("join trigger stderr: {error}"))
-            })??;
-            Ok::<_, TriggerError>((stdout, stderr))
-        })
-        .await
-        {
-            Ok(output) => output?,
-            Err(_) => {
-                return Err(TriggerError::Timeout {
-                    executable: self.executable.clone(),
-                    diagnostic: "Trigger output streams did not close".into(),
-                });
-            }
-        };
-        if let Some(process_group) = &mut process_group {
-            process_group.disarm();
-        }
-        let diagnostic = String::from_utf8_lossy(&stderr.bytes).into_owned();
-        if !status.success() {
-            return Err(TriggerError::Process {
+        .map_err(|error| {
+            TriggerError::Protocol(format!(
+                "execute external trigger {}: {error}",
+                self.executable.display()
+            ))
+        })?;
+        let diagnostic = String::from_utf8_lossy(&output.stderr).into_owned();
+        if output.completion == ProcessCompletion::DeadlineExceeded {
+            return Err(TriggerError::Timeout {
                 executable: self.executable.clone(),
-                status: status.to_string(),
                 diagnostic,
             });
         }
-        if stdout.truncated {
+        if !output.status.success() {
+            return Err(TriggerError::Process {
+                executable: self.executable.clone(),
+                status: output.status.to_string(),
+                diagnostic,
+            });
+        }
+        if output.stdout_truncated {
             return Err(TriggerError::Protocol(format!(
                 "trigger {} exceeded its {} byte stdout limit",
                 self.executable.display(),
@@ -357,7 +296,7 @@ impl ExternalTrigger {
             )));
         }
         let response: TriggerPhaseResponse =
-            serde_json::from_slice(&stdout.bytes).map_err(|error| {
+            serde_json::from_slice(&output.stdout).map_err(|error| {
                 TriggerError::Protocol(format!(
                     "invalid response from trigger {}: {error}; stderr: {}",
                     self.executable.display(),
@@ -522,59 +461,6 @@ fn unexpected_response(phase: &str, response: &TriggerPhaseResponse) -> TriggerE
     ))
 }
 
-struct ProcessGroupGuard {
-    process_id: u32,
-    armed: bool,
-}
-
-impl ProcessGroupGuard {
-    fn new(process_id: u32) -> Self {
-        Self {
-            process_id,
-            armed: true,
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for ProcessGroupGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            let _ =
-                crate::system::process::send_process_group_signal(self.process_id, libc::SIGKILL);
-        }
-    }
-}
-
-struct BoundedOutput {
-    bytes: Vec<u8>,
-    truncated: bool,
-}
-
-async fn read_bounded(
-    mut reader: impl AsyncRead + Unpin,
-    limit: usize,
-) -> Result<BoundedOutput, TriggerError> {
-    let mut output = Vec::with_capacity(limit.min(8192));
-    let mut buffer = [0_u8; 8192];
-    let mut truncated = false;
-    loop {
-        let count = reader.read(&mut buffer).await.map_err(TriggerError::Io)?;
-        if count == 0 {
-            return Ok(BoundedOutput {
-                bytes: output,
-                truncated,
-            });
-        }
-        let remaining = limit.saturating_sub(output.len());
-        output.extend_from_slice(&buffer[..count.min(remaining)]);
-        truncated |= count > remaining;
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct TriggerExecutableSnapshot {
     pub digest: String,
@@ -601,14 +487,31 @@ impl TriggerSnapshotStore {
         executable: &Path,
         bytes: &[u8],
     ) -> Result<TriggerExecutableSnapshot, TriggerError> {
+        #[cfg(unix)]
         if !bytes.starts_with(b"#!") {
             return Err(TriggerError::Protocol(format!(
                 "trigger {} does not begin with a shebang",
                 executable.display()
             )));
         }
+        #[cfg(windows)]
+        if !executable
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+            || !bytes.starts_with(b"MZ")
+        {
+            return Err(TriggerError::Protocol(format!(
+                "native Windows trigger {} must be a PE executable with an .exe extension",
+                executable.display()
+            )));
+        }
         let digest = format!("sha256:{:x}", Sha256::digest(bytes));
+        #[cfg(unix)]
         let path = self.root.join(digest.trim_start_matches("sha256:"));
+        #[cfg(windows)]
+        let path = self
+            .root
+            .join(format!("{}.exe", digest.trim_start_matches("sha256:")));
         if path.exists() {
             let actual = std::fs::read(&path).map_err(TriggerError::Io)?;
             if actual != bytes {
@@ -619,6 +522,9 @@ impl TriggerSnapshotStore {
             }
         } else {
             std::fs::create_dir_all(&self.root).map_err(TriggerError::Io)?;
+            #[cfg(windows)]
+            crate::system::windows_security::secure_path(&self.root, true)
+                .map_err(TriggerError::Io)?;
             static TEMPORARY_SEQUENCE: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(1);
             let temporary = self.root.join(format!(
@@ -628,9 +534,15 @@ impl TriggerSnapshotStore {
                 TEMPORARY_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ));
             std::fs::write(&temporary, bytes).map_err(TriggerError::Io)?;
+            #[cfg(unix)]
             std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o700))
                 .map_err(TriggerError::Io)?;
-            std::fs::File::open(&temporary)
+            #[cfg(windows)]
+            crate::system::windows_security::secure_path(&temporary, false)
+                .map_err(TriggerError::Io)?;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&temporary)
                 .and_then(|file| file.sync_all())
                 .map_err(TriggerError::Io)?;
             match std::fs::rename(&temporary, &path) {
@@ -859,6 +771,24 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    fn windows_process_is_running(pid: u32) -> bool {
+        use windows::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        let Ok(handle) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) })
+        else {
+            return false;
+        };
+        let mut exit_code = 0;
+        let running = unsafe { GetExitCodeProcess(handle, &mut exit_code) }.is_ok()
+            && exit_code == STILL_ACTIVE.0 as u32;
+        let _ = unsafe { CloseHandle(handle) };
+        running
+    }
+
     #[tokio::test]
     async fn scripted_trigger_covers_all_decisions_and_hooks() {
         let trigger = ScriptedTrigger::new([
@@ -1011,6 +941,47 @@ esac
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_trigger_timeout_includes_blocked_stdin_write() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = std::env::temp_dir().join(format!(
+            "prism-blocked-trigger-{}-{}",
+            std::process::id(),
+            crate::util::timestamp_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let executable = root.join("trigger");
+        std::fs::write(&executable, "#!/bin/sh\nsleep 60\n").unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        let limits = ExternalTriggerLimits {
+            timeout: Duration::from_millis(250),
+            ..ExternalTriggerLimits::default()
+        };
+        let trigger = ExternalTrigger::new(executable, limits);
+        let started = std::time::Instant::now();
+        let error = trigger
+            .post_step_run(
+                &context(),
+                &PreparedState::default(),
+                &AgentOutcome {
+                    status: AgentOutcomeStatus::Succeeded,
+                    process_id: None,
+                    session_id: "blocked".into(),
+                    final_text: "x".repeat(2 * 1024 * 1024),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, TriggerError::Timeout { .. }));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
     #[test]
     fn snapshots_pin_executable_bytes() {
         let root = std::env::temp_dir().join(format!(
@@ -1031,6 +1002,162 @@ esac
         assert_eq!(
             std::fs::read_to_string(snapshot.path).unwrap(),
             "#!/bin/sh\nexit 0\n"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_external_trigger_executes_native_versioned_json_lifecycle() {
+        let root = std::env::temp_dir().join(format!(
+            "prism-external-trigger-{}-{}",
+            std::process::id(),
+            crate::util::timestamp_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("trigger.rs");
+        let executable = root.join("trigger.exe");
+        let descendant_pid_file = root.join("descendant.pid");
+        let fixture = r##"use std::io::{self, Read as _};
+fn main() {
+    if std::env::current_exe().unwrap().file_stem().and_then(|value| value.to_str()) == Some("blocked") {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        return;
+    }
+    let mut request = String::new();
+    io::stdin().read_to_string(&mut request).unwrap();
+    if request.contains(r#""run_id":"timeout""#) {
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/D", "/S", "/C", "ping.exe -n 60 127.0.0.1 >NUL"])
+            .spawn()
+            .unwrap();
+        std::fs::write(__PID_PATH__, child.id().to_string()).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        let _ = child.kill();
+    } else if request.contains("should_run_step") {
+        println!("{}", r#"{"response":"decision","protocol_version":1,"decision":{"decision":"run","summary":"work found"}}"#);
+    } else if request.contains("pre_step_run") {
+        println!("{}", r#"{"response":"prepared","protocol_version":1,"prepared_state":{"captured":["T1"]}}"#);
+    } else if request.contains("post_step_run") {
+        println!("{}", r#"{"response":"completed","protocol_version":1,"completion":{"result":"success","summary":"done"}}"#);
+    } else {
+        std::process::exit(4);
+    }
+}
+"##
+        .replace("__PID_PATH__", &format!("{descendant_pid_file:?}"));
+        std::fs::write(&source, fixture).unwrap();
+        let output = std::process::Command::new("rustc")
+            .arg("--edition=2021")
+            .arg(&source)
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "compile native trigger fixture: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let blocked_executable = root.join("blocked.exe");
+        std::fs::copy(&executable, &blocked_executable).unwrap();
+        let trigger = ExternalTrigger::new(executable.clone(), ExternalTriggerLimits::default());
+
+        assert!(matches!(
+            trigger.should_run_step(&context()).await.unwrap(),
+            TriggerDecision::Run { .. }
+        ));
+        let prepared = trigger.pre_step_run(&context()).await.unwrap();
+        assert_eq!(prepared.0["captured"][0], "T1");
+        assert!(matches!(
+            trigger
+                .post_step_run(
+                    &context(),
+                    &prepared,
+                    &AgentOutcome {
+                        status: AgentOutcomeStatus::Succeeded,
+                        process_id: Some(42),
+                        session_id: "fresh".into(),
+                        final_text: "plain final".into(),
+                    },
+                )
+                .await
+                .unwrap(),
+            PostStepResult::Success { .. }
+        ));
+
+        let limits = ExternalTriggerLimits {
+            timeout: Duration::from_secs(2),
+            ..ExternalTriggerLimits::default()
+        };
+        let timeout_trigger = ExternalTrigger::new(executable, limits);
+        let mut timeout_context = context();
+        timeout_context.run_id = "timeout".into();
+        assert!(matches!(
+            timeout_trigger
+                .should_run_step(&timeout_context)
+                .await
+                .unwrap_err(),
+            TriggerError::Timeout { .. }
+        ));
+        let descendant_pid = std::fs::read_to_string(&descendant_pid_file)
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while windows_process_is_running(descendant_pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(!windows_process_is_running(descendant_pid));
+
+        let blocked_limits = ExternalTriggerLimits {
+            timeout: Duration::from_millis(500),
+            ..ExternalTriggerLimits::default()
+        };
+        let blocked_trigger = ExternalTrigger::new(blocked_executable, blocked_limits);
+        let started = std::time::Instant::now();
+        let blocked = blocked_trigger
+            .post_step_run(
+                &context(),
+                &PreparedState::default(),
+                &AgentOutcome {
+                    status: AgentOutcomeStatus::Succeeded,
+                    process_id: None,
+                    session_id: "blocked".into(),
+                    final_text: "x".repeat(2 * 1024 * 1024),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(blocked, TriggerError::Timeout { .. }));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_snapshots_preserve_native_executable_extension() {
+        let root = std::env::temp_dir().join(format!(
+            "prism-trigger-snapshot-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let executable = root.join("trigger.exe");
+        std::fs::write(&executable, b"MZnative-trigger-fixture").unwrap();
+        let snapshot = TriggerSnapshotStore::new(root.join("snapshots"))
+            .retain(&executable)
+            .unwrap();
+        assert_eq!(
+            snapshot.path.extension().and_then(|value| value.to_str()),
+            Some("exe")
+        );
+        assert_eq!(
+            std::fs::read(snapshot.path).unwrap(),
+            b"MZnative-trigger-fixture"
         );
         std::fs::remove_dir_all(root).unwrap();
     }

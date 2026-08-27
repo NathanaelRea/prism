@@ -1,9 +1,9 @@
+use crate::process::Command;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 use std::sync::LazyLock;
 use std::time::Instant;
 
@@ -16,7 +16,7 @@ use crate::file_persistence::{self, BoxError, FileContents, UpdateOptions};
 use crate::observability;
 use crate::process::{
     ProcessDescriptor, ProcessOutput, ProcessPolicy, run_output_allow_failure_named,
-    run_output_named, run_status_inherited_named,
+    run_output_named,
 };
 use crate::repo::Repository;
 
@@ -168,7 +168,9 @@ impl WorktrunkFailure {
     }
 
     fn from_output(command: &Command, output: &ProcessOutput) -> Self {
-        let combined = format!("{}\n{}", output.stdout, output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let combined = format!("{stdout}\n{stderr}");
         let kind = classify_failure(&combined);
         let summary = if kind == FailureKind::ApprovalRequired {
             safe_summary(combined.trim())
@@ -177,10 +179,10 @@ impl WorktrunkFailure {
         };
         Self {
             kind,
-            command: observability::command_display(command),
+            command: observability::sanitize_command_text(&command.command_line()),
             summary,
-            stdout: bounded_context(&output.stdout),
-            stderr: bounded_context(&output.stderr),
+            stdout: bounded_context(&String::from_utf8_lossy(&output.stdout)),
+            stderr: bounded_context(&String::from_utf8_lossy(&output.stderr)),
             approval_hint: None,
         }
     }
@@ -188,16 +190,16 @@ impl WorktrunkFailure {
     fn malformed(command: &Command, output: &ProcessOutput, error: impl fmt::Display) -> Self {
         Self {
             kind: FailureKind::MalformedOutput,
-            command: observability::command_display(command),
+            command: observability::sanitize_command_text(&command.command_line()),
             summary: format!("invalid Worktrunk JSON output: {error}"),
-            stdout: bounded_context(&output.stdout),
-            stderr: bounded_context(&output.stderr),
+            stdout: bounded_context(&String::from_utf8_lossy(&output.stdout)),
+            stderr: bounded_context(&String::from_utf8_lossy(&output.stderr)),
             approval_hint: None,
         }
     }
 
     fn process(command: &Command, error: String) -> Self {
-        let command_display = observability::command_display(command);
+        let command_display = observability::sanitize_command_text(&command.command_line());
         let summary = error
             .strip_prefix(&format!("{command_display}: "))
             .unwrap_or(&error)
@@ -215,10 +217,10 @@ impl WorktrunkFailure {
     fn unsupported_schema(command: &Command, output: &ProcessOutput, schema: &Value) -> Self {
         Self {
             kind: FailureKind::UnsupportedSchema,
-            command: observability::command_display(command),
+            command: observability::sanitize_command_text(&command.command_line()),
             summary: format!("unsupported Worktrunk JSON schema {schema}"),
-            stdout: bounded_context(&output.stdout),
-            stderr: bounded_context(&output.stderr),
+            stdout: bounded_context(&String::from_utf8_lossy(&output.stdout)),
+            stderr: bounded_context(&String::from_utf8_lossy(&output.stderr)),
             approval_hint: None,
         }
     }
@@ -376,12 +378,17 @@ struct ConfigShowProject {
     identifier: String,
 }
 
-pub(crate) fn switch_worktree(
+pub(crate) async fn switch_worktree(
     request: SwitchRequest<'_>,
 ) -> Result<SwitchOutcome, WorktrunkFailure> {
-    let mut command = switch_command(request);
-    let output = run_output_named(&mut command, ProcessPolicy::LocalMutation, SWITCH_PROCESS)
-        .map_err(|error| WorktrunkFailure::process(&command, error))?;
+    let command = switch_command(request);
+    let output = run_output_named(
+        command.clone(),
+        ProcessPolicy::LocalMutation,
+        SWITCH_PROCESS,
+    )
+    .await
+    .map_err(|error| WorktrunkFailure::process(&command, error))?;
     if !output.status.success() {
         return Err(WorktrunkFailure::from_output(&command, &output)
             .with_approval_hint(request.repo, request.config));
@@ -389,14 +396,19 @@ pub(crate) fn switch_worktree(
     parse_switch_output(&command, &output)
 }
 
-pub(crate) fn remove_worktree(
+pub(crate) async fn remove_worktree(
     request: RemoveRequest<'_>,
 ) -> Result<RemoveOutcome, WorktrunkFailure> {
     let requested_path = normalize_path_lexically(request.path);
     let canonical_path = normalize_path(request.path);
-    let mut command = remove_command(request);
-    let output = run_output_named(&mut command, ProcessPolicy::LocalMutation, REMOVE_PROCESS)
-        .map_err(|error| WorktrunkFailure::process(&command, error))?;
+    let command = remove_command(request);
+    let output = run_output_named(
+        command.clone(),
+        ProcessPolicy::LocalMutation,
+        REMOVE_PROCESS,
+    )
+    .await
+    .map_err(|error| WorktrunkFailure::process(&command, error))?;
     if !output.status.success() {
         return Err(WorktrunkFailure::from_output(&command, &output)
             .with_approval_hint(request.repo, request.config));
@@ -404,20 +416,24 @@ pub(crate) fn remove_worktree(
     parse_remove_output(&command, &output, &requested_path, &canonical_path)
 }
 
-pub(crate) fn approval_status(
+pub(crate) async fn approval_status(
     repo: &Repository,
     config: &Config,
 ) -> Result<ApprovalStatus, WorktrunkFailure> {
-    if config.worktree_command != "wt" {
+    if !is_worktrunk_command(&config.worktree_command) {
         return Ok(ApprovalStatus::NotWorktrunk);
     }
-    let mut command = approvals_command(repo, config);
+    let command = approvals_command(repo, config);
     let output =
-        run_output_allow_failure_named(&mut command, ProcessPolicy::Metadata, APPROVALS_PROCESS)
+        run_output_allow_failure_named(command.clone(), ProcessPolicy::Metadata, APPROVALS_PROCESS)
+            .await
             .map_err(|error| WorktrunkFailure::process(&command, error))?;
-    if output.status.success()
-        || is_missing_project_config(&format!("{}\n{}", output.stdout, output.stderr))
-    {
+    let diagnostic = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if output.status.success() || is_missing_project_config(&diagnostic) {
         return Ok(ApprovalStatus::Approved);
     }
     let failure = WorktrunkFailure::from_output(&command, &output);
@@ -428,37 +444,44 @@ pub(crate) fn approval_status(
     }
 }
 
-pub(crate) fn run_approval_prompt(repo: &Repository, config: &Config) -> Result<(), String> {
-    run_status_inherited_named(&mut approvals_command(repo, config), APPROVALS_PROCESS)
+pub(crate) async fn run_approval_prompt(repo: &Repository, config: &Config) -> Result<(), String> {
+    crate::process::run_status_inherited_named(approvals_command(repo, config), APPROVALS_PROCESS)
+        .await
 }
 
 pub(crate) fn approval_command_display(repo: &Repository, config: &Config) -> String {
-    observability::command_display(&approvals_command(repo, config))
+    observability::sanitize_command_text(&approvals_command(repo, config).command_line())
 }
 
-pub(crate) fn discover_user_config(
+pub(crate) async fn discover_user_config(
     repo: &Repository,
     config: &Config,
 ) -> Result<UserConfigLocation, WorktrunkFailure> {
-    let mut command = config_show_command(repo, config);
-    let output = run_output_named(&mut command, ProcessPolicy::Metadata, CONFIG_SHOW_PROCESS)
-        .map_err(|error| WorktrunkFailure::process(&command, error))?;
+    let command = config_show_command(repo, config);
+    let output = run_output_named(
+        command.clone(),
+        ProcessPolicy::Metadata,
+        CONFIG_SHOW_PROCESS,
+    )
+    .await
+    .map_err(|error| WorktrunkFailure::process(&command, error))?;
     if !output.status.success() {
         return Err(WorktrunkFailure::from_output(&command, &output));
     }
     parse_config_show_output(&command, &output)
 }
 
-pub(crate) fn create_user_config(
+pub(crate) async fn create_user_config(
     repo: &Repository,
     config: &Config,
 ) -> Result<(), WorktrunkFailure> {
-    let mut command = config_create_command(repo, config);
+    let command = config_create_command(repo, config);
     let output = run_output_named(
-        &mut command,
+        command.clone(),
         ProcessPolicy::LocalMutation,
         CONFIG_CREATE_PROCESS,
     )
+    .await
     .map_err(|error| WorktrunkFailure::process(&command, error))?;
     if output.status.success() {
         Ok(())
@@ -467,15 +490,44 @@ pub(crate) fn create_user_config(
     }
 }
 
-pub(crate) fn ensure_user_project_config(repo: &Repository, config: &Config) -> Result<(), String> {
-    if config.worktree_command != "wt" {
+pub(crate) async fn ensure_user_project_config(
+    repo: &Repository,
+    config: &Config,
+) -> Result<(), String> {
+    if !is_worktrunk_command(&config.worktree_command) {
         return Ok(());
     }
-    let location = discover_user_config(repo, config).map_err(|error| error.to_string())?;
-    ensure_user_project_entry_with_create(&location.path, &location.project_identifier, || {
-        create_user_config(repo, config)
-            .map_err(|error| Box::new(io::Error::other(error.to_string())) as BoxError)
+    let location = discover_user_config(repo, config)
+        .await
+        .map_err(|error| error.to_string())?;
+    let runtime = tokio::runtime::Handle::try_current()
+        .map_err(|error| format!("access async runtime for Worktrunk registration: {error}"))?;
+    let cancellation = crate::process::current_cancellation();
+    let repo = repo.clone();
+    let config = config.clone();
+    tokio::task::spawn_blocking(move || {
+        ensure_user_project_entry_with_create(
+            &location.path,
+            &location.project_identifier,
+            move || {
+                runtime
+                    .block_on(async move {
+                        if let Some(token) = cancellation {
+                            crate::process::with_cancellation(
+                                token,
+                                create_user_config(&repo, &config),
+                            )
+                            .await
+                        } else {
+                            create_user_config(&repo, &config).await
+                        }
+                    })
+                    .map_err(|error| Box::new(io::Error::other(error.to_string())) as BoxError)
+            },
+        )
     })
+    .await
+    .map_err(|error| format!("join Worktrunk user config registration: {error}"))?
     .map(|_| ())
 }
 
@@ -549,7 +601,7 @@ fn ensure_user_project_entry_with_create(
 }
 
 pub(crate) fn user_config_create_command_display(repo: &Repository, config: &Config) -> String {
-    observability::command_display(&config_create_command(repo, config))
+    observability::sanitize_command_text(&config_create_command(repo, config).command_line())
 }
 
 pub(crate) fn is_approval_failure(output: &str) -> bool {
@@ -562,12 +614,13 @@ fn is_missing_project_config(output: &str) -> bool {
         .contains("no project configuration found")
 }
 
-pub(crate) fn observe_repository(
+pub(crate) async fn observe_repository(
     repo: &Repository,
     config: &Config,
 ) -> Result<WorktrunkSnapshot, WorktrunkFailure> {
-    let mut command = list_command(repo, config);
-    let output = run_output_named(&mut command, ProcessPolicy::Metadata, LIST_PROCESS)
+    let command = list_command(repo, config);
+    let output = run_output_named(command.clone(), ProcessPolicy::Metadata, LIST_PROCESS)
+        .await
         .map_err(|error| WorktrunkFailure::process(&command, error))?;
     if !output.status.success() {
         return Err(WorktrunkFailure::from_output(&command, &output));
@@ -575,12 +628,13 @@ pub(crate) fn observe_repository(
     parse_list_output(&command, &output, &config.worktree_columns)
 }
 
-pub(crate) fn observe_hook_logs(
+pub(crate) async fn observe_hook_logs(
     repo: &Repository,
     config: &Config,
 ) -> Result<Vec<HookLogEntry>, WorktrunkFailure> {
-    let mut command = logs_command(repo, config);
-    let output = run_output_named(&mut command, ProcessPolicy::Metadata, LOGS_PROCESS)
+    let command = logs_command(repo, config);
+    let output = run_output_named(command.clone(), ProcessPolicy::Metadata, LOGS_PROCESS)
+        .await
         .map_err(|error| WorktrunkFailure::process(&command, error))?;
     if !output.status.success() {
         return Err(WorktrunkFailure::from_output(&command, &output));
@@ -588,11 +642,30 @@ pub(crate) fn observe_hook_logs(
     parse_hook_log_output(&command, &output)
 }
 
+fn reject_truncated_json(
+    command: &Command,
+    output: &ProcessOutput,
+) -> Result<(), WorktrunkFailure> {
+    if output.stdout_truncated {
+        Err(WorktrunkFailure::malformed(
+            command,
+            output,
+            format_args!(
+                "JSON output was truncated after {} total bytes",
+                output.stdout_total_bytes
+            ),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn parse_hook_log_output(
     command: &Command,
     output: &ProcessOutput,
 ) -> Result<Vec<HookLogEntry>, WorktrunkFailure> {
-    let envelope = serde_json::from_str::<HookLogEnvelope>(&output.stdout)
+    reject_truncated_json(command, output)?;
+    let envelope = serde_json::from_slice::<HookLogEnvelope>(&output.stdout)
         .map_err(|error| WorktrunkFailure::malformed(command, output, error))?;
     Ok(envelope
         .hook_output
@@ -618,7 +691,8 @@ fn parse_config_show_output(
     command: &Command,
     output: &ProcessOutput,
 ) -> Result<UserConfigLocation, WorktrunkFailure> {
-    let envelope = serde_json::from_str::<ConfigShowEnvelope>(&output.stdout)
+    reject_truncated_json(command, output)?;
+    let envelope = serde_json::from_slice::<ConfigShowEnvelope>(&output.stdout)
         .map_err(|error| WorktrunkFailure::malformed(command, output, error))?;
     if envelope.user.path.as_os_str().is_empty() {
         return Err(WorktrunkFailure::malformed(
@@ -840,25 +914,28 @@ pub(crate) fn projected_columns(facts: &WorktrunkWorktreeFacts) -> BTreeMap<Stri
     facts.extra_columns.clone()
 }
 
-pub(crate) fn detect_version(config: &Config) -> Result<WorktrunkVersion, WorktrunkFailure> {
-    let mut command = version_command(config);
-    let output = run_output_named(&mut command, ProcessPolicy::Metadata, VERSION_PROCESS)
+pub(crate) async fn detect_version(config: &Config) -> Result<WorktrunkVersion, WorktrunkFailure> {
+    let command = version_command(config);
+    let output = run_output_named(command.clone(), ProcessPolicy::Metadata, VERSION_PROCESS)
+        .await
         .map_err(|error| WorktrunkFailure::process(&command, error))?;
     if !output.status.success() {
         return Err(WorktrunkFailure::from_output(&command, &output));
     }
-    parse_version(&output.stdout).ok_or_else(|| WorktrunkFailure {
+    parse_version(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| WorktrunkFailure {
         kind: FailureKind::MalformedOutput,
-        command: observability::command_display(&command),
+        command: observability::sanitize_command_text(&command.command_line()),
         summary: "could not parse Worktrunk version".to_string(),
-        stdout: bounded_context(&output.stdout),
-        stderr: bounded_context(&output.stderr),
+        stdout: bounded_context(&String::from_utf8_lossy(&output.stdout)),
+        stderr: bounded_context(&String::from_utf8_lossy(&output.stderr)),
         approval_hint: None,
     })
 }
 
-pub(crate) fn ensure_supported_version(config: &Config) -> Result<WorktrunkVersion, String> {
-    let version = detect_version(config).map_err(|error| error.to_string())?;
+pub(crate) async fn ensure_supported_version(config: &Config) -> Result<WorktrunkVersion, String> {
+    let version = detect_version(config)
+        .await
+        .map_err(|error| error.to_string())?;
     if version.supported() {
         Ok(version)
     } else {
@@ -870,22 +947,22 @@ pub(crate) fn ensure_supported_version(config: &Config) -> Result<WorktrunkVersi
 }
 
 fn switch_command(request: SwitchRequest<'_>) -> Command {
-    let mut command = Command::new(request.config.tool(&request.config.worktree_command));
-    command.arg("-C").arg(&request.repo.root).arg("switch");
+    let mut command = Command::new(request.config.tool(&request.config.worktree_command))
+        .arg("-C")
+        .arg(&request.repo.root)
+        .arg("switch");
     if request.create {
-        command.arg("--create");
+        command = command.arg("--create");
     }
-    command.args(["--no-cd", "--format=json"]);
+    command = command.args(["--no-cd", "--format=json"]);
     if let Some(base) = request.base.map(str::trim).filter(|base| !base.is_empty()) {
-        command.arg("--base").arg(base);
+        command = command.arg("--base").arg(base);
     }
-    command.arg(request.branch);
-    command
+    command.arg(request.branch)
 }
 
 fn remove_command(request: RemoveRequest<'_>) -> Command {
-    let mut command = Command::new(request.config.tool(&request.config.worktree_command));
-    command
+    Command::new(request.config.tool(&request.config.worktree_command))
         .arg("-C")
         .arg(&request.repo.root)
         .arg("remove")
@@ -896,47 +973,39 @@ fn remove_command(request: RemoveRequest<'_>) -> Command {
             "--format=json",
             "--",
         ])
-        .arg(request.path);
-    command
+        .arg(request.path)
 }
 
 fn list_command(repo: &Repository, config: &Config) -> Command {
-    let mut command = Command::new(config.tool(&config.worktree_command));
-    command
+    Command::new(config.tool(&config.worktree_command))
         .arg("-C")
         .arg(&repo.root)
-        .args(["list", "--format=json"]);
-    command
+        .args(["list", "--format=json"])
 }
 
 fn config_show_command(repo: &Repository, config: &Config) -> Command {
-    let mut command = Command::new(config.tool(&config.worktree_command));
-    command
+    Command::new(config.tool(&config.worktree_command))
         .arg("-C")
         .arg(&repo.root)
-        .args(["config", "show", "--format=json"]);
-    command
+        .args(["config", "show", "--format=json"])
 }
 
 fn config_create_command(repo: &Repository, config: &Config) -> Command {
-    let mut command = Command::new(config.tool(&config.worktree_command));
-    command.arg("-C").arg(&repo.root).args(["config", "create"]);
-    command
+    Command::new(config.tool(&config.worktree_command))
+        .arg("-C")
+        .arg(&repo.root)
+        .args(["config", "create"])
 }
 
 fn logs_command(repo: &Repository, config: &Config) -> Command {
-    let mut command = Command::new(config.tool(&config.worktree_command));
-    command
+    Command::new(config.tool(&config.worktree_command))
         .arg("-C")
         .arg(&repo.root)
-        .args(["config", "state", "logs", "--format=json"]);
-    command
+        .args(["config", "state", "logs", "--format=json"])
 }
 
 fn version_command(config: &Config) -> Command {
-    let mut command = Command::new(config.tool(&config.worktree_command));
-    command.arg("--version");
-    command
+    Command::new(config.tool(&config.worktree_command)).arg("--version")
 }
 
 fn parse_list_output(
@@ -944,7 +1013,8 @@ fn parse_list_output(
     output: &ProcessOutput,
     configured_columns: &[String],
 ) -> Result<WorktrunkSnapshot, WorktrunkFailure> {
-    let value = serde_json::from_str::<Value>(&output.stdout)
+    reject_truncated_json(command, output)?;
+    let value = serde_json::from_slice::<Value>(&output.stdout)
         .map_err(|error| WorktrunkFailure::malformed(command, output, error))?;
     match value {
         Value::Array(items) => parse_schema1_items(items, configured_columns)
@@ -1155,20 +1225,31 @@ fn parse_version(output: &str) -> Option<WorktrunkVersion> {
     })
 }
 
+fn is_worktrunk_command(command: &str) -> bool {
+    Path::new(command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case("wt")
+                || name.eq_ignore_ascii_case("wt.exe")
+                || name.eq_ignore_ascii_case("git-wt")
+                || name.eq_ignore_ascii_case("git-wt.exe")
+        })
+}
+
 fn approvals_command(repo: &Repository, config: &Config) -> Command {
-    let mut command = Command::new(config.tool(&config.worktree_command));
-    command
+    Command::new(config.tool(&config.worktree_command))
         .arg("-C")
         .arg(&repo.root)
-        .args(["config", "approvals", "add"]);
-    command
+        .args(["config", "approvals", "add"])
 }
 
 fn parse_switch_output(
     command: &Command,
     output: &ProcessOutput,
 ) -> Result<SwitchOutcome, WorktrunkFailure> {
-    let raw = serde_json::from_str::<RawSwitchOutcome>(&output.stdout)
+    reject_truncated_json(command, output)?;
+    let raw = serde_json::from_slice::<RawSwitchOutcome>(&output.stdout)
         .map_err(|error| WorktrunkFailure::malformed(command, output, error))?;
     let action = match raw.action.as_str() {
         "created" => SwitchAction::Created,
@@ -1195,7 +1276,8 @@ fn parse_remove_output(
     requested_path: &Path,
     canonical_path: &Path,
 ) -> Result<RemoveOutcome, WorktrunkFailure> {
-    let mut raw = serde_json::from_str::<Vec<RawRemoveOutcome>>(&output.stdout)
+    reject_truncated_json(command, output)?;
+    let mut raw = serde_json::from_slice::<Vec<RawRemoveOutcome>>(&output.stdout)
         .map_err(|error| WorktrunkFailure::malformed(command, output, error))?;
     if raw.len() != 1 {
         return Err(WorktrunkFailure::malformed(
@@ -1250,8 +1332,8 @@ fn classify_failure(output: &str) -> FailureKind {
 }
 
 fn process_failure_message(output: &ProcessOutput) -> String {
-    first_non_empty_line(&output.stderr)
-        .or_else(|| first_non_empty_line(&output.stdout))
+    first_non_empty_line(&String::from_utf8_lossy(&output.stderr))
+        .or_else(|| first_non_empty_line(&String::from_utf8_lossy(&output.stdout)))
         .unwrap_or_else(|| format!("exited with {}", output.status))
 }
 
@@ -1274,16 +1356,18 @@ fn safe_summary(output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    use std::process::Command as StdCommand;
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
 
-    #[test]
-    fn hook_log_tail_is_bounded_sanitized_and_confined() {
+    #[tokio::test]
+    async fn hook_log_tail_is_bounded_sanitized_and_confined() {
         let temp = unique_temp_dir("prism-worktrunk-log-tail");
         let root = temp.join("repo");
         let logs = root.join(".git/wt/logs");
@@ -1318,16 +1402,16 @@ mod tests {
                     .contains("symlink")
             );
         }
+        let directory_error = read_hook_log_tail(&repo, &logs).unwrap_err();
         assert!(
-            read_hook_log_tail(&repo, &logs)
-                .unwrap_err()
-                .contains("regular file")
+            directory_error.contains("regular file")
+                || (cfg!(windows) && directory_error.contains("open Worktrunk log"))
         );
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn hook_log_tail_resolves_linked_worktree_common_git_directory() {
+    #[tokio::test]
+    async fn hook_log_tail_resolves_linked_worktree_common_git_directory() {
         let temp = unique_temp_dir("prism-worktrunk-linked-log-tail");
         let common = temp.join("main/.git");
         let linked_git = common.join("worktrees/feature");
@@ -1353,8 +1437,8 @@ mod tests {
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn hook_log_inventory_accepts_floor_numeric_timestamps() {
+    #[tokio::test]
+    async fn hook_log_inventory_accepts_floor_numeric_timestamps() {
         let envelope = serde_json::from_str::<HookLogEnvelope>(
             r#"{"hook_output":[{"path":"/repo/.git/wt/logs/hook.log","modified_at":1720000000}]}"#,
         )
@@ -1365,8 +1449,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn hook_log_inventory_parses_empty_populated_and_future_fields() {
+    #[tokio::test]
+    async fn hook_log_inventory_parses_empty_populated_and_future_fields() {
         assert!(
             parse_hook_log_fixture(r#"{"hook_output":[]}"#)
                 .unwrap()
@@ -1382,17 +1466,17 @@ mod tests {
         assert_eq!(entries[0].size, 42);
     }
 
-    #[test]
-    fn hook_log_inventory_rejects_malformed_output() {
+    #[tokio::test]
+    async fn hook_log_inventory_rejects_malformed_output() {
         let error = parse_hook_log_fixture(r#"{"hook_output":"not-an-array"}"#).unwrap_err();
         assert_eq!(error.kind, FailureKind::MalformedOutput);
         let missing = parse_hook_log_fixture("{}").unwrap_err();
         assert_eq!(missing.kind, FailureKind::MalformedOutput);
     }
 
-    #[test]
+    #[tokio::test]
     #[ignore = "requires PRISM_TEST_WORKTRUNK pointing to a real Worktrunk binary"]
-    fn real_worktrunk_create_observe_remove_smoke() {
+    async fn real_worktrunk_create_observe_remove_smoke() {
         let wt = std::env::var("PRISM_TEST_WORKTRUNK")
             .expect("PRISM_TEST_WORKTRUNK must point to Worktrunk");
         let wt_config = std::env::var("WORKTRUNK_CONFIG_PATH")
@@ -1407,7 +1491,7 @@ mod tests {
             vec!["commit", "--allow-empty", "-m", "init"],
         ] {
             assert!(
-                Command::new("git")
+                StdCommand::new("git")
                     .arg("-C")
                     .arg(&root)
                     .args(args)
@@ -1419,11 +1503,11 @@ mod tests {
         let repo = Repository::with_config_dir_for_test(root, temp.join("prism-config"));
         let mut config = crate::test_support::test_config();
         config.tools.insert("wt".to_string(), wt);
-        let location = discover_user_config(&repo, &config).unwrap();
+        let location = discover_user_config(&repo, &config).await.unwrap();
         assert_eq!(location.path, PathBuf::from(&wt_config));
         assert!(!location.exists);
-        ensure_user_project_config(&repo, &config).unwrap();
-        let location = discover_user_config(&repo, &config).unwrap();
+        ensure_user_project_config(&repo, &config).await.unwrap();
+        let location = discover_user_config(&repo, &config).await.unwrap();
         assert!(location.exists);
         let user_config =
             toml::from_str::<toml::Value>(&fs::read_to_string(&location.path).unwrap()).unwrap();
@@ -1440,22 +1524,24 @@ mod tests {
             create: true,
             base: Some("main"),
         })
+        .await
         .unwrap();
-        let snapshot = observe_repository(&repo, &config).unwrap();
+        let snapshot = observe_repository(&repo, &config).await.unwrap();
         assert!(associate_snapshot(&snapshot, [(created.path.clone(), ())]).contains_key(&()));
         let removed = remove_worktree(RemoveRequest {
             repo: &repo,
             config: &config,
             path: &created.path,
         })
+        .await
         .unwrap();
         assert_eq!(removed.branch.as_deref(), Some("ci/real-smoke"));
         assert!(!created.path.exists());
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn switch_arguments_preserve_special_values_without_shell_evaluation() {
+    #[tokio::test]
+    async fn switch_arguments_preserve_special_values_without_shell_evaluation() {
         let repo = Repository::with_config_dir_for_test(
             PathBuf::from("/repo/space and ünicode"),
             PathBuf::from("/config"),
@@ -1468,58 +1554,40 @@ mod tests {
             create: true,
             base: Some("--release/base"),
         });
-
-        assert_eq!(
-            command
-                .get_args()
-                .map(|arg| arg.to_string_lossy().into_owned())
-                .collect::<Vec<_>>(),
-            vec![
-                "-C",
-                "/repo/space and ünicode",
-                "switch",
-                "--create",
-                "--no-cd",
-                "--format=json",
-                "--base",
-                "--release/base",
-                "feat/topic with space;λ",
-            ]
-        );
+        let line = command.command_line();
+        for argument in [
+            "/repo/space and ünicode",
+            "switch",
+            "--create",
+            "--format=json",
+            "--release/base",
+            "feat/topic with space;λ",
+        ] {
+            assert!(
+                line.contains(argument),
+                "missing {argument:?} from {line:?}"
+            );
+        }
     }
 
-    #[test]
-    fn config_commands_use_selected_repository_and_machine_output() {
+    #[tokio::test]
+    async fn config_commands_use_selected_repository_and_machine_output() {
         let repo = Repository::with_config_dir_for_test(
             PathBuf::from("/repo/space and ünicode"),
             PathBuf::from("/config"),
         );
         let config = crate::test_support::test_config();
-
-        assert_eq!(
-            config_show_command(&repo, &config)
-                .get_args()
-                .map(|arg| arg.to_string_lossy().into_owned())
-                .collect::<Vec<_>>(),
-            vec![
-                "-C",
-                "/repo/space and ünicode",
-                "config",
-                "show",
-                "--format=json",
-            ]
-        );
-        assert_eq!(
-            config_create_command(&repo, &config)
-                .get_args()
-                .map(|arg| arg.to_string_lossy().into_owned())
-                .collect::<Vec<_>>(),
-            vec!["-C", "/repo/space and ünicode", "config", "create"]
-        );
+        let show = config_show_command(&repo, &config).command_line();
+        assert!(show.contains("/repo/space and ünicode"));
+        assert!(show.contains("config show --format=json"));
+        let create = config_create_command(&repo, &config).command_line();
+        assert!(create.contains("/repo/space and ünicode"));
+        assert!(create.contains("config create"));
     }
 
-    #[test]
-    fn missing_user_config_is_created_and_selected_project_is_registered() {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn missing_user_config_is_created_and_selected_project_is_registered() {
         let temp = unique_temp_dir("prism-worktrunk-project-config");
         fs::create_dir_all(&temp).unwrap();
         let wt = temp.join("wt");
@@ -1539,7 +1607,7 @@ mod tests {
             .tools
             .insert("wt".to_string(), wt.display().to_string());
 
-        ensure_user_project_config(&repo, &config).unwrap();
+        ensure_user_project_config(&repo, &config).await.unwrap();
 
         let text = fs::read_to_string(&user_config).unwrap();
         let parsed = toml::from_str::<toml::Value>(&text).unwrap();
@@ -1635,8 +1703,8 @@ mod tests {
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn config_show_parses_existing_and_missing_user_config_locations() {
+    #[tokio::test]
+    async fn config_show_parses_existing_and_missing_user_config_locations() {
         let existing = parse_config_show_fixture(
             r#"{"user":{"path":"/home/user/.config/worktrunk/config.toml","exists":true,"config":{}},"project":{"identifier":"github.com/example/repo"}}"#,
         )
@@ -1658,8 +1726,8 @@ mod tests {
         assert_eq!(missing.path, existing.path);
     }
 
-    #[test]
-    fn config_show_rejects_missing_or_empty_config_identity_fields() {
+    #[tokio::test]
+    async fn config_show_rejects_missing_or_empty_config_identity_fields() {
         for fixture in [
             r#"{}"#,
             r#"{"user":null}"#,
@@ -1674,41 +1742,38 @@ mod tests {
         }
     }
 
-    #[test]
-    fn remove_arguments_use_foreground_force_without_branch_deletion_and_exact_path() {
+    #[tokio::test]
+    async fn remove_arguments_use_foreground_force_without_branch_deletion_and_exact_path() {
         let repo = Repository::with_config_dir_for_test(
             PathBuf::from("/repo/space and ünicode"),
             PathBuf::from("/config"),
         );
         let config = crate::test_support::test_config();
         let path = PathBuf::from("/repo/worktrees/--feature λ");
-        let command = remove_command(RemoveRequest {
+        let line = remove_command(RemoveRequest {
             repo: &repo,
             config: &config,
             path: &path,
-        });
-
-        assert_eq!(
-            command
-                .get_args()
-                .map(|arg| arg.to_string_lossy().into_owned())
-                .collect::<Vec<_>>(),
-            vec![
-                "-C",
-                "/repo/space and ünicode",
-                "remove",
-                "--foreground",
-                "--force",
-                "--no-delete-branch",
-                "--format=json",
-                "--",
-                "/repo/worktrees/--feature λ",
-            ]
-        );
+        })
+        .command_line();
+        for argument in [
+            "/repo/space and ünicode",
+            "remove",
+            "--foreground",
+            "--force",
+            "--no-delete-branch",
+            "--format=json",
+            "/repo/worktrees/--feature λ",
+        ] {
+            assert!(
+                line.contains(argument),
+                "missing {argument:?} from {line:?}"
+            );
+        }
     }
 
-    #[test]
-    fn parses_created_and_existing_switch_fixtures() {
+    #[tokio::test]
+    async fn parses_created_and_existing_switch_fixtures() {
         let created = parse_fixture(
             r#"{"action":"created","branch":"feat/topic","path":"/repo.feat-topic","created_branch":true,"base_branch":"main"}"#,
         )
@@ -1729,8 +1794,8 @@ mod tests {
         assert_eq!(already_at.action, SwitchAction::Existing);
     }
 
-    #[test]
-    fn parses_exact_remove_result_and_rejects_unsafe_results() {
+    #[tokio::test]
+    async fn parses_exact_remove_result_and_rejects_unsafe_results() {
         let path = Path::new("/repo/worktree");
         let removed = parse_remove_fixture(
             r#"[{"branch":"feat/topic","branch_deleted":false,"kind":"worktree","path":"/repo/worktree"}]"#,
@@ -1755,8 +1820,9 @@ mod tests {
         assert_eq!(deleted_branch.kind, FailureKind::MalformedOutput);
     }
 
-    #[test]
-    fn remove_accepts_requested_symlink_path_after_worktree_disappears() {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remove_accepts_requested_symlink_path_after_worktree_disappears() {
         let temp = unique_temp_dir("prism-wt-remove-symlink-path");
         let real_parent = temp.join("real");
         let alias_parent = temp.join("alias");
@@ -1783,6 +1849,7 @@ mod tests {
             config: &config,
             path: &worktree,
         })
+        .await
         .unwrap();
 
         assert_eq!(removed.path, worktree);
@@ -1790,8 +1857,9 @@ mod tests {
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn remove_failure_classifies_approval_and_preserves_exact_path_argument() {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remove_failure_classifies_approval_and_preserves_exact_path_argument() {
         let temp = unique_temp_dir("prism-wt-remove-approval");
         fs::create_dir_all(&temp).unwrap();
         let wt = temp.join("wt");
@@ -1815,6 +1883,7 @@ mod tests {
             config: &config,
             path: &path,
         })
+        .await
         .unwrap_err();
 
         assert!(failure.approval_required());
@@ -1826,8 +1895,8 @@ mod tests {
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn parses_and_normalizes_schema_1_fixtures() {
+    #[tokio::test]
+    async fn parses_and_normalizes_schema_1_fixtures() {
         let full = parse_list_fixture(include_str!(
             "../../tests/fixtures/worktrunk/schema1-full.json"
         ))
@@ -1853,8 +1922,8 @@ mod tests {
         assert_eq!(minimal.by_path.len(), 1);
     }
 
-    #[test]
-    fn parses_and_normalizes_schema_2_fixtures() {
+    #[tokio::test]
+    async fn parses_and_normalizes_schema_2_fixtures() {
         let full = parse_list_fixture(include_str!(
             "../../tests/fixtures/worktrunk/schema2-full.json"
         ))
@@ -1879,8 +1948,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unknown_schema_fails_closed_and_malformed_items_are_isolated() {
+    #[tokio::test]
+    async fn unknown_schema_fails_closed_and_malformed_items_are_isolated() {
         let unsupported = parse_list_fixture(r#"{"schema":3,"items":[]}"#).unwrap_err();
         assert_eq!(unsupported.kind, FailureKind::UnsupportedSchema);
 
@@ -1899,8 +1968,8 @@ mod tests {
         assert!(schema2.by_path.contains_key(Path::new("/valid")));
     }
 
-    #[test]
-    fn duplicate_exact_paths_are_omitted_as_ambiguous() {
+    #[tokio::test]
+    async fn duplicate_exact_paths_are_omitted_as_ambiguous() {
         let snapshot = parse_list_fixture(
             r#"[{"path":"/same","url":"http://localhost:3000"},{"path":"/same","url":"http://localhost:4000"}]"#,
         )
@@ -1908,8 +1977,9 @@ mod tests {
         assert!(snapshot.by_path.is_empty());
     }
 
-    #[test]
-    fn path_association_uses_canonical_paths_and_rejects_ambiguity() {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn path_association_uses_canonical_paths_and_rejects_ambiguity() {
         let temp = unique_temp_dir("prism-wt-path-association");
         let real = temp.join("real");
         let alias = temp.join("alias");
@@ -1936,8 +2006,8 @@ mod tests {
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn parses_supported_worktrunk_versions() {
+    #[tokio::test]
+    async fn parses_supported_worktrunk_versions() {
         let floor = parse_version("worktrunk 0.58.0\n").unwrap();
         let current = parse_version("wt 1.2.3-beta.1\n").unwrap();
         assert!(floor.supported());
@@ -1951,8 +2021,8 @@ mod tests {
         assert!(parse_version("worktrunk development").is_none());
     }
 
-    #[test]
-    fn classifies_compatibility_failures_and_malformed_output() {
+    #[tokio::test]
+    async fn classifies_compatibility_failures_and_malformed_output() {
         assert_eq!(
             classify_failure(
                 "repo needs approval to execute commands; cannot prompt in non-interactive mode"
@@ -1974,20 +2044,22 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn switch_process_classifies_hook_and_git_failures() {
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn switch_process_classifies_hook_and_git_failures() {
         assert_eq!(
-            run_failure_fixture("printf '%s\\n' 'pre-start hook failed' >&2\nexit 1\n"),
+            run_failure_fixture("printf '%s\\n' 'pre-start hook failed' >&2\nexit 1\n").await,
             FailureKind::Hook
         );
         assert_eq!(
-            run_failure_fixture("printf '%s\\n' 'fatal: invalid reference' >&2\nexit 1\n"),
+            run_failure_fixture("printf '%s\\n' 'fatal: invalid reference' >&2\nexit 1\n").await,
             FailureKind::Git
         );
     }
 
-    #[test]
-    fn successful_switch_accepts_warnings_on_stderr() {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_switch_accepts_warnings_on_stderr() {
         let temp = unique_temp_dir("prism-wt-warning");
         fs::create_dir_all(&temp).unwrap();
         let wt = temp.join("wt");
@@ -2008,14 +2080,16 @@ mod tests {
             create: true,
             base: None,
         })
+        .await
         .unwrap();
 
         assert_eq!(outcome.action, SwitchAction::Created);
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn switch_capture_is_bounded() {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn switch_capture_is_bounded() {
         let temp = unique_temp_dir("prism-wt-bounded");
         fs::create_dir_all(&temp).unwrap();
         let wt = temp.join("wt");
@@ -2036,6 +2110,7 @@ mod tests {
             create: true,
             base: None,
         })
+        .await
         .unwrap_err();
 
         assert!(failure.stdout.len() <= 2_000);
@@ -2043,8 +2118,9 @@ mod tests {
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn switch_does_not_evaluate_shell_syntax_in_branch_argument() {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn switch_does_not_evaluate_shell_syntax_in_branch_argument() {
         let temp = unique_temp_dir("prism-wt-no-shell");
         fs::create_dir_all(&temp).unwrap();
         let wt = temp.join("wt");
@@ -2071,6 +2147,7 @@ mod tests {
             create: true,
             base: None,
         })
+        .await
         .unwrap();
 
         assert!(!marker.exists());
@@ -2082,62 +2159,26 @@ mod tests {
     }
 
     fn parse_fixture(stdout: &str) -> Result<SwitchOutcome, WorktrunkFailure> {
-        let mut command = Command::new("wt");
-        command.arg("switch");
-        let output = ProcessOutput {
-            status: success_status(),
-            stdout: stdout.to_string(),
-            stderr: String::new(),
-            stdout_total_bytes: stdout.len() as u64,
-            stdout_truncated: false,
-            stderr_total_bytes: 0,
-            stderr_truncated: false,
-        };
+        let command = Command::new("wt").arg("switch");
+        let output = ProcessOutput::successful_for_test(stdout.as_bytes(), Vec::new());
         parse_switch_output(&command, &output)
     }
 
     fn parse_list_fixture(stdout: &str) -> Result<WorktrunkSnapshot, WorktrunkFailure> {
-        let mut command = Command::new("wt");
-        command.arg("list");
-        let output = ProcessOutput {
-            status: success_status(),
-            stdout: stdout.to_string(),
-            stderr: String::new(),
-            stdout_total_bytes: stdout.len() as u64,
-            stdout_truncated: false,
-            stderr_total_bytes: 0,
-            stderr_truncated: false,
-        };
+        let command = Command::new("wt").arg("list");
+        let output = ProcessOutput::successful_for_test(stdout.as_bytes(), Vec::new());
         parse_list_output(&command, &output, &[])
     }
 
     fn parse_hook_log_fixture(stdout: &str) -> Result<Vec<HookLogEntry>, WorktrunkFailure> {
-        let mut command = Command::new("wt");
-        command.args(["config", "state", "logs"]);
-        let output = ProcessOutput {
-            status: success_status(),
-            stdout: stdout.to_string(),
-            stderr: String::new(),
-            stdout_total_bytes: stdout.len() as u64,
-            stdout_truncated: false,
-            stderr_total_bytes: 0,
-            stderr_truncated: false,
-        };
+        let command = Command::new("wt").args(["config", "state", "logs"]);
+        let output = ProcessOutput::successful_for_test(stdout.as_bytes(), Vec::new());
         parse_hook_log_output(&command, &output)
     }
 
     fn parse_config_show_fixture(stdout: &str) -> Result<UserConfigLocation, WorktrunkFailure> {
-        let mut command = Command::new("wt");
-        command.args(["config", "show", "--format=json"]);
-        let output = ProcessOutput {
-            status: success_status(),
-            stdout: stdout.to_string(),
-            stderr: String::new(),
-            stdout_total_bytes: stdout.len() as u64,
-            stdout_truncated: false,
-            stderr_total_bytes: 0,
-            stderr_truncated: false,
-        };
+        let command = Command::new("wt").args(["config", "show", "--format=json"]);
+        let output = ProcessOutput::successful_for_test(stdout.as_bytes(), Vec::new());
         parse_config_show_output(&command, &output)
     }
 
@@ -2145,21 +2186,13 @@ mod tests {
         stdout: &str,
         expected_path: &Path,
     ) -> Result<RemoveOutcome, WorktrunkFailure> {
-        let mut command = Command::new("wt");
-        command.arg("remove");
-        let output = ProcessOutput {
-            status: success_status(),
-            stdout: stdout.to_string(),
-            stderr: String::new(),
-            stdout_total_bytes: stdout.len() as u64,
-            stdout_truncated: false,
-            stderr_total_bytes: 0,
-            stderr_truncated: false,
-        };
+        let command = Command::new("wt").arg("remove");
+        let output = ProcessOutput::successful_for_test(stdout.as_bytes(), Vec::new());
         parse_remove_output(&command, &output, expected_path, expected_path)
     }
 
-    fn run_failure_fixture(body: &str) -> FailureKind {
+    #[cfg(unix)]
+    async fn run_failure_fixture(body: &str) -> FailureKind {
         let temp = unique_temp_dir("prism-wt-failure");
         fs::create_dir_all(&temp).unwrap();
         let wt = temp.join("wt");
@@ -2176,17 +2209,13 @@ mod tests {
             create: true,
             base: None,
         })
+        .await
         .unwrap_err();
         let _ = fs::remove_dir_all(temp);
         failure.kind
     }
 
     #[cfg(unix)]
-    fn success_status() -> std::process::ExitStatus {
-        use std::os::unix::process::ExitStatusExt;
-        std::process::ExitStatus::from_raw(0)
-    }
-
     fn write_executable(path: &Path, contents: &str) {
         fs::write(path, contents).unwrap();
         let mut permissions = fs::metadata(path).unwrap().permissions();

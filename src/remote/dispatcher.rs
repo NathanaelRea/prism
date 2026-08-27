@@ -1,5 +1,5 @@
+use crate::process::Command;
 use std::path::Path;
-use std::process::Command;
 use std::time::Duration;
 
 use sha2::{Digest as _, Sha256};
@@ -38,8 +38,12 @@ enum Adapter<'a> {
 }
 
 impl<'a> Adapter<'a> {
-    fn resolve(path: &'a Path, config: &'a Config) -> Result<(Self, DiscoveredRemote), String> {
+    async fn resolve(
+        path: &'a Path,
+        config: &'a Config,
+    ) -> Result<(Self, DiscoveredRemote), String> {
         let discovered = discover_git_remote(path, config, "origin", RemoteUrlKind::Fetch)
+            .await
             .map_err(|error| error.to_string())?;
         let adapter = match discovered.repository.id.provider() {
             ProviderKind::GitHub => Self::GitHub(
@@ -99,9 +103,9 @@ impl<'a> Adapter<'a> {
         }
     }
 
-    fn discover_issues(&self) -> Result<Vec<ProviderItemObservation>, RemoteError> {
+    async fn discover_issues(&self) -> Result<Vec<ProviderItemObservation>, RemoteError> {
         match self {
-            Self::GitHub(adapter) => adapter.discover_issues("all"),
+            Self::GitHub(adapter) => adapter.discover_issues("all").await,
             Self::GitLab(_) => Err(RemoteError::new(
                 ProviderKind::GitLab,
                 RemoteOperation::DiscoverIssues,
@@ -119,9 +123,9 @@ impl<'a> Adapter<'a> {
         }
     }
 
-    fn observe_issue(&self, native_id: &str) -> Result<ProviderItemObservation, RemoteError> {
+    async fn observe_issue(&self, native_id: &str) -> Result<ProviderItemObservation, RemoteError> {
         match self {
-            Self::GitHub(adapter) => adapter.observe_issue(native_id),
+            Self::GitHub(adapter) => adapter.observe_issue(native_id).await,
             Self::GitLab(_) => Err(unsupported_issue_operation(
                 ProviderKind::GitLab,
                 RemoteOperation::DiscoverIssues,
@@ -133,13 +137,13 @@ impl<'a> Adapter<'a> {
         }
     }
 
-    fn set_issue_labels(
+    async fn set_issue_labels(
         &self,
         native_id: &str,
         labels: &[String],
     ) -> Result<ProviderItemObservation, RemoteError> {
         match self {
-            Self::GitHub(adapter) => adapter.set_issue_labels(native_id, labels),
+            Self::GitHub(adapter) => adapter.set_issue_labels(native_id, labels).await,
             Self::GitLab(_) => Err(unsupported_issue_operation(
                 ProviderKind::GitLab,
                 RemoteOperation::MutateLabels,
@@ -151,13 +155,13 @@ impl<'a> Adapter<'a> {
         }
     }
 
-    fn set_issue_assignees(
+    async fn set_issue_assignees(
         &self,
         native_id: &str,
         assignees: &[String],
     ) -> Result<ProviderItemObservation, RemoteError> {
         match self {
-            Self::GitHub(adapter) => adapter.set_issue_assignees(native_id, assignees),
+            Self::GitHub(adapter) => adapter.set_issue_assignees(native_id, assignees).await,
             Self::GitLab(_) => Err(unsupported_issue_operation(
                 ProviderKind::GitLab,
                 RemoteOperation::MutateAssignment,
@@ -169,13 +173,13 @@ impl<'a> Adapter<'a> {
         }
     }
 
-    fn set_issue_lifecycle(
+    async fn set_issue_lifecycle(
         &self,
         native_id: &str,
         lifecycle: &str,
     ) -> Result<ProviderItemObservation, RemoteError> {
         match self {
-            Self::GitHub(adapter) => adapter.set_issue_lifecycle(native_id, lifecycle),
+            Self::GitHub(adapter) => adapter.set_issue_lifecycle(native_id, lifecycle).await,
             Self::GitLab(_) => Err(unsupported_issue_operation(
                 ProviderKind::GitLab,
                 RemoteOperation::MutateIssueLifecycle,
@@ -187,9 +191,13 @@ impl<'a> Adapter<'a> {
         }
     }
 
-    fn issue_has_comment_marker(&self, native_id: &str, marker: &str) -> Result<bool, RemoteError> {
+    async fn issue_has_comment_marker(
+        &self,
+        native_id: &str,
+        marker: &str,
+    ) -> Result<bool, RemoteError> {
         match self {
-            Self::GitHub(adapter) => adapter.issue_has_comment_marker(native_id, marker),
+            Self::GitHub(adapter) => adapter.issue_has_comment_marker(native_id, marker).await,
             Self::GitLab(_) => Err(unsupported_issue_operation(
                 ProviderKind::GitLab,
                 RemoteOperation::CreateIssueComment,
@@ -201,14 +209,14 @@ impl<'a> Adapter<'a> {
         }
     }
 
-    fn create_issue_comment(
+    async fn create_issue_comment(
         &self,
         native_id: &str,
         body: &str,
         marker: &str,
     ) -> Result<(), RemoteError> {
         match self {
-            Self::GitHub(adapter) => adapter.create_issue_comment(native_id, body, marker),
+            Self::GitHub(adapter) => adapter.create_issue_comment(native_id, body, marker).await,
             Self::GitLab(_) => Err(unsupported_issue_operation(
                 ProviderKind::GitLab,
                 RemoteOperation::CreateIssueComment,
@@ -220,104 +228,180 @@ impl<'a> Adapter<'a> {
         }
     }
 
-    fn list_change_requests(
+    async fn list_change_requests(
         &self,
         repository: &RemoteRepositoryId,
         head_ref: Option<&str>,
     ) -> Result<Vec<ChangeRequestSummary>, RemoteError> {
         match self {
-            Self::GitHub(adapter) => adapter.list_change_requests(head_ref),
-            Self::GitLab(adapter) => adapter.list_change_requests(),
-            Self::Forgejo(adapter) => adapter.list_change_requests(repository),
+            Self::GitHub(adapter) => adapter.list_change_requests(head_ref).await,
+            Self::GitLab(adapter) => adapter.list_change_requests().await,
+            Self::Forgejo(adapter) => {
+                let adapter = (**adapter).clone();
+                let repository = repository.clone();
+                forgejo_call(RemoteOperation::ListChangeRequests, move || {
+                    adapter.list_change_requests(&repository)
+                })
+                .await
+            }
         }
     }
 
-    fn observe_change_request(
+    async fn observe_change_request(
         &self,
         id: &ChangeRequestId,
     ) -> Result<ChangeRequestSummary, RemoteError> {
         match self {
-            Self::GitHub(adapter) => adapter.observe_change_request(id),
-            Self::GitLab(adapter) => adapter.observe_change_request(id),
-            Self::Forgejo(adapter) => adapter.change_request_summary(id),
+            Self::GitHub(adapter) => adapter.observe_change_request(id).await,
+            Self::GitLab(adapter) => adapter.observe_change_request(id).await,
+            Self::Forgejo(adapter) => {
+                let adapter = (**adapter).clone();
+                let id = id.clone();
+                forgejo_call(RemoteOperation::ObserveChangeRequest, move || {
+                    adapter.change_request_summary(&id)
+                })
+                .await
+            }
         }
     }
 
-    fn lookup_change_request(
+    async fn lookup_change_request(
         &self,
         id: &ChangeRequestId,
     ) -> Result<Option<ChangeRequestSummary>, RemoteError> {
         match self {
-            Self::GitHub(adapter) => adapter.lookup_change_request(id),
-            Self::GitLab(adapter) => adapter.observe_change_request(id).map(Some),
-            Self::Forgejo(adapter) => adapter.change_request_summary(id).map(Some),
+            Self::GitHub(adapter) => adapter.lookup_change_request(id).await,
+            Self::GitLab(adapter) => adapter.observe_change_request(id).await.map(Some),
+            Self::Forgejo(adapter) => {
+                let adapter = (**adapter).clone();
+                let id = id.clone();
+                forgejo_call(RemoteOperation::ObserveChangeRequest, move || {
+                    adapter.change_request_summary(&id).map(Some)
+                })
+                .await
+            }
         }
     }
 
-    fn change_request_details(
+    async fn change_request_details(
         &self,
         change_request: &ChangeRequest,
     ) -> Result<ChangeRequestDetails, RemoteError> {
         match self {
-            Self::GitHub(adapter) => adapter.change_request_details(change_request),
-            Self::GitLab(adapter) => adapter.change_request_details(change_request),
-            Self::Forgejo(adapter) => adapter.change_request_details(change_request),
+            Self::GitHub(adapter) => adapter.change_request_details(change_request).await,
+            Self::GitLab(adapter) => adapter.change_request_details(change_request).await,
+            Self::Forgejo(adapter) => {
+                let adapter = (**adapter).clone();
+                let change_request = change_request.clone();
+                forgejo_call(RemoteOperation::ObserveChangeRequest, move || {
+                    adapter.change_request_details(&change_request)
+                })
+                .await
+            }
         }
     }
 
-    fn repository_policy(
+    async fn repository_policy(
         &self,
         repository: &RemoteRepositoryId,
         target_branch: &str,
     ) -> Result<RepositoryPolicy, RemoteError> {
         match self {
-            Self::GitHub(adapter) => adapter.repository_policy(target_branch),
-            Self::GitLab(adapter) => adapter.repository_policy(target_branch),
-            Self::Forgejo(adapter) => adapter.repository_policy(repository, target_branch),
+            Self::GitHub(adapter) => adapter.repository_policy(target_branch).await,
+            Self::GitLab(adapter) => adapter.repository_policy(target_branch).await,
+            Self::Forgejo(adapter) => {
+                let adapter = (**adapter).clone();
+                let repository = repository.clone();
+                let target_branch = target_branch.to_string();
+                forgejo_call(RemoteOperation::ObserveRepositoryPolicy, move || {
+                    adapter.repository_policy(&repository, &target_branch)
+                })
+                .await
+            }
         }
     }
 
-    fn create_change_request(
+    async fn create_change_request(
         &self,
         request: &CreateChangeRequest,
     ) -> Result<ChangeRequestSummary, RemoteError> {
         match self {
-            Self::GitHub(adapter) => adapter.create_change_request(request),
-            Self::GitLab(adapter) => adapter.create_change_request(request),
-            Self::Forgejo(adapter) => adapter.create_change_request(request.clone()),
+            Self::GitHub(adapter) => adapter.create_change_request(request).await,
+            Self::GitLab(adapter) => adapter.create_change_request(request).await,
+            Self::Forgejo(adapter) => {
+                let adapter = (**adapter).clone();
+                let request = request.clone();
+                forgejo_call(RemoteOperation::CreateChangeRequest, move || {
+                    adapter.create_change_request(request)
+                })
+                .await
+            }
         }
     }
 
-    fn merge_change_request(
+    async fn merge_change_request(
         &self,
         request: &GuardedMerge,
     ) -> Result<MergeMutationResult, RemoteError> {
         match self {
-            Self::GitHub(adapter) => adapter.merge_change_request(request),
-            Self::GitLab(adapter) => adapter.merge_change_request(request),
-            Self::Forgejo(adapter) => adapter.merge_change_request(request.clone()),
+            Self::GitHub(adapter) => adapter.merge_change_request(request).await,
+            Self::GitLab(adapter) => adapter.merge_change_request(request).await,
+            Self::Forgejo(adapter) => {
+                let adapter = (**adapter).clone();
+                let request = request.clone();
+                forgejo_call(RemoteOperation::MergeChangeRequest, move || {
+                    adapter.merge_change_request(request)
+                })
+                .await
+            }
         }
     }
 
-    fn resolve_review_thread(&self, request: &ResolveReviewThread) -> Result<(), RemoteError> {
+    async fn resolve_review_thread(
+        &self,
+        request: &ResolveReviewThread,
+    ) -> Result<(), RemoteError> {
         match self {
-            Self::GitHub(adapter) => adapter.resolve_review_thread(request),
-            Self::GitLab(adapter) => adapter.resolve_review_thread(request).map(|_| ()),
-            Self::Forgejo(adapter) => adapter.resolve_review_thread(request.clone()),
+            Self::GitHub(adapter) => adapter.resolve_review_thread(request).await,
+            Self::GitLab(adapter) => adapter.resolve_review_thread(request).await.map(|_| ()),
+            Self::Forgejo(adapter) => {
+                let adapter = (**adapter).clone();
+                let request = request.clone();
+                forgejo_call(RemoteOperation::ResolveReviewThread, move || {
+                    adapter.resolve_review_thread(request)
+                })
+                .await
+            }
         }
     }
 
-    fn submit_review(&self, request: &SubmitReview) -> Result<(), RemoteError> {
+    async fn submit_review(&self, request: &SubmitReview) -> Result<(), RemoteError> {
         match self {
-            Self::GitHub(adapter) => adapter.submit_review(request),
+            Self::GitHub(adapter) => adapter.submit_review(request).await,
             Self::GitLab(adapter) => adapter.submit_review(request),
             Self::Forgejo(adapter) => adapter.submit_review(request),
         }
     }
 }
 
-pub(crate) fn configured(path: &Path, config: &Config) -> bool {
-    Adapter::resolve(path, config).is_ok()
+async fn forgejo_call<T, F>(operation: RemoteOperation, call: F) -> Result<T, RemoteError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, RemoteError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(call).await.map_err(|error| {
+        RemoteError::new(
+            ProviderKind::Forgejo,
+            operation,
+            RemoteErrorClass::Provider,
+            Retryability::Retryable,
+            format!("Forgejo HTTP task failed: {error}"),
+        )
+    })?
+}
+
+pub(crate) async fn configured(path: &Path, config: &Config) -> bool {
+    Adapter::resolve(path, config).await.is_ok()
 }
 
 /// Discovers authoritative open Issues through the provider seam. Unsupported
@@ -332,11 +416,11 @@ fn unsupported_issue_operation(provider: ProviderKind, operation: RemoteOperatio
     )
 }
 
-pub(crate) fn discover_issues(
+pub(crate) async fn discover_issues(
     path: &Path,
     config: &Config,
 ) -> Result<Vec<ProviderItemObservation>, RemoteError> {
-    let (adapter, _) = Adapter::resolve(path, config).map_err(|message| {
+    let (adapter, _) = Adapter::resolve(path, config).await.map_err(|message| {
         RemoteError::new(
             ProviderKind::GitHub,
             RemoteOperation::DiscoverIssues,
@@ -345,10 +429,10 @@ pub(crate) fn discover_issues(
             message,
         )
     })?;
-    adapter.discover_issues()
+    adapter.discover_issues().await
 }
 
-pub(crate) fn observe_issue(
+pub(crate) async fn observe_issue(
     path: &Path,
     config: &Config,
     repository: &RemoteRepositoryId,
@@ -356,10 +440,11 @@ pub(crate) fn observe_issue(
 ) -> Result<ProviderItemObservation, String> {
     Adapter::for_repository(path, config, repository)?
         .observe_issue(native_id)
+        .await
         .map_err(|error| error.to_string())
 }
 
-pub(crate) fn set_issue_labels(
+pub(crate) async fn set_issue_labels(
     path: &Path,
     config: &Config,
     repository: &RemoteRepositoryId,
@@ -368,10 +453,11 @@ pub(crate) fn set_issue_labels(
 ) -> Result<ProviderItemObservation, String> {
     Adapter::for_repository(path, config, repository)?
         .set_issue_labels(native_id, labels)
+        .await
         .map_err(|error| error.to_string())
 }
 
-pub(crate) fn set_issue_assignees(
+pub(crate) async fn set_issue_assignees(
     path: &Path,
     config: &Config,
     repository: &RemoteRepositoryId,
@@ -380,10 +466,11 @@ pub(crate) fn set_issue_assignees(
 ) -> Result<ProviderItemObservation, String> {
     Adapter::for_repository(path, config, repository)?
         .set_issue_assignees(native_id, assignees)
+        .await
         .map_err(|error| error.to_string())
 }
 
-pub(crate) fn set_issue_lifecycle(
+pub(crate) async fn set_issue_lifecycle(
     path: &Path,
     config: &Config,
     repository: &RemoteRepositoryId,
@@ -392,10 +479,11 @@ pub(crate) fn set_issue_lifecycle(
 ) -> Result<ProviderItemObservation, String> {
     Adapter::for_repository(path, config, repository)?
         .set_issue_lifecycle(native_id, lifecycle)
+        .await
         .map_err(|error| error.to_string())
 }
 
-pub(crate) fn issue_has_comment_marker(
+pub(crate) async fn issue_has_comment_marker(
     path: &Path,
     config: &Config,
     repository: &RemoteRepositoryId,
@@ -404,10 +492,11 @@ pub(crate) fn issue_has_comment_marker(
 ) -> Result<bool, String> {
     Adapter::for_repository(path, config, repository)?
         .issue_has_comment_marker(native_id, marker)
+        .await
         .map_err(|error| error.to_string())
 }
 
-pub(crate) fn create_issue_comment(
+pub(crate) async fn create_issue_comment(
     path: &Path,
     config: &Config,
     repository: &RemoteRepositoryId,
@@ -417,24 +506,28 @@ pub(crate) fn create_issue_comment(
 ) -> Result<(), String> {
     Adapter::for_repository(path, config, repository)?
         .create_issue_comment(native_id, body, marker)
+        .await
         .map_err(|error| error.to_string())
 }
 
-pub(crate) fn provider(path: &Path, config: &Config) -> Result<ProviderKind, String> {
-    Adapter::resolve(path, config).map(|(_, remote)| remote.repository.id.provider())
+pub(crate) async fn provider(path: &Path, config: &Config) -> Result<ProviderKind, String> {
+    Adapter::resolve(path, config)
+        .await
+        .map(|(_, remote)| remote.repository.id.provider())
 }
 
-pub(crate) fn repository_project(
+pub(crate) async fn repository_project(
     path: &Path,
     config: &Config,
     remote_name: &str,
 ) -> Result<String, String> {
     discover_git_remote(path, config, remote_name, RemoteUrlKind::Fetch)
+        .await
         .map(|remote| remote.repository.id.project_path().to_string())
         .map_err(|error| error.to_string())
 }
 
-pub(crate) fn fetch_change_request_branch(
+pub(crate) async fn fetch_change_request_branch(
     path: &Path,
     config: &Config,
     summary: &PrSummary,
@@ -468,14 +561,21 @@ pub(crate) fn fetch_change_request_branch(
     }
 
     let destination_ref = format!("refs/heads/{branch}");
-    validate_git_ref(path, config, &destination_ref)?;
-    let destination_old_oid = read_git_ref_or_zero(path, config, &destination_ref)?;
-    if destination_old_oid != "0000000000000000000000000000000000000000" {
-        return Ok(());
+    validate_git_ref(path, config, &destination_ref).await?;
+    let destination_old_oid = read_git_ref_or_zero(path, config, &destination_ref).await?;
+    if destination_old_oid != *"0000000000000000000000000000000000000000" {
+        if destination_old_oid == summary.head_sha {
+            return Ok(());
+        }
+        return Err(format!(
+            "destination branch {branch} already exists at a different commit"
+        ));
     }
     let mut configured = Vec::new();
     for remote_name in ["origin", "upstream"] {
-        if let Ok(remote) = discover_git_remote(path, config, remote_name, RemoteUrlKind::Fetch) {
+        if let Ok(remote) =
+            discover_git_remote(path, config, remote_name, RemoteUrlKind::Fetch).await
+        {
             configured.push((remote_name, remote.repository.id));
         }
     }
@@ -487,7 +587,7 @@ pub(crate) fn fetch_change_request_branch(
         &target,
         &configured,
     )?;
-    validate_git_ref(path, config, &fetch.remote_ref)?;
+    validate_git_ref(path, config, &fetch.remote_ref).await?;
 
     let temporary_ref = format!(
         "refs/prism/change-requests/{:016x}",
@@ -496,7 +596,7 @@ pub(crate) fn fetch_change_request_branch(
             ^ crate::util::stable_hash(Path::new(branch))
     );
     let refspec = format!("+{}:{temporary_ref}", fetch.remote_ref);
-    crate::process::run_status_named(
+    let fetch_result = crate::process::run_status_named(
         Command::new(config.tool("git"))
             .arg("-C")
             .arg(path)
@@ -504,9 +604,11 @@ pub(crate) fn fetch_change_request_branch(
             .arg(refspec),
         crate::process::ProcessPolicy::NetworkQuery,
         crate::process::ProcessDescriptor::new("git.fetch"),
-    )?;
+    )
+    .await;
 
-    let publish = (|| {
+    let publish = async {
+        fetch_result?;
         let fetched_sha = crate::process::run_capture_named(
             Command::new(config.tool("git"))
                 .arg("-C")
@@ -515,7 +617,8 @@ pub(crate) fn fetch_change_request_branch(
                 .arg(format!("{temporary_ref}^{{commit}}")),
             crate::process::ProcessPolicy::Metadata,
             crate::process::ProcessDescriptor::new("git.rev_parse"),
-        )?;
+        )
+        .await?;
         if fetched_sha.trim() != summary.head_sha {
             return Err("change request head changed while it was being fetched".to_string());
         }
@@ -529,20 +632,30 @@ pub(crate) fn fetch_change_request_branch(
             crate::process::ProcessPolicy::LocalMutation,
             crate::process::ProcessDescriptor::new("git.update_ref"),
         )
-    })();
-    let cleanup = crate::process::run_status_named(
-        Command::new(config.tool("git")).arg("-C").arg(path).args([
-            "update-ref",
-            "-d",
-            &temporary_ref,
-        ]),
-        crate::process::ProcessPolicy::LocalMutation,
-        crate::process::ProcessDescriptor::new("git.update_ref"),
-    );
+        .await
+    }
+    .await;
+    let cleanup = crate::process::with_cancellation(
+        crate::process::CancellationToken::new(),
+        crate::process::run_status_named(
+            Command::new(config.tool("git")).arg("-C").arg(path).args([
+                "update-ref",
+                "-d",
+                &temporary_ref,
+            ]),
+            crate::process::ProcessPolicy::LocalMutation,
+            crate::process::ProcessDescriptor::new("git.update_ref"),
+        ),
+    )
+    .await;
     publish.and(cleanup)
 }
 
-fn read_git_ref_or_zero(path: &Path, config: &Config, reference: &str) -> Result<String, String> {
+async fn read_git_ref_or_zero(
+    path: &Path,
+    config: &Config,
+    reference: &str,
+) -> Result<String, String> {
     let output = crate::process::run_output_allow_failure_named(
         Command::new(config.tool("git")).arg("-C").arg(path).args([
             "rev-parse",
@@ -551,11 +664,13 @@ fn read_git_ref_or_zero(path: &Path, config: &Config, reference: &str) -> Result
         ]),
         crate::process::ProcessPolicy::Metadata,
         crate::process::ProcessDescriptor::new("git.rev_parse"),
-    )?;
+    )
+    .await?;
     if !output.status.success() {
         return Ok("0000000000000000000000000000000000000000".to_string());
     }
-    let oid = output.stdout.trim();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let oid = stdout.trim();
     if oid.is_empty() {
         return Err(format!("git returned an empty object ID for {reference}"));
     }
@@ -615,7 +730,7 @@ fn select_fetch_source<'a>(
     )
 }
 
-fn validate_git_ref(path: &Path, config: &Config, reference: &str) -> Result<(), String> {
+async fn validate_git_ref(path: &Path, config: &Config, reference: &str) -> Result<(), String> {
     crate::process::run_status_named(
         Command::new(config.tool("git"))
             .arg("-C")
@@ -624,9 +739,10 @@ fn validate_git_ref(path: &Path, config: &Config, reference: &str) -> Result<(),
         crate::process::ProcessPolicy::Metadata,
         crate::process::ProcessDescriptor::new("git.check_ref_format"),
     )
+    .await
 }
 
-pub(crate) fn submit_review(
+pub(crate) async fn submit_review(
     path: &Path,
     config: &Config,
     summary: &PrSummary,
@@ -638,7 +754,8 @@ pub(crate) fn submit_review(
     if change_request.id.repository() != target {
         return Err("change request identity has an inconsistent target repository".to_string());
     }
-    configured_remote_repositories(path, config)?
+    configured_remote_repositories(path, config)
+        .await?
         .validate_target_repository(target)
         .map_err(|_| "change request target changed before review submission".to_string())?;
     let adapter = Adapter::for_repository(path, config, target)?;
@@ -649,22 +766,30 @@ pub(crate) fn submit_review(
             kind,
             body,
         })
+        .await
         .map_err(|error| error.to_string())
 }
 
-pub(crate) fn capabilities(path: &Path, config: &Config) -> Result<Capabilities, String> {
-    let (adapter, remote) = Adapter::resolve(path, config)?;
+pub(crate) async fn capabilities(path: &Path, config: &Config) -> Result<Capabilities, String> {
+    let (adapter, remote) = Adapter::resolve(path, config).await?;
     match adapter {
-        Adapter::Forgejo(adapter) => adapter
-            .runtime_diagnostics(&remote.repository.id)
-            .map(|diagnostics| diagnostics.capabilities)
-            .map_err(|error| error.to_string()),
+        Adapter::Forgejo(adapter) => {
+            let adapter = (*adapter).clone();
+            let repository = remote.repository.id;
+            forgejo_call(RemoteOperation::DiscoverRepository, move || {
+                adapter
+                    .runtime_diagnostics(&repository)
+                    .map(|diagnostics| diagnostics.capabilities)
+            })
+            .await
+            .map_err(|error| error.to_string())
+        }
         adapter => Ok(adapter.capabilities()),
     }
 }
 
-pub(crate) fn authentication_status(path: &Path, config: &Config) -> Result<String, String> {
-    let (adapter, remote) = Adapter::resolve(path, config)?;
+pub(crate) async fn authentication_status(path: &Path, config: &Config) -> Result<String, String> {
+    let (adapter, remote) = Adapter::resolve(path, config).await?;
     match adapter {
         Adapter::GitHub(_) => crate::process::run_capture_named(
             Command::new(config.tool("gh"))
@@ -675,6 +800,7 @@ pub(crate) fn authentication_status(path: &Path, config: &Config) -> Result<Stri
             crate::process::ProcessPolicy::NetworkQuery,
             crate::process::ProcessDescriptor::new("gh.auth.status"),
         )
+        .await
         .map(|_| "ok".to_string()),
         Adapter::GitLab(_) => crate::process::run_capture_named(
             Command::new(config.tool("glab"))
@@ -685,6 +811,7 @@ pub(crate) fn authentication_status(path: &Path, config: &Config) -> Result<Stri
             crate::process::ProcessPolicy::NetworkQuery,
             crate::process::ProcessDescriptor::new("glab.auth.status"),
         )
+        .await
         .map(|_| "ok".to_string()),
         Adapter::Forgejo(_) => {
             let profile = config
@@ -706,13 +833,19 @@ pub(crate) fn authentication_status(path: &Path, config: &Config) -> Result<Stri
     }
 }
 
-pub(crate) fn server_version(path: &Path, config: &Config) -> Result<Option<String>, String> {
-    let (adapter, _) = Adapter::resolve(path, config)?;
+pub(crate) async fn server_version(path: &Path, config: &Config) -> Result<Option<String>, String> {
+    let (adapter, _) = Adapter::resolve(path, config).await?;
     match adapter {
-        Adapter::Forgejo(adapter) => adapter
-            .discover_instance()
-            .map(|instance| Some(instance.version))
-            .map_err(|error| error.to_string()),
+        Adapter::Forgejo(adapter) => {
+            let adapter = (*adapter).clone();
+            forgejo_call(RemoteOperation::DiscoverRepository, move || {
+                adapter
+                    .discover_instance()
+                    .map(|instance| Some(instance.version))
+            })
+            .await
+            .map_err(|error| error.to_string())
+        }
         Adapter::GitHub(_) | Adapter::GitLab(_) => Ok(None),
     }
 }
@@ -722,16 +855,20 @@ pub(crate) struct RemoteRuntimeDiagnostics {
     pub(crate) server_version: Option<String>,
 }
 
-pub(crate) fn runtime_diagnostics(
+pub(crate) async fn runtime_diagnostics(
     path: &Path,
     config: &Config,
 ) -> Result<RemoteRuntimeDiagnostics, String> {
-    let (adapter, remote) = Adapter::resolve(path, config)?;
+    let (adapter, remote) = Adapter::resolve(path, config).await?;
     match adapter {
         Adapter::Forgejo(adapter) => {
-            let diagnostics = adapter
-                .runtime_diagnostics(&remote.repository.id)
-                .map_err(|error| error.to_string())?;
+            let adapter = (*adapter).clone();
+            let repository = remote.repository.id.clone();
+            let diagnostics = forgejo_call(RemoteOperation::DiscoverRepository, move || {
+                adapter.runtime_diagnostics(&repository)
+            })
+            .await
+            .map_err(|error| error.to_string())?;
             Ok(RemoteRuntimeDiagnostics {
                 capabilities: diagnostics.capabilities,
                 server_version: Some(diagnostics.instance.version),
@@ -752,21 +889,25 @@ pub(crate) fn capabilities_for_summary(summary: &PrSummary) -> Capabilities {
         .unwrap_or_default()
 }
 
-pub(crate) fn list_change_requests(path: &Path, config: &Config) -> Result<Vec<PrSummary>, String> {
-    list_change_requests_for_head(path, config, None)
+pub(crate) async fn list_change_requests(
+    path: &Path,
+    config: &Config,
+) -> Result<Vec<PrSummary>, String> {
+    list_change_requests_for_head(path, config, None).await
 }
 
-fn list_change_requests_for_head(
+async fn list_change_requests_for_head(
     path: &Path,
     config: &Config,
     head_ref: Option<&str>,
 ) -> Result<Vec<PrSummary>, String> {
-    let repositories = configured_change_request_repositories(path, config)?;
+    let repositories = configured_change_request_repositories(path, config).await?;
     let mut summaries = Vec::new();
     for repository in repositories {
         let adapter = Adapter::for_repository(path, config, &repository)?;
         let observed = adapter
             .list_change_requests(&repository, head_ref)
+            .await
             .map_err(|error| error.to_string())?
             .into_iter()
             .map(legacy_summary)
@@ -783,11 +924,13 @@ fn list_change_requests_for_head(
     Ok(summaries)
 }
 
-fn configured_change_request_repositories(
+async fn configured_change_request_repositories(
     path: &Path,
     config: &Config,
 ) -> Result<Vec<RemoteRepositoryId>, String> {
-    Ok(configured_remote_repositories(path, config)?.fetch_repositories)
+    Ok(configured_remote_repositories(path, config)
+        .await?
+        .fetch_repositories)
 }
 
 struct ConfiguredRemoteRepositories {
@@ -884,15 +1027,17 @@ pub(crate) fn same_push_target(left: &PushGuard, right: &PushGuard) -> bool {
         && left.expected_head_sha == right.expected_head_sha
 }
 
-fn configured_remote_repositories(
+async fn configured_remote_repositories(
     path: &Path,
     config: &Config,
 ) -> Result<ConfiguredRemoteRepositories, String> {
     let origin_fetch = discover_git_remote(path, config, "origin", RemoteUrlKind::Fetch)
+        .await
         .map_err(|error| error.to_string())?
         .repository
         .id;
     let origin_push = discover_git_remote(path, config, "origin", RemoteUrlKind::Push)
+        .await
         .map_err(|error| error.to_string())?
         .repository
         .id;
@@ -901,10 +1046,12 @@ fn configured_remote_repositories(
     }
 
     let upstream_fetch = discover_git_remote(path, config, "upstream", RemoteUrlKind::Fetch)
+        .await
         .ok()
         .map(|remote| remote.repository.id)
         .filter(|repository| repository.provider() == origin_fetch.provider());
     let upstream_push = discover_git_remote(path, config, "upstream", RemoteUrlKind::Push)
+        .await
         .ok()
         .map(|remote| remote.repository.id)
         .filter(|repository| repository.provider() == origin_fetch.provider());
@@ -921,39 +1068,40 @@ fn configured_remote_repositories(
     })
 }
 
-pub(crate) fn create_change_request_targets(
+pub(crate) async fn create_change_request_targets(
     path: &Path,
     config: &Config,
 ) -> Result<(RemoteRepositoryId, Option<RemoteRepositoryId>), String> {
-    let remotes = configured_remote_repositories(path, config)?;
+    let remotes = configured_remote_repositories(path, config).await?;
     let upstream = remotes
         .upstream_fetch
         .filter(|repository| repository != &remotes.origin_fetch);
     Ok((remotes.origin_fetch, upstream))
 }
 
-pub(crate) fn fetch_remote_name_for_repository(
+pub(crate) async fn fetch_remote_name_for_repository(
     path: &Path,
     config: &Config,
     repository: &RemoteRepositoryId,
 ) -> Result<String, String> {
-    configured_remote_repositories(path, config)?
+    configured_remote_repositories(path, config)
+        .await?
         .fetch_remote_name(repository)
         .map(str::to_string)
 }
 
-pub(crate) fn fetch_repository_branch_head_sha(
+pub(crate) async fn fetch_repository_branch_head_sha(
     path: &Path,
     config: &Config,
     repository: &RemoteRepositoryId,
     branch: &str,
 ) -> Result<Option<String>, String> {
-    let remote = fetch_remote_name_for_repository(path, config, repository)?;
-    crate::git::fetch_remote_branch(path, &remote, branch, config)?;
-    crate::git::remote_branch_head_sha_on(path, &remote, branch, config)
+    let remote = fetch_remote_name_for_repository(path, config, repository).await?;
+    crate::git::fetch_remote_branch(path, &remote, branch, config).await?;
+    crate::git::remote_branch_head_sha_on(path, &remote, branch, config).await
 }
 
-pub(crate) fn fetch_change_request_base_head_sha(
+pub(crate) async fn fetch_change_request_base_head_sha(
     path: &Path,
     config: &Config,
     summary: &PrSummary,
@@ -965,17 +1113,18 @@ pub(crate) fn fetch_change_request_base_head_sha(
     let target = identity
         .target_repository()
         .map_err(|error| error.to_string())?;
-    fetch_repository_branch_head_sha(path, config, &target, &summary.base_ref)
+    fetch_repository_branch_head_sha(path, config, &target, &summary.base_ref).await
 }
 
-fn prepare_create_change_request(
+async fn prepare_create_change_request(
     path: &Path,
     config: &Config,
     branch: &str,
     target_repository: &RemoteRepositoryId,
     source_push: &PushGuard,
 ) -> Result<PreparedChangeRequest, String> {
-    let current_branch = crate::git::current_branch_name(path, config)?
+    let current_branch = crate::git::current_branch_name(path, config)
+        .await?
         .ok_or_else(|| "cannot create a change request from detached HEAD".to_string())?;
     if current_branch != branch {
         return Err(format!(
@@ -983,11 +1132,11 @@ fn prepare_create_change_request(
         ));
     }
 
-    let fresh_push = prepare_push(path, config, branch)?;
+    let fresh_push = prepare_push(path, config, branch).await?;
     if &fresh_push != source_push {
         return Err("change request push source changed before creation".to_string());
     }
-    let remotes = configured_remote_repositories(path, config)?;
+    let remotes = configured_remote_repositories(path, config).await?;
     remotes.validate_target_repository(target_repository)?;
     if source_push.repository.provider() != target_repository.provider() {
         return Err("change request source and target use different providers".to_string());
@@ -1000,19 +1149,21 @@ fn prepare_create_change_request(
         .filter(|branch| !branch.is_empty())
         .unwrap_or("main")
         .to_string();
-    crate::git::fetch_remote_branch(path, target_remote, &target_branch, config)?;
-    crate::git::remote_branch_head_sha_on(path, target_remote, &target_branch, config)?
+    crate::git::fetch_remote_branch(path, target_remote, &target_branch, config).await?;
+    crate::git::remote_branch_head_sha_on(path, target_remote, &target_branch, config)
+        .await?
         .ok_or_else(|| {
             format!("change request target branch {target_remote}/{target_branch} does not exist")
         })?;
 
-    let expected_head_sha = crate::git::current_head_sha(path, config)?;
+    let expected_head_sha = crate::git::current_head_sha(path, config).await?;
     let source_head_sha = crate::git::push_remote_branch_head_sha(
         path,
         &source_push.remote,
         &source_push.remote_branch,
         config,
-    )?
+    )
+    .await?
     .ok_or_else(|| "change request source branch does not exist on the push remote".to_string())?;
     if source_head_sha != expected_head_sha {
         return Err("change request source branch does not match the expected HEAD".to_string());
@@ -1028,12 +1179,13 @@ fn prepare_create_change_request(
     })
 }
 
-pub(crate) fn prepare_push(
+pub(crate) async fn prepare_push(
     path: &Path,
     config: &Config,
     selected_branch: &str,
 ) -> Result<PushGuard, String> {
-    let local_branch = crate::git::current_branch_name(path, config)?
+    let local_branch = crate::git::current_branch_name(path, config)
+        .await?
         .ok_or_else(|| "cannot push detached HEAD".to_string())?;
     if local_branch != selected_branch {
         return Err(format!(
@@ -1048,7 +1200,8 @@ pub(crate) fn prepare_push(
             .arg("--format=%(push:remotename)%00%(push)")
             .arg(format!("refs/heads/{selected_branch}")),
         crate::process::ProcessPolicy::Metadata,
-    )?;
+    )
+    .await?;
     let (remote, remote_branch, set_upstream) = match push_destination.trim().split_once('\0') {
         Some((remote, push_ref)) if !remote.is_empty() && !push_ref.is_empty() => {
             let prefix = format!("refs/remotes/{remote}/");
@@ -1063,17 +1216,18 @@ pub(crate) fn prepare_push(
         }
         _ => ("origin".to_string(), selected_branch.to_string(), true),
     };
-    crate::git::single_push_remote_url(path, &remote, config)?;
+    crate::git::single_push_remote_url(path, &remote, config).await?;
     let repository = discover_git_remote(path, config, &remote, RemoteUrlKind::Push)
+        .await
         .map_err(|error| error.to_string())?
         .repository
         .id;
     Ok(PushGuard {
         repository,
-        remote,
+        remote: remote.to_string(),
         remote_branch,
         local_branch,
-        expected_head_sha: crate::git::current_head_sha(path, config)?,
+        expected_head_sha: crate::git::current_head_sha(path, config).await?,
         set_upstream,
     })
 }
@@ -1087,7 +1241,7 @@ fn push_unique_repository(
     }
 }
 
-pub(crate) fn refresh_change_request_cache(
+pub(crate) async fn refresh_change_request_cache(
     repo: &Repository,
     branch: &str,
     cache: &mut PrCache,
@@ -1095,7 +1249,7 @@ pub(crate) fn refresh_change_request_cache(
     config: &Config,
     force_details: bool,
 ) -> Result<(), String> {
-    let remotes = configured_remote_repositories(path, config)?;
+    let remotes = configured_remote_repositories(path, config).await?;
     let observation = if cache.summary_observed_in_process
         && let Some(summary) = cache.summary()
         && let Ok(change_request) = change_request_from_legacy(summary)
@@ -1107,6 +1261,7 @@ pub(crate) fn refresh_change_request_cache(
                 Adapter::for_repository(path, config, change_request.id.repository())?;
             target_adapter
                 .lookup_change_request(&change_request.id)
+                .await
                 .map_err(|error| error.to_string())
                 .and_then(|summary| summary.map(legacy_summary).transpose())
                 .and_then(|summary| match summary {
@@ -1115,9 +1270,10 @@ pub(crate) fn refresh_change_request_cache(
                 })
         }
     } else {
-        let source_push = prepare_push(path, config, branch)?;
-        list_change_requests_for_head(path, config, Some(&source_push.remote_branch)).map(
-            |summaries| {
+        let source_push = prepare_push(path, config, branch).await?;
+        list_change_requests_for_head(path, config, Some(&source_push.remote_branch))
+            .await
+            .map(|summaries| {
                 let matching = summaries.into_iter().filter(|summary| {
                     summary.head_ref == source_push.remote_branch
                         && summary.head_sha == source_push.expected_head_sha
@@ -1142,34 +1298,35 @@ pub(crate) fn refresh_change_request_cache(
                     }
                 }
                 unknown_lifecycle
-            },
-        )
+            })
     };
     super::store::record_provider_summary_refresh(repo, branch, cache, observation)?;
     if force_details && cache.summary().is_some() {
-        refresh_change_request_details_state(branch, cache, path, config);
+        refresh_change_request_details_state(branch, cache, path, config).await;
         super::store::persist_pr_cache_snapshot(repo, branch, cache)?;
     }
     Ok(())
 }
 
-pub(crate) fn refresh_change_request_details_state(
+pub(crate) async fn refresh_change_request_details_state(
     _branch: &str,
     cache: &mut PrCache,
     path: &Path,
     config: &Config,
 ) {
-    let result = (|| {
+    let result = async {
         let summary = cache
             .summary()
             .cloned()
             .ok_or_else(|| "change request summary is not loaded".to_string())?;
         let change_request = change_request_from_legacy(&summary)?;
-        configured_remote_repositories(path, config)?
+        configured_remote_repositories(path, config)
+            .await?
             .validate_target_repository(&change_request.target_repository)?;
         let adapter = Adapter::for_repository(path, config, change_request.id.repository())?;
         let details = adapter
             .change_request_details(&change_request)
+            .await
             .map_err(|error| error.to_string())?;
         if !details.association.as_ref().is_some_and(|association| {
             association.matches(&change_request.id, &change_request.head_sha)
@@ -1178,28 +1335,29 @@ pub(crate) fn refresh_change_request_details_state(
         }
         let details = to_legacy_details(details);
         Ok(details)
-    })();
+    }
+    .await;
     match result {
         Ok(details) => cache::record_provider_details_refresh(cache, Ok(details)),
         Err(error) => cache::record_provider_details_refresh(cache, Err(error)),
     }
 }
 
-pub(crate) fn refresh_repository_policy(
+pub(crate) async fn refresh_repository_policy(
     repo: &Repository,
     path: &Path,
     config: &Config,
 ) -> Result<RepoPolicyCache, String> {
-    refresh_repository_policy_for(repo, path, config, None)
+    refresh_repository_policy_for(repo, path, config, None).await
 }
 
-pub(crate) fn refresh_repository_policy_for(
+pub(crate) async fn refresh_repository_policy_for(
     repo: &Repository,
     path: &Path,
     config: &Config,
     target_repository: Option<&RemoteRepositoryId>,
 ) -> Result<RepoPolicyCache, String> {
-    let (origin_adapter, remote) = Adapter::resolve(path, config)?;
+    let (origin_adapter, remote) = Adapter::resolve(path, config).await?;
     let repository = target_repository
         .cloned()
         .unwrap_or_else(|| remote.repository.id.clone());
@@ -1208,7 +1366,7 @@ pub(crate) fn refresh_repository_policy_for(
     } else {
         origin_adapter
     };
-    let observed_target = observed_policy_target_branch(repo, path, config, &repository);
+    let observed_target = observed_policy_target_branch(repo, path, config, &repository).await;
     let target = observed_target
         .as_deref()
         .or(config.default_base.as_deref())
@@ -1225,7 +1383,7 @@ pub(crate) fn refresh_repository_policy_for(
         refreshed_unix_ms: unix_seconds(),
         ..RepoPolicyCache::default()
     };
-    match policy {
+    match policy.await {
         Ok(policy) => {
             if policy
                 .repository
@@ -1274,13 +1432,14 @@ pub(crate) fn refresh_repository_policy_for(
     Ok(cache)
 }
 
-fn observed_policy_target_branch(
+async fn observed_policy_target_branch(
     repo: &Repository,
     path: &Path,
     config: &Config,
     repository: &RemoteRepositoryId,
 ) -> Option<String> {
     let branch = crate::git::current_branch_name(path, config)
+        .await
         .ok()
         .flatten()?;
     let cache = super::store::load_pr_cache(repo, &branch);
@@ -1305,7 +1464,7 @@ fn policy_fact<T: Default>(
     }
 }
 
-pub(crate) fn create_change_request(
+pub(crate) async fn create_change_request(
     repo: &Repository,
     config: &Config,
     path: &Path,
@@ -1318,7 +1477,8 @@ pub(crate) fn create_change_request(
         input.branch,
         input.target_repository,
         input.source_push,
-    )?;
+    )
+    .await?;
     let source = guard.source_repository.clone();
     let target = guard.target_repository.clone();
     let adapter = Adapter::for_repository(path, config, &target)?;
@@ -1334,12 +1494,13 @@ pub(crate) fn create_change_request(
     };
     let summary = adapter
         .create_change_request(&request)
+        .await
         .map_err(|error| error.to_string())?;
     super::store::record_pr_summary(repo, &guard.local_branch, cache, legacy_summary(summary)?);
     cache.refresh_result()
 }
 
-pub(crate) fn merge_change_request(
+pub(crate) async fn merge_change_request(
     config: &Config,
     path: &Path,
     authorized_identity: &CanonicalChangeRequestIdentity,
@@ -1352,18 +1513,19 @@ pub(crate) fn merge_change_request(
         authorized_identity,
         display_number,
         expected_head_sha,
-    )?;
-    execute_guarded_merge(config, path, &request)
+    )
+    .await?;
+    execute_guarded_merge(config, path, &request).await
 }
 
-pub(crate) fn prepare_merge_change_request(
+pub(crate) async fn prepare_merge_change_request(
     config: &Config,
     path: &Path,
     authorized_identity: &CanonicalChangeRequestIdentity,
     display_number: u64,
     expected_head_sha: &str,
 ) -> Result<GuardedMerge, String> {
-    let remotes = configured_remote_repositories(path, config)?;
+    let remotes = configured_remote_repositories(path, config).await?;
     let authorized_id = authorized_identity
         .change_request_id(Some(display_number))
         .map_err(|error| error.to_string())?;
@@ -1385,6 +1547,7 @@ pub(crate) fn prepare_merge_change_request(
     }
     let summary = adapter
         .observe_change_request(&authorized_id)
+        .await
         .map_err(|error| error.to_string())?;
     if summary.change_request.id != authorized_id {
         return Err("provider returned a different change request identity".to_string());
@@ -1412,9 +1575,11 @@ pub(crate) fn prepare_merge_change_request(
             &summary.change_request.target_repository,
             &summary.change_request.target_branch,
         )
+        .await
         .map_err(|error| error.to_string())?;
     let details = adapter
         .change_request_details(&summary.change_request)
+        .await
         .map_err(|error| error.to_string())?;
     if !policy_satisfied(&policy, &details, &summary) {
         return Err("provider policy does not currently authorize merge".to_string());
@@ -1428,12 +1593,12 @@ pub(crate) enum GuardedMergeExecution {
     Uncertain(String),
 }
 
-pub(crate) fn execute_guarded_merge(
+pub(crate) async fn execute_guarded_merge(
     config: &Config,
     path: &Path,
     request: &GuardedMerge,
 ) -> Result<MergeMutationResult, String> {
-    match execute_guarded_merge_reconciled(config, path, request) {
+    match execute_guarded_merge_reconciled(config, path, request).await {
         GuardedMergeExecution::Applied(result) => Ok(*result),
         GuardedMergeExecution::Rejected(reason) | GuardedMergeExecution::Uncertain(reason) => {
             Err(reason)
@@ -1441,7 +1606,7 @@ pub(crate) fn execute_guarded_merge(
     }
 }
 
-pub(crate) fn execute_guarded_merge_reconciled(
+pub(crate) async fn execute_guarded_merge_reconciled(
     config: &Config,
     path: &Path,
     request: &GuardedMerge,
@@ -1450,11 +1615,11 @@ pub(crate) fn execute_guarded_merge_reconciled(
         Ok(adapter) => adapter,
         Err(reason) => return GuardedMergeExecution::Rejected(reason),
     };
-    let error = match adapter.merge_change_request(request) {
+    let error = match adapter.merge_change_request(request).await {
         Ok(result) => return GuardedMergeExecution::Applied(Box::new(result)),
         Err(error) => error.to_string(),
     };
-    let observed = match adapter.observe_change_request(&request.id) {
+    let observed = match adapter.observe_change_request(&request.id).await {
         Ok(observed) => observed,
         Err(_) => return GuardedMergeExecution::Uncertain(error),
     };
@@ -1469,14 +1634,15 @@ pub(crate) fn execute_guarded_merge_reconciled(
     }
 }
 
-pub(crate) fn resolve_review_thread(
+pub(crate) async fn resolve_review_thread(
     path: &Path,
     config: &Config,
     summary: &PrSummary,
     thread_id: &str,
 ) -> Result<(), String> {
     let change_request = change_request_from_legacy(summary)?;
-    configured_remote_repositories(path, config)?
+    configured_remote_repositories(path, config)
+        .await?
         .validate_target_repository(&change_request.target_repository)
         .map_err(|_| "change request repository changed before thread resolution".to_string())?;
     let adapter = Adapter::for_repository(path, config, change_request.id.repository())?;
@@ -1488,10 +1654,11 @@ pub(crate) fn resolve_review_thread(
     };
     adapter
         .resolve_review_thread(&request)
+        .await
         .map_err(|error| error.to_string())
 }
 
-pub(crate) fn wait_for_change_request_merged(
+pub(crate) async fn wait_for_change_request_merged(
     path: &Path,
     expected: &ChangeRequest,
     config: &Config,
@@ -1499,7 +1666,7 @@ pub(crate) fn wait_for_change_request_merged(
     let mut last_summary = None;
     let mut last_error = None;
     for attempt in 0..MERGE_VERIFY_ATTEMPTS {
-        match observe_exact_change_request(path, expected, config) {
+        match observe_exact_change_request(path, expected, config).await {
             Ok(summary) if summary.lifecycle == LifecycleState::Merged => return Ok(summary),
             Ok(summary) => {
                 last_summary = Some(summary);
@@ -1508,7 +1675,7 @@ pub(crate) fn wait_for_change_request_merged(
             Err(error) => last_error = Some(error),
         }
         if attempt + 1 < MERGE_VERIFY_ATTEMPTS {
-            std::thread::sleep(MERGE_VERIFY_INTERVAL);
+            tokio::time::sleep(MERGE_VERIFY_INTERVAL).await;
         }
     }
     last_summary.ok_or_else(|| {
@@ -1517,7 +1684,7 @@ pub(crate) fn wait_for_change_request_merged(
     })
 }
 
-fn observe_exact_change_request(
+async fn observe_exact_change_request(
     path: &Path,
     expected: &ChangeRequest,
     config: &Config,
@@ -1525,6 +1692,7 @@ fn observe_exact_change_request(
     let adapter = Adapter::for_repository(path, config, expected.id.repository())?;
     let observed = adapter
         .observe_change_request(&expected.id)
+        .await
         .map_err(|error| error.to_string())?;
     let request = &observed.change_request;
     if request.id != expected.id
@@ -1546,14 +1714,14 @@ fn observe_exact_change_request(
 /// Resolve an opaque workflow Change Request reference through the repository's configured
 /// provider adapter and return one current, exact-head Gate observation. Extensions receive only
 /// the normalized value; provider credentials and adapter identities remain inside Prism.
-pub(crate) fn observe_workflow_change_request(
+pub(crate) async fn observe_workflow_change_request(
     path: &Path,
     config: &Config,
     subject_id: &str,
     expected_head: &str,
     operation: &str,
 ) -> Result<serde_json::Value, String> {
-    let (adapter, discovered) = Adapter::resolve(path, config)?;
+    let (adapter, discovered) = Adapter::resolve(path, config).await?;
     let marker = ":change_request:";
     let (repository_key, native_id) = subject_id
         .rsplit_once(marker)
@@ -1571,6 +1739,7 @@ pub(crate) fn observe_workflow_change_request(
         .map_err(|error| error.to_string())?;
     let summary = adapter
         .list_change_requests(&discovered.repository.id, None)
+        .await
         .map_err(|error| error.to_string())?
         .into_iter()
         .find(|summary| summary.change_request.id.native_id() == &native_id)
@@ -1579,19 +1748,29 @@ pub(crate) fn observe_workflow_change_request(
         return Err("Change Request head changed before workflow observation".into());
     }
 
-    let details = matches!(operation, "review" | "policy")
-        .then(|| adapter.change_request_details(&summary.change_request))
-        .transpose()
-        .map_err(|error| error.to_string())?;
-    let policy = (operation == "policy")
-        .then(|| {
-            adapter.repository_policy(
-                &summary.change_request.target_repository,
-                &summary.change_request.target_branch,
-            )
-        })
-        .transpose()
-        .map_err(|error| error.to_string())?;
+    let details = if matches!(operation, "review" | "policy") {
+        Some(
+            adapter
+                .change_request_details(&summary.change_request)
+                .await
+                .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
+    };
+    let policy = if operation == "policy" {
+        Some(
+            adapter
+                .repository_policy(
+                    &summary.change_request.target_repository,
+                    &summary.change_request.target_branch,
+                )
+                .await
+                .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
+    };
 
     let satisfied = match operation {
         "ci" => matches!(
@@ -1660,7 +1839,7 @@ pub(crate) fn observe_workflow_change_request(
 
 /// Resolve one exact review thread for an opaque workflow Change Request identity. The current
 /// head is reobserved immediately before mutation.
-pub(crate) fn resolve_workflow_review_thread(
+pub(crate) async fn resolve_workflow_review_thread(
     path: &Path,
     config: &Config,
     subject_id: &str,
@@ -1668,7 +1847,7 @@ pub(crate) fn resolve_workflow_review_thread(
     thread_id: &str,
     expected_thread_revision: &str,
 ) -> Result<(), String> {
-    let (adapter, discovered) = Adapter::resolve(path, config)?;
+    let (adapter, discovered) = Adapter::resolve(path, config).await?;
     let (repository_key, native_id) = subject_id
         .rsplit_once(":change_request:")
         .ok_or_else(|| "opaque subject is not a Change Request identity".to_string())?;
@@ -1685,6 +1864,7 @@ pub(crate) fn resolve_workflow_review_thread(
         .map_err(|error| error.to_string())?;
     let summary = adapter
         .list_change_requests(&discovered.repository.id, None)
+        .await
         .map_err(|error| error.to_string())?
         .into_iter()
         .find(|summary| summary.change_request.id.native_id() == &native_id)
@@ -1694,6 +1874,7 @@ pub(crate) fn resolve_workflow_review_thread(
     }
     let details = adapter
         .change_request_details(&summary.change_request)
+        .await
         .map_err(|error| error.to_string())?;
     let native_thread =
         NativeReviewThreadId::new(thread_id.to_string()).map_err(|error| error.to_string())?;
@@ -1724,16 +1905,17 @@ pub(crate) fn resolve_workflow_review_thread(
             thread_id: native_thread,
             expected_head_sha: expected_head.to_string(),
         })
+        .await
         .map_err(|error| error.to_string())
 }
 
-pub(crate) fn merge_workflow_change_request(
+pub(crate) async fn merge_workflow_change_request(
     path: &Path,
     config: &Config,
     subject_id: &str,
     expected_head: &str,
 ) -> Result<serde_json::Value, String> {
-    let (adapter, discovered) = Adapter::resolve(path, config)?;
+    let (adapter, discovered) = Adapter::resolve(path, config).await?;
     let marker = ":change_request:";
     let (repository_key, native_id) = subject_id
         .rsplit_once(marker)
@@ -1751,6 +1933,7 @@ pub(crate) fn merge_workflow_change_request(
         .map_err(|error| error.to_string())?;
     let summary = adapter
         .list_change_requests(&discovered.repository.id, None)
+        .await
         .map_err(|error| error.to_string())?
         .into_iter()
         .find(|summary| summary.change_request.id.native_id() == &native_id)
@@ -1771,6 +1954,7 @@ pub(crate) fn merge_workflow_change_request(
         .map_err(|error| error.to_string())?;
     let result = adapter
         .merge_change_request(&request)
+        .await
         .map_err(|error| error.to_string())?;
     Ok(serde_json::json!({
         "status": match result.outcome {
@@ -1848,7 +2032,7 @@ fn policy_satisfied(
         && queue_policy_known
 }
 
-pub(crate) fn observe_change_request_identity(
+pub(crate) async fn observe_change_request_identity(
     path: &Path,
     config: &Config,
     identity: &CanonicalChangeRequestIdentity,
@@ -1860,11 +2044,13 @@ pub(crate) fn observe_change_request_identity(
     let target = identity
         .target_repository()
         .map_err(|error| error.to_string())?;
-    configured_remote_repositories(path, config)?
+    configured_remote_repositories(path, config)
+        .await?
         .validate_target_repository(&target)
         .map_err(|_| "change request repository changed since authorization".to_string())?;
     let observed = Adapter::for_repository(path, config, &target)?
         .observe_change_request(&id)
+        .await
         .map_err(|error| error.to_string())?;
     if observed.change_request.id != id {
         return Err("provider returned a different change request identity".to_string());
@@ -1872,18 +2058,20 @@ pub(crate) fn observe_change_request_identity(
     Ok(observed)
 }
 
-pub(crate) fn observe_change_request_for_source(
+pub(crate) async fn observe_change_request_for_source(
     path: &Path,
     config: &Config,
     target: &RemoteRepositoryId,
     source_branch: &str,
     expected_head: &str,
 ) -> Result<Option<ChangeRequestSummary>, String> {
-    configured_remote_repositories(path, config)?
+    configured_remote_repositories(path, config)
+        .await?
         .validate_target_repository(target)
         .map_err(|_| "change request target repository is not configured".to_string())?;
     let matches = Adapter::for_repository(path, config, target)?
         .list_change_requests(target, Some(source_branch))
+        .await
         .map_err(|error| error.to_string())?
         .into_iter()
         .filter(|summary| {
@@ -1898,7 +2086,7 @@ pub(crate) fn observe_change_request_for_source(
     }
 }
 
-pub(crate) fn review_thread_resolution_state(
+pub(crate) async fn review_thread_resolution_state(
     path: &Path,
     config: &Config,
     identity: &CanonicalChangeRequestIdentity,
@@ -1906,7 +2094,7 @@ pub(crate) fn review_thread_resolution_state(
     expected_head: &str,
     thread_id: &str,
 ) -> Result<Option<bool>, String> {
-    let summary = observe_change_request_identity(path, config, identity, display_number)?;
+    let summary = observe_change_request_identity(path, config, identity, display_number).await?;
     if summary.change_request.head_sha != expected_head {
         return Err("change request head changed before review-thread observation".to_string());
     }
@@ -1914,6 +2102,7 @@ pub(crate) fn review_thread_resolution_state(
         NativeReviewThreadId::new(thread_id.to_string()).map_err(|error| error.to_string())?;
     let details = Adapter::for_repository(path, config, summary.change_request.id.repository())?
         .change_request_details(&summary.change_request)
+        .await
         .map_err(|error| error.to_string())?;
     match details.review_threads {
         Observation::Known(threads) => Ok(threads
@@ -1925,7 +2114,7 @@ pub(crate) fn review_thread_resolution_state(
     }
 }
 
-pub(crate) fn resolve_review_thread_identity(
+pub(crate) async fn resolve_review_thread_identity(
     path: &Path,
     config: &Config,
     identity: &CanonicalChangeRequestIdentity,
@@ -1933,7 +2122,7 @@ pub(crate) fn resolve_review_thread_identity(
     expected_head: &str,
     thread_id: &str,
 ) -> Result<(), String> {
-    let summary = observe_change_request_identity(path, config, identity, display_number)?;
+    let summary = observe_change_request_identity(path, config, identity, display_number).await?;
     if summary.change_request.head_sha != expected_head {
         return Err("change request head changed before review-thread resolution".to_string());
     }
@@ -1945,6 +2134,7 @@ pub(crate) fn resolve_review_thread_identity(
     };
     Adapter::for_repository(path, config, request.id.repository())?
         .resolve_review_thread(&request)
+        .await
         .map_err(|error| error.to_string())
 }
 
@@ -2281,8 +2471,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn push_guard_uses_git_push_destination_and_canonical_push_url() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn push_guard_uses_git_push_destination_and_canonical_push_url() {
         let directory = std::env::temp_dir().join(format!(
             "prism-push-guard-{}-{}",
             std::process::id(),
@@ -2309,7 +2499,7 @@ esac
 "#,
         );
 
-        let guard = prepare_push(&directory, &config, "feature").unwrap();
+        let guard = prepare_push(&directory, &config, "feature").await.unwrap();
 
         assert_eq!(guard.remote, "publish");
         assert_eq!(guard.remote_branch, "review/feature");
@@ -2346,8 +2536,8 @@ esac
         }
     }
 
-    #[test]
-    fn fork_fetch_uses_the_configured_target_request_ref() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fork_fetch_uses_the_configured_target_request_ref() {
         let source = repository(ProviderKind::GitHub, "contributor/widget");
         let target = repository(ProviderKind::GitHub, "acme/widget");
         let configured = [("origin", source.clone()), ("upstream", target.clone())];
@@ -2367,8 +2557,8 @@ esac
     }
 
     #[cfg(unix)]
-    #[test]
-    fn upstream_github_review_uses_the_canonical_target_repository() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn upstream_github_review_uses_the_canonical_target_repository() {
         let directory = std::env::temp_dir().join(format!(
             "prism-upstream-review-{}-{}",
             std::process::id(),
@@ -2431,6 +2621,7 @@ esac
             ReviewSubmissionKind::Approve,
             "looks good".to_string(),
         )
+        .await
         .unwrap();
 
         assert_eq!(
@@ -2441,8 +2632,8 @@ esac
     }
 
     #[cfg(unix)]
-    #[test]
-    fn cached_github_details_use_canonical_target_number_not_origin_branch() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cached_github_details_use_canonical_target_number_not_origin_branch() {
         let directory = std::env::temp_dir().join(format!(
             "prism-upstream-details-{}-{}",
             std::process::id(),
@@ -2510,7 +2701,8 @@ esac
             &mut cache,
             &directory,
             &config,
-        );
+        )
+        .await;
 
         let commands = std::fs::read_to_string(&log).unwrap();
         assert!(commands.contains("owner=acme"));
@@ -2519,8 +2711,8 @@ esac
         std::fs::remove_dir_all(directory).unwrap();
     }
 
-    #[test]
-    fn forgejo_fetch_uses_the_canonical_source_branch() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forgejo_fetch_uses_the_canonical_source_branch() {
         let source = repository(ProviderKind::Forgejo, "contributor/widget");
         let target = repository(ProviderKind::Forgejo, "acme/widget");
         let configured = [("origin", source.clone()), ("upstream", target.clone())];
@@ -2539,8 +2731,8 @@ esac
         assert_eq!(fetch.remote_ref, "refs/heads/topic");
     }
 
-    #[test]
-    fn forgejo_fork_fetch_uses_the_configured_target_request_ref_without_source_remote() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forgejo_fork_fetch_uses_the_configured_target_request_ref_without_source_remote() {
         let source = repository(ProviderKind::Forgejo, "contributor/widget");
         let target = repository(ProviderKind::Forgejo, "acme/widget");
         let configured = [("origin", target.clone())];
@@ -2559,8 +2751,8 @@ esac
         assert_eq!(fetch.remote_ref, "refs/pull/42/head");
     }
 
-    #[test]
-    fn fetch_rejects_unconfigured_source_and_target_repositories() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fetch_rejects_unconfigured_source_and_target_repositories() {
         let source = repository(ProviderKind::GitLab, "contributor/widget");
         let target = repository(ProviderKind::GitLab, "acme/widget");
         let configured = [(
@@ -2583,8 +2775,8 @@ esac
     }
 
     #[cfg(unix)]
-    #[test]
-    fn change_request_discovery_includes_distinct_origin_and_upstream_identities() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn change_request_discovery_includes_distinct_origin_and_upstream_identities() {
         let directory = std::env::temp_dir().join(format!(
             "prism-remote-identities-{}-{}",
             std::process::id(),
@@ -2610,7 +2802,9 @@ esac
 "#,
         );
 
-        let repositories = configured_change_request_repositories(&directory, &config).unwrap();
+        let repositories = configured_change_request_repositories(&directory, &config)
+            .await
+            .unwrap();
 
         assert_eq!(
             repositories,
@@ -2623,8 +2817,8 @@ esac
     }
 
     #[cfg(unix)]
-    #[test]
-    fn triangular_remote_identities_are_independent_deduplicated_and_guard_mutations() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn triangular_remote_identities_are_independent_deduplicated_and_guard_mutations() {
         let directory = std::env::temp_dir().join(format!(
             "prism-triangular-identities-{}-{}",
             std::process::id(),
@@ -2650,7 +2844,9 @@ esac
 "#,
         );
 
-        let remotes = configured_remote_repositories(&directory, &config).unwrap();
+        let remotes = configured_remote_repositories(&directory, &config)
+            .await
+            .unwrap();
         let target = repository(ProviderKind::GitHub, "acme/widget");
         let source = repository(ProviderKind::GitHub, "contributor/widget");
 
@@ -2667,7 +2863,9 @@ esac
         );
         assert_eq!(remotes.create_target(None).unwrap(), target);
         assert_eq!(
-            configured_change_request_repositories(&directory, &config).unwrap(),
+            configured_change_request_repositories(&directory, &config)
+                .await
+                .unwrap(),
             std::slice::from_ref(&target)
         );
         assert!(remotes.validate_source_mutation(&source, &target).is_ok());
@@ -2684,8 +2882,8 @@ esac
     }
 
     #[cfg(unix)]
-    #[test]
-    fn triangular_create_uses_origin_push_source_and_explicit_fetch_target() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn triangular_create_uses_origin_push_source_and_explicit_fetch_target() {
         let directory = std::env::temp_dir().join(format!(
             "prism-triangular-create-{}-{}",
             std::process::id(),
@@ -2742,7 +2940,7 @@ esac
             Repository::with_config_dir_for_test(directory.clone(), directory.join("config"));
         let mut cache = PrCache::default();
         let target = repository(ProviderKind::GitHub, "acme/widget");
-        let source_push = prepare_push(&directory, &config, "topic").unwrap();
+        let source_push = prepare_push(&directory, &config, "topic").await.unwrap();
 
         create_change_request(
             &repo,
@@ -2756,6 +2954,7 @@ esac
             },
             &mut cache,
         )
+        .await
         .unwrap();
 
         let identity = cache
@@ -2809,8 +3008,8 @@ esac
     }
 
     #[cfg(unix)]
-    #[test]
-    fn polling_associates_the_configured_branch_push_repository_as_source() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn polling_associates_the_configured_branch_push_repository_as_source() {
         let directory = std::env::temp_dir().join(format!(
             "prism-triangular-poll-{}-{}",
             std::process::id(),
@@ -2858,6 +3057,7 @@ printf '%s\n' '{{"data":{{"repository":{{"pullRequests":{{"nodes":[{{"id":"PR_fo
         let mut cache = PrCache::default();
 
         refresh_change_request_cache(&repo, "topic", &mut cache, &directory, &config, false)
+            .await
             .unwrap();
 
         let identity = cache
@@ -2879,8 +3079,8 @@ printf '%s\n' '{{"data":{{"repository":{{"pullRequests":{{"nodes":[{{"id":"PR_fo
     }
 
     #[cfg(unix)]
-    #[test]
-    fn maintainer_target_checkout_can_merge_a_fork_change_request() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn maintainer_target_checkout_can_merge_a_fork_change_request() {
         let directory = std::env::temp_dir().join(format!(
             "prism-changed-push-{}-{}",
             std::process::id(),
@@ -2946,6 +3146,7 @@ esac
             42,
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         )
+        .await
         .unwrap();
 
         assert_eq!(
@@ -2960,8 +3161,8 @@ esac
     }
 
     #[cfg(unix)]
-    #[test]
-    fn maintainer_target_checkout_can_resolve_a_fork_review_thread() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn maintainer_target_checkout_can_resolve_a_fork_review_thread() {
         let directory = std::env::temp_dir().join(format!(
             "prism-maintainer-resolve-{}-{}",
             std::process::id(),
@@ -3020,7 +3221,9 @@ esac
             &target,
         ));
 
-        resolve_review_thread(&directory, &config, &summary, "PRRT_1").unwrap();
+        resolve_review_thread(&directory, &config, &summary, "PRRT_1")
+            .await
+            .unwrap();
 
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -3126,8 +3329,8 @@ esac
         assert_eq!(round_trip.native_state_evidence.queue, ["PREPARING"]);
     }
 
-    #[test]
-    fn compatibility_conversion_preserves_comment_count_and_ui_check_labels() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compatibility_conversion_preserves_comment_count_and_ui_check_labels() {
         let labels = [
             ("pending", "running"),
             ("running", "running"),
@@ -3162,8 +3365,8 @@ esac
     }
 
     #[cfg(unix)]
-    #[test]
-    fn cached_github_exact_lookup_absence_clears_stale_summary_authoritatively() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cached_github_exact_lookup_absence_clears_stale_summary_authoritatively() {
         let directory = std::env::temp_dir().join(format!(
             "prism-github-exact-absence-{}-{}",
             std::process::id(),
@@ -3201,6 +3404,7 @@ printf '%s\n' '{"data":{"repository":{"pullRequest":null}}}'
         let mut cache = PrCache::observed(legacy_summary_fixture(), None);
 
         refresh_change_request_cache(&repo, "topic", &mut cache, &directory, &config, false)
+            .await
             .unwrap();
 
         assert!(cache.summary().is_none());
@@ -3214,8 +3418,8 @@ printf '%s\n' '{"data":{"repository":{"pullRequest":null}}}'
     }
 
     #[cfg(unix)]
-    #[test]
-    fn merge_verification_observes_the_canonical_fork_target() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merge_verification_observes_the_canonical_fork_target() {
         let directory = std::env::temp_dir().join(format!(
             "prism-fork-merge-verification-{}-{}",
             std::process::id(),
@@ -3254,7 +3458,9 @@ printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_fork","number"
             head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
         };
 
-        let observed = wait_for_change_request_merged(&directory, &expected, &config).unwrap();
+        let observed = wait_for_change_request_merged(&directory, &expected, &config)
+            .await
+            .unwrap();
 
         assert_eq!(observed.lifecycle, LifecycleState::Merged);
         let commands = std::fs::read_to_string(&log).unwrap();
@@ -3315,8 +3521,8 @@ printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_fork","number"
         );
     }
 
-    #[test]
-    fn stale_current_details_update_display_but_remain_untrusted() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stale_current_details_update_display_but_remain_untrusted() {
         let mut cache = PrCache::observed(
             legacy_summary_fixture(),
             Some(PrDetails {
@@ -3366,8 +3572,8 @@ printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_fork","number"
     }
 
     #[cfg(unix)]
-    #[test]
-    fn changed_head_is_not_published_to_the_destination_branch() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn changed_head_is_not_published_to_the_destination_branch() {
         let directory = std::env::temp_dir().join(format!(
             "prism-fetch-{}-{}",
             std::process::id(),
@@ -3401,8 +3607,9 @@ exit 1
         );
         let summary = legacy_summary_fixture();
 
-        let error =
-            fetch_change_request_branch(&directory, &config, &summary, "pr/42").unwrap_err();
+        let error = fetch_change_request_branch(&directory, &config, &summary, "pr/42")
+            .await
+            .unwrap_err();
 
         assert!(error.contains("head changed"));
         let commands = std::fs::read_to_string(&log).unwrap();
@@ -3413,10 +3620,110 @@ exit 1
     }
 
     #[cfg(unix)]
-    #[test]
-    fn existing_destination_branch_is_preserved() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancellation_during_fetch_still_deletes_the_temporary_ref() {
+        let directory = std::env::temp_dir().join(format!(
+            "prism-fetch-cancel-{}-{}",
+            std::process::id(),
+            crate::util::timestamp_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let log = directory.join("git.log");
+        let fetch_started = directory.join("fetch-started");
+        let mut config = crate::test_support::test_config();
+        crate::test_support::install_tool(
+            &mut config,
+            &directory,
+            "git",
+            &format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$*" in
+  *"remote get-url origin"*) printf '%s\n' 'https://github.com/example/repo.git'; exit 0 ;;
+  *"remote get-url upstream"*) exit 2 ;;
+  *"check-ref-format"*) exit 0 ;;
+  *"fetch origin"*) touch '{}'; sleep 30; exit 0 ;;
+  *"update-ref -d refs/prism/change-requests/"*) exit 0 ;;
+esac
+exit 1
+"#,
+                log.display(),
+                fetch_started.display()
+            ),
+        );
+        let token = crate::process::CancellationToken::new();
+        let cancel = token.clone();
+        let marker = fetch_started.clone();
+        let cancellation = tokio::spawn(async move {
+            while !marker.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            cancel.cancel();
+        });
+
+        let error = crate::process::with_cancellation(
+            token,
+            fetch_change_request_branch(&directory, &config, &legacy_summary_fixture(), "pr/42"),
+        )
+        .await
+        .unwrap_err();
+        cancellation.await.unwrap();
+
+        assert!(crate::process::is_cancellation_error(&error), "{error}");
+        let commands = std::fs::read_to_string(&log).unwrap();
+        assert!(commands.contains("fetch origin"));
+        assert!(commands.contains("update-ref -d refs/prism/change-requests/"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn existing_destination_branch_is_preserved() {
         let directory = std::env::temp_dir().join(format!(
             "prism-fetch-existing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let log = directory.join("git.log");
+        let mut config = crate::test_support::test_config();
+        crate::test_support::install_tool(
+            &mut config,
+            &directory,
+            "git",
+            &format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$*" in
+  *"remote get-url origin"*) printf '%s\n' 'https://github.com/example/repo.git'; exit 0 ;;
+  *"remote get-url upstream"*) exit 2 ;;
+  *"check-ref-format"*) exit 0 ;;
+  *"rev-parse --verify refs/heads/pr/42"*) printf '%s\n' 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; exit 0 ;;
+esac
+exit 1
+"#,
+                log.display()
+            ),
+        );
+
+        fetch_change_request_branch(&directory, &config, &legacy_summary_fixture(), "pr/42")
+            .await
+            .unwrap();
+
+        let commands = std::fs::read_to_string(&log).unwrap();
+        assert!(!commands.contains("fetch origin"));
+        assert!(!commands.contains("update-ref refs/heads/pr/42"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn existing_destination_branch_at_another_head_is_rejected() {
+        let directory = std::env::temp_dir().join(format!(
+            "prism-fetch-existing-mismatch-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -3445,9 +3752,15 @@ exit 1
             ),
         );
 
-        fetch_change_request_branch(&directory, &config, &legacy_summary_fixture(), "pr/42")
-            .unwrap();
+        let error =
+            fetch_change_request_branch(&directory, &config, &legacy_summary_fixture(), "pr/42")
+                .await
+                .unwrap_err();
 
+        assert!(
+            error.contains("already exists at a different commit"),
+            "{error}"
+        );
         let commands = std::fs::read_to_string(&log).unwrap();
         assert!(!commands.contains("fetch origin"));
         assert!(!commands.contains("update-ref refs/heads/pr/42"));
@@ -3455,8 +3768,8 @@ exit 1
     }
 
     #[cfg(unix)]
-    #[test]
-    fn destination_branch_race_fails_the_compare_and_swap_publication() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn destination_branch_race_fails_the_compare_and_swap_publication() {
         let directory = std::env::temp_dir().join(format!(
             "prism-fetch-race-{}-{}",
             std::process::id(),
@@ -3493,6 +3806,7 @@ exit 1
 
         let error =
             fetch_change_request_branch(&directory, &config, &legacy_summary_fixture(), "pr/42")
+                .await
                 .unwrap_err();
 
         assert!(error.contains("update-ref"));
@@ -3505,8 +3819,8 @@ exit 1
     }
 
     #[cfg(unix)]
-    #[test]
-    fn forgejo_target_request_ref_still_requires_the_exact_observed_sha() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forgejo_target_request_ref_still_requires_the_exact_observed_sha() {
         let directory = std::env::temp_dir().join(format!(
             "prism-forgejo-fork-fetch-{}-{}",
             std::process::id(),
@@ -3548,8 +3862,9 @@ exit 1
             &target,
         ));
 
-        let error =
-            fetch_change_request_branch(&directory, &config, &summary, "pr/42").unwrap_err();
+        let error = fetch_change_request_branch(&directory, &config, &summary, "pr/42")
+            .await
+            .unwrap_err();
 
         assert!(error.contains("head changed"));
         let commands = std::fs::read_to_string(&log).unwrap();
@@ -3560,8 +3875,8 @@ exit 1
     }
 
     #[cfg(unix)]
-    #[test]
-    fn gitlab_policy_cache_persists_only_classified_static_errors() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gitlab_policy_cache_persists_only_classified_static_errors() {
         let directory = std::env::temp_dir().join(format!(
             "prism-gitlab-safe-policy-cache-{}-{}",
             std::process::id(),
@@ -3592,9 +3907,9 @@ esac
 printf '%s\n' 'https://attacker.example/collect?access_token=query-secret'
 printf '%s\n' '{"message":"malicious multiline response body"}'
 printf '%s\n' 'HTTP 503 Service Unavailable' >&2
-printf '%s\n' 'glpat-direct-secret' >&2
+printf '%s%s\n' 'glpat-' 'direct-secret' >&2
 printf '%s\n' 'Authorization: Bearer bearer-header-secret' >&2
-printf '%s\n' 'PRIVATE-TOKEN: glpat-private-header-secret' >&2
+printf '%s%s\n' 'PRIVATE-TOKEN: glpat-' 'private-header-secret' >&2
 printf '%s\n' 'injected cache line' 'another injected line' >&2
 exit 17
 "#,
@@ -3602,7 +3917,9 @@ exit 17
         let repo =
             Repository::with_config_dir_for_test(directory.clone(), directory.join("config"));
 
-        let cache = refresh_repository_policy(&repo, &directory, &config).unwrap();
+        let cache = refresh_repository_policy(&repo, &directory, &config)
+            .await
+            .unwrap();
         let expected = "GitLab observe_repository_policy failed: provider; retry=retryable; status=503; exit=17; hint=backoff";
         assert!(
             cache
@@ -3619,9 +3936,9 @@ exit 17
         assert_eq!(persisted.error, cache.error);
         let persisted_error = persisted.error.unwrap();
         for untrusted in [
-            "glpat-direct-secret",
+            concat!("glpat-", "direct-secret"),
             "bearer-header-secret",
-            "glpat-private-header-secret",
+            concat!("glpat-", "private-header-secret"),
             "query-secret",
             "Authorization",
             "PRIVATE-TOKEN",

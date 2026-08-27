@@ -33,13 +33,25 @@ pub enum CommandKind {
         source: PathBuf,
         destination: PathBuf,
     },
+    OpencodeServerSupervisor {
+        program: PathBuf,
+        repository: PathBuf,
+        port: u16,
+    },
     List(InspectOptions),
     Status(StatusOptions),
     Pause(Option<String>),
     Resume(Option<String>),
     Stop(Option<String>),
-    Recover(Option<String>),
+    Recover(RecoverOptions),
     Daemon(DaemonCommand),
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RecoverOptions {
+    pub selector: Option<String>,
+    pub outcome: Option<String>,
+    pub evidence: Option<String>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -258,6 +270,34 @@ impl Args {
                     }
                     break;
                 }
+                "__opencode-server" => {
+                    let program = iter.next().ok_or_else(|| {
+                        "__opencode-server requires <program> <repository> <port>".to_string()
+                    })?;
+                    let repository = iter.next().ok_or_else(|| {
+                        "__opencode-server requires <program> <repository> <port>".to_string()
+                    })?;
+                    let port = iter
+                        .next()
+                        .ok_or_else(|| {
+                            "__opencode-server requires <program> <repository> <port>".to_string()
+                        })?
+                        .to_string_lossy()
+                        .parse::<u16>()
+                        .map_err(|_| "__opencode-server requires a valid TCP port".to_string())?;
+                    if let Some(extra) = iter.next() {
+                        return Err(format!(
+                            "unknown __opencode-server argument: {}",
+                            extra.to_string_lossy()
+                        ));
+                    }
+                    command = CommandKind::OpencodeServerSupervisor {
+                        program: PathBuf::from(program),
+                        repository: PathBuf::from(repository),
+                        port,
+                    };
+                    break;
+                }
                 "__prepare-dev-state" => {
                     let source = iter.next().ok_or_else(|| {
                         "__prepare-dev-state requires <source> <destination>".to_string()
@@ -341,6 +381,8 @@ impl Args {
                 "pause" | "resume" | "stop" | "recover" => {
                     let name = text.into_owned();
                     let mut selector = None;
+                    let mut outcome = None;
+                    let mut evidence = None;
                     while let Some(value) = iter.next() {
                         let value = value.to_string_lossy().to_string();
                         if value == "--repo" && repo.is_none() {
@@ -350,6 +392,26 @@ impl Args {
                             ));
                         } else if value == "--repo" {
                             return Err("--repo accepts only one path".to_string());
+                        } else if name == "recover" && value == "--outcome" {
+                            if outcome.is_some() {
+                                return Err("--outcome accepts only one value".to_string());
+                            }
+                            outcome = Some(
+                                iter.next()
+                                    .ok_or_else(|| "--outcome requires a value".to_string())?
+                                    .to_string_lossy()
+                                    .to_string(),
+                            );
+                        } else if name == "recover" && value == "--evidence" {
+                            if evidence.is_some() {
+                                return Err("--evidence accepts only one value".to_string());
+                            }
+                            evidence = Some(
+                                iter.next()
+                                    .ok_or_else(|| "--evidence requires text".to_string())?
+                                    .to_string_lossy()
+                                    .to_string(),
+                            );
                         } else if selector.is_none() {
                             selector = Some(value);
                         } else {
@@ -360,7 +422,11 @@ impl Args {
                         "pause" => CommandKind::Pause(selector),
                         "resume" => CommandKind::Resume(selector),
                         "stop" => CommandKind::Stop(selector),
-                        _ => CommandKind::Recover(selector),
+                        _ => CommandKind::Recover(RecoverOptions {
+                            selector,
+                            outcome,
+                            evidence,
+                        }),
                     };
                     break;
                 }
@@ -552,6 +618,32 @@ mod tests {
     }
 
     #[test]
+    fn internal_opencode_server_supervisor_parses_exact_launch_contract() {
+        assert_eq!(
+            parse(&[
+                "__opencode-server",
+                "C:/tools/opencode.cmd",
+                "C:/repo with spaces",
+                "43123",
+            ]),
+            CommandKind::OpencodeServerSupervisor {
+                program: PathBuf::from("C:/tools/opencode.cmd"),
+                repository: PathBuf::from("C:/repo with spaces"),
+                port: 43123,
+            }
+        );
+        assert!(Args::parse(["__opencode-server".into()]).is_err());
+        assert!(
+            Args::parse(
+                ["__opencode-server", "opencode", "repo", "not-a-port"]
+                    .into_iter()
+                    .map(OsString::from)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn inspection_and_control_commands_parse() {
         assert_eq!(
             parse(&["list", "--all", "--json"]),
@@ -576,7 +668,25 @@ mod tests {
             parse(&["stop", "w:run-1"]),
             CommandKind::Stop(Some("w:run-1".to_string()))
         );
-        assert_eq!(parse(&["recover"]), CommandKind::Recover(None));
+        assert_eq!(
+            parse(&["recover"]),
+            CommandKind::Recover(RecoverOptions::default())
+        );
+        assert_eq!(
+            parse(&[
+                "recover",
+                "w:run-1",
+                "--outcome",
+                "rejected-before-effect",
+                "--evidence",
+                "provider rejected request R-17"
+            ]),
+            CommandKind::Recover(RecoverOptions {
+                selector: Some("w:run-1".to_string()),
+                outcome: Some("rejected-before-effect".to_string()),
+                evidence: Some("provider rejected request R-17".to_string()),
+            })
+        );
     }
 
     #[test]

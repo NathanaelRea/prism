@@ -17,14 +17,15 @@ use super::super::PanelFocus;
 use super::super::command::{CommandOutcome, CommandState, DashboardCommand};
 use super::support::{ScriptedTerminal, test_pr_summary, test_tui};
 
-#[test]
-fn semantic_commands_dispatch_without_the_crossterm_adapter() {
+#[tokio::test]
+async fn semantic_commands_dispatch_without_the_crossterm_adapter() {
     let mut tui = test_tui();
     let mut terminal = ScriptedTerminal::default();
     let mut state = CommandState::default();
 
     let outcome = tui
         .dispatch_command(&mut terminal, DashboardCommand::FocusRepos, &mut state)
+        .await
         .unwrap();
 
     assert_eq!(outcome, CommandOutcome::Continue);
@@ -32,12 +33,13 @@ fn semantic_commands_dispatch_without_the_crossterm_adapter() {
     assert_eq!(terminal.draws, 0);
 
     tui.dispatch_command(&mut terminal, DashboardCommand::FocusMerges, &mut state)
+        .await
         .expect("focus merges");
     assert_eq!(tui.focused_panel, PanelFocus::Merges);
 }
 
-#[test]
-fn command_state_is_retained_across_dispatches() {
+#[tokio::test]
+async fn command_state_is_retained_across_dispatches() {
     let mut tui = test_tui();
     let mut terminal = ScriptedTerminal::default();
     let mut state = CommandState::default();
@@ -48,21 +50,24 @@ fn command_state_is_retained_across_dispatches() {
         DashboardCommand::Bottom,
     ] {
         tui.dispatch_command(&mut terminal, command, &mut state)
+            .await
             .unwrap();
     }
     assert_eq!(tui.selected_worktree_index(), Some(3));
 
     tui.dispatch_command(&mut terminal, DashboardCommand::G, &mut state)
+        .await
         .unwrap();
     assert_eq!(tui.selected_worktree_index(), Some(3));
 
     tui.dispatch_command(&mut terminal, DashboardCommand::G, &mut state)
+        .await
         .unwrap();
     assert_eq!(tui.selected_worktree_index(), Some(1));
 }
 
-#[test]
-fn interactive_commands_use_the_terminal_driver_seam() {
+#[tokio::test]
+async fn interactive_commands_use_the_terminal_driver_seam() {
     let mut tui = test_tui();
     let mut terminal = ScriptedTerminal::default();
     terminal.push_key(KeyCode::Enter);
@@ -70,6 +75,7 @@ fn interactive_commands_use_the_terminal_driver_seam() {
 
     let outcome = tui
         .dispatch_command(&mut terminal, DashboardCommand::Help, &mut state)
+        .await
         .unwrap();
 
     assert_eq!(outcome, CommandOutcome::Continue);
@@ -77,8 +83,8 @@ fn interactive_commands_use_the_terminal_driver_seam() {
     assert!(tui.dialog.is_none());
 }
 
-#[test]
-fn enter_on_workflow_stage_opens_workflow_details_before_comment_details() {
+#[tokio::test]
+async fn enter_on_workflow_stage_opens_workflow_details_before_comment_details() {
     let mut tui = test_tui();
     tui.focus_worktrees();
     tui.select_worktree(1);
@@ -176,6 +182,7 @@ fn enter_on_workflow_stage_opens_workflow_details_before_comment_details() {
     let mut state = CommandState::default();
 
     tui.dispatch_command(&mut terminal, DashboardCommand::OpenTmuxSession, &mut state)
+        .await
         .unwrap();
 
     let dialog_titles = terminal

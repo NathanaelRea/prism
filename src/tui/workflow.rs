@@ -66,7 +66,7 @@ impl Tui {
                 revision,
                 Some(TUI_ACTION_JOB_TIMEOUT),
                 "prism-workflow-poll".to_string(),
-                move |_| {
+                move |_| async move {
                     let worker_health =
                         crate::worker::probe_health().and_then(|health| match health.state {
                             crate::worker::DaemonState::Running => Ok(()),
@@ -78,18 +78,21 @@ impl Tui {
                                 Err("Prism worker is stopped".to_string())
                             }
                         });
-                    let repository_snapshot = WorkspaceState::open(WorkspaceContext {
+                    let state = WorkspaceState::open(WorkspaceContext {
                         repo: Some(repo.root.clone()),
                         cwd: repo.root.clone(),
-                    })?
-                    .inspect(InspectRequest {
-                        include_hidden: true,
-                        include_terminal: true,
-                    })?
-                    .repositories
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| "workspace inspection returned no repository".to_string())?;
+                    })
+                    .await?;
+                    let repository_snapshot = state
+                        .inspect(InspectRequest {
+                            include_hidden: true,
+                            include_terminal: true,
+                        })
+                        .await?
+                        .repositories
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| "workspace inspection returned no repository".to_string())?;
                     Ok(Some(TuiJobPayload::WorkflowPoll(WorkflowPollResult {
                         repository: job_repository,
                         revision,

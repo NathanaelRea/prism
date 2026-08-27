@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted
+Superseded by [ADR 0005](0005-native-windows-mechanisms.md). Its Linux/macOS-only declaration is historical and is no longer the active product contract.
 
 ## Context
 

@@ -13,8 +13,8 @@ use super::super::{
 };
 use super::support::{test_config, test_session, unique_temp_dir};
 
-#[test]
-fn running_agent_does_not_block_quit() {
+#[tokio::test(flavor = "multi_thread")]
+async fn running_agent_does_not_block_quit() {
     let repo = Repository {
         root: PathBuf::from("/tmp/repo"),
     };
@@ -26,8 +26,25 @@ fn running_agent_does_not_block_quit() {
     assert!(tui.dialog.is_none());
 }
 
-#[test]
-fn shutdown_notification_requests_the_matching_run_loop_exit_path() {
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_process_scope_exposes_and_cancels_only_its_task_local_token() {
+    let notification = crate::tui_signal::ShutdownNotification::for_test();
+    let task = tokio::spawn(super::super::with_shutdown_process_scope(
+        notification.cancellation(),
+        async {
+            let token = crate::process::current_cancellation().expect("TUI process scope");
+            token.cancelled().await;
+            token.is_cancelled()
+        },
+    ));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    notification.request_for_test(crate::tui_signal::ShutdownSignal::Sigterm);
+    assert!(task.await.unwrap());
+    assert!(crate::process::current_cancellation().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_notification_requests_the_matching_run_loop_exit_path() {
     let notification = crate::tui_signal::ShutdownNotification::for_test();
     assert_eq!(super::super::requested_shutdown(&notification), None);
 
@@ -39,8 +56,8 @@ fn shutdown_notification_requests_the_matching_run_loop_exit_path() {
     );
 }
 
-#[test]
-fn opencode_in_flight_clears_after_panic_and_spawn_failure_then_restarts() {
+#[tokio::test(flavor = "multi_thread")]
+async fn opencode_in_flight_clears_after_panic_and_spawn_failure_then_restarts() {
     let _ = crate::observability::take_captured_events();
     let temp = unique_temp_dir("prism-tui-job-recovery-test");
     fs::create_dir_all(&temp).unwrap();
@@ -53,58 +70,71 @@ fn opencode_in_flight_clears_after_panic_and_spawn_failure_then_restarts() {
     );
 
     tui.opencode_polls_in_flight.insert(key.clone());
-    tui.spawn_tui_job(
+    let panicked_id = tui.spawn_tui_job(
         TuiJobKind::OpencodePoll,
         TuiJobKey::Opencode(key.clone()),
         key.generation,
         Some(Duration::from_secs(1)),
         "panic-before-result".to_string(),
-        |_| panic!("before result"),
+        |_| async { panic!("before result") },
     );
     wait_for_opencode_job(&mut tui, &key);
     assert!(!tui.opencode_polls_in_flight.contains(&key));
 
     tui.opencode_polls_in_flight.insert(key.clone());
     tui.background.fail_next_spawn();
-    tui.spawn_tui_job(
+    let spawn_failed_id = tui.spawn_tui_job(
         TuiJobKind::OpencodePoll,
         TuiJobKey::Opencode(key.clone()),
         key.generation,
         Some(Duration::from_secs(1)),
         "spawn-failure".to_string(),
-        |_| Ok(None),
+        |_| async { Ok(None) },
     );
     wait_for_opencode_job(&mut tui, &key);
     assert!(!tui.opencode_polls_in_flight.contains(&key));
 
     tui.opencode_polls_in_flight.insert(key.clone());
-    tui.spawn_tui_job(
+    let completed_id = tui.spawn_tui_job(
         TuiJobKind::OpencodePoll,
         TuiJobKey::Opencode(key.clone()),
         key.generation,
         Some(Duration::from_secs(1)),
         "restart-after-failure".to_string(),
-        |_| Ok(None),
+        |_| async { Ok(None) },
     );
     wait_for_opencode_job(&mut tui, &key);
     assert!(!tui.opencode_polls_in_flight.contains(&key));
 
-    let terminal_events = crate::observability::take_captured_events()
-        .into_iter()
-        .filter(|event| event.target == "tui_job" && event.action == "terminal")
-        .filter_map(|event| event.data_json)
-        .map(|data| serde_json::from_str::<serde_json::Value>(&data).unwrap())
-        .filter(|data| data["kind"] == "opencode_poll")
-        .filter(|data| {
-            data["key"]
-                .as_str()
-                .is_some_and(|key| key.contains(&temp.display().to_string()))
-        })
-        .collect::<Vec<_>>();
-    for outcome in ["panicked", "spawn_failed", "completed"] {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let key_fragment = format!("{temp:?}");
+    let mut terminal_events = Vec::new();
+    while terminal_events.len() < 3 && Instant::now() < deadline {
+        terminal_events.extend(
+            crate::observability::take_captured_events()
+                .into_iter()
+                .filter(|event| event.target == "tui_job" && event.action == "terminal")
+                .filter_map(|event| event.data_json)
+                .map(|data| serde_json::from_str::<serde_json::Value>(&data).unwrap())
+                .filter(|data| data["kind"] == "opencode_poll")
+                .filter(|data| {
+                    data["key"]
+                        .as_str()
+                        .is_some_and(|key| key.contains(&key_fragment))
+                }),
+        );
+        if terminal_events.len() < 3 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    for (job_id, outcome) in [
+        (panicked_id, "panicked"),
+        (spawn_failed_id, "spawn_failed"),
+        (completed_id, "completed"),
+    ] {
         let matching = terminal_events
             .iter()
-            .filter(|data| data["outcome"] == outcome)
+            .filter(|data| data["job_id"].as_u64() == Some(job_id) && data["outcome"] == outcome)
             .count();
         assert_eq!(matching, 1, "outcome {outcome}");
     }
@@ -112,13 +142,13 @@ fn opencode_in_flight_clears_after_panic_and_spawn_failure_then_restarts() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn tui_tick_terminal_budget_retains_every_remaining_outcome() {
+#[tokio::test(flavor = "multi_thread")]
+async fn tui_tick_terminal_budget_retains_every_remaining_outcome() {
     let repo = Repository {
         root: PathBuf::from("/tmp/repo"),
     };
     let mut tui = Tui::new_single(repo, test_config(), Vec::new());
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(101));
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(101));
     let completed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     for index in 0..100 {
         let barrier = barrier.clone();
@@ -129,20 +159,20 @@ fn tui_tick_terminal_budget_retains_every_remaining_outcome() {
             0,
             None,
             format!("budget-{index}"),
-            move |_| {
-                barrier.wait();
+            move |_| async move {
+                barrier.wait().await;
                 completed.fetch_add(1, std::sync::atomic::Ordering::Release);
                 Ok(None)
             },
         );
     }
-    barrier.wait();
+    barrier.wait().await;
     while completed.load(std::sync::atomic::Ordering::Acquire) != 100 {
-        std::thread::yield_now();
+        tokio::task::yield_now().await;
     }
     while !tui.background.active_metadata().is_empty() {
         tui.background.collect_finished();
-        std::thread::yield_now();
+        tokio::task::yield_now().await;
     }
 
     tui.route_tui_job_messages();
@@ -152,8 +182,8 @@ fn tui_tick_terminal_budget_retains_every_remaining_outcome() {
     assert!(remaining < 100);
 }
 
-#[test]
-fn completed_delete_keeps_in_flight_state_until_its_payload_is_applied() {
+#[tokio::test(flavor = "multi_thread")]
+async fn completed_delete_keeps_in_flight_state_until_its_payload_is_applied() {
     let temp = unique_temp_dir("prism-delete-payload-order-test");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -172,7 +202,7 @@ fn completed_delete_keeps_in_flight_state_until_its_payload_is_applied() {
         key.generation,
         Some(Duration::from_secs(1)),
         "delete-payload-order".to_string(),
-        move |context| {
+        move |context| async move {
             Ok(Some(TuiJobPayload::DeleteSession(DeleteSessionResult {
                 key: result_key,
                 delivery_id: context.id(),
@@ -211,8 +241,8 @@ fn completed_delete_keeps_in_flight_state_until_its_payload_is_applied() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn opencode_snapshot_burst_converges_through_bounded_coalesced_slots() {
+#[tokio::test(flavor = "multi_thread")]
+async fn opencode_snapshot_burst_converges_through_bounded_coalesced_slots() {
     let temp = unique_temp_dir("prism-opencode-coalesced-burst-test");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -250,7 +280,7 @@ fn opencode_snapshot_burst_converges_through_bounded_coalesced_slots() {
             0,
             None,
             "coalesced-listener".to_string(),
-            move |context| {
+            move |context| async move {
                 let send = |context: &crate::tui_jobs::JobContext<_, _, _>, facet, event| {
                     context.send_coalesced(
                         facet,
@@ -297,7 +327,7 @@ fn opencode_snapshot_burst_converges_through_bounded_coalesced_slots() {
                     )?;
                 }
                 ready_tx.send(()).unwrap();
-                while !context.wait(Duration::from_secs(60)) {}
+                while !context.wait(Duration::from_secs(60)).await {}
                 Ok(None)
             },
         );
@@ -325,8 +355,8 @@ fn opencode_snapshot_burst_converges_through_bounded_coalesced_slots() {
     fs::remove_dir_all(temp).unwrap();
 }
 
-#[test]
-fn opencode_overflow_requests_full_reconciliation_and_stale_events_cannot_regress_it() {
+#[tokio::test(flavor = "multi_thread")]
+async fn opencode_overflow_requests_full_reconciliation_and_stale_events_cannot_regress_it() {
     let temp = unique_temp_dir("prism-opencode-overflow-reconcile-test");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -363,7 +393,7 @@ fn opencode_overflow_requests_full_reconciliation_and_stale_events_cannot_regres
             0,
             None,
             "overflow-listener".to_string(),
-            move |context| {
+            move |context| async move {
                 for _ in 0..1_000 {
                     context.send(super::super::TuiJobPayload::OpencodeEvent(
                         super::super::OpencodeEventResult {
@@ -453,8 +483,8 @@ fn opencode_overflow_requests_full_reconciliation_and_stale_events_cannot_regres
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn stale_opencode_job_payload_is_rejected_after_generation_changes() {
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_opencode_job_payload_is_rejected_after_generation_changes() {
     let temp = unique_temp_dir("prism-tui-job-generation-test");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -473,7 +503,7 @@ fn stale_opencode_job_payload_is_rejected_after_generation_changes() {
         key.generation,
         Some(Duration::from_secs(1)),
         "stale-opencode-poll".to_string(),
-        move |_| {
+        move |_| async move {
             Ok(Some(super::super::TuiJobPayload::OpencodePoll(
                 super::super::OpencodePollResult {
                     key: payload_key,
@@ -504,12 +534,13 @@ fn stale_opencode_job_payload_is_rejected_after_generation_changes() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn cleanup_cancels_and_joins_listener_job() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cleanup_cancels_and_joins_listener_job() {
     let _ = crate::observability::take_captured_events();
     let (mut tui, stopped_rx) = tui_with_active_listener("user-quit");
 
     tui.cleanup_tui_jobs(super::super::ShutdownReason::UserQuit)
+        .await
         .unwrap();
 
     stopped_rx.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -530,12 +561,13 @@ fn cleanup_cancels_and_joins_listener_job() {
     assert_eq!(cleanup["unfinished_jobs"], 0);
 }
 
-#[test]
-fn run_error_path_cleans_up_active_listener() {
+#[tokio::test(flavor = "multi_thread")]
+async fn run_error_path_cleans_up_active_listener() {
     let (mut tui, stopped_rx) = tui_with_active_listener("run-error");
 
     let error = tui
         .finish_run(Ok(Err("injected draw error".to_string())), None)
+        .await
         .unwrap_err();
 
     assert_eq!(error, "injected draw error");
@@ -544,8 +576,8 @@ fn run_error_path_cleans_up_active_listener() {
     assert!(tui.opencode_listeners.is_empty());
 }
 
-#[test]
-fn sigterm_exit_path_cleans_up_active_listener() {
+#[tokio::test(flavor = "multi_thread")]
+async fn sigterm_exit_path_cleans_up_active_listener() {
     let (mut tui, stopped_rx) = tui_with_active_listener("sigterm");
     let notification = crate::tui_signal::ShutdownNotification::for_test();
     notification.request_for_test(crate::tui_signal::ShutdownSignal::Sigterm);
@@ -558,6 +590,7 @@ fn sigterm_exit_path_cleans_up_active_listener() {
         Ok(Err("interactive subprocess canceled".to_string())),
         notification.signal(),
     )
+    .await
     .unwrap();
 
     stopped_rx.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -590,8 +623,8 @@ fn tui_with_active_listener(label: &str) -> (Tui, std::sync::mpsc::Receiver<()>)
         0,
         None,
         "cleanup-listener".to_string(),
-        move |context| {
-            while !context.wait(Duration::from_secs(60)) {}
+        move |context| async move {
+            while !context.wait(Duration::from_secs(60)).await {}
             stopped_tx.send(()).unwrap();
             Ok(None)
         },
@@ -609,8 +642,8 @@ fn wait_for_opencode_job(tui: &mut Tui, key: &super::super::OpencodePollKey) {
     }
 }
 
-#[test]
-fn pr_poll_identity_uses_repository_and_worktree_generation_not_repo_order() {
+#[tokio::test(flavor = "multi_thread")]
+async fn pr_poll_identity_uses_repository_and_worktree_generation_not_repo_order() {
     let repository = WorktreeRepositoryKey::new(PathBuf::from("/tmp/repo"));
     let mut session = test_session(0, "/tmp/repo", "feature");
     let first = PrPollKey::for_repository_session_generation(&repository, &session, 3);

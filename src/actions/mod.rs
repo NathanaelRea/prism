@@ -1,6 +1,6 @@
+use crate::process::Command;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 use crate::agent::AgentState;
@@ -13,9 +13,9 @@ use crate::lifecycle::{
 };
 use crate::observability::append_runtime_message;
 use crate::opencode::{self, OpencodeStatus, load_runtime};
-use crate::process::{
-    ProcessPolicy, command_exists, parse_command_words, run_output_allow_failure,
-};
+use crate::process::parse_command_words;
+#[cfg(unix)]
+use crate::process::{ProcessPolicy, command_exists, run_output_allow_failure};
 use crate::remote::{
     PR_SUMMARY_POLL_INTERVAL, PrCache, apply_pr_details_poll_result, apply_pr_summary_poll_result,
     persist_pr_cache_snapshot, pr_cache_comment_count, pr_cache_render_signature,
@@ -56,12 +56,14 @@ mod tests;
 use crate::worktrunk::discover_columns as discover_wt_columns;
 #[cfg(test)]
 use polling::status_label_with_behind;
+#[cfg(all(test, unix))]
+use pull_requests::run_browser_opener;
 #[cfg(test)]
 use pull_requests::{
     apply_bulk_review_resolution, create_change_request_id, open_http_url_in_browser,
     pr_target_choice_list, push_request_id, remote_create_mutation_target, remote_pr_choice_keys,
-    remote_pr_worktree_branch, resolve_review_request_id, run_browser_opener,
-    unresolved_review_thread_ids,
+    remote_pr_worktree_branch, resolve_review_request_id, session_conflicts_with_change_request,
+    session_matches_change_request, unresolved_review_thread_ids,
 };
 #[cfg(test)]
 use repositories::worktree_column_choices;

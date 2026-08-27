@@ -1,5 +1,5 @@
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-compile_error!("unsupported Prism target OS; Prism supports only Linux and macOS");
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+compile_error!("unsupported Prism target OS; Prism supports only Linux, macOS, and Windows");
 
 mod actions;
 mod agent_runtime;
@@ -24,7 +24,9 @@ pub(crate) use telemetry::{flight_recorder, observability, run_marker};
 #[cfg(test)]
 mod testing;
 #[cfg(test)]
-pub(crate) use testing::{compact_runtime, test_support};
+pub(crate) use testing::compact_runtime;
+#[cfg(test)]
+pub(crate) use testing::test_support;
 mod tui;
 pub(crate) use tui::{
     input, jobs as tui_jobs, runtime as tui_runtime, signal as tui_signal, state as ui_state,
@@ -48,11 +50,11 @@ pub use workflow::agent_phase::{
     HarnessAgentExecutor, RecordingAgentExecutor, prompt_with_context,
 };
 pub use workflow::kernel::{
-    AttemptStatus as PromptAttemptStatus, MemoryWorkflowRunStore, SchedulerProgress,
-    StartPromptWorkflow, StepPhase as PromptStepPhase, StoreFuture, WorkflowAttemptState,
-    WorkflowEvent as PromptWorkflowEvent, WorkflowKernelError, WorkflowRunState,
-    WorkflowRunStatus as PromptWorkflowRunStatus, WorkflowRunStore, WorkflowScheduler,
-    WorkflowStepState as PromptWorkflowStepState,
+    AttemptStatus as PromptAttemptStatus, MemoryWorkflowRunStore, RecoveryResolution,
+    SchedulerProgress, StartPromptWorkflow, StepPhase as PromptStepPhase, StoreFuture,
+    WorkflowAttemptState, WorkflowEvent as PromptWorkflowEvent, WorkflowKernelError,
+    WorkflowRunState, WorkflowRunStatus as PromptWorkflowRunStatus, WorkflowRunStore,
+    WorkflowScheduler, WorkflowStepState as PromptWorkflowStepState,
 };
 pub use workflow::prompt_worker::{PromptWorkflowService, now_unix_ms as workflow_now_unix_ms};
 pub use workflow::source::{

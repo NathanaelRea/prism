@@ -29,7 +29,7 @@ pub const CONFIG_SCHEMA_URL: &str =
 pub const CONFIG_SCHEMA_JSON: &str = include_str!("../schemas/config.schema.json");
 
 pub fn config_example() -> String {
-    format!("#:schema {CONFIG_SCHEMA_URL}\n")
+    let example = format!("#:schema {CONFIG_SCHEMA_URL}\n")
         + r#"
 # Prism config. Harness settings are global; other settings may be repository overrides.
 default_harness = "opencode"
@@ -77,7 +77,18 @@ fzf = "fzf"
 # provider = "forgejo"
 # credential_env = "FORGEJO_TOKEN" # variable name only; never put a token here
 
-"#
+"#;
+    if crate::platform::current_os() == crate::platform::SupportedOs::Windows {
+        example
+            .replace(
+                "worktree_command = \"wt\"",
+                "worktree_command = \"git-wt.exe\"",
+            )
+            .replace("tmux = \"tmux\"", "tmux = \"psmux.exe\"")
+            .replace("wt = \"wt\"", "\"git-wt.exe\" = \"git-wt.exe\"")
+    } else {
+        example
+    }
 }
 
 pub fn user_config_template() -> String {
@@ -446,6 +457,30 @@ fn parse_and_validate_config(
     Ok(raw)
 }
 
+#[cfg(unix)]
+fn secure_existing_config_path(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn secure_existing_config_path(path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent()
+        && parent.exists()
+    {
+        crate::system::windows_security::secure_path(parent, true).map_err(|error| {
+            format!(
+                "secure configuration directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    if path.exists() {
+        crate::system::windows_security::secure_path(path, false)
+            .map_err(|error| format!("secure configuration file {}: {error}", path.display()))?;
+    }
+    Ok(())
+}
+
 fn validate_config_values(raw: &RawConfig, is_user_config: bool) -> Result<(), String> {
     if let Some(base) = raw.opencode_port_base {
         validate_opencode_port_range(base, raw.opencode_port_span.unwrap_or(1))?;
@@ -573,9 +608,17 @@ impl Config {
         let mut config = Self::defaults(user_path, repo_config_path);
 
         let user_path = config.user_path.clone();
-        config.apply_file(&user_path);
+        if let Err(error) = secure_existing_config_path(&user_path) {
+            config.config_errors.push(error);
+        } else {
+            config.apply_file(&user_path);
+        }
         let repo_config_path = config.repo_config_path.clone();
-        config.apply_file(&repo_config_path);
+        if let Err(error) = secure_existing_config_path(&repo_config_path) {
+            config.config_errors.push(error);
+        } else {
+            config.apply_file(&repo_config_path);
+        };
         config.default_agent = config.default_harness.clone();
         for (id, harness) in &config.harnesses {
             if let Err(error) = harness.validate(id) {
@@ -599,12 +642,14 @@ impl Config {
     }
 
     fn defaults(user_path: PathBuf, repo_config_path: PathBuf) -> Self {
+        let os = crate::platform::current_os();
+        let worktrunk = crate::platform::default_worktrunk_command(os);
         let tools = [
-            ("wt", "wt"),
+            (worktrunk, worktrunk),
             ("gh", "gh"),
             ("glab", "glab"),
             ("git", "git"),
-            ("tmux", "tmux"),
+            ("tmux", crate::platform::default_session_runtime(os)),
             ("lazygit", "lazygit"),
             ("fzf", "fzf"),
             ("opencode", "opencode"),
@@ -629,7 +674,7 @@ impl Config {
             default_agent: "opencode".to_string(),
             default_base: Some("main".to_string()),
             review_packet_dir: ".agent/review".to_string(),
-            worktree_command: "wt".to_string(),
+            worktree_command: worktrunk.to_string(),
             opencode_port_base: 41_000,
             opencode_port_span: 1_000,
             opencode_shutdown_owned_servers: false,
@@ -1317,7 +1362,7 @@ pub fn print_config(repo: &Repository, config: &Config) {
     }
 }
 
-pub fn doctor(repo: &Repository, config: &mut Config) -> Result<(), String> {
+pub async fn doctor(repo: &Repository, config: &mut Config) -> Result<(), String> {
     println!("Prism doctor");
     println!("repo: {}", repo.root.display());
     println!("user config: {}", config.user_path.display());
@@ -1358,14 +1403,14 @@ pub fn doctor(repo: &Repository, config: &mut Config) -> Result<(), String> {
             description.submit,
             description.cancel_session
         );
-        print_tool_status("harness", program, true);
+        print_tool_status("harness", program, true).await;
         if let Some(headless_program) = configured
             .headless_command
             .as_ref()
             .and_then(|command| command.first())
             && headless_program != program
         {
-            print_tool_status("harness headless", headless_program, true);
+            print_tool_status("harness headless", headless_program, true).await;
         }
         for (capability, supported, reason) in [
             (
@@ -1409,22 +1454,22 @@ pub fn doctor(repo: &Repository, config: &mut Config) -> Result<(), String> {
     }
     println!();
 
-    print_tool_status("git", &config.tool("git"), true);
-    print_tool_status("gh", &config.tool("gh"), false);
-    print_tool_status("glab", &config.tool("glab"), false);
-    print_tool_status("tmux", &config.tool("tmux"), true);
-    print_worktrunk_status(repo, config);
-    print_tool_status("fzf", &config.tool("fzf"), false);
+    print_tool_status("git", &config.tool("git"), true).await;
+    print_tool_status("gh", &config.tool("gh"), false).await;
+    print_tool_status("glab", &config.tool("glab"), false).await;
+    print_tool_status("tmux", &config.tool("tmux"), true).await;
+    print_worktrunk_status(repo, config).await;
+    print_tool_status("fzf", &config.tool("fzf"), false).await;
     println!();
 
     println!();
-    print_remote_doctor(repo, config);
+    print_remote_doctor(repo, config).await;
 
     println!();
     print_workflow_doctor(repo);
 
     println!();
-    match discover_sessions(repo, config) {
+    match discover_sessions(repo, config).await {
         Ok(sessions) => {
             println!("worktrees: {}", sessions.len());
             for session in sessions {
@@ -1514,16 +1559,32 @@ fn harness_config_source(config: &Config) -> String {
 fn resolve_executable(program: &str) -> Option<PathBuf> {
     let path = PathBuf::from(program);
     if path.components().count() > 1 {
-        return path.exists().then_some(path);
+        return resolve_executable_candidate(path);
     }
     std::env::var_os("PATH")
         .into_iter()
         .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
-        .map(|directory| directory.join(program))
-        .find(|candidate| candidate.is_file())
+        .find_map(|directory| resolve_executable_candidate(directory.join(program)))
 }
 
-pub fn ensure_required_tools(
+fn resolve_executable_candidate(candidate: PathBuf) -> Option<PathBuf> {
+    if candidate.is_file() {
+        return Some(candidate);
+    }
+    #[cfg(windows)]
+    if candidate.extension().is_none() {
+        let extensions =
+            std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+        return extensions
+            .split(';')
+            .filter(|extension| !extension.is_empty())
+            .map(|extension| candidate.with_extension(extension.trim_start_matches('.')))
+            .find(|path| path.is_file());
+    }
+    None
+}
+
+pub async fn ensure_required_tools(
     repo: &Repository,
     config: &Config,
 ) -> Result<crate::worktrunk::WorktrunkVersion, String> {
@@ -1540,7 +1601,9 @@ pub fn ensure_required_tools(
         config,
         "origin",
         crate::remote::RemoteUrlKind::Fetch,
-    ) {
+    )
+    .await
+    {
         match remote.repository.id.provider() {
             ProviderKind::GitHub => required.push(("gh", config.tool("gh"))),
             ProviderKind::GitLab => required.push(("glab", config.tool("glab"))),
@@ -1560,10 +1623,10 @@ pub fn ensure_required_tools(
             config.repo_config_path.display()
         ));
     }
-    crate::worktrunk::ensure_supported_version(config)
+    crate::worktrunk::ensure_supported_version(config).await
 }
 
-fn print_worktrunk_status(repo: &Repository, config: &Config) {
+async fn print_worktrunk_status(repo: &Repository, config: &Config) {
     let command = config.tool(&config.worktree_command);
     if !command_exists(&command) {
         println!(
@@ -1572,7 +1635,7 @@ fn print_worktrunk_status(repo: &Repository, config: &Config) {
         );
         return;
     }
-    match crate::worktrunk::detect_version(config) {
+    match crate::worktrunk::detect_version(config).await {
         Ok(version) => {
             let status = if version.supported() {
                 "ok"
@@ -1587,7 +1650,7 @@ fn print_worktrunk_status(repo: &Repository, config: &Config) {
                 crate::worktrunk::TESTED_CURRENT_VERSION,
             );
             if version.supported() {
-                match crate::worktrunk::observe_repository(repo, config) {
+                match crate::worktrunk::observe_repository(repo, config).await {
                     Ok(snapshot) => println!(
                         "worktrunk observation: fresh schema={} worktrees={}",
                         match snapshot.schema {
@@ -1610,20 +1673,21 @@ fn print_worktrunk_status(repo: &Repository, config: &Config) {
     }
 }
 
-fn print_remote_doctor(repo: &Repository, config: &Config) {
-    for line in remote_doctor_lines(repo, config) {
+async fn print_remote_doctor(repo: &Repository, config: &Config) {
+    for line in remote_doctor_lines(repo, config).await {
         println!("{line}");
     }
 }
 
-fn remote_doctor_lines(repo: &Repository, config: &Config) -> Vec<String> {
+async fn remote_doctor_lines(repo: &Repository, config: &Config) -> Vec<String> {
     let mut lines = Vec::new();
     let remote = crate::remote::discover_git_remote(
         &repo.root,
         config,
         "origin",
         crate::remote::RemoteUrlKind::Fetch,
-    );
+    )
+    .await;
     let Ok(remote) = remote else {
         lines.push(format!("remote: unavailable: {}", remote.unwrap_err()));
         return lines;
@@ -1640,7 +1704,7 @@ fn remote_doctor_lines(repo: &Repository, config: &Config) -> Vec<String> {
             crate::remote::WebScheme::Https => "https",
         }
     ));
-    let diagnostics = crate::remote::dispatcher::runtime_diagnostics(&repo.root, config);
+    let diagnostics = crate::remote::dispatcher::runtime_diagnostics(&repo.root, config).await;
     let capabilities = diagnostics
         .as_ref()
         .map(|diagnostics| diagnostics.capabilities.clone())
@@ -1665,6 +1729,7 @@ fn remote_doctor_lines(repo: &Repository, config: &Config) -> Vec<String> {
     lines.push(format!(
         "remote authentication: {}",
         crate::remote::dispatcher::authentication_status(&repo.root, config)
+            .await
             .unwrap_or_else(|error| error)
     ));
     lines.push(format!(
@@ -1680,14 +1745,16 @@ fn remote_doctor_lines(repo: &Repository, config: &Config) -> Vec<String> {
     lines
 }
 
-fn print_tool_status(label: &str, command: &str, required: bool) {
+async fn print_tool_status(label: &str, command: &str, required: bool) {
     let prefix = if command_exists(command) {
         "ok"
     } else {
         "missing"
     };
     let required = if required { "required" } else { "optional" };
-    let version = command_version(command).unwrap_or_else(|| "-".to_string());
+    let version = command_version(command)
+        .await
+        .unwrap_or_else(|| "-".to_string());
     println!("{prefix:7} {label:12} {command:18} {required:8} {version}");
 }
 
@@ -1838,8 +1905,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn doctor_reports_configured_transport_and_runtime_forgejo_capabilities() {
+    #[tokio::test]
+    async fn doctor_reports_configured_transport_and_runtime_forgejo_capabilities() {
         let directory = std::env::temp_dir().join(format!(
             "prism-doctor-forgejo-{}-{}",
             std::process::id(),
@@ -1865,7 +1932,7 @@ mod tests {
             },
         );
 
-        let report = remote_doctor_lines(&repo, &config).join("\n");
+        let report = remote_doctor_lines(&repo, &config).await.join("\n");
         worker.join().unwrap();
 
         assert!(report.contains("remote transport: http"));
@@ -1877,8 +1944,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn doctor_reports_unknown_runtime_capabilities_with_safe_failure_reason() {
+    #[tokio::test]
+    async fn doctor_reports_unknown_runtime_capabilities_with_safe_failure_reason() {
         let directory = std::env::temp_dir().join(format!(
             "prism-doctor-forgejo-unavailable-{}-{}",
             std::process::id(),
@@ -1903,7 +1970,7 @@ mod tests {
             },
         );
 
-        let report = remote_doctor_lines(&repo, &config).join("\n");
+        let report = remote_doctor_lines(&repo, &config).await.join("\n");
 
         assert!(report.contains("remote transport: https"));
         assert!(report.contains("create=unknown"));
@@ -1914,8 +1981,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn doctor_reports_gitlab_rebase_merge_as_unavailable() {
+    #[tokio::test]
+    async fn doctor_reports_gitlab_rebase_merge_as_unavailable() {
         let directory = std::env::temp_dir().join(format!(
             "prism-doctor-gitlab-rebase-{}-{}",
             std::process::id(),
@@ -1931,7 +1998,7 @@ mod tests {
             .tools
             .insert("git".to_string(), git.display().to_string());
 
-        let report = remote_doctor_lines(&repo, &config).join("\n");
+        let report = remote_doctor_lines(&repo, &config).await.join("\n");
 
         assert!(report.contains("merge=unsupported"));
         assert!(
@@ -2301,7 +2368,7 @@ review = "fix\nreview"
             "other-agent".to_string(),
             HarnessConfig {
                 adapter: "generic".to_string(),
-                interactive_command: vec!["/bin/sh".to_string()],
+                interactive_command: vec![std::env::current_exe().unwrap().display().to_string()],
                 arguments: Vec::new(),
                 interactive_prompt_transport: None,
                 headless_command: None,

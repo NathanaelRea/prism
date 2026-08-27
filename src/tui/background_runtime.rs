@@ -207,7 +207,7 @@ impl Drop for BackgroundRuntime {
 }
 
 impl BackgroundRuntime {
-    pub(super) fn spawn<F>(
+    pub(super) fn spawn<F, Fut>(
         &mut self,
         kind: TuiJobKind,
         key: TuiJobKey,
@@ -217,11 +217,8 @@ impl BackgroundRuntime {
         job: F,
     ) -> JobId
     where
-        F: FnOnce(
-                JobContext<TuiJobKind, TuiJobKey, TuiJobPayload>,
-            ) -> Result<Option<TuiJobPayload>, String>
-            + Send
-            + 'static,
+        F: FnOnce(JobContext<TuiJobKind, TuiJobKey, TuiJobPayload>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<Option<TuiJobPayload>, String>> + Send + 'static,
     {
         let label = kind.label();
         let diagnostic = crate::tui_jobs::JobDiagnostic {
@@ -718,8 +715,8 @@ impl BackgroundRuntime {
 mod tests {
     use super::*;
 
-    #[test]
-    fn shutdown_preserves_reconciliation_jobs_and_orders_admission_cutoff() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_preserves_reconciliation_jobs_and_orders_admission_cutoff() {
         let mut runtime = BackgroundRuntime::default();
         let id = runtime.spawn(
             TuiJobKind::RemoteAction,
@@ -727,8 +724,8 @@ mod tests {
             0,
             None,
             "mutation".into(),
-            |_| {
-                std::thread::sleep(Duration::from_millis(20));
+            |_| async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
                 Ok(None)
             },
         );
@@ -780,8 +777,8 @@ mod tests {
         runtime.stop_admission_for_shutdown();
     }
 
-    #[test]
-    fn generation_admission_cancels_stale_jobs_and_routes_terminal() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn generation_admission_cancels_stale_jobs_and_routes_terminal() {
         let mut runtime = BackgroundRuntime::default();
         let current = runtime.spawn(
             TuiJobKind::PrSummary,
@@ -789,7 +786,7 @@ mod tests {
             1,
             None,
             "current".into(),
-            |_| Ok(None),
+            |_| async { Ok(None) },
         );
         let stale = runtime.spawn(
             TuiJobKind::PrSummary,
@@ -797,8 +794,8 @@ mod tests {
             0,
             None,
             "stale".into(),
-            |_| {
-                std::thread::sleep(Duration::from_millis(50));
+            |_| async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
                 Ok(None)
             },
         );

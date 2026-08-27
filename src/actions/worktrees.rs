@@ -48,7 +48,7 @@ pub(super) fn archived_picker_overflow_message(
 }
 
 impl Tui {
-    pub(crate) fn open_selected_development_url(&mut self) -> Result<(), String> {
+    pub(crate) async fn open_selected_development_url(&mut self) -> Result<(), String> {
         if !self.is_worktree_session_panel() {
             return Err("focus worktrees or merges to open a development URL".to_string());
         }
@@ -74,7 +74,7 @@ impl Tui {
             .and_then(|facts| facts.dev_server.as_ref())
             .map(|server| server.url.clone())
             .ok_or_else(|| "selected worktree has no development URL".to_string())?;
-        super::pull_requests::open_http_url_in_browser(&url)?;
+        super::pull_requests::open_http_url_in_browser(&url).await?;
         self.show_message(development_url_opened_message(stale))
     }
 
@@ -106,7 +106,7 @@ impl Tui {
             base_generation,
             Some(TUI_ACTION_JOB_TIMEOUT),
             "prism-session-refresh".to_string(),
-            move |context| {
+            move |context| async move {
                 for managed in &mut repos {
                     let config = crate::config::Config::load(&managed.repo);
                     if config.config_errors.is_empty() {
@@ -137,51 +137,56 @@ impl Tui {
                         ))
                     })
                     .collect();
-                let result = crate::session::refresh_worktree_sessions(
+                let result = match crate::session::refresh_worktree_sessions(
                     &repositories,
                     &previous_repository_identities,
                     &mut sessions,
                 )
-                .map(|()| {
-                    let tmux_generations = sessions
-                        .iter()
-                        .filter_map(|session| {
-                            let managed = repos.get(session.repo_index)?;
+                .await
+                {
+                    Ok(()) => {
+                        let mut tmux_generations = BTreeMap::new();
+                        for session in &sessions {
+                            let Some(managed) = repos.get(session.repo_index) else {
+                                continue;
+                            };
                             let slot = AgentSessionSlot::for_repository_session(
                                 &managed.identity,
                                 session,
                             );
                             if known_tmux_slots.contains(&slot) {
-                                return None;
+                                continue;
                             }
                             let generation = crate::tmux::latest_agent_session_generation(
                                 &managed.repo,
                                 &managed.config,
                                 &session.branch,
                             )
+                            .await
                             .unwrap_or_default();
-                            Some((slot, generation))
+                            tmux_generations.insert(slot, generation);
+                        }
+                        Ok(SessionRefreshSnapshot {
+                            repository_identities: repos
+                                .iter()
+                                .enumerate()
+                                .map(|(index, repo)| (index, repo.identity.clone()))
+                                .collect(),
+                            configs: repos
+                                .iter()
+                                .map(|repo| (repo.identity.clone(), repo.config.clone()))
+                                .collect(),
+                            baseline_sessions,
+                            worktree_harness_configs: crate::tui::load_worktree_harness_configs(
+                                &repos, &sessions,
+                            ),
+                            tmux_generations,
+                            sessions,
                         })
-                        .collect();
-                    SessionRefreshSnapshot {
-                        repository_identities: repos
-                            .iter()
-                            .enumerate()
-                            .map(|(index, repo)| (index, repo.identity.clone()))
-                            .collect(),
-                        configs: repos
-                            .iter()
-                            .map(|repo| (repo.identity.clone(), repo.config.clone()))
-                            .collect(),
-                        baseline_sessions,
-                        worktree_harness_configs: crate::tui::load_worktree_harness_configs(
-                            &repos, &sessions,
-                        ),
-                        tmux_generations,
-                        sessions,
                     }
-                });
-                if result.is_err() && context.wait(Duration::from_secs(1)) {
+                    Err(error) => Err(error),
+                };
+                if result.is_err() && context.wait(Duration::from_secs(1)).await {
                     return Ok(None);
                 }
                 Ok(Some(TuiJobPayload::SessionRefresh(SessionRefreshResult {
@@ -279,7 +284,7 @@ impl Tui {
         changed
     }
 
-    pub(crate) fn refresh_sessions(&mut self) -> Result<(), String> {
+    pub(crate) async fn refresh_sessions(&mut self) -> Result<(), String> {
         for managed in &mut self.repos {
             let config = crate::config::Config::load(&managed.repo);
             if config.config_errors.is_empty() {
@@ -305,7 +310,8 @@ impl Tui {
             &repositories,
             &self.session_repository_identities,
             &mut self.sessions,
-        )?;
+        )
+        .await?;
         self.session_inventory_generation = self.session_inventory_generation.saturating_add(1);
         self.reconcile_session_inventory();
         self.worktree_harness_configs =
@@ -359,14 +365,14 @@ impl Tui {
         self.ensure_navigation_valid();
     }
 
-    pub(crate) fn create_session(
+    pub(crate) async fn create_session(
         &mut self,
         raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<bool, String> {
         let context = self
             .selected_repo_context()
             .ok_or_else(|| "no selected repository".to_string())?;
-        self.ensure_default_branch_ready_for_create(raw)?;
+        self.ensure_default_branch_ready_for_create(raw).await?;
         let repo_label = self
             .repos
             .get(context.repo_index)
@@ -386,7 +392,7 @@ impl Tui {
         let harness =
             crate::harness::Harness::new(&context.config.default_harness, &harness_config);
         self.show_loading_dialog(raw, "Create Session", "Loading model options")?;
-        let selection_options = harness.selection_options();
+        let selection_options = harness.selection_options().await;
         let Some(session_input) = self.prompt_create_session_form(raw, &selection_options)? else {
             return Ok(false);
         };
@@ -402,13 +408,16 @@ impl Tui {
             "Create Session",
             &format!("Creating worktree for {}", branch.trim()),
         )?;
-        let first_attempt = create_worktree_session(&context.repo, &context.config, branch.trim());
+        let first_attempt =
+            create_worktree_session(&context.repo, &context.config, branch.trim()).await;
         self.request_wt_hook_log_refresh(context.repo_index);
         let creation = match first_attempt {
             Ok(outcome) => outcome,
             Err(error) => {
                 if !error.approval_required()
-                    || !self.offer_worktrunk_approval(raw, &context.repo, &context.config)?
+                    || !self
+                        .offer_worktrunk_approval(raw, &context.repo, &context.config)
+                        .await?
                 {
                     self.request_wt_poll(context.repo_index);
                     return Err(error.to_string());
@@ -418,7 +427,8 @@ impl Tui {
                     "Create Session",
                     &format!("Creating worktree for {}", branch.trim()),
                 )?;
-                let retry = create_worktree_session(&context.repo, &context.config, branch.trim());
+                let retry =
+                    create_worktree_session(&context.repo, &context.config, branch.trim()).await;
                 self.request_wt_hook_log_refresh(context.repo_index);
                 match retry {
                     Ok(outcome) => outcome,
@@ -430,14 +440,14 @@ impl Tui {
             }
         };
         if let CreateWorktreeOutcome::CreatedMetadataFailed { error } = creation {
-            self.refresh_sessions()?;
+            self.refresh_sessions().await?;
             self.request_wt_poll(context.repo_index);
             self.show_message(&format!(
                 "worktree created, but restoring Prism metadata failed: {error}"
             ))?;
             return Ok(true);
         }
-        self.refresh_sessions()?;
+        self.refresh_sessions().await?;
         self.request_wt_poll(context.repo_index);
         let index = self
             .sessions
@@ -483,7 +493,8 @@ impl Tui {
                     model: session_input.model.as_deref(),
                     variant: session_input.variant.as_deref(),
                 },
-            )?;
+            )
+            .await?;
             self.show_message("submitted initial prompt to agent session")?;
         } else {
             let session = self.sessions[index].background_job_snapshot();
@@ -497,7 +508,7 @@ impl Tui {
         Ok(true)
     }
 
-    pub(super) fn ensure_default_branch_ready_for_create(
+    pub(super) async fn ensure_default_branch_ready_for_create(
         &mut self,
         raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
@@ -515,7 +526,7 @@ impl Tui {
             return Ok(());
         };
         let base_path = self.default_branch_path_for_repo(context.repo_index, &base);
-        let behind = branch_behind(&base_path, &base, &context.config)?;
+        let behind = branch_behind(&base_path, &base, &context.config).await?;
         if behind == 0 {
             return Ok(());
         }
@@ -527,13 +538,13 @@ impl Tui {
         )?;
         if should_pull {
             self.show_loading_dialog(raw, "Pull Default Branch", &format!("Pulling {base}"))?;
-            pull_branch(&base_path, &base, &context.config)?;
-            self.refresh_sessions()?;
+            pull_branch(&base_path, &base, &context.config).await?;
+            self.refresh_sessions().await?;
         }
         Ok(())
     }
 
-    pub(crate) fn pull_default_branch(
+    pub(crate) async fn pull_default_branch(
         &mut self,
         raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
@@ -553,8 +564,8 @@ impl Tui {
         };
         let base_path = self.default_branch_path_for_repo(context.repo_index, &base);
         self.show_loading_dialog(raw, "Pull Default Branch", &format!("Pulling {base}"))?;
-        pull_branch(&base_path, &base, &context.config)?;
-        self.refresh_sessions()?;
+        pull_branch(&base_path, &base, &context.config).await?;
+        self.refresh_sessions().await?;
         self.start_wt_column_poll();
         self.show_message(&format!("pulled {base}"))?;
         Ok(())
@@ -573,7 +584,7 @@ impl Tui {
             .unwrap_or_else(|| self.repo.root.clone())
     }
 
-    pub(crate) fn archive_session(
+    pub(crate) async fn archive_session(
         &mut self,
         raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
@@ -604,12 +615,12 @@ impl Tui {
         if self.selected_worktree_by_repo.get(&context.repo.root) == Some(&path) {
             self.selected_worktree_by_repo.remove(&context.repo.root);
         }
-        self.refresh_sessions()?;
+        self.refresh_sessions().await?;
         self.show_message("archived worktree; files and branch were kept")?;
         Ok(())
     }
 
-    pub(crate) fn unarchive_session(
+    pub(crate) async fn unarchive_session(
         &mut self,
         raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
@@ -662,7 +673,8 @@ impl Tui {
             "Unarchive Worktree",
             &format!("Restoring {}", worktree.branch),
         )?;
-        let restoration = create_worktree_session(&context.repo, &context.config, &worktree.branch);
+        let restoration =
+            create_worktree_session(&context.repo, &context.config, &worktree.branch).await;
         self.request_wt_hook_log_refresh(context.repo_index);
         let restoration = match restoration {
             Ok(outcome) => outcome,
@@ -674,7 +686,7 @@ impl Tui {
         match restoration {
             CreateWorktreeOutcome::Created | CreateWorktreeOutcome::Restored => {}
             CreateWorktreeOutcome::CreatedMetadataFailed { error } => {
-                self.refresh_sessions()?;
+                self.refresh_sessions().await?;
                 self.request_wt_poll(context.repo_index);
                 self.show_message(&format!(
                     "worktree restored, but Prism metadata restoration failed: {error}"
@@ -682,7 +694,7 @@ impl Tui {
                 return Ok(());
             }
         }
-        self.refresh_sessions()?;
+        self.refresh_sessions().await?;
         self.request_wt_poll(context.repo_index);
         self.start_tmux_agent_warmup();
         if let Some(index) = self
@@ -701,17 +713,19 @@ impl Tui {
         Ok(())
     }
 
-    pub(crate) fn delete_session(
+    pub(crate) async fn delete_session(
         &mut self,
         raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
         let Some(selected) = self.selected_worktree_index() else {
             return Ok(());
         };
-        self.confirm_and_delete_session(raw, selected).map(|_| ())
+        self.confirm_and_delete_session(raw, selected)
+            .await
+            .map(|_| ())
     }
 
-    pub(crate) fn confirm_and_delete_session(
+    pub(crate) async fn confirm_and_delete_session(
         &mut self,
         raw: &mut dyn crate::tui_runtime::TerminalDriver,
         selected: usize,
@@ -740,14 +754,17 @@ impl Tui {
         if !self.confirm_delete_dialog(raw, &branch, &path_display, &warnings, false)? {
             return Ok(false);
         }
-        if !self.ensure_worktrunk_deletion_approved(raw, &repo, &config, removal_complete)? {
+        if !self
+            .ensure_worktrunk_deletion_approved(raw, &repo, &config, removal_complete)
+            .await?
+        {
             return Ok(false);
         }
         self.start_delete_worktree_session(repo, config, path, branch)?;
         Ok(true)
     }
 
-    fn ensure_worktrunk_deletion_approved(
+    async fn ensure_worktrunk_deletion_approved(
         &mut self,
         raw: &mut dyn crate::tui_runtime::TerminalDriver,
         repo: &Repository,
@@ -755,21 +772,23 @@ impl Tui {
         removal_complete: bool,
     ) -> Result<bool, String> {
         if removal_complete
-            || check_worktrunk_approval_status(repo, config)? != WorktrunkApprovalStatus::Pending
+            || check_worktrunk_approval_status(repo, config).await?
+                != WorktrunkApprovalStatus::Pending
         {
             return Ok(true);
         }
-        if !self.offer_worktrunk_approval(raw, repo, config)? {
+        if !self.offer_worktrunk_approval(raw, repo, config).await? {
             return Ok(false);
         }
-        if check_worktrunk_approval_status(repo, config)? == WorktrunkApprovalStatus::Pending {
+        if check_worktrunk_approval_status(repo, config).await? == WorktrunkApprovalStatus::Pending
+        {
             self.show_message("Worktrunk approvals still pending; deletion was not scheduled")?;
             return Ok(false);
         }
         Ok(true)
     }
 
-    pub(crate) fn offer_deferred_merge_cleanup(
+    pub(crate) async fn offer_deferred_merge_cleanup(
         &mut self,
         raw: &mut dyn crate::tui_runtime::TerminalDriver,
         selected: usize,
@@ -786,11 +805,14 @@ impl Tui {
         let config = managed.config.clone();
         let branch = session.branch.clone();
         let path = session.path_display.clone();
-        let warnings = crate::session::deferred_merge_cleanup_warnings(&config, session);
+        let warnings = crate::session::deferred_merge_cleanup_warnings(&config, session).await;
         if !self.confirm_deferred_merge_cleanup_dialog(raw, &branch, &path, &warnings)? {
             return Ok(false);
         }
-        if !self.ensure_worktrunk_deletion_approved(raw, &repo, &config, false)? {
+        if !self
+            .ensure_worktrunk_deletion_approved(raw, &repo, &config, false)
+            .await?
+        {
             return Ok(false);
         }
         crate::session::schedule_deferred_merge_cleanup(
@@ -798,7 +820,8 @@ impl Tui {
             &config,
             &self.sessions[selected],
             &warnings,
-        )?;
+        )
+        .await?;
         self.show_message("worktree will be deleted after the provider confirms the merge")?;
         Ok(true)
     }
@@ -847,8 +870,8 @@ impl Tui {
             generation,
             Some(TUI_ACTION_JOB_TIMEOUT),
             format!("prism-deferred-merge-cleanup-{branch}"),
-            move |_| {
-                let result = (|| match action {
+            move |_| async move {
+                let result = match action {
                     DeferredMergeCleanupAction::Cancel(message) => {
                         if crate::session::cancel_deferred_merge_cleanup(&repo, &session.branch)? {
                             Ok(DeferredMergeCleanupOutcome::Canceled(message.to_string()))
@@ -859,7 +882,9 @@ impl Tui {
                     DeferredMergeCleanupAction::Inspect => {
                         match crate::session::deferred_merge_cleanup_status(
                             &repo, &config, &session,
-                        )? {
+                        )
+                        .await?
+                        {
                             crate::session::DeferredMergeCleanupStatus::NotScheduled => {
                                 Ok(DeferredMergeCleanupOutcome::NotScheduled)
                             }
@@ -878,7 +903,7 @@ impl Tui {
                     DeferredMergeCleanupAction::Preserve | DeferredMergeCleanupAction::Wait => {
                         unreachable!("non-actionable cleanup evidence was queued")
                     }
-                })();
+                };
                 Ok(Some(TuiJobPayload::DeferredMergeCleanup(
                     DeferredMergeCleanupResult {
                         key: job_key,
@@ -1020,11 +1045,12 @@ impl Tui {
             key.generation,
             Some(TUI_ACTION_JOB_TIMEOUT),
             format!("prism-delete-{}", branch),
-            move |context| {
+            move |context| async move {
                 let result = if let Some(session) = deferred_session {
                     crate::session::delete_deferred_merge_cleanup_if_current(
                         &repo, &config, &session,
                     )
+                    .await
                 } else {
                     crate::session::delete_worktree_session_if_current(
                         &repo,
@@ -1033,6 +1059,7 @@ impl Tui {
                         &branch_for_job,
                         Some(&key.worktree.incarnation),
                     )
+                    .await
                 };
                 Ok(Some(TuiJobPayload::DeleteSession(DeleteSessionResult {
                     key: job_key,
@@ -1169,7 +1196,7 @@ impl Tui {
         changed
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn start_delete_session_for_test(&mut self) -> Result<(), String> {
         let context = self
             .selected_worktree_context()

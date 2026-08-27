@@ -1,5 +1,4 @@
 use std::path::Path;
-use std::str::FromStr;
 use std::time::Duration;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -104,15 +103,12 @@ fn query_error(error: sqlx::Error) -> String {
 }
 
 fn readonly_options(path: &Path) -> Result<SqliteConnectOptions, String> {
-    SqliteConnectOptions::from_str(&path.to_string_lossy())
-        .map_err(|error| format!("open workspace database {}: {error}", path.display()))
-        .map(|options| {
-            options
-                .read_only(true)
-                .create_if_missing(false)
-                .foreign_keys(true)
-                .busy_timeout(Duration::from_millis(50))
-        })
+    Ok(SqliteConnectOptions::new()
+        .filename(path)
+        .read_only(true)
+        .create_if_missing(false)
+        .foreign_keys(true)
+        .busy_timeout(Duration::from_millis(50)))
 }
 
 #[cfg(test)]

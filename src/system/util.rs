@@ -53,18 +53,34 @@ pub fn status_count(status: &str, key: &str) -> Option<usize> {
 }
 
 pub fn home_dir() -> Option<PathBuf> {
-    env::var_os("HOME").map(PathBuf::from)
+    #[cfg(windows)]
+    let home = env::var_os("USERPROFILE").or_else(|| env::var_os("HOME"));
+    #[cfg(not(windows))]
+    let home = env::var_os("HOME");
+    home.map(PathBuf::from)
 }
 
 pub fn prism_config_dir() -> PathBuf {
+    let prism_home = env::var_os("PRISM_HOME").map(PathBuf::from);
+    #[cfg(windows)]
+    {
+        prism_windows_config_dir_from(
+            prism_home,
+            env::var_os("APPDATA").map(PathBuf::from),
+            home_dir(),
+            env::temp_dir(),
+        )
+    }
+    #[cfg(not(windows))]
     prism_config_dir_from(
-        env::var_os("PRISM_HOME").map(PathBuf::from),
+        prism_home,
         env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
         home_dir(),
         env::temp_dir(),
     )
 }
 
+#[cfg(not(windows))]
 fn prism_config_dir_from(
     prism_home: Option<PathBuf>,
     xdg_config_home: Option<PathBuf>,
@@ -83,6 +99,25 @@ fn prism_config_dir_from(
     temporary.join("prism")
 }
 
+#[cfg(windows)]
+fn prism_windows_config_dir_from(
+    prism_home: Option<PathBuf>,
+    appdata: Option<PathBuf>,
+    home: Option<PathBuf>,
+    temporary: PathBuf,
+) -> PathBuf {
+    if let Some(path) = prism_home.filter(|path| !path.as_os_str().is_empty()) {
+        return path;
+    }
+    if let Some(path) = appdata.filter(|path| !path.as_os_str().is_empty()) {
+        return path.join("Prism");
+    }
+    if let Some(home) = home.filter(|path| !path.as_os_str().is_empty()) {
+        return home.join("AppData/Roaming/Prism");
+    }
+    temporary.join("prism")
+}
+
 pub fn stable_hash(path: &Path) -> u64 {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in path.display().to_string().as_bytes() {
@@ -93,14 +128,15 @@ pub fn stable_hash(path: &Path) -> u64 {
 }
 
 pub fn safe_branch_filename(branch: &str) -> String {
-    branch
+    let safe = branch
         .chars()
         .map(|ch| match ch {
             '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
             ch if ch.is_ascii_control() => '_',
             ch => ch,
         })
-        .collect()
+        .collect::<String>();
+    windows_safe_component_if_needed(safe, "branch")
 }
 
 pub fn safe_path_component(value: &str) -> String {
@@ -114,13 +150,51 @@ pub fn safe_path_component(value: &str) -> String {
             }
         })
         .collect::<String>();
-    if safe.is_empty() {
+    let safe = if safe.is_empty() {
         "repo".to_string()
     } else {
         safe
-    }
+    };
+    windows_safe_component_if_needed(safe, "repo")
 }
 
+#[cfg(not(windows))]
+fn windows_safe_component_if_needed(value: String, _fallback: &str) -> String {
+    value
+}
+
+#[cfg(windows)]
+fn windows_safe_component_if_needed(value: String, fallback: &str) -> String {
+    windows_safe_component(&value, fallback)
+}
+
+#[cfg(any(windows, test))]
+fn windows_safe_component(value: &str, fallback: &str) -> String {
+    let trimmed = value.trim_end_matches([' ', '.']);
+    let mut safe = if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed.to_string()
+    };
+    let stem = safe
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || stem
+            .strip_prefix("COM")
+            .or_else(|| stem.strip_prefix("LPT"))
+            .is_some_and(|number| {
+                matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+            });
+    if reserved {
+        safe.insert(0, '_');
+    }
+    safe
+}
+
+#[cfg(unix)]
 pub fn timestamp_label() -> String {
     let Ok(elapsed) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
         return "now".to_string();
@@ -141,6 +215,16 @@ pub fn timestamp_label() -> String {
     )
 }
 
+#[cfg(windows)]
+pub fn timestamp_label() -> String {
+    // SAFETY: GetLocalTime returns an initialized SYSTEMTIME value.
+    let local = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+    format!(
+        "{:02}:{:02}:{:02}",
+        local.wHour, local.wMinute, local.wSecond
+    )
+}
+
 #[allow(dead_code)]
 pub fn timestamp_nanos() -> u128 {
     std::time::SystemTime::now()
@@ -155,11 +239,15 @@ pub fn yes(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
+    #[cfg(not(windows))]
+    use std::path::PathBuf;
 
+    #[cfg(not(windows))]
+    use super::prism_config_dir_from;
     use super::{
-        prism_config_dir_from, safe_path_component, single_line, stable_hash, status_count,
-        strip_ansi, truncate_line,
+        safe_path_component, single_line, stable_hash, status_count, strip_ansi, truncate_line,
+        windows_safe_component,
     };
 
     #[test]
@@ -187,6 +275,7 @@ mod tests {
         assert_eq!(status_count("clean", "dirty"), None);
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn prism_home_overrides_xdg_without_changing_its_shape() {
         assert_eq!(
@@ -221,5 +310,33 @@ mod tests {
     fn path_component_is_filesystem_safe() {
         assert_eq!(safe_path_component("my project/foo"), "my_project_foo");
         assert_eq!(safe_path_component(""), "repo");
+    }
+
+    #[test]
+    fn windows_components_avoid_reserved_names_and_trailing_dots() {
+        assert_eq!(windows_safe_component("CON", "repo"), "_CON");
+        assert_eq!(windows_safe_component("lpt9.log", "repo"), "_lpt9.log");
+        assert_eq!(windows_safe_component("feature. ", "repo"), "feature");
+        assert_eq!(windows_safe_component("...", "repo"), "repo");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_long_unicode_paths_round_trip_without_ansi_conversion() {
+        let root = std::env::temp_dir().join(format!(
+            "prism windows path 雪 {} {}",
+            std::process::id(),
+            crate::util::timestamp_nanos()
+        ));
+        let long = root
+            .join("a".repeat(96))
+            .join("b".repeat(96))
+            .join("c".repeat(96));
+        std::fs::create_dir_all(&long).unwrap();
+        let path = long.join("state 雪.txt");
+        std::fs::write(&path, "unicode 雪\n").unwrap();
+        assert!(path.as_os_str().len() > 260);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "unicode 雪\n");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

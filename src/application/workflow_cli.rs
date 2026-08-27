@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -34,28 +34,32 @@ struct SkillInstallation {
     sha256: String,
 }
 
-pub(crate) fn run_workflow(repo: Option<&Path>, arguments: &[String]) -> Result<(), String> {
+pub(crate) async fn run_workflow(repo: Option<&Path>, arguments: &[String]) -> Result<(), String> {
     finish_family(
         "workflow",
         arguments,
-        block_on(run_workflow_async(repo, arguments)),
+        run_workflow_async(repo, arguments).await,
     )
 }
 
-pub(crate) fn run_skill(repo: Option<&Path>, arguments: &[String]) -> Result<(), String> {
-    let result = ResourceContext::load(repo)
-        .and_then(|context| run_copyable_resource(&context, arguments, ResourceKind::Skill));
+pub(crate) async fn run_skill(repo: Option<&Path>, arguments: &[String]) -> Result<(), String> {
+    let result = match ResourceContext::load(repo).await {
+        Ok(context) => run_copyable_resource(&context, arguments, ResourceKind::Skill),
+        Err(error) => Err(error),
+    };
     finish_family("skill", arguments, result)
 }
 
-pub(crate) fn run_template(repo: Option<&Path>, arguments: &[String]) -> Result<(), String> {
-    let result = ResourceContext::load(repo)
-        .and_then(|context| run_copyable_resource(&context, arguments, ResourceKind::Template));
+pub(crate) async fn run_template(repo: Option<&Path>, arguments: &[String]) -> Result<(), String> {
+    let result = match ResourceContext::load(repo).await {
+        Ok(context) => run_copyable_resource(&context, arguments, ResourceKind::Template),
+        Err(error) => Err(error),
+    };
     finish_family("template", arguments, result)
 }
 
 async fn run_workflow_async(repo: Option<&Path>, arguments: &[String]) -> Result<(), String> {
-    let context = ResourceContext::load(repo)?;
+    let context = ResourceContext::load(repo).await?;
     crate::seed_editable_defaults(&context.global).map_err(|error| error.to_string())?;
     let (arguments, json_output) = split_json(arguments);
     let repository_resources = context.repository_resources();
@@ -308,13 +312,16 @@ async fn run_workflow_async(repo: Option<&Path>, arguments: &[String]) -> Result
                 &worktree,
                 &config,
                 json_output,
-            )?;
+            )
+            .await?;
             let (change_request, change_request_head) = match (
                 launch_arguments.change_request,
                 launch_arguments.change_request_head,
             ) {
                 (Some(identity), Some(head)) => (Some(identity), Some(head)),
-                (None, None) => prompt_change_request_subject(&repository, &config, &worktree),
+                (None, None) => {
+                    prompt_change_request_subject(&repository, &config, &worktree).await
+                }
                 _ => unreachable!("workflow subject arguments are validated as a pair"),
             };
             let now = now_ms();
@@ -366,8 +373,7 @@ async fn run_workflow_async(repo: Option<&Path>, arguments: &[String]) -> Result
                 "resume" => crate::worker::PromptWorkflowControl::Resume,
                 "cancel" => crate::worker::PromptWorkflowControl::Cancel,
                 "recover" => crate::worker::PromptWorkflowControl::Recover {
-                    evidence: "operator confirmed authoritative reconciliation from CLI"
-                        .to_string(),
+                    resolution: parse_recovery_resolution(&arguments[2..])?,
                 },
                 "discard" => crate::worker::PromptWorkflowControl::Discard,
                 _ => crate::worker::PromptWorkflowControl::Retry,
@@ -382,6 +388,52 @@ async fn run_workflow_async(repo: Option<&Path>, arguments: &[String]) -> Result
         }
         Some(other) => Err(format!("unknown workflow subcommand: {other}")),
         None => Err("workflow requires a subcommand".into()),
+    }
+}
+
+fn parse_recovery_resolution(arguments: &[String]) -> Result<crate::RecoveryResolution, String> {
+    let mut outcome = None;
+    let mut evidence = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--outcome" if outcome.is_none() => {
+                outcome = Some(
+                    arguments
+                        .get(index + 1)
+                        .ok_or_else(|| "workflow recover --outcome requires a value".to_string())?
+                        .as_str(),
+                );
+                index += 2;
+            }
+            "--evidence" if evidence.is_none() => {
+                evidence = Some(
+                    arguments
+                        .get(index + 1)
+                        .ok_or_else(|| "workflow recover --evidence requires text".to_string())?
+                        .clone(),
+                );
+                index += 2;
+            }
+            option => return Err(format!("unknown workflow recover argument: {option}")),
+        }
+    }
+    let evidence = evidence
+        .filter(|evidence| !evidence.trim().is_empty())
+        .ok_or_else(|| {
+            "workflow recover requires --evidence <authoritative-evidence>".to_string()
+        })?;
+    match outcome {
+        Some("rejected-before-effect") => {
+            Ok(crate::RecoveryResolution::RejectedBeforeEffect { evidence })
+        }
+        Some("applied") => Ok(crate::RecoveryResolution::Applied { evidence }),
+        Some(other) => Err(format!(
+            "unknown recovery outcome '{other}'; expected rejected-before-effect or applied"
+        )),
+        None => {
+            Err("workflow recover requires --outcome rejected-before-effect|applied".to_string())
+        }
     }
 }
 
@@ -411,12 +463,13 @@ fn validate_prompt_workflow_name(name: &str) -> Result<(), String> {
     }
 }
 
-fn prompt_change_request_subject(
+async fn prompt_change_request_subject(
     repository: &crate::repo::Repository,
     config: &crate::config::Config,
     worktree: &Path,
 ) -> (Option<String>, Option<String>) {
     let Some(branch) = crate::git::current_branch_name(worktree, config)
+        .await
         .ok()
         .flatten()
     else {
@@ -447,13 +500,14 @@ struct ResourceContext {
 }
 
 impl ResourceContext {
-    fn load(repo: Option<&Path>) -> Result<Self, String> {
+    async fn load(repo: Option<&Path>) -> Result<Self, String> {
         let global = crate::util::prism_config_dir();
         crate::resource::ensure_global_drop_in_directories(&global)
             .map_err(|error| error.to_string())?;
         let repository = match repo {
-            Some(path) => Some(crate::repo::Repository::discover(Some(path))?.root),
+            Some(path) => Some(crate::repo::Repository::discover(Some(path)).await?.root),
             None => crate::repo::Repository::discover(None)
+                .await
                 .ok()
                 .map(|repo| repo.root),
         };
@@ -767,7 +821,7 @@ fn parse_workflow_run_arguments(arguments: &[String]) -> Result<WorkflowRunArgum
     Ok(parsed)
 }
 
-fn bind_launch_inputs(
+async fn bind_launch_inputs(
     workflow: &crate::CompiledWorkflow,
     mut supplied: BTreeMap<String, String>,
     worktree: &Path,
@@ -784,13 +838,13 @@ fn bind_launch_inputs(
                 type_name = input.type_name()
             ));
         }
-        let value = select_workflow_input(&config.tool("fzf"), name, worktree, input)?;
+        let value = select_workflow_input(&config.tool("fzf"), name, worktree, input).await?;
         supplied.insert(name.clone(), value);
     }
     crate::bind_workflow_inputs(workflow, worktree, &supplied).map_err(|error| error.to_string())
 }
 
-fn select_workflow_input(
+async fn select_workflow_input(
     fzf: &str,
     name: &str,
     worktree: &Path,
@@ -812,16 +866,20 @@ fn select_workflow_input(
                 &format!("Select a file matching {glob}"),
                 &candidates,
             )
+            .await
         }
         crate::CompiledWorkflowInput::Enum { options, .. } => {
-            select_fzf_value(fzf, name, "Select one option", options)
+            select_fzf_value(fzf, name, "Select one option", options).await
         }
-        crate::CompiledWorkflowInput::Bool { .. } => select_fzf_value(
-            fzf,
-            name,
-            "Select true or false",
-            &["true".into(), "false".into()],
-        ),
+        crate::CompiledWorkflowInput::Bool { .. } => {
+            select_fzf_value(
+                fzf,
+                name,
+                "Select true or false",
+                &["true".into(), "false".into()],
+            )
+            .await
+        }
         crate::CompiledWorkflowInput::String { .. } => {
             prompt_typed_workflow_input(name, "text", worktree, input)
         }
@@ -831,33 +889,32 @@ fn select_workflow_input(
     }
 }
 
-fn select_fzf_value(
+async fn select_fzf_value(
     fzf: &str,
     name: &str,
     header: &str,
     candidates: &[String],
 ) -> Result<String, String> {
-    let mut child = Command::new(fzf)
-        .args([
-            &format!("--prompt={name}> "),
-            &format!("--header={header}"),
-            "--height=80%",
-            "--reverse",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("start fzf '{fzf}' for Workflow input '{name}': {error}"))?;
-    {
-        let stdin = child.stdin.as_mut().expect("fzf stdin is piped");
-        for candidate in candidates {
-            writeln!(stdin, "{candidate}")
-                .map_err(|error| format!("write Workflow input candidates: {error}"))?;
-        }
-    }
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("wait for Workflow input picker: {error}"))?;
+    let candidate_input = candidates
+        .iter()
+        .map(|candidate| format!("{candidate}\n"))
+        .collect::<String>();
+    let output = crate::process::run_output_allow_failure_named(
+        crate::process::Command::new(fzf)
+            .args([
+                &format!("--prompt={name}> "),
+                &format!("--header={header}"),
+                "--height=80%",
+                "--reverse",
+            ])
+            .stdin(crate::process::Stdin::from_bytes(
+                candidate_input.into_bytes(),
+            )),
+        crate::process::ProcessPolicy::LocalMutation,
+        crate::process::ProcessDescriptor::new("fzf.workflow_input.select"),
+    )
+    .await
+    .map_err(|error| format!("run fzf '{fzf}' for Workflow input '{name}': {error}"))?;
     if !output.status.success() {
         return Err(format!("Workflow input '{name}' selection cancelled"));
     }
@@ -962,14 +1019,6 @@ fn finish_family(
     result
 }
 
-fn block_on<T>(future: impl std::future::Future<Output = Result<T, String>>) -> Result<T, String> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(string_error)?
-        .block_on(future)
-}
-
 fn scope_name(scope: ResourceScope) -> &'static str {
     match scope {
         ResourceScope::Global => "global",
@@ -996,6 +1045,47 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workflow_input_picker_delivers_every_candidate_through_processkit_stdin() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = std::env::temp_dir().join(format!(
+            "prism-workflow-picker-{}-{}",
+            std::process::id(),
+            crate::util::timestamp_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let received = root.join("received.txt");
+        let picker = root.join("picker");
+        std::fs::write(
+            &picker,
+            format!(
+                "#!/bin/sh\ncat > '{}'\nprintf '%s\\n' 'beta value'\n",
+                received.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&picker).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&picker, permissions).unwrap();
+
+        let candidates = vec!["alpha".to_string(), "beta value".to_string()];
+        assert_eq!(
+            select_fzf_value(
+                &picker.display().to_string(),
+                "choice",
+                "Select",
+                &candidates,
+            )
+            .await
+            .unwrap(),
+            "beta value"
+        );
+        assert_eq!(std::fs::read(&received).unwrap(), b"alpha\nbeta value\n");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn workflow_run_arguments_accept_repeatable_named_inputs() {

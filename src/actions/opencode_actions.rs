@@ -84,7 +84,7 @@ impl Tui {
                 generation,
                 Some(TUI_ACTION_JOB_TIMEOUT),
                 format!("prism-opencode-poll-{}", session_index),
-                move |_| {
+                move |_| async move {
                     let status =
                         load_runtime(&repo, &harness_id, &branch, &path).and_then(|runtime| {
                             let Some(runtime) = runtime else {
@@ -178,17 +178,20 @@ impl Tui {
                 stream.generation,
                 None,
                 format!("prism-opencode-sse-{}", target.session_index),
-                move |context| {
+                move |context| async move {
                     let mut backoff = OPENCODE_SSE_RECONNECT_INITIAL;
                     loop {
                         if context.is_canceled() {
                             return Ok(None);
                         }
-                        let result = opencode::listen_classified_events_until(
-                            &listener_url,
-                            &listener_directory,
-                            || context.is_canceled(),
-                            |event, snapshot_facet| {
+                        let cancellation_context = context.clone();
+                        let event_context = context.clone();
+                        let event_stream = job_stream.clone();
+                        let result = opencode::listen_classified_events_until_async(
+                            listener_url.clone(),
+                            listener_directory.clone(),
+                            move || cancellation_context.is_canceled(),
+                            move |event, snapshot_facet| {
                                 let facet = match snapshot_facet {
                                     Some(opencode::OpencodeSnapshotFacet::Status) => {
                                         Some(CoalescedFacet::Status)
@@ -199,17 +202,18 @@ impl Tui {
                                     None => None,
                                 };
                                 let payload = TuiJobPayload::OpencodeEvent(OpencodeEventResult {
-                                    stream: job_stream.clone(),
+                                    stream: event_stream.clone(),
                                     received_at: Instant::now(),
                                     event: Ok(event),
                                 });
                                 if let Some(facet) = facet {
-                                    context.send_coalesced(facet, payload)
+                                    event_context.send_coalesced(facet, payload)
                                 } else {
-                                    context.send(payload)
+                                    event_context.send(payload)
                                 }
                             },
-                        );
+                        )
+                        .await;
                         if context.is_canceled() {
                             return Ok(None);
                         }
@@ -224,7 +228,7 @@ impl Tui {
                         {
                             return Ok(None);
                         }
-                        if context.wait(backoff) {
+                        if context.wait(backoff).await {
                             return Ok(None);
                         }
                         backoff = (backoff * 2).min(OPENCODE_SSE_RECONNECT_MAX);
@@ -514,7 +518,7 @@ impl Tui {
         self.apply_agent_state(index, agent_state, notify) || changed
     }
 
-    pub(crate) fn abort_selected_opencode_session(
+    pub(crate) async fn abort_selected_opencode_session(
         &mut self,
         raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
@@ -549,7 +553,8 @@ impl Tui {
                 &session_config,
                 &self.sessions[selected].branch,
                 &self.sessions[selected].path,
-            )?
+            )
+            .await?
             .ok_or_else(|| "selected harness has no native session protocol".to_string())?;
         let Some(session_id) = runtime.opencode_session_id.clone() else {
             return Err("OpenCode session ID is not available".to_string());
@@ -595,7 +600,7 @@ impl Tui {
         Ok(())
     }
 
-    pub(crate) fn shutdown_owned_opencode_servers(&mut self) -> Result<(), String> {
+    pub(crate) async fn shutdown_owned_opencode_servers(&mut self) -> Result<(), String> {
         let mut seen = BTreeSet::new();
         let mut errors = Vec::new();
         for session in &self.sessions {
@@ -631,7 +636,7 @@ impl Tui {
             if !seen.insert(pid) {
                 continue;
             }
-            if let Err(error) = opencode::shutdown_owned_server(&runtime) {
+            if let Err(error) = opencode::shutdown_owned_server(&runtime).await {
                 errors.push(format!("stop OpenCode server pid {pid}: {error}"));
             }
         }

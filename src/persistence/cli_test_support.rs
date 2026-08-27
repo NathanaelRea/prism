@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 
 use std::path::Path;
-use std::str::FromStr;
 
 use sha2::{Digest, Sha256};
 use sqlx::sqlite::SqliteConnectOptions;
@@ -14,8 +13,8 @@ fn runtime() -> Result<tokio::runtime::Runtime, String> {
 }
 
 async fn connect(path: &Path, read_only: bool) -> Result<SqliteConnection, String> {
-    let options = SqliteConnectOptions::from_str(&path.to_string_lossy())
-        .map_err(|error| format!("configure {}: {error}", path.display()))?
+    let options = SqliteConnectOptions::new()
+        .filename(path)
         .read_only(read_only)
         .create_if_missing(false)
         .foreign_keys(true);

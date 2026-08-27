@@ -7,7 +7,6 @@ mod tests;
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::process::{Command, Stdio};
 
 use crate::config::Config;
 use crate::observability;
@@ -33,8 +32,9 @@ pub use client::{
     reason = "preserves internal worktree-scoped client APIs"
 )]
 pub(crate) use client::{
-    list_sessions_for_directory, listen_classified_events_until, parse_localhost_url,
-    submit_prompt_for_worktree, submit_prompt_for_worktree_with_selection,
+    list_sessions_for_directory, listen_classified_events_until,
+    listen_classified_events_until_async, parse_localhost_url, submit_prompt_for_worktree,
+    submit_prompt_for_worktree_with_selection,
 };
 pub(crate) use registry::load_runtimes_for_worktree_session;
 #[allow(
@@ -69,7 +69,7 @@ impl OpencodeStatus {
 }
 
 #[allow(dead_code, reason = "optional OpenCode server lifecycle API")]
-pub fn ensure_opencode_server(
+pub async fn ensure_opencode_server(
     repo: &Repository,
     config: &Config,
     branch: &str,
@@ -83,9 +83,10 @@ pub fn ensure_opencode_server(
         worktree,
         &config.tool("opencode"),
     )
+    .await
 }
 
-pub fn ensure_opencode_server_with_program(
+pub async fn ensure_opencode_server_with_program(
     repo: &Repository,
     config: &Config,
     harness_id: &str,
@@ -94,10 +95,10 @@ pub fn ensure_opencode_server_with_program(
     program: &str,
 ) -> Result<OpencodeRuntime, String> {
     let _server_lock = server::lock_repository_server(repo)?;
-    ensure_opencode_server_locked(repo, config, harness_id, branch, worktree, program)
+    ensure_opencode_server_locked(repo, config, harness_id, branch, worktree, program).await
 }
 
-fn ensure_opencode_server_locked(
+async fn ensure_opencode_server_locked(
     repo: &Repository,
     config: &Config,
     harness_id: &str,
@@ -107,7 +108,7 @@ fn ensure_opencode_server_locked(
 ) -> Result<OpencodeRuntime, String> {
     let existing = registry::load_runtime(repo, harness_id, branch, worktree)?;
     let runtimes = registry::load_runtimes_for_harness(repo, harness_id)?;
-    if let Some(shared) = healthy_shared_runtime(&runtimes) {
+    if let Some(shared) = healthy_shared_runtime(&runtimes).await {
         let runtime =
             registry::runtime_for_worktree(repo, harness_id, branch, worktree, &shared, &existing);
         registry::save_shared_server_runtime(repo, &runtime)?;
@@ -115,13 +116,7 @@ fn ensure_opencode_server_locked(
     }
 
     let runtime_identity = format!("{}:{harness_id}", repo.root.display());
-    let stored_port = runtimes
-        .iter()
-        .filter(|runtime| {
-            runtime.server_pid.is_some() && server::stored_server_identity_is_valid(runtime)
-        })
-        .min_by_key(|runtime| (runtime.server_port, runtime.server_url.as_str()))
-        .map(|runtime| runtime.server_port);
+    let stored_port = stop_unhealthy_stored_servers(&runtimes).await?;
     let port = server::allocate_port(
         &runtime_identity,
         "",
@@ -131,42 +126,52 @@ fn ensure_opencode_server_locked(
         server::port_status,
     )?;
     let server_url = server::server_url(port);
-    let mut started_server = None;
-    let server_pid = if server::check_health(&server_url) {
-        existing.as_ref().and_then(|runtime| runtime.server_pid)
-    } else {
-        let mut command = Command::new(program);
-        command
-            .arg("serve")
-            .args(["--hostname", "127.0.0.1"])
-            .args(["--port", &port.to_string()])
-            .current_dir(&repo.root)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let mut child = crate::process::SupervisedChild::spawn_named(
-            &mut command,
-            None,
-            None,
-            crate::process::ProcessDescriptor::new("opencode.server.serve"),
-        )
+    if server::check_health_async(&server_url).await {
+        let runtime = OpencodeRuntime {
+            repo_root: repo.root.display().to_string(),
+            harness_id: harness_id.to_string(),
+            branch: branch.to_string(),
+            worktree_path: worktree.display().to_string(),
+            server_port: port,
+            server_url,
+            server_pid: existing.as_ref().and_then(|runtime| runtime.server_pid),
+            server_process_identity: existing
+                .as_ref()
+                .and_then(|runtime| runtime.server_process_identity),
+            opencode_session_id: existing.and_then(|runtime| runtime.opencode_session_id),
+            generation: 0,
+            updated_unix_ms: client::unix_ms(),
+        };
+        registry::save_shared_server_runtime(repo, &runtime)?;
+        return Ok(runtime);
+    }
+
+    #[cfg(unix)]
+    let command = crate::process::Command::new(program)
+        .arg("serve")
+        .args(["--hostname", "127.0.0.1"])
+        .args(["--port", &port.to_string()])
+        .current_dir(&repo.root);
+    #[cfg(windows)]
+    let command = windows_server_supervisor_command(program, &repo.root, port)?;
+
+    let mut started_server = crate::process::spawn_verified_detached(command)
+        .await
         .map_err(|error| format!("start opencode server: {error}"))?;
-        if let Err(error) = server::wait_for_health(&server_url) {
-            let _ = child.terminate();
-            return Err(error);
+    let server_pid = started_server.pid();
+    let server_process_identity = match started_server.identity() {
+        Some(identity) => Some(identity),
+        None => {
+            let error = format!(
+                "record opencode server {server_pid} identity: reusable identity is unavailable"
+            );
+            return match stop_started_server(started_server).await {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(format!("{error}; startup cleanup failed: {cleanup}")),
+            };
         }
-        let pid = child.id();
-        started_server = Some(child);
-        Some(pid)
     };
 
-    let server_process_identity = if started_server.is_some() {
-        server_pid.and_then(server::stored_process_identity)
-    } else {
-        existing
-            .as_ref()
-            .and_then(|runtime| runtime.server_process_identity)
-    };
     let runtime = OpencodeRuntime {
         repo_root: repo.root.display().to_string(),
         harness_id: harness_id.to_string(),
@@ -174,43 +179,171 @@ fn ensure_opencode_server_locked(
         worktree_path: worktree.display().to_string(),
         server_port: port,
         server_url,
-        server_pid,
+        server_pid: Some(server_pid),
         server_process_identity,
-        opencode_session_id: existing.and_then(|runtime| runtime.opencode_session_id),
+        opencode_session_id: existing
+            .as_ref()
+            .and_then(|runtime| runtime.opencode_session_id.clone()),
         generation: 0,
         updated_unix_ms: client::unix_ms(),
     };
-    if let Err(error) = registry::save_shared_server_runtime(repo, &runtime) {
-        if let Some(mut child) = started_server {
-            let _ = child.terminate();
-        }
-        return Err(error);
+    if let Err(error) = registry::save_runtime(repo, &runtime) {
+        return match stop_started_server(started_server).await {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(format!("{error}; startup cleanup failed: {cleanup}")),
+        };
     }
-    if let Some(child) = started_server {
-        server::record_owned_server_process(child);
+    if let Err(error) = server::wait_for_health(&runtime.server_url).await {
+        return match stop_started_server(started_server).await {
+            Ok(()) => {
+                rollback_starting_runtime(repo, &runtime, existing.as_ref());
+                Err(error)
+            }
+            Err(cleanup) => Err(format!("{error}; startup cleanup failed: {cleanup}")),
+        };
+    }
+    if let Err(error) = validate_started_server(&mut started_server) {
+        return match stop_started_server(started_server).await {
+            Ok(()) => {
+                rollback_starting_runtime(repo, &runtime, existing.as_ref());
+                Err(format!("start opencode server: {error}"))
+            }
+            Err(cleanup) => Err(format!(
+                "start opencode server: {error}; startup cleanup failed: {cleanup}"
+            )),
+        };
+    }
+    if let Err(error) = registry::save_shared_server_runtime(repo, &runtime) {
+        return match stop_started_server(started_server).await {
+            Ok(()) => {
+                rollback_starting_runtime(repo, &runtime, existing.as_ref());
+                Err(error)
+            }
+            Err(cleanup) => Err(format!("{error}; startup cleanup failed: {cleanup}")),
+        };
+    }
+    if let Err(error) = commit_started_server(started_server).await {
+        rollback_starting_runtime(repo, &runtime, existing.as_ref());
+        return Err(format!("commit opencode server startup: {error}"));
     }
     Ok(runtime)
 }
 
-fn healthy_shared_runtime(runtimes: &[OpencodeRuntime]) -> Option<OpencodeRuntime> {
+fn rollback_starting_runtime(
+    repo: &Repository,
+    starting: &OpencodeRuntime,
+    previous: Option<&OpencodeRuntime>,
+) {
+    if let Some(previous) = previous {
+        let _ = registry::save_runtime(repo, previous);
+    } else {
+        let _ =
+            crate::persistence::session::delete_runtime(&observability::db_path(repo), starting);
+    }
+}
+
+#[cfg(windows)]
+fn windows_server_supervisor_command(
+    program: &str,
+    repository: &Path,
+    port: u16,
+) -> Result<crate::process::Command, String> {
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("locate Prism for OpenCode server supervision: {error}"))?;
+    Ok(crate::process::Command::new(executable)
+        .arg("__opencode-server")
+        .arg(program)
+        .arg(repository)
+        .arg(port.to_string()))
+}
+
+#[cfg(windows)]
+pub(crate) async fn run_server_supervisor(
+    program: &Path,
+    repository: &Path,
+    port: u16,
+) -> Result<(), String> {
+    let command = crate::process::Command::new(program)
+        .arg("serve")
+        .args(["--hostname", "127.0.0.1"])
+        .args(["--port", &port.to_string()])
+        .current_dir(repository);
+    let control = crate::process::spawn_owned(
+        command,
+        crate::process::ProcessDescriptor::new("opencode.server.supervised"),
+    )
+    .await
+    .map_err(|error| format!("start supervised opencode server: {error}"))?;
+    let pid = control.pid();
+    let completion = control.wait().await;
+    Err(format!(
+        "supervised opencode server {pid} exited unexpectedly: {completion:?}"
+    ))
+}
+
+fn validate_started_server(
+    server: &mut crate::process::VerifiedDetachedProcess,
+) -> Result<(), String> {
+    server.ensure_leader_running()
+}
+
+async fn stop_started_server(
+    server: crate::process::VerifiedDetachedProcess,
+) -> Result<(), String> {
+    server.shutdown().await
+}
+
+async fn commit_started_server(
+    server: crate::process::VerifiedDetachedProcess,
+) -> Result<(), String> {
+    server.detach().map(|_| ())
+}
+
+async fn healthy_shared_runtime(runtimes: &[OpencodeRuntime]) -> Option<OpencodeRuntime> {
     let mut servers = BTreeMap::new();
     for runtime in runtimes {
         servers
             .entry((runtime.server_port, runtime.server_url.as_str()))
             .or_insert(runtime);
     }
-    servers
-        .into_values()
-        .find(|runtime| {
-            server::check_health(&runtime.server_url)
-                && (server::stored_server_identity_is_valid(runtime)
-                    || runtime.server_pid.is_none())
-        })
-        .cloned()
+    for runtime in servers.into_values() {
+        if server::check_health_async(&runtime.server_url).await
+            && (server::owned_server_identity_is_valid(runtime).await
+                || server::stored_server_identity_is_valid(runtime)
+                || runtime.server_pid.is_none())
+        {
+            return Some(runtime.clone());
+        }
+    }
+    None
+}
+
+async fn stop_unhealthy_stored_servers(
+    runtimes: &[OpencodeRuntime],
+) -> Result<Option<u16>, String> {
+    let mut servers = BTreeMap::new();
+    for runtime in runtimes {
+        let Some(pid) = runtime.server_pid else {
+            continue;
+        };
+        if server::stored_server_identity_is_valid(runtime) {
+            servers
+                .entry((pid, runtime.server_process_identity))
+                .or_insert(runtime);
+        }
+    }
+    let stored_port = servers
+        .values()
+        .min_by_key(|runtime| (runtime.server_port, runtime.server_url.as_str()))
+        .map(|runtime| runtime.server_port);
+    for runtime in servers.into_values() {
+        server::shutdown_stored_server(runtime).await?;
+    }
+    Ok(stored_port)
 }
 
 #[allow(dead_code, reason = "optional OpenCode session lifecycle API")]
-pub fn ensure_opencode_session(
+pub async fn ensure_opencode_session(
     repo: &Repository,
     config: &Config,
     branch: &str,
@@ -224,9 +357,10 @@ pub fn ensure_opencode_session(
         worktree,
         &config.tool("opencode"),
     )
+    .await
 }
 
-pub fn ensure_opencode_session_with_program(
+pub async fn ensure_opencode_session_with_program(
     repo: &Repository,
     config: &Config,
     harness_id: &str,
@@ -236,7 +370,7 @@ pub fn ensure_opencode_session_with_program(
 ) -> Result<OpencodeRuntime, String> {
     let _server_lock = server::lock_repository_server(repo)?;
     let mut runtime =
-        ensure_opencode_server_locked(repo, config, harness_id, branch, worktree, program)?;
+        ensure_opencode_server_locked(repo, config, harness_id, branch, worktree, program).await?;
     let session = resolve_session(&runtime, worktree)?;
     registry::save_runtime_session(repo, &mut runtime, session.id)?;
     Ok(runtime)
@@ -282,8 +416,7 @@ fn resolve_session(runtime: &OpencodeRuntime, worktree: &Path) -> Result<Opencod
     match client::newest_listed_session_for_worktree(runtime, worktree) {
         Ok(Some(session)) => return Ok(session),
         Ok(None) => {}
-        Err(_) if stored_session.is_some() => return Ok(stored_session.unwrap()),
-        Err(error) => return Err(error),
+        Err(error) => return stored_session.ok_or(error),
     }
 
     if let Some(session) = stored_session {
@@ -300,7 +433,7 @@ pub(crate) fn reconcile_session_refresh(
     *current = previous;
 }
 
-pub(crate) fn shutdown_worktree_session_runtimes(
+pub(crate) async fn shutdown_worktree_session_runtimes(
     repo: &Repository,
     branch: &str,
     worktree: &Path,
@@ -320,7 +453,7 @@ pub(crate) fn shutdown_worktree_session_runtimes(
             }
         };
         if references <= 1
-            && let Err(error) = server::shutdown_stored_server(&runtime)
+            && let Err(error) = server::shutdown_stored_server(&runtime).await
         {
             errors.push(error);
             continue;
@@ -339,7 +472,7 @@ pub(crate) fn shutdown_worktree_session_runtimes(
     }
 }
 
-pub(crate) fn shutdown_worktree_session_runtime_processes_with_lock_held(
+pub(crate) async fn shutdown_worktree_session_runtime_processes_with_lock_held(
     repo: &Repository,
     runtimes: &[OpencodeRuntime],
 ) -> Result<(), String> {
@@ -355,7 +488,7 @@ pub(crate) fn shutdown_worktree_session_runtime_processes_with_lock_held(
             .count() as i64;
         match registry::server_reference_count(repo, runtime) {
             Ok(references) if references <= removed_references => {
-                if let Err(error) = server::shutdown_stored_server(runtime) {
+                if let Err(error) = server::shutdown_stored_server(runtime).await {
                     errors.push(error);
                 }
             }

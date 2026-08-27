@@ -10,15 +10,15 @@ use crate::view::RepoMainView;
 use super::super::{OpenTmuxSessionTarget, PanelFocus, Tui, WorktreeListMode};
 use super::support::{test_pr_summary, test_tui, unique_temp_dir};
 
-#[test]
-fn tui_defaults_to_repos_panel_focus() {
+#[tokio::test(flavor = "multi_thread")]
+async fn tui_defaults_to_repos_panel_focus() {
     let tui = test_tui();
 
     assert_eq!(tui.focused_panel, PanelFocus::Repos);
 }
 
-#[test]
-fn switching_repos_does_not_change_worktree_selection_until_worktrees_focus() {
+#[tokio::test(flavor = "multi_thread")]
+async fn switching_repos_does_not_change_worktree_selection_until_worktrees_focus() {
     let mut tui = test_tui();
 
     tui.select_worktree(1);
@@ -31,8 +31,8 @@ fn switching_repos_does_not_change_worktree_selection_until_worktrees_focus() {
     assert_eq!(tui.selected_worktree_index(), Some(3));
 }
 
-#[test]
-fn repeated_worktree_focus_does_not_change_list_mode() {
+#[tokio::test(flavor = "multi_thread")]
+async fn repeated_worktree_focus_does_not_change_list_mode() {
     let mut tui = test_tui();
     tui.focus_worktrees();
 
@@ -45,8 +45,8 @@ fn repeated_worktree_focus_does_not_change_list_mode() {
     assert_eq!(tui.visible_session_indices(), vec![1]);
 }
 
-#[test]
-fn merge_panel_separates_authoritative_merge_progress_from_active_worktrees() {
+#[tokio::test(flavor = "multi_thread")]
+async fn merge_panel_separates_authoritative_merge_progress_from_active_worktrees() {
     let mut tui = test_tui();
     tui.worktree_list_mode = WorktreeListMode::Global;
 
@@ -65,8 +65,8 @@ fn merge_panel_separates_authoritative_merge_progress_from_active_worktrees() {
     assert_eq!(tui.selected_worktree_index(), Some(1));
 }
 
-#[test]
-fn stale_merge_evidence_remains_in_active_worktrees() {
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_merge_evidence_remains_in_active_worktrees() {
     let mut tui = test_tui();
     tui.worktree_list_mode = WorktreeListMode::Global;
     let mut queued = test_pr_summary(false);
@@ -80,8 +80,8 @@ fn stale_merge_evidence_remains_in_active_worktrees() {
     assert!(!tui.visible_merge_indices().contains(&1));
 }
 
-#[test]
-fn failed_queued_merge_returns_to_active_worktrees() {
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_queued_merge_returns_to_active_worktrees() {
     let mut tui = test_tui();
     tui.worktree_list_mode = WorktreeListMode::Global;
     let mut failed = test_pr_summary(false);
@@ -94,8 +94,8 @@ fn failed_queued_merge_returns_to_active_worktrees() {
     assert!(!tui.visible_merge_indices().contains(&1));
 }
 
-#[test]
-fn switching_from_global_to_repo_mode_preserves_selected_worktree() {
+#[tokio::test(flavor = "multi_thread")]
+async fn switching_from_global_to_repo_mode_preserves_selected_worktree() {
     let mut tui = test_tui();
     tui.worktree_list_mode = WorktreeListMode::Global;
     tui.focus_worktrees();
@@ -109,8 +109,8 @@ fn switching_from_global_to_repo_mode_preserves_selected_worktree() {
     assert_eq!(tui.selected_worktree_index(), Some(1));
 }
 
-#[test]
-fn persisted_worktree_list_mode_loads_and_updates_on_switch() {
+#[tokio::test(flavor = "multi_thread")]
+async fn persisted_worktree_list_mode_loads_and_updates_on_switch() {
     let temp = unique_temp_dir("prism-tui-ui-state-test");
     let path = temp.join("ui-state.toml");
     crate::ui_state::save_to_path(&path, WorktreeListMode::Global).unwrap();
@@ -132,8 +132,8 @@ fn persisted_worktree_list_mode_loads_and_updates_on_switch() {
     let _ = std::fs::remove_dir_all(temp);
 }
 
-#[test]
-fn invalid_persisted_ui_state_keeps_current_mode_and_reports_error() {
+#[tokio::test(flavor = "multi_thread")]
+async fn invalid_persisted_ui_state_keeps_current_mode_and_reports_error() {
     let temp = unique_temp_dir("prism-tui-invalid-ui-state-test");
     fs::create_dir_all(&temp).unwrap();
     let path = temp.join("ui-state.toml");
@@ -155,8 +155,8 @@ fn invalid_persisted_ui_state_keeps_current_mode_and_reports_error() {
     fs::remove_dir_all(temp).unwrap();
 }
 
-#[test]
-fn worktree_filter_clear_restores_remembered_worktree() {
+#[tokio::test(flavor = "multi_thread")]
+async fn worktree_filter_clear_restores_remembered_worktree() {
     let mut tui = test_tui();
     tui.select_worktree(1);
 
@@ -171,8 +171,8 @@ fn worktree_filter_clear_restores_remembered_worktree() {
     assert_eq!(tui.selected_worktree_index(), Some(1));
 }
 
-#[test]
-fn hidden_sessions_are_not_visible_in_normal_worktree_list() {
+#[tokio::test(flavor = "multi_thread")]
+async fn hidden_sessions_are_not_visible_in_normal_worktree_list() {
     let mut tui = test_tui();
     tui.sessions[1].hidden = true;
     tui.selected = 1;
@@ -181,8 +181,8 @@ fn hidden_sessions_are_not_visible_in_normal_worktree_list() {
     assert_eq!(tui.selected_worktree_index(), None);
 }
 
-#[test]
-fn horizontal_keys_switch_repo_view_without_changing_focus() {
+#[tokio::test(flavor = "multi_thread")]
+async fn horizontal_keys_switch_repo_view_without_changing_focus() {
     let mut tui = test_tui();
     tui.focused_panel = PanelFocus::Repos;
 
@@ -210,8 +210,8 @@ fn horizontal_keys_switch_repo_view_without_changing_focus() {
     assert_eq!(tui.repo_main_view, RepoMainView::ChangeRequests);
 }
 
-#[test]
-fn main_panel_scrolls_when_pr_comments_are_selectable() {
+#[tokio::test(flavor = "multi_thread")]
+async fn main_panel_scrolls_when_pr_comments_are_selectable() {
     let mut tui = test_tui();
     tui.focus_worktrees();
     tui.select_worktree(1);
@@ -244,8 +244,8 @@ fn main_panel_scrolls_when_pr_comments_are_selectable() {
     assert_eq!(tui.selected_comment, 0);
 }
 
-#[test]
-fn mouse_wheel_scrolls_only_when_pointer_is_over_main_panel() {
+#[tokio::test(flavor = "multi_thread")]
+async fn mouse_wheel_scrolls_only_when_pointer_is_over_main_panel() {
     let mut tui = test_tui();
     let area = Rect::new(0, 0, 120, 30);
     let mouse = |kind, column| MouseEvent {
@@ -265,8 +265,8 @@ fn mouse_wheel_scrolls_only_when_pointer_is_over_main_panel() {
     assert_eq!(tui.main_scroll, 0);
 }
 
-#[test]
-fn panel_traversal_restores_selection_for_each_worktree_list() {
+#[tokio::test(flavor = "multi_thread")]
+async fn panel_traversal_restores_selection_for_each_worktree_list() {
     let mut tui = test_tui();
     tui.worktree_list_mode = WorktreeListMode::Global;
     tui.sessions[1].pr = PrCache::observed(test_pr_summary(true), None);
@@ -288,8 +288,8 @@ fn panel_traversal_restores_selection_for_each_worktree_list() {
     assert_eq!(tui.selected_worktree_index(), Some(3));
 }
 
-#[test]
-fn sidebar_navigation_leaves_main_focus() {
+#[tokio::test(flavor = "multi_thread")]
+async fn sidebar_navigation_leaves_main_focus() {
     let mut tui = test_tui();
     tui.focus_main();
 
@@ -303,8 +303,8 @@ fn sidebar_navigation_leaves_main_focus() {
     assert_eq!(tui.focused_panel, PanelFocus::Worktrees);
 }
 
-#[test]
-fn open_tmux_session_target_blocks_status_enter() {
+#[tokio::test(flavor = "multi_thread")]
+async fn open_tmux_session_target_blocks_status_enter() {
     let mut tui = test_tui();
     tui.focused_panel = PanelFocus::Status;
 
@@ -314,8 +314,8 @@ fn open_tmux_session_target_blocks_status_enter() {
     );
 }
 
-#[test]
-fn open_tmux_session_target_opens_repo_default_from_repos() {
+#[tokio::test(flavor = "multi_thread")]
+async fn open_tmux_session_target_opens_repo_default_from_repos() {
     let mut tui = test_tui();
     tui.focused_panel = PanelFocus::Repos;
 
@@ -325,8 +325,8 @@ fn open_tmux_session_target_opens_repo_default_from_repos() {
     );
 }
 
-#[test]
-fn open_tmux_session_target_ignores_worktree_filter_for_repo_default() {
+#[tokio::test(flavor = "multi_thread")]
+async fn open_tmux_session_target_ignores_worktree_filter_for_repo_default() {
     let mut tui = test_tui();
     tui.focused_panel = PanelFocus::Repos;
     tui.worktree_filter = "missing".to_string();
@@ -337,8 +337,8 @@ fn open_tmux_session_target_ignores_worktree_filter_for_repo_default() {
     );
 }
 
-#[test]
-fn open_tmux_session_target_opens_feature_worktree_agent() {
+#[tokio::test(flavor = "multi_thread")]
+async fn open_tmux_session_target_opens_feature_worktree_agent() {
     let mut tui = test_tui();
     tui.focused_panel = PanelFocus::Worktrees;
     tui.select_worktree(1);
@@ -349,8 +349,8 @@ fn open_tmux_session_target_opens_feature_worktree_agent() {
     );
 }
 
-#[test]
-fn open_tmux_session_target_blocks_default_branch_in_worktree_panel() {
+#[tokio::test(flavor = "multi_thread")]
+async fn open_tmux_session_target_blocks_default_branch_in_worktree_panel() {
     let mut tui = test_tui();
     tui.focused_panel = PanelFocus::Worktrees;
     tui.select_worktree(0);
@@ -361,8 +361,8 @@ fn open_tmux_session_target_blocks_default_branch_in_worktree_panel() {
     );
 }
 
-#[test]
-fn selected_repo_identity_survives_repo_reordering() {
+#[tokio::test(flavor = "multi_thread")]
+async fn selected_repo_identity_survives_repo_reordering() {
     let mut tui = test_tui();
     tui.select_repo(1);
     tui.repos.swap(0, 1);

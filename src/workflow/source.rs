@@ -5,13 +5,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString, OsString};
 use std::fmt;
 use std::fs;
-use std::io::{Read as _, Write as _};
+#[cfg(any(unix, windows))]
+use std::io::Read as _;
+use std::io::Write as _;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt as _;
+#[cfg(windows)]
+use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -550,7 +554,7 @@ impl TriggerRevision {
 }
 
 /// One immutable read of every executable repository resource. Paths are relative to `.prism`,
-/// normalized by `strip_prefix`, and symbolic links are rejected while capturing.
+/// and symbolic links or Windows reparse points are rejected while capturing.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RepositoryResourceSnapshot {
     root: PathBuf,
@@ -570,16 +574,24 @@ impl RepositoryResourceSnapshot {
                 collect_resource_files_at(&root_directory, Path::new(directory), &mut captured)?;
             }
         }
-        #[cfg(not(unix))]
-        for directory in ["workflows", "triggers", "skills", "templates", "packages"] {
-            collect_resource_files(root, &root.join(directory), &mut captured)?;
+        #[cfg(windows)]
+        if let Some(root_guard) = open_windows_resource_root_nofollow(root)? {
+            for directory in ["workflows", "triggers", "skills", "templates", "packages"] {
+                collect_resource_files_windows(
+                    &root_guard,
+                    root,
+                    Path::new(directory),
+                    &mut captured,
+                    true,
+                )?;
+            }
         }
         captured.sort_by(|left, right| left.0.cmp(&right.0));
         let mut revision_bytes = b"prism-repository-resource-snapshot\0v2".to_vec();
         revision_bytes.extend_from_slice(&(captured.len() as u64).to_be_bytes());
         let mut files = BTreeMap::new();
         for (relative, contents) in captured {
-            append_snapshot_field(&mut revision_bytes, relative_path_bytes(&relative));
+            append_snapshot_field(&mut revision_bytes, &relative_path_bytes(&relative));
             append_snapshot_field(&mut revision_bytes, &contents);
             files.insert(relative, contents);
         }
@@ -1912,6 +1924,51 @@ fn is_repository_trigger_path(path: &Path) -> bool {
         || (components.len() == 4 && components[0] == "packages" && components[2] == "triggers")
 }
 
+#[cfg(unix)]
+fn validated_external_trigger_name(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<String, WorkflowSourceError> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| WorkflowSourceError::Io("trigger filename is not UTF-8".into()))?;
+    if !bytes.starts_with(b"#!") {
+        return Err(WorkflowSourceError::Io(format!(
+            "external trigger {} must begin with a shebang",
+            path.display()
+        )));
+    }
+    Ok(name.to_string())
+}
+
+#[cfg(windows)]
+fn validated_external_trigger_name(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<String, WorkflowSourceError> {
+    let name = path
+        .file_stem()
+        .filter(|_| {
+            path.extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+        })
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            WorkflowSourceError::Io(format!(
+                "native Windows external trigger {} must use an .exe filename",
+                path.display()
+            ))
+        })?;
+    if !bytes.starts_with(b"MZ") {
+        return Err(WorkflowSourceError::Io(format!(
+            "native Windows external trigger {} must be a PE executable",
+            path.display()
+        )));
+    }
+    Ok(name.to_string())
+}
+
 fn discover_snapshot_triggers(
     repository: &TrustedRepositoryResources,
     catalog: &mut TriggerCatalog,
@@ -1920,21 +1977,12 @@ fn discover_snapshot_triggers(
         if !is_repository_trigger_path(relative) {
             continue;
         }
-        let name = relative
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| WorkflowSourceError::Io("trigger filename is not UTF-8".into()))?
-            .to_string();
-        if !bytes.starts_with(b"#!") {
-            return Err(WorkflowSourceError::Io(format!(
-                "external trigger {} must begin with a shebang",
-                repository.snapshot().absolute_path(relative).display()
-            )));
-        }
+        let path = repository.snapshot().absolute_path(relative);
+        let name = validated_external_trigger_name(&path, bytes)?;
         let directives = trigger_directives(bytes);
         catalog.insert(TriggerRevision {
             name,
-            executable: Some(repository.snapshot().absolute_path(relative)),
+            executable: Some(path),
             digest: sha256(bytes),
             check_only: directives.contains("check-only"),
             repeatable_prepare: directives.contains("repeatable-prepare"),
@@ -1960,18 +2008,8 @@ fn discover_trigger_directory(
             continue;
         }
         let path = entry.path();
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| WorkflowSourceError::Io("trigger filename is not UTF-8".into()))?
-            .to_string();
         let bytes = fs::read(&path)?;
-        if !bytes.starts_with(b"#!") {
-            return Err(WorkflowSourceError::Io(format!(
-                "external trigger {} must begin with a shebang",
-                path.display()
-            )));
-        }
+        let name = validated_external_trigger_name(&path, &bytes)?;
         let directives = trigger_directives(&bytes);
         catalog.insert(TriggerRevision {
             name,
@@ -2048,9 +2086,19 @@ fn append_snapshot_field(encoded: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 #[cfg(unix)]
-fn relative_path_bytes(path: &Path) -> &[u8] {
+fn relative_path_bytes(path: &Path) -> Vec<u8> {
     use std::os::unix::ffi::OsStrExt as _;
-    path.as_os_str().as_bytes()
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(windows)]
+fn relative_path_bytes(path: &Path) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    path.as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_be_bytes)
+        .collect()
 }
 
 #[cfg(unix)]
@@ -2246,35 +2294,117 @@ fn collect_resource_files_at(
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn collect_resource_files(
-    root: &Path,
-    directory: &Path,
-    files: &mut Vec<(PathBuf, Vec<u8>)>,
-) -> Result<(), WorkflowSourceError> {
-    let entries = match fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
+#[cfg(windows)]
+struct WindowsResourceRoot {
+    _handles: Vec<fs::File>,
+}
+
+#[cfg(windows)]
+fn open_windows_resource(
+    path: &Path,
+    desired_access: u32,
+) -> std::io::Result<(fs::File, fs::Metadata)> {
+    use windows::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_READ,
     };
-    let mut entries = entries.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(fs::DirEntry::file_name);
-    for entry in entries {
-        let file_type = entry.file_type()?;
-        if file_type.is_symlink() {
+
+    let mut options = fs::OpenOptions::new();
+    options
+        .access_mode(desired_access)
+        // Denying write and delete sharing keeps every checked component immutable while later
+        // path-based opens use it, closing junction/swap races without following reparse points.
+        .share_mode(FILE_SHARE_READ.0)
+        .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0);
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "repository resource {} must not be a Windows reparse point",
+                path.display()
+            ),
+        ));
+    }
+    Ok((file, metadata))
+}
+
+#[cfg(windows)]
+fn open_windows_resource_root_nofollow(
+    path: &Path,
+) -> Result<Option<WindowsResourceRoot>, WorkflowSourceError> {
+    use windows::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let ancestors = absolute
+        .ancestors()
+        .filter(|ancestor| !ancestor.as_os_str().is_empty())
+        .collect::<Vec<_>>();
+    let mut handles = Vec::with_capacity(ancestors.len());
+    for ancestor in ancestors.into_iter().rev() {
+        let (handle, metadata) = match open_windows_resource(ancestor, FILE_READ_ATTRIBUTES.0) {
+            Ok(opened) => opened,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.is_dir() {
             return Err(WorkflowSourceError::Io(format!(
-                "repository resource {} must not be a symbolic link",
-                entry.path().display()
+                "repository resource root ancestor {} is not a directory",
+                ancestor.display()
             )));
         }
-        if file_type.is_dir() {
-            collect_resource_files(root, &entry.path(), files)?;
-        } else if file_type.is_file() {
-            files.push((
-                entry.path().strip_prefix(root).unwrap().to_path_buf(),
-                fs::read(entry.path())?,
-            ));
+        handles.push(handle);
+    }
+    Ok(Some(WindowsResourceRoot { _handles: handles }))
+}
+
+#[cfg(windows)]
+fn collect_resource_files_windows(
+    _root_guard: &WindowsResourceRoot,
+    root: &Path,
+    relative: &Path,
+    files: &mut Vec<(PathBuf, Vec<u8>)>,
+    optional_directory: bool,
+) -> Result<(), WorkflowSourceError> {
+    let path = root.join(relative);
+    let (mut handle, metadata) =
+        match open_windows_resource(&path, windows::Win32::Foundation::GENERIC_READ.0) {
+            Ok(opened) => opened,
+            Err(error) if optional_directory && error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(WorkflowSourceError::Io(format!(
+                    "repository resource {} changed while it was captured: {error}",
+                    relative.display()
+                )));
+            }
+            Err(error) => return Err(error.into()),
+        };
+    if optional_directory && !metadata.is_dir() {
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        let mut entries = fs::read_dir(&path)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(fs::DirEntry::file_name);
+        for entry in entries {
+            collect_resource_files_windows(
+                _root_guard,
+                root,
+                &relative.join(entry.file_name()),
+                files,
+                false,
+            )?;
         }
+    } else if metadata.is_file() {
+        let mut contents = Vec::new();
+        handle.read_to_end(&mut contents)?;
+        files.push((relative.to_path_buf(), contents));
     }
     Ok(())
 }
@@ -2383,9 +2513,17 @@ pub fn copy_example(global_root: &Path, name: &str) -> Result<PathBuf, WorkflowS
 
 fn write_new_owner_only(path: &Path, bytes: &[u8]) -> Result<bool, WorkflowSourceError> {
     let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true).mode(0o600);
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
     match options.open(path) {
         Ok(mut file) => {
+            #[cfg(windows)]
+            if let Err(error) = crate::system::windows_security::secure_path(path, false) {
+                drop(file);
+                let _ = fs::remove_file(path);
+                return Err(error.into());
+            }
             file.write_all(bytes)?;
             file.sync_all()?;
             Ok(true)
@@ -2412,6 +2550,24 @@ mod tests {
             .canonicalize()
             .unwrap()
             .join(format!("{name}-{}", std::process::id()))
+    }
+
+    #[cfg(windows)]
+    fn create_directory_junction(link: &Path, target: &Path) {
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .expect("run mklink");
+        assert!(
+            output.status.success(),
+            "create junction {} -> {}: stdout={} stderr={}",
+            link.display(),
+            target.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -2796,6 +2952,7 @@ prompt = "{{title}} publish={{publish}} count={{count}} mode={{mode}}"
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn external_trigger_directives_declare_check_only_and_recovery_policy() {
         let root =
@@ -2813,6 +2970,41 @@ prompt = "{{title}} publish={{publish}} count={{count}} mode={{mode}}"
         assert!(revision.check_only);
         assert!(revision.repeatable_prepare);
         assert!(!revision.repeatable_finalize);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_global_and_snapshot_triggers_share_the_native_executable_contract() {
+        let root =
+            std::env::temp_dir().join(format!("prism-trigger-native-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("triggers")).unwrap();
+        let executable = root.join("triggers/check-clean.exe");
+        fs::write(&executable, b"MZnative-trigger-fixture").unwrap();
+
+        let repository_resources = root.join("repository/.prism");
+        fs::create_dir_all(repository_resources.join("triggers")).unwrap();
+        let repository_executable = repository_resources.join("triggers/repository-check.exe");
+        let repository_bytes = b"MZrepository-trigger-fixture";
+        fs::write(&repository_executable, repository_bytes).unwrap();
+        let repository = TrustedRepositoryResources(
+            RepositoryResourceSnapshot::capture(&repository_resources).unwrap(),
+        );
+
+        let catalog = TriggerCatalog::discover(&root, Some(&repository)).unwrap();
+        let revision = catalog.get("check-clean").unwrap();
+        assert_eq!(revision.executable.as_deref(), Some(executable.as_path()));
+        let repository_revision = catalog.get("repository-check").unwrap();
+        assert_eq!(
+            repository_revision.executable.as_deref(),
+            Some(repository_executable.as_path())
+        );
+        assert_eq!(
+            repository_revision.captured_bytes.as_deref(),
+            Some(repository_bytes.as_slice())
+        );
+        assert!(catalog.get("repository-check.exe").is_none());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2842,7 +3034,7 @@ prompt = "{{title}} publish={{publish}} count={{count}} mode={{mode}}"
     }
 
     #[test]
-    fn snapshot_revision_encoding_is_injective_and_rejects_symlink_roots() {
+    fn snapshot_revision_encoding_is_injective_and_rejects_linked_resources() {
         let root = canonical_temp("prism-workflow-snapshot-encoding");
         let _ = fs::remove_dir_all(&root);
         let one = root.join("one");
@@ -2866,26 +3058,57 @@ prompt = "{{title}} publish={{publish}} count={{count}} mode={{mode}}"
             .clone();
         assert_ne!(one_revision, two_revision);
 
-        let actual = root.join("actual");
-        fs::create_dir_all(actual.join("workflows")).unwrap();
-        let linked = root.join("linked");
-        std::os::unix::fs::symlink(&actual, &linked).unwrap();
-        assert!(
-            RepositoryResourceSnapshot::capture(&linked)
-                .unwrap_err()
-                .to_string()
-                .contains("symbolic link")
-        );
-        let top_level_link = root.join("top-level-link");
-        fs::create_dir_all(&top_level_link).unwrap();
-        std::os::unix::fs::symlink(actual.join("workflows"), top_level_link.join("workflows"))
-            .unwrap();
-        assert!(
-            RepositoryResourceSnapshot::capture(&top_level_link)
-                .unwrap_err()
-                .to_string()
-                .contains("symbolic link")
-        );
+        #[cfg(unix)]
+        {
+            let actual = root.join("actual");
+            fs::create_dir_all(actual.join("workflows")).unwrap();
+            let linked = root.join("linked");
+            std::os::unix::fs::symlink(&actual, &linked).unwrap();
+            assert!(
+                RepositoryResourceSnapshot::capture(&linked)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("symbolic link")
+            );
+            let top_level_link = root.join("top-level-link");
+            fs::create_dir_all(&top_level_link).unwrap();
+            std::os::unix::fs::symlink(actual.join("workflows"), top_level_link.join("workflows"))
+                .unwrap();
+            assert!(
+                RepositoryResourceSnapshot::capture(&top_level_link)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("symbolic link")
+            );
+        }
+        #[cfg(windows)]
+        {
+            let actual = root.join("actual");
+            fs::create_dir_all(actual.join("workflows")).unwrap();
+            fs::write(actual.join("workflows/outside.toml"), b"outside").unwrap();
+
+            let linked_root = root.join("linked-root");
+            create_directory_junction(&linked_root, &actual);
+            assert!(
+                RepositoryResourceSnapshot::capture(&linked_root)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("reparse point")
+            );
+            fs::remove_dir(&linked_root).unwrap();
+
+            let nested_root = root.join("nested-root");
+            fs::create_dir_all(nested_root.join("packages/pkg")).unwrap();
+            let nested_link = nested_root.join("packages/pkg/workflows");
+            create_directory_junction(&nested_link, &actual.join("workflows"));
+            assert!(
+                RepositoryResourceSnapshot::capture(&nested_root)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("reparse point")
+            );
+            fs::remove_dir(&nested_link).unwrap();
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2899,8 +3122,15 @@ prompt = "{{title}} publish={{publish}} count={{count}} mode={{mode}}"
         fs::create_dir_all(resources.join("packages/pkg/workflows")).unwrap();
         fs::create_dir_all(resources.join("packages/pkg/triggers")).unwrap();
         let workflow_path = resources.join("packages/pkg/workflows/review.toml");
+        #[cfg(unix)]
         let trigger_path = resources.join("packages/pkg/triggers/captured");
-        let original_trigger = b"#!/bin/sh\n# prism-trigger: repeatable-prepare\n";
+        #[cfg(windows)]
+        let trigger_path = resources.join("packages/pkg/triggers/captured.exe");
+        #[cfg(unix)]
+        let original_trigger: &[u8] = b"#!/bin/sh\n# prism-trigger: repeatable-prepare\n";
+        #[cfg(windows)]
+        let original_trigger: &[u8] =
+            b"MZnative-trigger-fixture\r\n// prism-trigger: repeatable-prepare\r\n";
         fs::write(
             &workflow_path,
             "[[step]]\ntrigger='captured'\nprompt='trusted prompt'\n",
@@ -2917,25 +3147,28 @@ prompt = "{{title}} publish={{publish}} count={{count}} mode={{mode}}"
             .unwrap();
 
         fs::write(&workflow_path, "[[step]]\nprompt='attacker prompt'\n").unwrap();
+        #[cfg(unix)]
         fs::write(&trigger_path, b"#!/bin/sh\nexit 99\n").unwrap();
+        #[cfg(windows)]
+        fs::write(&trigger_path, b"MZattacker-trigger-fixture").unwrap();
         let catalog = WorkflowCatalog::discover(&global, Some(&trusted)).unwrap();
         let workflow = catalog.get("review").unwrap();
         assert_eq!(workflow.steps[0].prompt.as_deref(), Some("trusted prompt"));
         let trigger = workflow.steps[0].trigger.as_ref().unwrap();
-        assert_eq!(
-            trigger.captured_bytes.as_deref(),
-            Some(original_trigger.as_slice())
-        );
+        assert_eq!(trigger.captured_bytes.as_deref(), Some(original_trigger));
         assert_eq!(trigger.digest, sha256(original_trigger));
 
-        let symlink = resources.join("packages/pkg/workflows/link.toml");
-        std::os::unix::fs::symlink(&workflow_path, &symlink).unwrap();
-        assert!(
-            RepositoryResourceSnapshot::capture(&resources)
-                .unwrap_err()
-                .to_string()
-                .contains("symbolic link")
-        );
+        #[cfg(unix)]
+        {
+            let symlink = resources.join("packages/pkg/workflows/link.toml");
+            std::os::unix::fs::symlink(&workflow_path, &symlink).unwrap();
+            assert!(
+                RepositoryResourceSnapshot::capture(&resources)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("symbolic link")
+            );
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

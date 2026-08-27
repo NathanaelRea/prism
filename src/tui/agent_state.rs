@@ -222,7 +222,7 @@ impl Tui {
                 request.generation,
                 Some(TUI_ACTION_JOB_TIMEOUT),
                 "prism-agent-state-persistence".to_string(),
-                move |_| {
+                move |_| async move {
                     match request.state {
                         Some(state) => {
                             crate::session::save_agent_state(&request.repo, &request.branch, state)?

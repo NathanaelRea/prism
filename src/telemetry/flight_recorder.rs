@@ -27,6 +27,7 @@ const SCHEMA_VERSION: u32 = 1;
 const MAX_CONTROL_BATCH: usize = 8;
 const MAX_EVENT_BATCH: usize = 1_024;
 const MAX_REQUEST_BATCH: usize = 64;
+#[cfg(unix)]
 const RECORDER_SOCKET_PATH_BUDGET: usize = 103;
 
 static RECORDER: OnceLock<Recorder> = OnceLock::new();
@@ -41,6 +42,10 @@ thread_local! {
     static CURRENT_JOB_CONTEXT: RefCell<Option<JobDiagnosticContext>> = const { RefCell::new(None) };
     #[cfg(test)]
     static EXTERNAL_CALLS_FORBIDDEN: Cell<bool> = const { Cell::new(false) };
+}
+
+tokio::task_local! {
+    static ASYNC_JOB_CONTEXT: JobDiagnosticContext;
 }
 
 #[cfg(test)]
@@ -64,6 +69,7 @@ struct JobDiagnosticContext {
     job_type: &'static str,
 }
 
+#[cfg(test)]
 pub(crate) fn with_job_context<T>(
     job_id: u64,
     job_type: &'static str,
@@ -83,8 +89,24 @@ pub(crate) fn with_job_context<T>(
     operation()
 }
 
+pub(crate) async fn with_async_job_context<F>(
+    job_id: u64,
+    job_type: &'static str,
+    operation: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    ASYNC_JOB_CONTEXT
+        .scope(JobDiagnosticContext { job_id, job_type }, operation)
+        .await
+}
+
 fn current_job_context() -> Option<JobDiagnosticContext> {
-    CURRENT_JOB_CONTEXT.with(|current| *current.borrow())
+    ASYNC_JOB_CONTEXT
+        .try_with(|context| *context)
+        .ok()
+        .or_else(|| CURRENT_JOB_CONTEXT.with(|current| *current.borrow()))
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -144,6 +166,7 @@ pub(crate) enum ExternalCallOutcome {
     TimedOut,
     Canceled,
     SpawnFailed,
+    Dropped,
     Closed,
 }
 
@@ -155,6 +178,7 @@ impl ExternalCallOutcome {
             Self::TimedOut => "timed_out",
             Self::Canceled => "canceled",
             Self::SpawnFailed => "spawn_failed",
+            Self::Dropped => "dropped",
             Self::Closed => "closed",
         }
     }
@@ -496,50 +520,64 @@ fn recorder() -> &'static Recorder {
 enum Control {
     Serve {
         endpoints: Vec<ServerEndpoint>,
-        reply: mpsc::SyncSender<Vec<PathBuf>>,
+        reply: mpsc::SyncSender<Vec<RecorderEndpoint>>,
     },
     Register {
         endpoints: Vec<ServerEndpoint>,
     },
     Stop {
-        paths: Vec<PathBuf>,
+        endpoints: Vec<RecorderEndpoint>,
     },
     StopAll,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     Drain {
         reply: mpsc::SyncSender<()>,
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RecorderEndpoint(PathBuf);
+
+impl RecorderEndpoint {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
 struct ServerEndpoint {
-    socket_path: PathBuf,
+    endpoint: RecorderEndpoint,
     output_dir: PathBuf,
 }
 
 struct ServerSocket {
+    #[cfg(unix)]
     socket: std::os::unix::net::UnixDatagram,
-    socket_path: PathBuf,
+    #[cfg(windows)]
+    socket: std::net::UdpSocket,
+    #[cfg(windows)]
+    token: String,
+    endpoint: RecorderEndpoint,
     output_dir: PathBuf,
     _lock: File,
 }
 
 pub(crate) struct ServerGuard {
-    paths: Vec<PathBuf>,
+    endpoints: Vec<RecorderEndpoint>,
 }
 
 impl ServerGuard {
     pub(crate) fn is_empty(&self) -> bool {
-        self.paths.is_empty()
+        self.endpoints.is_empty()
     }
 }
 
 impl Drop for ServerGuard {
     fn drop(&mut self) {
-        if self.paths.is_empty() {
+        if self.endpoints.is_empty() {
             return;
         }
         let _ = recorder().control_tx.try_send(Control::Stop {
-            paths: std::mem::take(&mut self.paths),
+            endpoints: std::mem::take(&mut self.endpoints),
         });
     }
 }
@@ -549,7 +587,9 @@ pub(crate) fn serve_repositories<'a>(
 ) -> ServerGuard {
     let endpoints = server_endpoints(repos);
     if endpoints.is_empty() {
-        return ServerGuard { paths: Vec::new() };
+        return ServerGuard {
+            endpoints: Vec::new(),
+        };
     }
     let (reply_tx, reply_rx) = mpsc::sync_channel(1);
     if recorder()
@@ -560,10 +600,12 @@ pub(crate) fn serve_repositories<'a>(
         })
         .is_err()
     {
-        return ServerGuard { paths: Vec::new() };
+        return ServerGuard {
+            endpoints: Vec::new(),
+        };
     }
     ServerGuard {
-        paths: reply_rx
+        endpoints: reply_rx
             .recv_timeout(Duration::from_secs(1))
             .unwrap_or_default(),
     }
@@ -583,7 +625,7 @@ pub(crate) fn stop_all_servers() {
     let _ = recorder().control_tx.try_send(Control::StopAll);
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn drain_events_for_test() -> bool {
     let (reply_tx, reply_rx) = mpsc::sync_channel(1);
     recorder()
@@ -597,7 +639,7 @@ fn server_endpoints<'a>(repos: impl IntoIterator<Item = &'a Repository>) -> Vec<
     repos
         .into_iter()
         .map(|repo| ServerEndpoint {
-            socket_path: control_socket_path(repo),
+            endpoint: control_endpoint(repo),
             output_dir: repo.prism_dir().join("recordings"),
         })
         .collect()
@@ -650,15 +692,20 @@ struct CaptureResponse {
 
 pub(crate) fn trigger(repo: &Repository, options: RecordOptions) -> Result<PathBuf, String> {
     let options = options.validate()?;
-    trigger_unix(repo, options)
+    #[cfg(unix)]
+    return trigger_unix(repo, options);
+    #[cfg(windows)]
+    return trigger_windows(repo, options);
 }
 
+#[cfg(unix)]
 fn trigger_unix(repo: &Repository, options: RecordOptions) -> Result<PathBuf, String> {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixDatagram;
 
-    let server_path = control_socket_path(repo);
-    validate_recorder_socket_path(&server_path, "recorder control")?;
+    let server_endpoint = control_endpoint(repo);
+    let server_path = server_endpoint.path();
+    validate_recorder_socket_path(server_path, "recorder control")?;
     if !server_path.exists() {
         return Err(format!(
             "no running Prism TUI recorder found for {}; start Prism for this repository first",
@@ -683,7 +730,7 @@ fn trigger_unix(repo: &Repository, options: RecordOptions) -> Result<PathBuf, St
         after_seconds: options.after_seconds,
     })
     .map_err(|error| format!("encode debug recorder request: {error}"))?;
-    socket.send_to(&request, &server_path).map_err(|error| {
+    socket.send_to(&request, server_path).map_err(|error| {
         format!(
             "contact running Prism TUI recorder at {}: {error}",
             server_path.display()
@@ -707,12 +754,118 @@ fn trigger_unix(repo: &Repository, options: RecordOptions) -> Result<PathBuf, St
         .ok_or_else(|| "debug recorder returned no artifact path".to_string())
 }
 
+#[cfg(windows)]
+const WINDOWS_RECORDER_VERSION: u8 = 1;
+#[cfg(windows)]
+const WINDOWS_RECORDER_TOKEN_LEN: usize = 64;
+#[cfg(windows)]
+const WINDOWS_RECORDER_MAX_PAYLOAD: usize = 4 * 1024;
+
+#[cfg(windows)]
+#[derive(Deserialize, Serialize)]
+struct WindowsRecorderDescriptor {
+    version: u8,
+    address: std::net::SocketAddr,
+    token: String,
+}
+
+#[cfg(windows)]
+fn windows_packet(token: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
+    if token.len() != WINDOWS_RECORDER_TOKEN_LEN || payload.len() > WINDOWS_RECORDER_MAX_PAYLOAD {
+        return Err("invalid Windows recorder packet bounds".to_string());
+    }
+    let mut packet = Vec::with_capacity(1 + token.len() + payload.len());
+    packet.push(WINDOWS_RECORDER_VERSION);
+    packet.extend_from_slice(token.as_bytes());
+    packet.extend_from_slice(payload);
+    Ok(packet)
+}
+
+#[cfg(windows)]
+fn decode_windows_packet<'a>(packet: &'a [u8], token: &str) -> Option<&'a [u8]> {
+    let header = 1 + WINDOWS_RECORDER_TOKEN_LEN;
+    if packet.len() < header
+        || packet.len() > header + WINDOWS_RECORDER_MAX_PAYLOAD
+        || packet[0] != WINDOWS_RECORDER_VERSION
+        || packet.get(1..header)? != token.as_bytes()
+    {
+        return None;
+    }
+    packet.get(header..)
+}
+
+#[cfg(windows)]
+fn trigger_windows(repo: &Repository, options: RecordOptions) -> Result<PathBuf, String> {
+    let endpoint = control_endpoint(repo);
+    let descriptor = fs::read(endpoint.path()).map_err(|error| {
+        format!(
+            "no running Prism TUI recorder found for {}: {error}",
+            repo.root.display()
+        )
+    })?;
+    let descriptor: WindowsRecorderDescriptor = serde_json::from_slice(&descriptor)
+        .map_err(|error| format!("decode debug recorder endpoint: {error}"))?;
+    if descriptor.version != WINDOWS_RECORDER_VERSION
+        || descriptor.token.len() != WINDOWS_RECORDER_TOKEN_LEN
+        || !descriptor.address.ip().is_loopback()
+    {
+        return Err("debug recorder endpoint is invalid".to_string());
+    }
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0")
+        .map_err(|error| format!("bind debug recorder response socket: {error}"))?;
+    socket
+        .set_read_timeout(Some(
+            Duration::from_secs(options.after_seconds).saturating_add(RESPONSE_GRACE),
+        ))
+        .map_err(|error| format!("configure debug recorder timeout: {error}"))?;
+    let request = serde_json::to_vec(&CaptureRequest {
+        schema_version: SCHEMA_VERSION,
+        before_seconds: options.before_seconds,
+        after_seconds: options.after_seconds,
+    })
+    .map_err(|error| format!("encode debug recorder request: {error}"))?;
+    let packet = windows_packet(&descriptor.token, &request)?;
+    socket
+        .send_to(&packet, descriptor.address)
+        .map_err(|error| format!("contact running Prism TUI recorder: {error}"))?;
+    let mut packet = [0_u8; 1 + WINDOWS_RECORDER_TOKEN_LEN + WINDOWS_RECORDER_MAX_PAYLOAD];
+    let (size, source) = socket
+        .recv_from(&mut packet)
+        .map_err(|error| format!("wait for debug recording: {error}"))?;
+    if source != descriptor.address {
+        return Err("debug recorder response came from an unexpected endpoint".to_string());
+    }
+    let response = decode_windows_packet(&packet[..size], &descriptor.token)
+        .ok_or_else(|| "debug recorder response failed authentication".to_string())?;
+    let response: CaptureResponse = serde_json::from_slice(response)
+        .map_err(|error| format!("decode debug recorder response: {error}"))?;
+    if let Some(error) = response.error {
+        return Err(error);
+    }
+    response
+        .path
+        .ok_or_else(|| "debug recorder returned no artifact path".to_string())
+}
+
+#[cfg(unix)]
 struct SocketPathGuard(PathBuf);
 
+#[cfg(unix)]
 impl Drop for SocketPathGuard {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
     }
+}
+
+enum ResponseEndpoint {
+    #[cfg(unix)]
+    Unix(PathBuf),
+    #[cfg(windows)]
+    Windows {
+        target: std::net::SocketAddr,
+        socket: std::net::UdpSocket,
+        token: String,
+    },
 }
 
 struct PendingCapture {
@@ -720,7 +873,7 @@ struct PendingCapture {
     trigger_unix_ms: u64,
     before: Duration,
     after: Duration,
-    response_path: PathBuf,
+    response_endpoint: ResponseEndpoint,
     output_dir: PathBuf,
     dropped_at_trigger: u64,
 }
@@ -735,6 +888,63 @@ struct RecorderState {
     next_sequence: u64,
     servers: Vec<ServerSocket>,
     capture: Option<PendingCapture>,
+}
+
+#[cfg(unix)]
+fn poll_server_requests(
+    server: &ServerSocket,
+    requests: &mut Vec<(PathBuf, ResponseEndpoint, Vec<u8>)>,
+    limit: usize,
+) {
+    while requests.len() < limit {
+        let mut bytes = [0_u8; 1024];
+        match server.socket.recv_from(&mut bytes) {
+            Ok((size, source)) => {
+                if let Some(response_path) = source.as_pathname() {
+                    requests.push((
+                        server.output_dir.clone(),
+                        ResponseEndpoint::Unix(response_path.to_path_buf()),
+                        bytes[..size].to_vec(),
+                    ));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(_) => break,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn poll_server_requests(
+    server: &ServerSocket,
+    requests: &mut Vec<(PathBuf, ResponseEndpoint, Vec<u8>)>,
+    limit: usize,
+) {
+    while requests.len() < limit {
+        let mut packet = [0_u8; 1 + WINDOWS_RECORDER_TOKEN_LEN + WINDOWS_RECORDER_MAX_PAYLOAD];
+        match server.socket.recv_from(&mut packet) {
+            Ok((size, source)) if source.ip().is_loopback() => {
+                let Some(bytes) = decode_windows_packet(&packet[..size], &server.token) else {
+                    continue;
+                };
+                let Ok(socket) = server.socket.try_clone() else {
+                    continue;
+                };
+                requests.push((
+                    server.output_dir.clone(),
+                    ResponseEndpoint::Windows {
+                        target: source,
+                        socket,
+                        token: server.token.clone(),
+                    },
+                    bytes.to_vec(),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(_) => break,
+        }
+    }
 }
 
 impl RecorderState {
@@ -832,11 +1042,11 @@ impl RecorderState {
             Control::Register { endpoints } => {
                 self.add_servers(endpoints);
             }
-            Control::Stop { paths } => {
+            Control::Stop { endpoints } => {
                 let mut retained = Vec::new();
                 for server in self.servers.drain(..) {
-                    if paths.contains(&server.socket_path) {
-                        let _ = fs::remove_file(&server.socket_path);
+                    if endpoints.contains(&server.endpoint) {
+                        let _ = fs::remove_file(server.endpoint.path());
                     } else {
                         retained.push(server);
                     }
@@ -844,7 +1054,7 @@ impl RecorderState {
                 self.servers = retained;
             }
             Control::StopAll => self.remove_all_servers(),
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             Control::Drain { reply } => {
                 for _ in 0..EVENT_CHANNEL_CAPACITY {
                     let Ok(event) = self.event_rx.try_recv() else {
@@ -857,53 +1067,43 @@ impl RecorderState {
         }
     }
 
-    fn add_servers(&mut self, endpoints: Vec<ServerEndpoint>) -> Vec<PathBuf> {
-        let mut paths = Vec::new();
+    fn add_servers(&mut self, endpoints: Vec<ServerEndpoint>) -> Vec<RecorderEndpoint> {
+        let mut added = Vec::new();
         for endpoint in endpoints {
             if self
                 .servers
                 .iter()
-                .any(|server| server.socket_path == endpoint.socket_path)
+                .any(|server| server.endpoint == endpoint.endpoint)
             {
                 continue;
             }
             if let Ok(server) = bind_server(endpoint) {
-                paths.push(server.socket_path.clone());
+                added.push(server.endpoint.clone());
                 self.servers.push(server);
             }
         }
-        paths
+        added
     }
 
     fn poll_servers(&mut self) {
         let mut requests = Vec::new();
-        'servers: for server in &self.servers {
-            loop {
-                if requests.len() == MAX_REQUEST_BATCH {
-                    break 'servers;
-                }
-                let mut bytes = [0_u8; 1024];
-                match server.socket.recv_from(&mut bytes) {
-                    Ok((size, source)) => {
-                        if let Some(response_path) = source.as_pathname() {
-                            requests.push((
-                                server.output_dir.clone(),
-                                response_path.to_path_buf(),
-                                bytes[..size].to_vec(),
-                            ));
-                        }
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(_) => break,
-                }
+        for server in &self.servers {
+            if requests.len() == MAX_REQUEST_BATCH {
+                break;
             }
+            poll_server_requests(server, &mut requests, MAX_REQUEST_BATCH);
         }
-        for (output_dir, response_path, bytes) in requests {
-            self.handle_request(output_dir, response_path, &bytes);
+        for (output_dir, response_endpoint, bytes) in requests {
+            self.handle_request(output_dir, response_endpoint, &bytes);
         }
     }
 
-    fn handle_request(&mut self, output_dir: PathBuf, response_path: PathBuf, bytes: &[u8]) {
+    fn handle_request(
+        &mut self,
+        output_dir: PathBuf,
+        response_endpoint: ResponseEndpoint,
+        bytes: &[u8],
+    ) {
         let request = match serde_json::from_slice::<CaptureRequest>(bytes) {
             Ok(request) if request.schema_version == SCHEMA_VERSION => request,
             _ => return,
@@ -913,12 +1113,12 @@ impl RecorderState {
             after_seconds: request.after_seconds,
         };
         if let Err(error) = options.validate() {
-            send_response(&response_path, Err(error));
+            send_response(&response_endpoint, Err(error));
             return;
         }
         if self.capture.is_some() {
             send_response(
-                &response_path,
+                &response_endpoint,
                 Err("a debug recording is already in progress".to_string()),
             );
             return;
@@ -929,7 +1129,7 @@ impl RecorderState {
             trigger_unix_ms: unix_ms(),
             before: Duration::from_secs(options.before_seconds),
             after: Duration::from_secs(options.after_seconds),
-            response_path,
+            response_endpoint,
             output_dir,
             dropped_at_trigger: self.dropped.load(Ordering::Relaxed),
         });
@@ -954,7 +1154,7 @@ impl RecorderState {
         }
         let capture = self.capture.take().expect("capture was checked above");
         let result = self.write_capture(&capture);
-        send_response(&capture.response_path, result);
+        send_response(&capture.response_endpoint, result);
     }
 
     fn write_capture(&self, capture: &PendingCapture) -> Result<PathBuf, String> {
@@ -980,6 +1180,15 @@ impl RecorderState {
                 capture.output_dir.display()
             )
         })?;
+        #[cfg(windows)]
+        crate::system::windows_security::secure_path(&capture.output_dir, true).map_err(
+            |error| {
+                format!(
+                    "secure recording directory {}: {error}",
+                    capture.output_dir.display()
+                )
+            },
+        )?;
         let path = capture.output_dir.join(format!(
             "prism-recording-{}-{}-{}.jsonl",
             capture.trigger_unix_ms,
@@ -1043,7 +1252,7 @@ impl RecorderState {
 
     fn remove_all_servers(&mut self) {
         for server in self.servers.drain(..) {
-            let _ = fs::remove_file(server.socket_path);
+            let _ = fs::remove_file(server.endpoint.path());
         }
     }
 }
@@ -1164,28 +1373,36 @@ fn write_json_line(writer: &mut impl Write, value: &impl Serialize) -> Result<()
 fn create_recording_file(path: &Path) -> Result<File, String> {
     let mut options = OpenOptions::new();
     options.create_new(true).write(true);
-    use std::os::unix::fs::OpenOptionsExt;
-    options.mode(0o600);
-    options
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
         .open(path)
-        .map_err(|error| format!("create debug recording {}: {error}", path.display()))
+        .map_err(|error| format!("create debug recording {}: {error}", path.display()))?;
+    #[cfg(windows)]
+    crate::system::windows_security::secure_path(path, false)
+        .map_err(|error| format!("secure debug recording {}: {error}", path.display()))?;
+    Ok(file)
 }
 
 fn bind_server(endpoint: ServerEndpoint) -> Result<ServerSocket, String> {
     bind_server_in(endpoint, &control_runtime_dir())
 }
 
+#[cfg(unix)]
 fn bind_server_in(endpoint: ServerEndpoint, runtime_dir: &Path) -> Result<ServerSocket, String> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use std::os::unix::net::UnixDatagram;
 
-    validate_recorder_socket_path(&endpoint.socket_path, "recorder control")?;
+    validate_recorder_socket_path(endpoint.endpoint.path(), "recorder control")?;
     let runtime_dir = ensure_control_runtime_dir_at(runtime_dir)?;
-    if endpoint.socket_path.parent() != Some(runtime_dir.as_path()) {
+    if endpoint.endpoint.path().parent() != Some(runtime_dir.as_path()) {
         return Err("recorder socket is outside its private runtime directory".to_string());
     }
-    let lock_path = endpoint.socket_path.with_extension("lock");
+    let lock_path = endpoint.endpoint.path().with_extension("lock");
     let lock = OpenOptions::new()
         .create(true)
         .read(true)
@@ -1200,18 +1417,18 @@ fn bind_server_in(endpoint: ServerEndpoint, runtime_dir: &Path) -> Result<Server
     if locked != 0 {
         return Err("another recorder already owns the control socket".to_string());
     }
-    remove_socket_if_present(&endpoint.socket_path)?;
-    let socket = UnixDatagram::bind(&endpoint.socket_path).map_err(|error| {
+    remove_socket_if_present(endpoint.endpoint.path())?;
+    let socket = UnixDatagram::bind(endpoint.endpoint.path()).map_err(|error| {
         format!(
             "bind recorder control socket {}: {error}",
-            endpoint.socket_path.display()
+            endpoint.endpoint.path().display()
         )
     })?;
-    fs::set_permissions(&endpoint.socket_path, fs::Permissions::from_mode(0o600)).map_err(
+    fs::set_permissions(endpoint.endpoint.path(), fs::Permissions::from_mode(0o600)).map_err(
         |error| {
             format!(
                 "secure recorder control socket {}: {error}",
-                endpoint.socket_path.display()
+                endpoint.endpoint.path().display()
             )
         },
     )?;
@@ -1220,15 +1437,68 @@ fn bind_server_in(endpoint: ServerEndpoint, runtime_dir: &Path) -> Result<Server
         .map_err(|error| format!("configure recorder control socket: {error}"))?;
     Ok(ServerSocket {
         socket,
-        socket_path: endpoint.socket_path,
+        endpoint: endpoint.endpoint,
         output_dir: endpoint.output_dir,
         _lock: lock,
     })
 }
 
-fn send_response(path: &Path, result: Result<PathBuf, String>) {
-    use std::os::unix::net::UnixDatagram;
+#[cfg(windows)]
+fn bind_server_in(endpoint: ServerEndpoint, runtime_dir: &Path) -> Result<ServerSocket, String> {
+    let runtime_dir = ensure_control_runtime_dir_at(runtime_dir)?;
+    if endpoint.endpoint.path().parent() != Some(runtime_dir.as_path()) {
+        return Err("recorder endpoint is outside its private runtime directory".to_string());
+    }
+    let lock_path = endpoint.endpoint.path().with_extension("lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|error| format!("open recorder lock {}: {error}", lock_path.display()))?;
+    crate::system::windows_security::secure_path(&lock_path, false)
+        .map_err(|error| format!("secure recorder lock {}: {error}", lock_path.display()))?;
+    if fs4::FileExt::try_lock(&lock).is_err() {
+        return Err("another recorder already owns the control endpoint".to_string());
+    }
+    remove_socket_if_present(endpoint.endpoint.path())?;
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0")
+        .map_err(|error| format!("bind recorder loopback endpoint: {error}"))?;
+    socket
+        .set_nonblocking(true)
+        .map_err(|error| format!("configure recorder loopback endpoint: {error}"))?;
+    let token = crate::system::windows_security::random_token_hex()
+        .map_err(|error| format!("generate recorder secret: {error}"))?;
+    let descriptor = WindowsRecorderDescriptor {
+        version: WINDOWS_RECORDER_VERSION,
+        address: socket
+            .local_addr()
+            .map_err(|error| format!("inspect recorder loopback endpoint: {error}"))?,
+        token: token.clone(),
+    };
+    let bytes = serde_json::to_vec(&descriptor)
+        .map_err(|error| format!("encode recorder endpoint: {error}"))?;
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(endpoint.endpoint.path())
+        .map_err(|error| format!("create recorder endpoint: {error}"))?;
+    crate::system::windows_security::secure_path(endpoint.endpoint.path(), false)
+        .map_err(|error| format!("secure recorder endpoint: {error}"))?;
+    file.write_all(&bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("write recorder endpoint: {error}"))?;
+    Ok(ServerSocket {
+        socket,
+        token,
+        endpoint: endpoint.endpoint,
+        output_dir: endpoint.output_dir,
+        _lock: lock,
+    })
+}
 
+fn send_response(endpoint: &ResponseEndpoint, result: Result<PathBuf, String>) {
     let response = match result {
         Ok(path) => CaptureResponse {
             schema_version: SCHEMA_VERSION,
@@ -1241,18 +1511,44 @@ fn send_response(path: &Path, result: Result<PathBuf, String>) {
             error: Some(error),
         },
     };
-    if let Ok(bytes) = serde_json::to_vec(&response)
-        && let Ok(socket) = UnixDatagram::unbound()
-    {
-        let _ = socket.send_to(&bytes, path);
+    let Ok(bytes) = serde_json::to_vec(&response) else {
+        return;
+    };
+    match endpoint {
+        #[cfg(unix)]
+        ResponseEndpoint::Unix(path) => {
+            use std::os::unix::net::UnixDatagram;
+            if let Ok(socket) = UnixDatagram::unbound() {
+                let _ = socket.send_to(&bytes, path);
+            }
+        }
+        #[cfg(windows)]
+        ResponseEndpoint::Windows {
+            target,
+            socket,
+            token,
+        } => {
+            if let Ok(packet) = windows_packet(token, &bytes) {
+                let _ = socket.send_to(&packet, target);
+            }
+        }
     }
 }
 
-pub(crate) fn control_socket_path(repo: &Repository) -> PathBuf {
+fn control_endpoint(repo: &Repository) -> RecorderEndpoint {
     let hash = stable_hash(&repo.root);
-    control_runtime_dir().join(format!("repo-{hash:016x}.sock"))
+    #[cfg(unix)]
+    let name = format!("repo-{hash:016x}.sock");
+    #[cfg(windows)]
+    let name = format!("repo-{hash:016x}.endpoint");
+    RecorderEndpoint(control_runtime_dir().join(name))
 }
 
+pub(crate) fn control_socket_path(repo: &Repository) -> PathBuf {
+    control_endpoint(repo).0
+}
+
+#[cfg(unix)]
 fn client_socket_path() -> Result<PathBuf, String> {
     let runtime_dir = control_runtime_dir();
     let path = runtime_dir.join(format!(
@@ -1266,13 +1562,20 @@ fn client_socket_path() -> Result<PathBuf, String> {
 }
 
 fn control_runtime_dir() -> PathBuf {
-    PathBuf::from("/tmp").join(format!("prism-flight-{}", unsafe { libc::geteuid() }))
+    #[cfg(unix)]
+    return PathBuf::from("/tmp").join(format!("prism-flight-{}", unsafe { libc::geteuid() }));
+    #[cfg(windows)]
+    return crate::util::prism_config_dir()
+        .join("runtime")
+        .join("flight-recorder");
 }
 
+#[cfg(unix)]
 fn ensure_control_runtime_dir() -> Result<PathBuf, String> {
     ensure_control_runtime_dir_at(&control_runtime_dir())
 }
 
+#[cfg(unix)]
 fn ensure_control_runtime_dir_at(path: &Path) -> Result<PathBuf, String> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 
@@ -1303,6 +1606,27 @@ fn ensure_control_runtime_dir_at(path: &Path) -> Result<PathBuf, String> {
         ));
     }
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("secure recorder runtime directory: {error}"))?;
+    Ok(path.to_path_buf())
+}
+
+#[cfg(windows)]
+fn ensure_control_runtime_dir_at(path: &Path) -> Result<PathBuf, String> {
+    fs::create_dir_all(path).map_err(|error| {
+        format!(
+            "create recorder runtime directory {}: {error}",
+            path.display()
+        )
+    })?;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect recorder runtime directory: {error}"))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(format!(
+            "recorder runtime path is not a directory: {}",
+            path.display()
+        ));
+    }
+    crate::system::windows_security::secure_path(path, true)
         .map_err(|error| format!("secure recorder runtime directory: {error}"))?;
     Ok(path.to_path_buf())
 }
@@ -1497,15 +1821,17 @@ mod tests {
             root: PathBuf::from("/work/example"),
         };
 
+        let extension = if cfg!(windows) { "endpoint" } else { "sock" };
         assert_eq!(
             control_socket_path(&repo),
-            control_runtime_dir().join(format!("repo-{:016x}.sock", stable_hash(&repo.root)))
+            control_runtime_dir()
+                .join(format!("repo-{:016x}.{extension}", stable_hash(&repo.root)))
         );
     }
 
     #[cfg(unix)]
-    #[test]
-    fn trigger_writes_an_atomic_jsonl_capture_without_sqlite() {
+    #[tokio::test]
+    async fn trigger_writes_an_atomic_jsonl_capture_without_sqlite() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = crate::compact_runtime::CompactTempDir::new("flight-recorder");
@@ -1573,8 +1899,7 @@ mod tests {
         assert!(drain_events_for_test());
         in_flight.finish(ExternalCallOutcome::Success, Vec::new());
         let secret = "flight-secret-argv-env-output-stderr";
-        let mut command = std::process::Command::new("sh");
-        command
+        let command = crate::process::Command::new("sh")
             .args([
                 "-c",
                 "printf '%s' \"$FLIGHT_SECRET\"; printf '%s' \"$1\" >&2",
@@ -1582,44 +1907,47 @@ mod tests {
                 secret,
             ])
             .env("FLIGHT_SECRET", secret);
-        with_job_context(77, "test_job", || {
+        with_async_job_context(
+            77,
+            "test_job",
             crate::process::run_output_named(
-                &mut command,
+                command,
                 crate::process::ProcessPolicy::Test,
                 crate::process::ProcessDescriptor::new("test.external.private"),
-            )
-        })
+            ),
+        )
+        .await
         .unwrap();
-        let mut missing = std::process::Command::new("/prism-test/missing-executable");
         assert!(
             crate::process::run_output_named(
-                &mut missing,
+                crate::process::Command::new("/prism-test/missing-executable"),
                 crate::process::ProcessPolicy::Test,
                 crate::process::ProcessDescriptor::new("test.external.spawn_failed"),
             )
+            .await
             .is_err()
         );
-        let mut timed_out = std::process::Command::new("sh");
-        timed_out.args(["-c", "exec sleep 2"]);
         assert!(
             crate::process::run_output_named(
-                &mut timed_out,
+                crate::process::Command::new("sh").args(["-c", "exec sleep 2"]),
                 crate::process::ProcessPolicy::Test,
                 crate::process::ProcessDescriptor::new("test.external.timed_out"),
             )
+            .await
             .is_err()
         );
-        let mut canceled = std::process::Command::new("sh");
-        canceled.args(["-c", "exec sleep 2"]);
-        let canceled_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let canceled = crate::process::CancellationToken::new();
+        canceled.cancel();
         assert!(
-            crate::process::with_cancellation(canceled_flag, || {
+            crate::process::with_cancellation(
+                canceled,
                 crate::process::run_output_named(
-                    &mut canceled,
+                    crate::process::Command::new("sh").args(["-c", "exec sleep 2"]),
                     crate::process::ProcessPolicy::Test,
                     crate::process::ProcessDescriptor::new("test.external.canceled"),
-                )
-            })
+                ),
+            )
+            .await
             .is_err()
         );
         let completed_path = trigger(
@@ -1657,6 +1985,10 @@ mod tests {
             line.contains("test.external.private")
                 && line.contains("\"job_id\",\"value\":77")
                 && line.contains("\"job_type\",\"value\":\"test_job\"")
+                && line.contains(&format!("\"stdout_bytes\",\"value\":{}", secret.len()))
+                && line.contains(&format!("\"stderr_bytes\",\"value\":{}", secret.len()))
+                && line.contains("\"stdout_truncated\",\"value\":false")
+                && line.contains("\"stderr_truncated\",\"value\":false")
         }));
         assert!(!completed.contains(secret));
         drop(server);
@@ -1668,7 +2000,7 @@ mod tests {
         let runtime = crate::compact_runtime::CompactTempDir::new("recorder-lock");
         let socket_path = runtime.runtime_path().join("lock.sock");
         let endpoint = || ServerEndpoint {
-            socket_path: socket_path.clone(),
+            endpoint: RecorderEndpoint(socket_path.clone()),
             output_dir: runtime.path().to_path_buf(),
         };
         let server = bind_server_in(endpoint(), runtime.runtime_path()).unwrap();
@@ -1697,5 +2029,70 @@ mod tests {
         assert!(validate_recorder_socket_path(&at_budget, "test").is_ok());
         assert!(validate_recorder_socket_path(&over_budget, "test").is_err());
         assert!(validate_recorder_socket_path(&non_utf8, "test").is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_recorder_round_trips_authenticated_capture_over_loopback_udp() {
+        let base = std::env::temp_dir().join(format!(
+            "prism-windows-recorder-{}-{}",
+            std::process::id(),
+            crate::util::timestamp_nanos()
+        ));
+        fs::create_dir_all(&base).unwrap();
+        let repo = Repository::with_config_dir_for_test(base.join("repo"), base.join("config"));
+        let server = serve_repositories([&repo]);
+        assert!(!server.is_empty());
+        record(
+            "windows_test",
+            "probe",
+            Some(Duration::from_micros(7)),
+            vec![unsigned("value", 1_u64)],
+        );
+
+        let path = trigger(
+            &repo,
+            RecordOptions {
+                before_seconds: 60,
+                after_seconds: 0,
+            },
+        )
+        .unwrap();
+        let contents = fs::read_to_string(path).unwrap();
+        assert!(contents.contains("\"category\":\"windows_test\""));
+        assert!(contents.contains("\"operation\":\"probe\""));
+
+        drop(server);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_recorder_authentication_bounds_packets_and_lock_ownership() {
+        let runtime = std::env::temp_dir().join(format!(
+            "prism-windows-recorder-lock-{}-{}",
+            std::process::id(),
+            crate::util::timestamp_nanos()
+        ));
+        fs::create_dir_all(&runtime).unwrap();
+        let endpoint_path = runtime.join("recorder.endpoint");
+        let endpoint = || ServerEndpoint {
+            endpoint: RecorderEndpoint(endpoint_path.clone()),
+            output_dir: runtime.clone(),
+        };
+        let server = bind_server_in(endpoint(), &runtime).unwrap();
+        assert!(bind_server_in(endpoint(), &runtime).is_err());
+        let valid = windows_packet(&server.token, b"event").unwrap();
+        assert_eq!(
+            decode_windows_packet(&valid, &server.token),
+            Some(b"event".as_slice())
+        );
+        assert!(decode_windows_packet(&valid, &"0".repeat(WINDOWS_RECORDER_TOKEN_LEN)).is_none());
+        assert!(
+            windows_packet(&server.token, &vec![0_u8; WINDOWS_RECORDER_MAX_PAYLOAD + 1]).is_err()
+        );
+
+        drop(server);
+        fs::remove_dir_all(runtime).unwrap();
     }
 }

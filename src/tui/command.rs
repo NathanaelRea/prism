@@ -76,7 +76,7 @@ impl Tui {
     /// Keyboard decoding and terminal event polling live outside this seam. A
     /// scripted terminal adapter can therefore exercise the same command path
     /// as the production Crossterm adapter.
-    pub(crate) fn dispatch_command(
+    pub(crate) async fn dispatch_command(
         &mut self,
         runtime: &mut dyn TerminalDriver,
         command: DashboardCommand,
@@ -200,41 +200,43 @@ impl Tui {
                 }
                 match self.open_tmux_session_target() {
                     OpenTmuxSessionTarget::RepoDefaultAgent(index) => {
-                        self.enter_agent_mode_for_index(runtime, index)?
+                        self.enter_agent_mode_for_index(runtime, index).await?
                     }
-                    OpenTmuxSessionTarget::WorktreeAgent => self.enter_agent_mode(runtime)?,
-                    OpenTmuxSessionTarget::RepoPr => self.open_selected_repo_pr_agent(runtime)?,
+                    OpenTmuxSessionTarget::WorktreeAgent => self.enter_agent_mode(runtime).await?,
+                    OpenTmuxSessionTarget::RepoPr => {
+                        self.open_selected_repo_pr_agent(runtime).await?
+                    }
                     OpenTmuxSessionTarget::Blocked(message) => self.show_message(message)?,
                 }
             }
             DashboardCommand::WorkflowLauncher => {
                 self.clear_leader_hint();
                 state.pending_g = false;
-                if let Err(error) = self.launch_workflow(runtime) {
+                if let Err(error) = self.launch_workflow(runtime).await {
                     self.show_error("workflow launcher failed", &error)?;
                 }
             }
             DashboardCommand::WorkflowAi => {
                 self.clear_leader_hint();
                 state.pending_g = false;
-                if let Err(error) = self.create_ai_workflow(runtime) {
+                if let Err(error) = self.create_ai_workflow(runtime).await {
                     self.show_error("AI Workflow creation failed", &error)?;
                 }
             }
             DashboardCommand::WorkflowPauseResume => {
-                if let Err(error) = self.control_selected_workflow(runtime, "toggle") {
+                if let Err(error) = self.control_selected_workflow(runtime, "toggle").await {
                     self.show_error("Workflow control failed", &error)?;
                 }
             }
             DashboardCommand::WorkflowRetry => {
-                if let Err(error) = self.control_selected_workflow(runtime, "retry") {
+                if let Err(error) = self.control_selected_workflow(runtime, "retry").await {
                     self.show_error("Workflow retry failed", &error)?;
                 }
             }
             DashboardCommand::Configuration => {
                 self.clear_leader_hint();
                 state.pending_g = false;
-                if let Err(error) = self.show_configuration_tree(runtime) {
+                if let Err(error) = self.show_configuration_tree(runtime).await {
                     self.show_error("configuration failed", &error)?;
                 }
             }
@@ -243,10 +245,12 @@ impl Tui {
                 state.pending_g = false;
                 if self.git_action_enabled(GitAction::LazyGit) {
                     if self.focused_panel == PanelFocus::Repos {
-                        if let Err(error) = self.open_selected_repo_lazygit(runtime) {
+                        if let Err(error) = self.open_selected_repo_lazygit(runtime).await {
                             self.show_error("repository lazygit failed", &error)?;
                         }
-                    } else if let Err(error) = self.open_tmux_window(runtime, TmuxWindow::LazyGit) {
+                    } else if let Err(error) =
+                        self.open_tmux_window(runtime, TmuxWindow::LazyGit).await
+                    {
                         self.show_error("lazygit failed", &error)?;
                     }
                 }
@@ -255,7 +259,7 @@ impl Tui {
                 self.clear_leader_hint();
                 state.pending_g = false;
                 if self.git_action_enabled(GitAction::OpenPr)
-                    && let Err(error) = self.open_selected_pr(runtime)
+                    && let Err(error) = self.open_selected_pr(runtime).await
                 {
                     self.show_error("open PR failed", &error)?;
                 }
@@ -263,7 +267,7 @@ impl Tui {
             DashboardCommand::OpenDevelopmentUrl => {
                 self.clear_leader_hint();
                 state.pending_g = false;
-                if let Err(error) = self.open_selected_development_url() {
+                if let Err(error) = self.open_selected_development_url().await {
                     self.show_error("open development URL failed", &error)?;
                 }
             }
@@ -289,10 +293,12 @@ impl Tui {
                 if self.focused_panel == PanelFocus::Status {
                     self.show_message("focus repos or worktrees to open a terminal")?;
                 } else if self.focused_panel == PanelFocus::Repos {
-                    if let Err(error) = self.open_selected_repo_terminal(runtime) {
+                    if let Err(error) = self.open_selected_repo_terminal(runtime).await {
                         self.show_error("repository terminal failed", &error)?;
                     }
-                } else if let Err(error) = self.open_tmux_window(runtime, TmuxWindow::Terminal) {
+                } else if let Err(error) =
+                    self.open_tmux_window(runtime, TmuxWindow::Terminal).await
+                {
                     self.show_error("terminal failed", &error)?;
                 }
             }
@@ -305,7 +311,7 @@ impl Tui {
                 self.clear_leader_hint();
                 state.pending_g = false;
                 if self.focused_panel == PanelFocus::Repos && !self.main_focused {
-                    if let Err(error) = self.reorder_repositories(runtime) {
+                    if let Err(error) = self.reorder_repositories(runtime).await {
                         self.show_error("reorder repositories failed", &error)?;
                     }
                 } else {
@@ -342,7 +348,7 @@ impl Tui {
                 self.clear_leader_hint();
                 state.pending_g = false;
                 if self.git_action_enabled(GitAction::Push)
-                    && let Err(error) = self.push_selected_branch(runtime)
+                    && let Err(error) = self.push_selected_branch(runtime).await
                 {
                     self.show_error("push failed", &error)?;
                 }
@@ -355,10 +361,10 @@ impl Tui {
                 if self.git_action_enabled(action) {
                     let result = match git_action_execution(action) {
                         GitActionExecution::ProviderMerge => {
-                            self.merge_selected_change_request(runtime)
+                            self.merge_selected_change_request(runtime).await
                         }
                         GitActionExecution::Stabilize => {
-                            self.launch_stabilization_workflow(runtime)
+                            self.launch_stabilization_workflow(runtime).await
                         }
                     };
                     if let Err(error) = result {
@@ -380,7 +386,7 @@ impl Tui {
                 state.pending_g = false;
                 if self.focused_panel != PanelFocus::Repos {
                     self.show_message("focus repos to pull the default branch")?;
-                } else if let Err(error) = self.pull_default_branch(runtime) {
+                } else if let Err(error) = self.pull_default_branch(runtime).await {
                     self.show_error("pull failed", &error)?;
                 }
             }
@@ -390,7 +396,7 @@ impl Tui {
                 if self.focused_panel != PanelFocus::Repos {
                     self.show_message("focus repos to create a worktree session")?;
                 } else {
-                    match self.create_session(runtime) {
+                    match self.create_session(runtime).await {
                         Ok(true) => self.focus_worktrees(),
                         Ok(false) => {}
                         Err(error) => self.show_error("create session failed", &error)?,
@@ -401,19 +407,19 @@ impl Tui {
                 if !self.is_worktree_session_panel() {
                     self.show_message("focus worktrees or merges to migrate an agent harness")?;
                 } else if let Some(index) = self.selected_worktree_index() {
-                    self.migrate_worktree_harness(index)?;
+                    self.migrate_worktree_harness(index).await?;
                 }
             }
             DashboardCommand::AbortOpencode => {
                 self.clear_leader_hint();
                 state.pending_g = false;
-                match self.control_selected_workflow(runtime, "cancel") {
+                match self.control_selected_workflow(runtime, "cancel").await {
                     Ok(true) => {}
                     Ok(false) if !self.is_worktree_session_panel() => {
                         self.show_message("focus worktrees or merges to abort an agent session")?;
                     }
                     Ok(false) => {
-                        if let Err(error) = self.abort_selected_opencode_session(runtime) {
+                        if let Err(error) = self.abort_selected_opencode_session(runtime).await {
                             self.show_error("abort failed", &error)?;
                         }
                     }
@@ -429,7 +435,7 @@ impl Tui {
                     != Some(crate::remote::SupportLevel::Supported)
                 {
                     self.show_message("remote PR listing is unavailable for this provider")?;
-                } else if let Err(error) = self.open_remote_pr_worktree(runtime) {
+                } else if let Err(error) = self.open_remote_pr_worktree(runtime).await {
                     self.show_error("open remote PR worktree failed", &error)?;
                 }
             }
@@ -440,7 +446,7 @@ impl Tui {
                     self.show_message("focus worktrees to delete a worktree/session")?;
                 } else if self.focused_panel == PanelFocus::Repos {
                     self.show_message("repository removal is available from r")?;
-                } else if let Err(error) = self.archive_session(runtime) {
+                } else if let Err(error) = self.archive_session(runtime).await {
                     self.show_error("archive failed", &error)?;
                 }
             }
@@ -449,7 +455,7 @@ impl Tui {
                 state.pending_g = false;
                 if self.focused_panel != PanelFocus::Repos {
                     self.show_message("focus repos to unarchive a worktree")?;
-                } else if let Err(error) = self.unarchive_session(runtime) {
+                } else if let Err(error) = self.unarchive_session(runtime).await {
                     self.show_error("unarchive failed", &error)?;
                 }
             }
@@ -460,7 +466,7 @@ impl Tui {
                     self.show_message(
                         "focus worktrees or merges to permanently delete a worktree/session",
                     )?;
-                } else if let Err(error) = self.delete_session(runtime) {
+                } else if let Err(error) = self.delete_session(runtime).await {
                     self.show_error("delete failed", &error)?;
                 }
             }

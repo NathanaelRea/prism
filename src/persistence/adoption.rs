@@ -40,6 +40,7 @@ enum Adoption {
 pub(super) async fn adopt_historical_repository_database(
     path: &Path,
     migrator: &sqlx::migrate::Migrator,
+    writer_busy_timeout: std::time::Duration,
 ) -> Result<(), DatabaseError> {
     if !path.exists()
         || std::fs::metadata(path)
@@ -77,12 +78,14 @@ pub(super) async fn adopt_historical_repository_database(
         validate_released_sqlx_schema(path, applied).await?;
     }
 
-    let mut connection = SqliteConnection::connect_with(&options(path, false, false)?)
-        .await
-        .map_err(|source| DatabaseError::Connect {
-            path: path.into(),
-            source,
-        })?;
+    let mut connection = SqliteConnection::connect_with(
+        &super::pools::options_with_writer_busy_timeout(path, false, false, writer_busy_timeout)?,
+    )
+    .await
+    .map_err(|source| DatabaseError::Connect {
+        path: path.into(),
+        source,
+    })?;
     sqlx::query("pragma foreign_keys = off")
         .execute(&mut connection)
         .await
@@ -221,10 +224,10 @@ async fn create_current_backup_and_lock(
             .bind(temporary.to_string_lossy().into_owned())
             .execute(&mut *connection)
             .await
-            .map_err(|source| DatabaseError::Backup {
+            .map_err(|source| DatabaseError::BackupQuery {
                 path: path.into(),
                 backup: temporary.clone(),
-                source: std::io::Error::other(source.to_string()),
+                source,
             })?;
         sqlx::query("begin immediate")
             .execute(&mut *connection)
@@ -244,10 +247,12 @@ async fn create_current_backup_and_lock(
     }
 
     set_owner_only(&temporary)?;
-    std::fs::rename(&temporary, &backup).map_err(|source| DatabaseError::Backup {
-        path: path.into(),
-        backup: backup.clone(),
-        source,
+    crate::system::file_persistence::commit_staging(&temporary, &backup).map_err(|source| {
+        DatabaseError::Backup {
+            path: path.into(),
+            backup: backup.clone(),
+            source,
+        }
     })?;
     Ok(())
 }

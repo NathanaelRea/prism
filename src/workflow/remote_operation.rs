@@ -201,7 +201,7 @@ impl RemoteMutationOperation {
     }
 }
 
-pub fn validate_envelope_paths(
+pub async fn validate_envelope_paths(
     outer_repository: &std::path::Path,
     outer_worktree: &std::path::Path,
     payload_paths: (&std::path::Path, &std::path::Path),
@@ -217,27 +217,27 @@ pub fn validate_envelope_paths(
     if repository != payload_repository || worktree != payload_worktree {
         return Err("remote request payload paths do not match its envelope paths".into());
     }
-    let common_dir = |path: &std::path::Path| -> Result<PathBuf, String> {
+    async fn common_dir(path: &std::path::Path) -> Result<PathBuf, String> {
         let output = crate::process::run_output_named(
-            std::process::Command::new("git").arg("-C").arg(path).args([
-                "rev-parse",
-                "--path-format=absolute",
-                "--git-common-dir",
-            ]),
+            crate::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(["rev-parse", "--path-format=absolute", "--git-common-dir"]),
             crate::process::ProcessPolicy::Metadata,
             crate::process::ProcessDescriptor::new("git.remote_request_common_dir"),
-        )?;
+        )
+        .await?;
         if !output.status.success() {
             return Err(format!(
                 "remote request path {} is not a Git worktree",
                 path.display()
             ));
         }
-        let value = output.stdout.trim();
-        std::fs::canonicalize(value)
+        let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        std::fs::canonicalize(&value)
             .map_err(|error| format!("normalize Git common directory {value}: {error}"))
-    };
-    if common_dir(&repository)? != common_dir(&worktree)? {
+    }
+    if common_dir(&repository).await? != common_dir(&worktree).await? {
         return Err("remote request worktree does not belong to its repository".into());
     }
     Ok((repository, worktree))
@@ -298,8 +298,8 @@ pub enum TuiRemoteMergeResult {
 mod tests {
     use super::*;
 
-    #[test]
-    fn envelope_paths_and_request_namespaces_fail_closed() {
+    #[tokio::test]
+    async fn envelope_paths_and_request_namespaces_fail_closed() {
         let root = std::env::temp_dir().join(format!(
             "prism-remote-operation-paths-{}",
             std::process::id()
@@ -314,6 +314,7 @@ mod tests {
         });
         assert!(
             validate_envelope_paths(&repository_a, &repository_a, operation.paths())
+                .await
                 .unwrap_err()
                 .contains("do not match")
         );

@@ -1,6 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+use futures_util::FutureExt;
 
 use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey, AgentSessionWarmupResult};
 use crate::config::Config;
@@ -45,13 +49,13 @@ mod tests;
 
 use agent_state::AgentStatePersistenceRequest;
 use background_runtime::BackgroundRuntime;
-use dialog::{choice_list, ctrl_key};
 #[cfg(test)]
 use dialog::{
-    confirmation_result, create_session_fields, create_session_submit_key,
+    append_line_paste, confirmation_result, create_session_fields, create_session_submit_key,
     move_enabled_ordered_item, selectable_choice_key, toggle_item_in_place, toggle_ordered_item,
     update_create_session_variant_field,
 };
+use dialog::{choice_list, ctrl_key};
 pub(crate) use git_actions::GitAction;
 use git_actions::{
     GitActionExecution, git_action_error_title, git_action_execution, git_action_for_command,
@@ -84,6 +88,12 @@ pub(crate) use repository::{
     ManagedRepo, SelectedRepoContext, SelectedWorktreeContext, WtHookLogInventory,
     load_worktree_harness_configs,
 };
+
+pub(crate) fn maintain_workflow_storage(_repo: &Repository) -> Result<(), String> {
+    // Workflow history and retention are owned by the global ledger/worker. Repository databases
+    // retain only repository-local caches and Worktree Session state.
+    Ok(())
+}
 
 pub struct Tui {
     pub(crate) repo: Repository,
@@ -232,6 +242,24 @@ fn requested_shutdown(notification: &ShutdownNotification) -> Option<ShutdownRea
         ShutdownSignal::Sigint => Some(ShutdownReason::Sigint),
         ShutdownSignal::Sigterm => Some(ShutdownReason::Sigterm),
     }
+}
+
+async fn with_shutdown_process_scope<F>(shutdown: Arc<AtomicBool>, operation: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    let cancellation = crate::process::CancellationToken::new();
+    let bridge_cancellation = cancellation.clone();
+    let bridge = tokio::spawn(async move {
+        while !shutdown.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        bridge_cancellation.cancel();
+    });
+    let output = crate::process::with_cancellation(cancellation, operation).await;
+    bridge.abort();
+    let _ = bridge.await;
+    output
 }
 
 fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
@@ -445,7 +473,7 @@ impl Tui {
         })
     }
 
-    pub fn run(&mut self) -> Result<(), String> {
+    pub async fn run(&mut self) -> Result<(), String> {
         if !stdin_is_tty() {
             return Err("TUI requires an interactive terminal".to_string());
         }
@@ -454,19 +482,20 @@ impl Tui {
         self.start_flight_recorder_servers();
         let shutdown = ShutdownNotification::install()?;
         let mut runtime = TerminalRuntime::enter()?;
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::process::with_cancellation(shutdown.cancellation(), || {
-                self.run_inner(&mut runtime, &shutdown)
-            })
-        }));
-        let result = self.finish_run(outcome, shutdown.signal());
+        let outcome = std::panic::AssertUnwindSafe(with_shutdown_process_scope(
+            shutdown.cancellation(),
+            self.run_inner(&mut runtime, &shutdown),
+        ))
+        .catch_unwind()
+        .await;
+        let result = self.finish_run(outcome, shutdown.signal()).await;
         crate::flight_recorder::finish_pending_input_without_frame();
         crate::flight_recorder::end_idle("tui_exit");
         crate::flight_recorder::stop_all_servers();
         result
     }
 
-    fn finish_run(
+    async fn finish_run(
         &mut self,
         outcome: std::thread::Result<Result<ShutdownReason, String>>,
         signal: Option<ShutdownSignal>,
@@ -478,15 +507,15 @@ impl Tui {
             Ok(Ok(reason)) => *reason,
             Ok(Err(_)) => ShutdownReason::RunError,
         };
-        let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.cleanup_tui_jobs(shutdown_reason)
-        }))
-        .unwrap_or_else(|payload| {
-            Err(format!(
-                "TUI cleanup panicked: {}",
-                panic_payload_message(payload.as_ref())
-            ))
-        });
+        let cleanup = std::panic::AssertUnwindSafe(self.cleanup_tui_jobs(shutdown_reason))
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|payload| {
+                Err(format!(
+                    "TUI cleanup panicked: {}",
+                    panic_payload_message(payload.as_ref())
+                ))
+            });
         match outcome {
             Ok(_) if signal.is_some() => cleanup,
             Ok(Ok(_)) => cleanup,
@@ -514,7 +543,7 @@ impl Tui {
         }
     }
 
-    fn run_inner(
+    async fn run_inner(
         &mut self,
         runtime: &mut dyn TerminalDriver,
         shutdown: &ShutdownNotification,
@@ -522,12 +551,12 @@ impl Tui {
         crate::worker::ensure_running()?;
         #[cfg(target_os = "macos")]
         let _notification_subscription = crate::worker::subscribe_notifications()?;
-        self.offer_interrupted_run_recovery(runtime)?;
+        self.offer_interrupted_run_recovery(runtime).await?;
         self.refresh_sessions_after_tmux()?;
         self.poll_tmux_portal();
         self.draw(runtime)?;
         if self.repos.is_empty() {
-            match self.add_repository(runtime) {
+            match self.add_repository(runtime).await {
                 Ok(()) => {}
                 Err(error) => self.show_error("add repository failed", &error)?,
             }
@@ -556,6 +585,10 @@ impl Tui {
                     }
                     continue;
                 }
+                RuntimeEvent::Paste(_) => {
+                    crate::flight_recorder::finish_pending_input_without_frame();
+                    continue;
+                }
                 RuntimeEvent::Resize => {
                     self.draw(runtime)?;
                     continue;
@@ -577,7 +610,10 @@ impl Tui {
                 continue;
             };
 
-            match self.dispatch_command(runtime, key, &mut command_state)? {
+            match self
+                .dispatch_command(runtime, key, &mut command_state)
+                .await?
+            {
                 CommandOutcome::Continue => self.draw(runtime)?,
                 CommandOutcome::Quit => {
                     crate::flight_recorder::finish_pending_input_without_frame();

@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 #[allow(dead_code, unused_imports)]
 #[path = "common/e2e/mod.rs"]
 mod support;

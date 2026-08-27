@@ -14,21 +14,21 @@ pub(super) fn pr_poll_key(
     PrPollKey::for_repository_session_generation(repository, session, generation)
 }
 
-pub(super) fn fetch_wt_observation(
+pub(super) async fn fetch_wt_observation(
     repo: &crate::repo::Repository,
     config: &crate::config::Config,
 ) -> Result<crate::worktrunk::WorktrunkSnapshot, crate::worktrunk::WorktrunkFailure> {
-    crate::worktrunk::observe_repository(repo, config)
+    crate::worktrunk::observe_repository(repo, config).await
 }
 
-pub(super) fn default_branch_status_label(
+pub(super) async fn default_branch_status_label(
     path: &Path,
     branch: &str,
     config: &crate::config::Config,
 ) -> Result<String, String> {
-    let behind = branch_behind(path, branch, config)?;
+    let behind = branch_behind(path, branch, config).await?;
     Ok(status_label_with_behind(
-        &git_status_label(path, config),
+        &git_status_label(path, config).await,
         behind,
     ))
 }
@@ -135,8 +135,8 @@ impl Tui {
                     generation,
                     Some(TUI_ACTION_JOB_TIMEOUT),
                     format!("prism-pr-summary-{repo_index}"),
-                    move |_| {
-                        let adapter = crate::remote::dispatcher::capabilities(&path, &config);
+                    move |_| async move {
+                        let adapter = crate::remote::dispatcher::capabilities(&path, &config).await;
                         let github_remote_configured = adapter.is_ok();
                         let summaries: Result<Vec<crate::remote::PrSummary>, String> =
                             if github_remote_configured {
@@ -162,15 +162,19 @@ impl Tui {
                             };
                         let capabilities = adapter.ok();
                         let observations = match &summaries {
-                            Ok(summaries) => Ok(session_snapshots
-                                .into_iter()
-                                .map(|(key, session)| PrSummarySessionResult {
-                                    key,
-                                    summary: resolve_pr_summary_for_session(
-                                        &session, &config, summaries,
-                                    ),
-                                })
-                                .collect()),
+                            Ok(summaries) => {
+                                let mut observations = Vec::with_capacity(session_snapshots.len());
+                                for (key, session) in session_snapshots {
+                                    observations.push(PrSummarySessionResult {
+                                        key,
+                                        summary: resolve_pr_summary_for_session(
+                                            &session, &config, summaries,
+                                        )
+                                        .await,
+                                    });
+                                }
+                                Ok(observations)
+                            }
                             Err(error) => Err(error.clone()),
                         };
                         let remote_branch_heads = reconciliation_refs
@@ -240,7 +244,7 @@ impl Tui {
                     generation,
                     Some(TUI_ACTION_JOB_TIMEOUT),
                     format!("prism-pr-details-{index}"),
-                    move |_| {
+                    move |_| async move {
                         let snapshot = crate::worker::observe_remote(
                             &repository,
                             &path,
@@ -558,14 +562,14 @@ impl Tui {
                 generation,
                 Some(TUI_ACTION_JOB_TIMEOUT),
                 "prism-pr-persistence".to_string(),
-                move |_| {
+                move |_| async move {
                     let result =
                         persist_pr_cache_snapshot(&request.repo, &request.branch, &request.cache);
                     let status_label = if result.is_ok() && request.remote_update {
-                        Some(crate::git::git_status_label(
-                            &request.session.path,
-                            &request.config,
-                        ))
+                        Some(
+                            crate::git::git_status_label(&request.session.path, &request.config)
+                                .await,
+                        )
                     } else {
                         None
                     };
@@ -639,8 +643,8 @@ impl Tui {
                 generation,
                 Some(TUI_ACTION_JOB_TIMEOUT),
                 format!("prism-wt-columns-{repo_index}"),
-                move |_| {
-                    let observation = fetch_wt_observation(&repo, &config).map(|snapshot| {
+                move |_| async move {
+                    let observation = fetch_wt_observation(&repo, &config).await.map(|snapshot| {
                         let facts = crate::worktrunk::associate_snapshot(&snapshot, sessions);
                         WtObservation {
                             snapshot,
@@ -787,8 +791,8 @@ impl Tui {
                 generation,
                 Some(TUI_ACTION_JOB_TIMEOUT),
                 format!("prism-default-branch-{repo_index}"),
-                move |_| {
-                    let status_label = default_branch_status_label(&path, &branch, &config);
+                move |_| async move {
+                    let status_label = default_branch_status_label(&path, &branch, &config).await;
                     Ok(Some(TuiJobPayload::DefaultBranch(
                         DefaultBranchPollResult {
                             key: job_key,

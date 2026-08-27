@@ -14,8 +14,8 @@ use crate::persistence::workflow_kernel::DurableWorkflowRunStore;
 
 use super::agent_phase::HarnessAgentExecutor;
 use super::kernel::{
-    SchedulerProgress, StartPromptWorkflow, WorkflowKernelError, WorkflowRunState,
-    WorkflowRunStore, WorkflowScheduler,
+    RecoveryResolution, SchedulerProgress, StartPromptWorkflow, WorkflowKernelError,
+    WorkflowRunState, WorkflowRunStore, WorkflowScheduler,
 };
 use super::remote_operation::{RemoteMutationOperation, RemoteObservationOperation};
 use super::source::CompiledWorkflow;
@@ -148,8 +148,9 @@ impl PromptWorkflowService {
             repository,
             worktree,
             operation.paths(),
-        )?;
-        let lane = super::standard_remote::lane_for_remote_paths(&repository, &worktree)?;
+        )
+        .await?;
+        let lane = super::standard_remote::lane_for_remote_paths(&repository, &worktree).await?;
         let label = operation.label();
         let payload =
             serde_json::to_value(&operation).map_err(|error| error.to_string())?["payload"].clone();
@@ -178,8 +179,9 @@ impl PromptWorkflowService {
             repository,
             worktree,
             operation.paths(),
-        )?;
-        let lane = super::standard_remote::lane_for_remote_paths(&repository, &worktree)?;
+        )
+        .await?;
+        let lane = super::standard_remote::lane_for_remote_paths(&repository, &worktree).await?;
         let request_id = super::remote_operation::namespaced_mutation_request_id(
             &repository,
             &subject,
@@ -214,8 +216,9 @@ impl PromptWorkflowService {
             repository,
             worktree,
             operation.paths(),
-        )?;
-        let lane = super::standard_remote::lane_for_remote_paths(&repository, &worktree)?;
+        )
+        .await?;
+        let lane = super::standard_remote::lane_for_remote_paths(&repository, &worktree).await?;
         let request_id = super::remote_operation::namespaced_mutation_request_id(
             &repository,
             &subject,
@@ -292,6 +295,21 @@ impl PromptWorkflowService {
         self.store.list_runs(repository, limit).await
     }
 
+    pub(crate) async fn list_page(
+        &self,
+        repository: Option<&Path>,
+        page_size: usize,
+        cursor: Option<&crate::persistence::workflow_kernel::WorkflowRunCursor>,
+    ) -> Result<crate::persistence::workflow_kernel::WorkflowRunPage, WorkflowKernelError> {
+        self.store
+            .list_runs_page(repository, page_size, cursor)
+            .await
+    }
+
+    pub(crate) async fn active_count(&self) -> Result<usize, WorkflowKernelError> {
+        self.store.active_run_count().await
+    }
+
     pub async fn inspect(
         &self,
         run_id: &str,
@@ -319,9 +337,9 @@ impl PromptWorkflowService {
         &self,
         run_id: &str,
         now: i64,
-        evidence: &str,
+        resolution: RecoveryResolution,
     ) -> Result<(), WorkflowKernelError> {
-        self.scheduler.recover(run_id, now, evidence).await
+        self.scheduler.recover(run_id, now, resolution).await
     }
 
     pub async fn discard(&self, run_id: &str, now: i64) -> Result<(), WorkflowKernelError> {
@@ -380,10 +398,11 @@ pub fn now_unix_ms() -> i64 {
         .unwrap_or(0)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn pinned_external_triggers_can_be_rehydrated_from_a_workflow_snapshot() {
         let root =

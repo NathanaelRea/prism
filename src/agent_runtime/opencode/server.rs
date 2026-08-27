@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use super::client::parse_localhost_url;
@@ -13,9 +13,14 @@ const HEALTH_TIMEOUT: Duration = Duration::from_millis(250);
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVER_START_POLL: Duration = Duration::from_millis(100);
 
-static OWNED_SERVER_PROCESSES: OnceLock<Mutex<BTreeMap<u32, OwnedServerProcess>>> = OnceLock::new();
+static OWNED_SERVER_PROCESSES: OnceLock<tokio::sync::Mutex<BTreeMap<u32, OwnedServerProcess>>> =
+    OnceLock::new();
+
+#[derive(Clone)]
 struct OwnedServerProcess {
-    child: crate::process::SupervisedChild,
+    pid: u32,
+    identity: Option<u64>,
+    control: crate::process::ProcessControl,
 }
 
 pub(crate) fn lock_repository_server(repo: &Repository) -> Result<File, String> {
@@ -68,42 +73,80 @@ pub(super) fn stored_server_identity_is_valid(runtime: &OpencodeRuntime) -> bool
     stored_runtime_session_matches(runtime)
 }
 
-pub fn shutdown_owned_server(runtime: &OpencodeRuntime) -> Result<(), String> {
+pub(super) async fn owned_server_identity_is_valid(runtime: &OpencodeRuntime) -> bool {
+    let Some(pid) = runtime.server_pid else {
+        return false;
+    };
+    owned_server_processes()
+        .lock()
+        .await
+        .get(&pid)
+        .is_some_and(|owned| {
+            owned.identity == runtime.server_process_identity && !owned.control.is_finished()
+        })
+}
+
+pub async fn shutdown_owned_server(runtime: &OpencodeRuntime) -> Result<(), String> {
     let Some(pid) = runtime.server_pid else {
         return Ok(());
     };
-    let Some(mut owned) = take_owned_server_process(pid) else {
-        return Ok(());
-    };
-    if owned
-        .child
-        .try_wait()
-        .map_err(|error| format!("inspect owned opencode server {pid} before shutdown: {error}"))?
-        .is_some()
-    {
-        return Ok(());
-    }
+    let owned =
+        match take_matching_owned_server_process(pid, runtime.server_process_identity).await? {
+            Some(owned) => owned,
+            None => return shutdown_external_server(runtime).await,
+        };
     owned
-        .child
-        .terminate()
-        .map(|_| ())
+        .control
+        .shutdown()
+        .await
         .map_err(|error| format!("stop opencode server {pid}: {error}"))
 }
 
-pub(crate) fn shutdown_stored_server(runtime: &OpencodeRuntime) -> Result<(), String> {
-    shutdown_stored_server_with(runtime, crate::process::process_arguments)
+pub(crate) async fn shutdown_stored_server(runtime: &OpencodeRuntime) -> Result<(), String> {
+    if let Some(pid) = runtime.server_pid
+        && owned_server_process(pid).await
+    {
+        return shutdown_owned_server(runtime).await;
+    }
+    shutdown_external_server(runtime).await
 }
 
-pub(super) fn shutdown_stored_server_with(
+#[cfg(test)]
+pub(super) async fn shutdown_stored_server_with(
     runtime: &OpencodeRuntime,
     inspect_arguments: impl FnOnce(
         u32,
     )
         -> Result<Option<Vec<String>>, crate::process::ProcessLifecycleError>,
 ) -> Result<(), String> {
-    if runtime.server_pid.is_some_and(owned_server_process) {
-        return shutdown_owned_server(runtime);
+    if let Some(pid) = runtime.server_pid
+        && owned_server_process(pid).await
+    {
+        return shutdown_owned_server(runtime).await;
     }
+    shutdown_external_server_with(runtime, inspect_arguments).await
+}
+
+async fn shutdown_external_server(runtime: &OpencodeRuntime) -> Result<(), String> {
+    let Some(pid) = runtime.server_pid else {
+        return Ok(());
+    };
+    if !stored_server_process_matches(pid, runtime.server_port)
+        .map_err(|error| format!("inspect stored opencode server {pid} before shutdown: {error}"))?
+    {
+        return Ok(());
+    }
+    terminate_external_server(runtime, pid).await
+}
+
+#[cfg(test)]
+async fn shutdown_external_server_with(
+    runtime: &OpencodeRuntime,
+    inspect_arguments: impl FnOnce(
+        u32,
+    )
+        -> Result<Option<Vec<String>>, crate::process::ProcessLifecycleError>,
+) -> Result<(), String> {
     let Some(pid) = runtime.server_pid else {
         return Ok(());
     };
@@ -112,9 +155,14 @@ pub(super) fn shutdown_stored_server_with(
     {
         return Ok(());
     }
+    terminate_external_server(runtime, pid).await
+}
+
+async fn terminate_external_server(runtime: &OpencodeRuntime, pid: u32) -> Result<(), String> {
     let recorded =
         crate::process::RecordedProcess::from_stored(pid, runtime.server_process_identity);
     match crate::process::terminate_recorded_process(recorded, Duration::from_secs(1))
+        .await
         .map_err(|error| format!("stop opencode server {pid}: {error}"))?
     {
         crate::process::TerminationOutcome::Terminated
@@ -126,6 +174,7 @@ pub(super) fn shutdown_stored_server_with(
     }
 }
 
+#[cfg(unix)]
 fn stored_server_process_matches(
     pid: u32,
     port: u16,
@@ -133,6 +182,23 @@ fn stored_server_process_matches(
     stored_server_process_matches_with(pid, port, crate::process::process_arguments)
 }
 
+#[cfg(windows)]
+fn stored_server_process_matches(
+    pid: u32,
+    _port: u16,
+) -> Result<bool, crate::process::ProcessLifecycleError> {
+    let Some(observed) = crate::process::process_executable(pid)? else {
+        return Ok(false);
+    };
+    let expected = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .map_err(|source| crate::process::ProcessLifecycleError::Inspect { pid, source })?;
+    let observed = std::fs::canonicalize(observed)
+        .map_err(|source| crate::process::ProcessLifecycleError::Inspect { pid, source })?;
+    Ok(expected == observed)
+}
+
+#[cfg(any(unix, test))]
 fn stored_server_process_matches_with(
     pid: u32,
     port: u16,
@@ -147,6 +213,7 @@ fn stored_server_process_matches_with(
     }))
 }
 
+#[cfg(any(unix, test))]
 pub(super) fn stored_server_args_match(args: &[&str], port: u16) -> bool {
     let port = port.to_string();
     args.windows(2).any(|window| window[1] == "serve")
@@ -158,38 +225,39 @@ pub(super) fn stored_server_args_match(args: &[&str], port: u16) -> bool {
             .any(|window| window[0] == "--port" && window[1] == port)
 }
 
-fn owned_server_processes() -> &'static Mutex<BTreeMap<u32, OwnedServerProcess>> {
-    OWNED_SERVER_PROCESSES.get_or_init(|| Mutex::new(BTreeMap::new()))
+fn owned_server_processes() -> &'static tokio::sync::Mutex<BTreeMap<u32, OwnedServerProcess>> {
+    OWNED_SERVER_PROCESSES.get_or_init(|| tokio::sync::Mutex::new(BTreeMap::new()))
 }
 
-pub(super) fn record_owned_server_process(child: crate::process::SupervisedChild) {
-    let pid = child.id();
-    let process = OwnedServerProcess { child };
-    owned_server_processes()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .insert(pid, process);
+#[cfg(all(test, unix))]
+pub(super) async fn record_owned_server_process(control: crate::process::ProcessControl) {
+    let pid = control.pid();
+    let process = OwnedServerProcess {
+        pid,
+        identity: control.identity(),
+        control,
+    };
+    owned_server_processes().lock().await.insert(pid, process);
 }
 
-pub(super) fn owned_server_process(pid: u32) -> bool {
-    owned_server_processes()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .contains_key(&pid)
+pub(super) async fn owned_server_process(pid: u32) -> bool {
+    owned_server_processes().lock().await.contains_key(&pid)
 }
 
-fn take_owned_server_process(pid: u32) -> Option<OwnedServerProcess> {
-    owned_server_processes()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .remove(&pid)
-}
-
-pub(super) fn stored_process_identity(pid: u32) -> Option<u64> {
-    crate::process::record_process(pid)
-        .ok()?
-        .identity
-        .map(crate::process::ProcessIdentity::stored_value)
+async fn take_matching_owned_server_process(
+    pid: u32,
+    identity: Option<u64>,
+) -> Result<Option<OwnedServerProcess>, String> {
+    let mut processes = owned_server_processes().lock().await;
+    let Some(owned) = processes.get(&pid) else {
+        return Ok(None);
+    };
+    if owned.pid != pid || owned.identity != identity {
+        return Err(format!(
+            "refusing to stop owned opencode server {pid}: registry identity disagrees with persisted identity"
+        ));
+    }
+    Ok(processes.remove(&pid))
 }
 
 pub fn allocate_port(
@@ -246,6 +314,34 @@ pub fn check_health(server_url: &str) -> bool {
     super::client::check_health(server_url, HEALTH_TIMEOUT)
 }
 
+pub(super) async fn check_health_async(server_url: &str) -> bool {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let Ok((host, port)) = parse_localhost_url(server_url) else {
+        return false;
+    };
+    let request = async {
+        let mut stream = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
+        stream
+            .write_all(
+                format!(
+                    "GET /global/health HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await?;
+        let mut response = [0_u8; 64];
+        let count = stream.read(&mut response).await?;
+        Ok::<bool, std::io::Error>(
+            response[..count].starts_with(b"HTTP/1.1 200")
+                || response[..count].starts_with(b"HTTP/1.0 200"),
+        )
+    };
+    tokio::time::timeout(HEALTH_TIMEOUT, request)
+        .await
+        .is_ok_and(|result| result.unwrap_or(false))
+}
+
 pub fn port_status(port: u16) -> PortStatus {
     let url = server_url(port);
     if check_health(&url) {
@@ -258,13 +354,13 @@ pub fn port_status(port: u16) -> PortStatus {
     }
 }
 
-pub(super) fn wait_for_health(server_url: &str) -> Result<(), String> {
-    let started = std::time::Instant::now();
+pub(super) async fn wait_for_health(server_url: &str) -> Result<(), String> {
+    let started = tokio::time::Instant::now();
     while started.elapsed() < SERVER_START_TIMEOUT {
-        if check_health(server_url) {
+        if check_health_async(server_url).await {
             return Ok(());
         }
-        std::thread::sleep(SERVER_START_POLL);
+        tokio::time::sleep(SERVER_START_POLL).await;
     }
     Err(format!(
         "opencode server did not become healthy at {server_url}"

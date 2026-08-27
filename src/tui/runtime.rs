@@ -6,9 +6,9 @@ use std::{
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{
-        self, DisableFocusChange, EnableFocusChange, EnableMouseCapture, Event, KeyEvent,
-        KeyboardEnhancementFlags, MouseEvent, PopKeyboardEnhancementFlags,
-        PushKeyboardEnhancementFlags,
+        self, DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
+        EnableMouseCapture, Event, KeyEvent, KeyboardEnhancementFlags, MouseEvent,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{
@@ -30,6 +30,7 @@ pub(crate) struct TerminalRuntime {
 pub(crate) enum RuntimeEvent {
     Key(KeyEvent),
     Mouse(MouseEvent),
+    Paste(String),
     Resize,
     FocusGained,
     FocusLost,
@@ -72,6 +73,35 @@ pub(crate) fn suspend_for<T>(
     );
     resume_result?;
     result
+}
+
+impl dyn TerminalDriver + '_ {
+    pub(crate) async fn suspend_for_async<T, F>(&mut self, future: F) -> Result<T, String>
+    where
+        F: std::future::Future<Output = Result<T, String>>,
+    {
+        self.suspend()?;
+        let away_started = Instant::now();
+        let mut restore = AsyncRestore::new(self, resume_terminal_driver);
+        let result = future.await;
+        let away = away_started.elapsed();
+        let resume_result = restore.resume();
+        crate::flight_recorder::record(
+            "lifecycle",
+            "suspended_operation",
+            Some(away),
+            vec![
+                crate::flight_recorder::boolean("operation_success", result.is_ok()),
+                crate::flight_recorder::boolean("resume_success", resume_result.is_ok()),
+            ],
+        );
+        resume_result?;
+        result
+    }
+}
+
+fn resume_terminal_driver(runtime: &mut (dyn TerminalDriver + '_)) -> Result<(), String> {
+    runtime.resume()
 }
 
 impl TerminalRuntime {
@@ -181,9 +211,9 @@ impl TerminalRuntime {
             Event::Resize(_, _) => Ok(Some(RuntimeEvent::Resize)),
             Event::FocusGained => Ok(Some(RuntimeEvent::FocusGained)),
             Event::FocusLost => Ok(Some(RuntimeEvent::FocusLost)),
-            Event::Paste(_) => {
+            Event::Paste(text) => {
                 crate::flight_recorder::finish_pending_input_without_frame();
-                Ok(None)
+                Ok(Some(RuntimeEvent::Paste(text)))
             }
         };
         crate::flight_recorder::record(
@@ -210,6 +240,7 @@ impl TerminalRuntime {
             EnterAlternateScreen,
             EnableMouseCapture,
             EnableFocusChange,
+            EnableBracketedPaste,
             Hide
         )
         .map_err(|error| error.to_string())
@@ -250,6 +281,7 @@ impl TerminalRuntime {
                     io::stdout(),
                     crossterm::event::DisableMouseCapture,
                     DisableFocusChange,
+                    DisableBracketedPaste,
                     LeaveAlternateScreen,
                     Clear(ClearType::All),
                     MoveTo(0, 0),
@@ -260,6 +292,7 @@ impl TerminalRuntime {
                     io::stdout(),
                     crossterm::event::DisableMouseCapture,
                     DisableFocusChange,
+                    DisableBracketedPaste,
                     LeaveAlternateScreen,
                     Show
                 )
@@ -278,6 +311,38 @@ impl TerminalRuntime {
             }
         }
         first_error.map_or(Ok(()), Err)
+    }
+}
+
+struct AsyncRestore<'a, T: ?Sized> {
+    target: &'a mut T,
+    restore: fn(&mut T) -> Result<(), String>,
+    armed: bool,
+}
+
+impl<'a, T: ?Sized> AsyncRestore<'a, T> {
+    fn new(target: &'a mut T, restore: fn(&mut T) -> Result<(), String>) -> Self {
+        Self {
+            target,
+            restore,
+            armed: true,
+        }
+    }
+
+    fn resume(&mut self) -> Result<(), String> {
+        let result = (self.restore)(self.target);
+        if result.is_ok() {
+            self.armed = false;
+        }
+        result
+    }
+}
+
+impl<T: ?Sized> Drop for AsyncRestore<'_, T> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = (self.restore)(self.target);
+        }
     }
 }
 
@@ -306,5 +371,62 @@ impl TerminalDriver for TerminalRuntime {
 impl Drop for TerminalRuntime {
     fn drop(&mut self) {
         let _ = self.leave_active_terminal(false);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::AsyncRestore;
+
+    async fn suspended_probe<F>(restores: Arc<AtomicUsize>, future: F) -> Result<(), String>
+    where
+        F: std::future::Future<Output = Result<(), String>>,
+    {
+        let mut restores = restores;
+        let mut restore = AsyncRestore::new(&mut restores, |restores| {
+            restores.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        let result = future.await;
+        restore.resume()?;
+        result
+    }
+
+    #[tokio::test]
+    async fn async_suspension_restores_after_success_and_error() {
+        let restores = Arc::new(AtomicUsize::new(0));
+        suspended_probe(Arc::clone(&restores), async { Ok(()) })
+            .await
+            .unwrap();
+        assert_eq!(restores.load(Ordering::SeqCst), 1);
+
+        let error = suspended_probe(Arc::clone(&restores), async { Err("failed".to_string()) })
+            .await
+            .unwrap_err();
+        assert_eq!(error, "failed");
+        assert_eq!(restores.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn async_suspension_restores_after_cancellation_and_panic() {
+        let canceled_restores = Arc::new(AtomicUsize::new(0));
+        let canceled = tokio::spawn(suspended_probe(
+            Arc::clone(&canceled_restores),
+            std::future::pending::<Result<(), String>>(),
+        ));
+        tokio::task::yield_now().await;
+        canceled.abort();
+        assert!(canceled.await.unwrap_err().is_cancelled());
+        assert_eq!(canceled_restores.load(Ordering::SeqCst), 1);
+
+        let panic_restores = Arc::new(AtomicUsize::new(0));
+        let panicked = tokio::spawn(suspended_probe(Arc::clone(&panic_restores), async {
+            panic!("suspended operation panic");
+        }));
+        assert!(panicked.await.unwrap_err().is_panic());
+        assert_eq!(panic_restores.load(Ordering::SeqCst), 1);
     }
 }

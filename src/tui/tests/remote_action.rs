@@ -33,8 +33,8 @@ fn wait_for_background(tui: &mut Tui) {
     while tui.route_tui_job_messages() > 0 {}
 }
 
-#[test]
-fn coordinated_mutations_are_blocked_until_startup_markers_are_loaded() {
+#[tokio::test(flavor = "multi_thread")]
+async fn coordinated_mutations_are_blocked_until_startup_markers_are_loaded() {
     let temp = unique_temp_dir("prism-tui-marker-startup-admission");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -51,8 +51,8 @@ fn coordinated_mutations_are_blocked_until_startup_markers_are_loaded() {
     fs::remove_dir_all(temp).unwrap();
 }
 
-#[test]
-fn corrupt_startup_marker_fails_closed_and_marks_sessions_untrusted() {
+#[tokio::test(flavor = "multi_thread")]
+async fn corrupt_startup_marker_fails_closed_and_marks_sessions_untrusted() {
     let temp = unique_temp_dir("prism-tui-corrupt-startup-marker");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -78,8 +78,8 @@ fn corrupt_startup_marker_fails_closed_and_marks_sessions_untrusted() {
     fs::remove_dir_all(temp).unwrap();
 }
 
-#[test]
-fn stale_marker_load_error_does_not_block_a_new_repository_incarnation() {
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_marker_load_error_does_not_block_a_new_repository_incarnation() {
     let temp = unique_temp_dir("prism-tui-stale-marker-load-error");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -115,8 +115,8 @@ fn stale_marker_load_error_does_not_block_a_new_repository_incarnation() {
     fs::remove_dir_all(temp).unwrap();
 }
 
-#[test]
-fn startup_marker_load_survives_session_generation_change() {
+#[tokio::test(flavor = "multi_thread")]
+async fn startup_marker_load_survives_session_generation_change() {
     let temp = unique_temp_dir("prism-tui-marker-generation-race");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -144,8 +144,8 @@ fn startup_marker_load_survives_session_generation_change() {
     fs::remove_dir_all(temp).unwrap();
 }
 
-#[test]
-fn marker_persistence_remains_admitted_after_general_shutdown_cutoff() {
+#[tokio::test(flavor = "multi_thread")]
+async fn marker_persistence_remains_admitted_after_general_shutdown_cutoff() {
     let temp = unique_temp_dir("prism-tui-marker-after-cutoff");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -168,8 +168,8 @@ fn marker_persistence_remains_admitted_after_general_shutdown_cutoff() {
     fs::remove_dir_all(temp).unwrap();
 }
 
-#[test]
-fn marker_writer_retries_repeated_start_failures_and_survives_restart() {
+#[tokio::test(flavor = "multi_thread")]
+async fn marker_writer_retries_repeated_start_failures_and_survives_restart() {
     let temp = unique_temp_dir("prism-tui-marker-spawn-retry");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -192,8 +192,8 @@ fn marker_writer_retries_repeated_start_failures_and_survives_restart() {
     fs::remove_dir_all(temp).unwrap();
 }
 
-#[test]
-fn marker_writer_retries_repeated_write_failures_and_survives_restart() {
+#[tokio::test(flavor = "multi_thread")]
+async fn marker_writer_retries_repeated_write_failures_and_survives_restart() {
     let temp = unique_temp_dir("prism-tui-marker-write-retry");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -216,8 +216,8 @@ fn marker_writer_retries_repeated_write_failures_and_survives_restart() {
     fs::remove_dir_all(temp).unwrap();
 }
 
-#[test]
-fn permanent_marker_write_failure_makes_shutdown_explicitly_unsuccessful() {
+#[tokio::test(flavor = "multi_thread")]
+async fn permanent_marker_write_failure_makes_shutdown_explicitly_unsuccessful() {
     let temp = unique_temp_dir("prism-tui-marker-permanent-failure");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -232,6 +232,7 @@ fn permanent_marker_write_failure_makes_shutdown_explicitly_unsuccessful() {
 
     let error = tui
         .cleanup_tui_jobs(super::super::ShutdownReason::UserQuit)
+        .await
         .unwrap_err();
     assert!(error.contains("shutdown durability failure"), "{error}");
     assert!(error.contains("remain unacknowledged"), "{error}");
@@ -239,8 +240,8 @@ fn permanent_marker_write_failure_makes_shutdown_explicitly_unsuccessful() {
     fs::remove_dir_all(temp).unwrap();
 }
 
-#[test]
-fn empty_list_retains_persisted_create_marker_until_matching_summary_is_observed() {
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_list_retains_persisted_create_marker_until_matching_summary_is_observed() {
     let temp = unique_temp_dir("prism-tui-mutation-reconciliation-test");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -333,8 +334,9 @@ fn empty_list_retains_persisted_create_marker_until_matching_summary_is_observed
     fs::remove_dir_all(temp).unwrap();
 }
 
-#[test]
-fn typed_push_and_create_markers_select_authoritative_result_observations_after_push_advances() {
+#[tokio::test(flavor = "multi_thread")]
+async fn typed_push_and_create_markers_select_authoritative_result_observations_after_push_advances()
+ {
     let provider = crate::remote::ProviderKind::GitHub;
     let repository_id = crate::remote::RemoteRepositoryId::new(
         provider,
@@ -442,8 +444,8 @@ fn typed_push_and_create_markers_select_authoritative_result_observations_after_
     ));
 }
 
-#[test]
-fn failed_reconciliation_releases_the_marker_for_retry() {
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_reconciliation_releases_the_marker_for_retry() {
     let temp = unique_temp_dir("prism-tui-reconciliation-retry");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -498,7 +500,44 @@ fn failed_reconciliation_releases_the_marker_for_retry() {
 }
 
 #[test]
-fn reconciliation_clears_legacy_merge_marker_with_authoritative_evidence_only() {
+fn merged_evidence_from_a_different_head_does_not_reconcile() {
+    let repository = crate::session::WorktreeRepositoryKey::new("/repo".into());
+    let identity = test_change_request_identity(crate::remote::ProviderKind::GitHub);
+    let marker = super::super::remote_action::RemoteMutationReconciliationMarker {
+        target: RemoteMutationTarget::Merge {
+            change_request: identity.clone(),
+            expected_head_sha: "abc123".into(),
+        },
+        ledger: None,
+        database_path: std::path::PathBuf::new(),
+        job_id: 1,
+        reason: "uncertain".into(),
+        recorded_unix_ms: 1,
+    };
+    let mut summary = test_pr_summary(true);
+    summary.change_request_identity = Some(identity);
+    summary.head_sha = "def456".into();
+
+    let commands = super::super::remote_reconciliation::classify_summary_evidence(
+        &repository,
+        std::slice::from_ref(&marker),
+        std::slice::from_ref(&summary),
+        &BTreeMap::new(),
+    );
+    assert!(commands.is_empty());
+
+    summary.head_sha = "abc123".into();
+    let commands = super::super::remote_reconciliation::classify_summary_evidence(
+        &repository,
+        &[marker],
+        &[summary],
+        &BTreeMap::new(),
+    );
+    assert_eq!(commands.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reconciliation_clears_legacy_merge_marker_with_authoritative_evidence_only() {
     let temp = unique_temp_dir("prism-tui-matched-mutation-evidence-test");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -621,8 +660,8 @@ fn reconciliation_clears_legacy_merge_marker_with_authoritative_evidence_only() 
     }
 }
 
-#[test]
-fn cleanup_applies_a_mutation_payload_routed_before_shutdown_started() {
+#[tokio::test(flavor = "multi_thread")]
+async fn cleanup_applies_a_mutation_payload_routed_before_shutdown_started() {
     let temp = unique_temp_dir("prism-tui-routed-mutation-shutdown-test");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -652,7 +691,7 @@ fn cleanup_applies_a_mutation_payload_routed_before_shutdown_started() {
         0,
         None,
         "already-routed-mutation".to_string(),
-        move |context| {
+        move |context| async move {
             Ok(Some(TuiJobPayload::RemoteAction(Box::new(
                 RemoteActionDelivery {
                     id: context.id(),
@@ -702,6 +741,7 @@ fn cleanup_applies_a_mutation_payload_routed_before_shutdown_started() {
     tui.route_tui_job_messages();
 
     tui.cleanup_tui_jobs(super::super::ShutdownReason::Sigterm)
+        .await
         .unwrap();
 
     assert!(tui.background.tracked_remote_action_ids().is_empty());
@@ -712,11 +752,13 @@ fn cleanup_applies_a_mutation_payload_routed_before_shutdown_started() {
             .number,
         42
     );
+    drop(tui);
+    drop(repo);
     fs::remove_dir_all(temp).unwrap();
 }
 
-#[test]
-fn mutation_remote_action_jobs_cannot_be_abandoned_or_timed_out() {
+#[tokio::test(flavor = "multi_thread")]
+async fn mutation_remote_action_jobs_cannot_be_abandoned_or_timed_out() {
     let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
     let interrupt = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
 
@@ -747,8 +789,8 @@ fn mutation_remote_action_jobs_cannot_be_abandoned_or_timed_out() {
     );
 }
 
-#[test]
-fn push_remote_action_cannot_be_abandoned_and_reconciles_after_generation_change() {
+#[tokio::test(flavor = "multi_thread")]
+async fn push_remote_action_cannot_be_abandoned_and_reconciles_after_generation_change() {
     let abandon_cancelable = false;
     let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
     let interrupt = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
@@ -767,7 +809,7 @@ fn push_remote_action_cannot_be_abandoned_and_reconciles_after_generation_change
         tui.session_inventory_generation,
         remote_action_timeout(abandon_cancelable),
         "push-reconciliation-test".to_string(),
-        |context| {
+        |context| async move {
             Ok(Some(TuiJobPayload::RemoteAction(Box::new(
                 RemoteActionDelivery {
                     id: context.id(),
@@ -803,8 +845,8 @@ fn push_remote_action_cannot_be_abandoned_and_reconciles_after_generation_change
     tui.background.finish_remote_action(id);
 }
 
-#[test]
-fn queued_remote_timing_updates_the_visible_progress_dialog() {
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_remote_timing_updates_the_visible_progress_dialog() {
     let temp = unique_temp_dir("prism-tui-remote-wait-progress-test");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -828,8 +870,8 @@ fn queued_remote_timing_updates_the_visible_progress_dialog() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn merge_summary_refresh_preserves_matching_details() {
+#[tokio::test(flavor = "multi_thread")]
+async fn merge_summary_refresh_preserves_matching_details() {
     let summary = test_pr_summary(false);
     let details = PrDetails {
         comments: vec![crate::remote::PrComment {
@@ -848,8 +890,8 @@ fn merge_summary_refresh_preserves_matching_details() {
     assert_eq!(cache.details().unwrap().comments.len(), 1);
 }
 
-#[test]
-fn uncertain_merge_summary_remains_untrusted_until_reobserved() {
+#[tokio::test(flavor = "multi_thread")]
+async fn uncertain_merge_summary_remains_untrusted_until_reobserved() {
     let mut cache = PrCache::observed(test_pr_summary(false), None);
     cache.require_reconciliation(
         "provider merge outcome is uncertain; authoritative re-observation required",
@@ -858,8 +900,8 @@ fn uncertain_merge_summary_remains_untrusted_until_reobserved() {
     assert!(cache.trusted_summary().is_err());
 }
 
-#[test]
-fn uncertain_merge_result_requires_authoritative_reconciliation() {
+#[tokio::test(flavor = "multi_thread")]
+async fn uncertain_merge_result_requires_authoritative_reconciliation() {
     assert!(
         super::super::uncertain_remote_mutation_error(&Err("provider rejected the request".into()))
             .is_none()
@@ -897,8 +939,8 @@ fn uncertain_merge_result_requires_authoritative_reconciliation() {
     }
 }
 
-#[test]
-fn applying_remote_action_results_performs_no_provider_or_database_io() {
+#[tokio::test(flavor = "multi_thread")]
+async fn applying_remote_action_results_performs_no_provider_or_database_io() {
     let temp = unique_temp_dir("prism-tui-remote-action-result-test");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));

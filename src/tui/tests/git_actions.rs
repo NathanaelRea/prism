@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -8,13 +9,15 @@ use crate::repo::Repository;
 use crate::view::RepoMainView;
 
 use super::super::{GitAction, PanelFocus, PrPollResult, Tui};
+#[cfg(unix)]
+use super::support::unique_temp_dir;
 use super::support::{
     test_change_request_identity, test_change_request_identity_for, test_config, test_pr_summary,
-    test_session, unique_temp_dir,
+    test_session,
 };
 
-#[test]
-fn open_pr_action_requires_an_observed_change_request() {
+#[tokio::test(flavor = "multi_thread")]
+async fn open_pr_action_requires_an_observed_change_request() {
     let repo = Repository {
         root: PathBuf::from("/tmp/repo"),
     };
@@ -44,8 +47,9 @@ fn open_pr_action_requires_an_observed_change_request() {
     assert!(tui.git_action_enabled(GitAction::OpenPr));
 }
 
-#[test]
-fn merge_action_requires_fresh_summary_and_supported_guarded_merge() {
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn merge_action_requires_fresh_summary_and_supported_guarded_merge() {
     let repo = Repository {
         root: PathBuf::from("/tmp/repo"),
     };
@@ -94,8 +98,9 @@ fn merge_action_requires_fresh_summary_and_supported_guarded_merge() {
     assert!(tui.git_action_enabled(GitAction::Merge));
 }
 
-#[test]
-fn submit_review_requires_the_configured_gh_executable() {
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_review_requires_the_configured_gh_executable() {
     let temp = unique_temp_dir("prism-tui-submit-review-test");
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
     let mut config = test_config();
@@ -132,8 +137,8 @@ fn submit_review_requires_the_configured_gh_executable() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn repository_change_request_selection_uses_canonical_identity_across_reordering() {
+#[tokio::test(flavor = "multi_thread")]
+async fn repository_change_request_selection_uses_canonical_identity_across_reordering() {
     let repo = Repository {
         root: PathBuf::from("/tmp/repo"),
     };
@@ -207,8 +212,8 @@ fn repository_change_request_selection_uses_canonical_identity_across_reordering
     }));
 }
 
-#[test]
-fn review_resolution_action_requires_main_panel_and_unresolved_threads() {
+#[tokio::test(flavor = "multi_thread")]
+async fn review_resolution_action_requires_main_panel_and_unresolved_threads() {
     let repo = Repository {
         root: PathBuf::from("/tmp/repo"),
     };

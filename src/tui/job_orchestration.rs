@@ -170,7 +170,7 @@ impl Tui {
         Ok(true)
     }
 
-    pub(crate) fn spawn_tui_job<F>(
+    pub(crate) fn spawn_tui_job<F, Fut>(
         &mut self,
         kind: TuiJobKind,
         key: TuiJobKey,
@@ -180,11 +180,8 @@ impl Tui {
         job: F,
     ) -> JobId
     where
-        F: FnOnce(
-                JobContext<TuiJobKind, TuiJobKey, TuiJobPayload>,
-            ) -> Result<Option<TuiJobPayload>, String>
-            + Send
-            + 'static,
+        F: FnOnce(JobContext<TuiJobKind, TuiJobKey, TuiJobPayload>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<Option<TuiJobPayload>, String>> + Send + 'static,
     {
         self.background
             .spawn(kind, key, generation, timeout, name, job)
@@ -932,13 +929,13 @@ impl Tui {
         }
     }
 
-    pub(super) fn cleanup_tui_jobs(&mut self, reason: ShutdownReason) -> Result<(), String> {
+    pub(super) async fn cleanup_tui_jobs(&mut self, reason: ShutdownReason) -> Result<(), String> {
         let mut errors = Vec::new();
         let started = Instant::now();
         let active_jobs = self.background.begin_shutdown();
         errors.extend(self.apply_routed_remote_actions_for_shutdown());
         self.background.stop_admission_for_shutdown();
-        if let Err(error) = self.shutdown_owned_opencode_servers() {
+        if let Err(error) = self.shutdown_owned_opencode_servers().await {
             errors.push(error);
         }
 

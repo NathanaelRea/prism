@@ -11,6 +11,7 @@ use sqlx::{Connection, Row, SqliteConnection};
 
 pub const WRITER_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[cfg(unix)]
 static VALIDATED_DATABASES: OnceLock<Mutex<BTreeMap<PathBuf, ValidatedDatabase>>> = OnceLock::new();
 static WAL_WARNING_BUCKETS: OnceLock<Mutex<BTreeMap<PathBuf, u64>>> = OnceLock::new();
 
@@ -28,10 +29,20 @@ const SQLITE_NOTADB: i32 = 26;
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DatabaseIdentity {
     path: PathBuf,
+    native: NativeDatabaseIdentity,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct NativeDatabaseIdentity {
     device: u64,
     inode: u64,
 }
 
+#[cfg(windows)]
+type NativeDatabaseIdentity = file_id::FileId;
+
+#[cfg(unix)]
 struct ValidatedDatabase {
     identity: DatabaseIdentity,
     _file: fs::File,
@@ -228,6 +239,7 @@ fn sqlite_error_code(error: &sqlx::Error) -> Option<i32> {
 fn database_error_code(error: &crate::persistence::error::DatabaseError) -> Option<i32> {
     let source = match error {
         crate::persistence::error::DatabaseError::Connect { source, .. }
+        | crate::persistence::error::DatabaseError::BackupQuery { source, .. }
         | crate::persistence::error::DatabaseError::Query(source) => source,
         _ => return None,
     };
@@ -287,14 +299,18 @@ fn open_writable(path: &Path) -> Result<SqliteConnection, StorageError> {
 }
 
 fn open_writable_inner(path: &Path) -> Result<SqliteConnection, StorageError> {
-    let identity = database_identity(path)?;
-    let initialized = match identity.as_ref() {
+    #[cfg(unix)]
+    let initialized = match database_identity(path)?.as_ref() {
         Some(identity) => database_identity_is_validated(identity)?,
         None => {
             evict_database_validation(path)?;
             false
         }
     };
+    // A path identity sampled before sqlite opens is not handle-bound on Windows. Another
+    // process can replace the path in between, so never use that sample to skip initialization.
+    #[cfg(windows)]
+    let initialized = false;
     let started = Instant::now();
     let connection = if initialized {
         crate::persistence::database::connect_writable(path)
@@ -389,10 +405,27 @@ fn diagnose_corruption(path: &Path, mut error: StorageError) -> StorageError {
 }
 
 fn database_identity(path: &Path) -> Result<Option<DatabaseIdentity>, StorageError> {
-    use std::os::unix::fs::MetadataExt;
-
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
+    #[cfg(unix)]
+    let native = {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(StorageError::from_io(
+                    format!("identify database {}", path.display()),
+                    error,
+                ));
+            }
+        };
+        NativeDatabaseIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    };
+    #[cfg(windows)]
+    let native = match file_id::get_file_id(path) {
+        Ok(identity) => identity,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(StorageError::from_io(
@@ -403,11 +436,11 @@ fn database_identity(path: &Path) -> Result<Option<DatabaseIdentity>, StorageErr
     };
     Ok(Some(DatabaseIdentity {
         path: path.to_path_buf(),
-        device: metadata.dev(),
-        inode: metadata.ino(),
+        native,
     }))
 }
 
+#[cfg(unix)]
 fn database_identity_is_validated(identity: &DatabaseIdentity) -> Result<bool, StorageError> {
     VALIDATED_DATABASES
         .get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -429,6 +462,7 @@ fn database_identity_is_validated(identity: &DatabaseIdentity) -> Result<bool, S
         })
 }
 
+#[cfg(unix)]
 fn mark_database_validated(identity: Option<DatabaseIdentity>) -> Result<(), StorageError> {
     let Some(identity) = identity else {
         return Ok(());
@@ -446,7 +480,7 @@ fn mark_database_validated(identity: Option<DatabaseIdentity>) -> Result<(), Sto
         )
     })?;
     use std::os::unix::fs::MetadataExt;
-    if metadata.dev() != identity.device || metadata.ino() != identity.inode {
+    if metadata.dev() != identity.native.device || metadata.ino() != identity.native.inode {
         return evict_database_validation(&identity.path);
     }
     VALIDATED_DATABASES
@@ -469,6 +503,12 @@ fn mark_database_validated(identity: Option<DatabaseIdentity>) -> Result<(), Sto
         })
 }
 
+#[cfg(windows)]
+fn mark_database_validated(_identity: Option<DatabaseIdentity>) -> Result<(), StorageError> {
+    Ok(())
+}
+
+#[cfg(unix)]
 fn evict_database_validation(path: &Path) -> Result<(), StorageError> {
     VALIDATED_DATABASES
         .get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -799,6 +839,7 @@ mod tests {
         remove_database(&path);
     }
 
+    #[cfg(unix)]
     #[test]
     fn normal_database_writes_preserve_the_validated_identity() {
         let path = test_path("in-place-write");
@@ -813,6 +854,28 @@ mod tests {
         remove_database(&path);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn cached_database_open_restores_externally_changed_journal_mode() {
+        let path = test_path("cached-journal-mode");
+        let writer = open_writable(&path).unwrap();
+        finish_connection(writer, Ok(()), "close initialized writer").unwrap();
+
+        let options = crate::persistence::pools::options(&path, false, false).unwrap();
+        let mut external = run_sqlx(SqliteConnection::connect_with(&options)).unwrap();
+        let mode: String =
+            run_sqlx(sqlx::query_scalar("pragma journal_mode = delete").fetch_one(&mut external))
+                .unwrap();
+        assert_eq!(mode, "delete");
+        run_sqlx(external.close()).unwrap();
+
+        let mut reopened = open_writable(&path).unwrap();
+        assert_eq!(text_pragma(&mut reopened, "journal_mode"), "wal");
+        finish_connection(reopened, Ok(()), "close revalidated writer").unwrap();
+        remove_database(&path);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn database_replacement_at_same_path_is_revalidated() {
         let path = test_path("replacement");
@@ -847,6 +910,45 @@ mod tests {
     }
 
     #[test]
+    fn backup_query_lock_errors_preserve_sqlite_classification() {
+        let path = test_path("backup-query-classification");
+        let mut blocker = open_writable(&path).unwrap();
+        run_sqlx(sqlx::query("begin immediate").execute(&mut blocker)).unwrap();
+        let options = crate::persistence::pools::options_with_writer_busy_timeout(
+            &path,
+            false,
+            false,
+            Duration::ZERO,
+        )
+        .unwrap();
+        let mut contender = run_sqlx(SqliteConnection::connect_with(&options)).unwrap();
+        let source = run_sqlx(sqlx::query("begin immediate").execute(&mut contender))
+            .expect_err("fixture should encounter the held write lock");
+        let elapsed = Duration::from_millis(123);
+        let error = StorageError::from_database(
+            crate::persistence::error::DatabaseError::BackupQuery {
+                path: path.clone(),
+                backup: path.with_extension("backup"),
+                source,
+            },
+            elapsed,
+        );
+
+        assert_eq!(error.kind(), StorageErrorKind::Busy);
+        assert_eq!(error.primary_code(), Some(SQLITE_BUSY));
+        assert_eq!(
+            error.extended_code().map(|code| code & 0xff),
+            Some(SQLITE_BUSY)
+        );
+        assert_eq!(error.busy_elapsed(), Some(elapsed));
+
+        run_sqlx(contender.close()).unwrap();
+        run_sqlx(sqlx::query("rollback").execute(&mut blocker)).unwrap();
+        finish_connection(blocker, Ok(()), "close classification blocker").unwrap();
+        remove_database(&path);
+    }
+
+    #[test]
     fn readonly_checks_and_passive_checkpoint_report_healthy_database() {
         let path = test_path("checks");
         drop(open_writable(&path).unwrap());
@@ -859,6 +961,39 @@ mod tests {
         assert!(wal.main_bytes > 0);
         assert!(wal.checkpoint_busy >= 0);
         remove_database(&path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_sqlite_close_releases_database_and_sidecars_for_cleanup() {
+        let path = test_path("windows-sharing");
+        let connection = open_writable(&path).unwrap();
+        finish_connection(connection, Ok(()), "close Windows sharing smoke").unwrap();
+        verify_readonly(&path).unwrap();
+
+        for candidate in [
+            &path,
+            &sidecar_path(&path, "-wal"),
+            &sidecar_path(&path, "-shm"),
+        ] {
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            loop {
+                match fs::remove_file(candidate) {
+                    Ok(()) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(error)
+                        if matches!(error.raw_os_error(), Some(5 | 32 | 33))
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => {
+                        panic!("remove {} after SQLite close: {error}", candidate.display())
+                    }
+                }
+            }
+        }
+        assert!(!path.exists());
     }
 
     fn integer_pragma(connection: &mut SqliteConnection, name: &str) -> i64 {

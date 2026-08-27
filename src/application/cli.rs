@@ -1,10 +1,11 @@
 use super::dev_install;
 use crate::args::{
     self, AgentCommand, Args, CommandKind, ConfigCommand, DaemonCommand, DbCommand, DebugCommand,
-    InspectOptions, StatusOptions, WorkerCommand,
+    InspectOptions, RecoverOptions, StatusOptions, WorkerCommand,
 };
 use crate::config::Config;
 use crate::observability::{self, LogLevel, ObserverOptions};
+use crate::process::Command as ProcessCommand;
 use crate::repo::Repository;
 use crate::tui::ManagedRepo;
 use crate::workspace_state::{
@@ -12,11 +13,29 @@ use crate::workspace_state::{
     WorkspaceState,
 };
 use crate::{agent_session, config, session, setup, tui, ui_state, workspace};
-use std::process::Command as ProcessCommand;
+use std::future::Future;
+use std::pin::Pin;
 
-pub fn run() -> Result<(), String> {
-    let _dev_install_reader = dev_install::reader_lease_from_environment()?;
+pub fn run() -> Pin<Box<dyn Future<Output = Result<(), String>>>> {
+    Box::pin(run_inner())
+}
+
+async fn run_inner() -> Result<(), String> {
     let args = Args::parse(std::env::args_os().skip(1))?;
+    #[cfg(windows)]
+    if let CommandKind::OpencodeServerSupervisor {
+        program,
+        repository,
+        port,
+    } = &args.command
+    {
+        return crate::opencode::run_server_supervisor(program, repository, *port).await;
+    }
+    #[cfg(not(windows))]
+    if matches!(args.command, CommandKind::OpencodeServerSupervisor { .. }) {
+        return Err("the OpenCode server supervisor is only available on Windows".to_string());
+    }
+    let _dev_install_reader = dev_install::reader_lease_from_environment()?;
     if let CommandKind::PrepareDevState {
         source,
         destination,
@@ -38,7 +57,7 @@ pub fn run() -> Result<(), String> {
         return Ok(());
     }
     if let CommandKind::Debug(DebugCommand::Record(options)) = &args.command {
-        let repo = load_integrity_repo_context(args.repo.as_deref())?;
+        let repo = load_integrity_repo_context(args.repo.as_deref()).await?;
         eprintln!(
             "capturing the previous {}s and next {}s from the running Prism TUI...",
             options.before_seconds, options.after_seconds
@@ -48,7 +67,7 @@ pub fn run() -> Result<(), String> {
         return Ok(());
     }
     if matches!(args.command, CommandKind::Debug(DebugCommand::Integrity)) {
-        let repo = load_integrity_repo_context(args.repo.as_deref())?;
+        let repo = load_integrity_repo_context(args.repo.as_deref()).await?;
         return crate::storage::print_integrity(&observability::db_path(&repo))
             .map_err(|error| error.to_string());
     }
@@ -78,52 +97,55 @@ pub fn run() -> Result<(), String> {
             run_static_command(args.command)
         }
         CommandKind::Config(command) => {
-            let (repo, config) = load_single_repo_context(args.repo.as_deref())?;
+            let (repo, config) = load_single_repo_context(args.repo.as_deref()).await?;
             run_config_command(command, &repo, &config)
         }
         CommandKind::Doctor => {
-            let (repo, mut config) = load_single_repo_context(args.repo.as_deref())?;
-            config::doctor(&repo, &mut config)
+            let (repo, mut config) = load_single_repo_context(args.repo.as_deref()).await?;
+            config::doctor(&repo, &mut config).await
         }
         CommandKind::Agent(command) => {
-            let (repo, mut config) = load_single_repo_context(args.repo.as_deref())?;
+            let (repo, mut config) = load_single_repo_context(args.repo.as_deref()).await?;
             config::ensure_default_agent_noninteractive(&mut config)?;
-            crate::tmux::migrate_legacy_agent_sessions(&repo, &config)?;
-            run_agent_command(command, &repo, &config)
+            crate::tmux::migrate_legacy_agent_sessions(&repo, &config).await?;
+            run_agent_command(command, &repo, &config).await
         }
         CommandKind::Workflow(arguments) => {
-            crate::application::workflow_cli::run_workflow(args.repo.as_deref(), &arguments)
+            crate::application::workflow_cli::run_workflow(args.repo.as_deref(), &arguments).await
         }
         CommandKind::Skill(arguments) => {
-            crate::application::workflow_cli::run_skill(args.repo.as_deref(), &arguments)
+            crate::application::workflow_cli::run_skill(args.repo.as_deref(), &arguments).await
         }
         CommandKind::Template(arguments) => {
-            crate::application::workflow_cli::run_template(args.repo.as_deref(), &arguments)
+            crate::application::workflow_cli::run_template(args.repo.as_deref(), &arguments).await
         }
         CommandKind::Debug(command) => {
-            let (repo, mut config) = load_single_repo_context(args.repo.as_deref())?;
-            run_debug_command(command, &repo, &mut config)
+            let (repo, mut config) = load_single_repo_context(args.repo.as_deref()).await?;
+            run_debug_command(command, &repo, &mut config).await
         }
         CommandKind::Db(command) => {
-            let repo = load_db_repo_context(args.repo.as_deref())?;
-            run_db_command(command, &repo)
+            let repo = load_db_repo_context(args.repo.as_deref()).await?;
+            run_db_command(command, &repo).await
         }
-        CommandKind::Worker(command) => run_worker_command(command),
+        CommandKind::Worker(command) => run_worker_command(command).await,
         CommandKind::PrepareDevState { .. } => unreachable!("handled before logging setup"),
-        CommandKind::List(options) => run_list_command(args.repo.as_deref(), options),
-        CommandKind::Status(options) => run_status_command(args.repo.as_deref(), options),
+        CommandKind::OpencodeServerSupervisor { .. } => {
+            unreachable!("handled before logging setup")
+        }
+        CommandKind::List(options) => run_list_command(args.repo.as_deref(), options).await,
+        CommandKind::Status(options) => run_status_command(args.repo.as_deref(), options).await,
         CommandKind::Pause(selector) => {
-            run_control_command(args.repo.as_deref(), ControlAction::Pause, selector)
+            run_control_command(args.repo.as_deref(), ControlAction::Pause, selector, None).await
         }
         CommandKind::Resume(selector) => {
-            run_control_command(args.repo.as_deref(), ControlAction::Resume, selector)
+            run_control_command(args.repo.as_deref(), ControlAction::Resume, selector, None).await
         }
         CommandKind::Stop(selector) => {
-            run_control_command(args.repo.as_deref(), ControlAction::Stop, selector)
+            run_control_command(args.repo.as_deref(), ControlAction::Stop, selector, None).await
         }
-        CommandKind::Recover(selector) => run_recover_command(args.repo.as_deref(), selector),
+        CommandKind::Recover(options) => run_recover_command(args.repo.as_deref(), options).await,
         CommandKind::Daemon(command) => run_daemon_command(command),
-        CommandKind::Tui => run_tui(args.repo.as_deref()),
+        CommandKind::Tui => run_tui(args.repo.as_deref()).await,
     };
     match &result {
         Ok(()) => observability::finish_process_runs("ok", None),
@@ -153,15 +175,16 @@ fn run_config_command(
     Ok(())
 }
 
-fn run_agent_command(
+async fn run_agent_command(
     command: AgentCommand,
     repo: &Repository,
     config: &Config,
 ) -> Result<(), String> {
     match command {
         AgentCommand::Ensure { branch } => {
-            session::reconcile_worktree_state(repo, config)?;
-            let mut matches = session::discover_sessions(repo, config)?
+            session::reconcile_worktree_state(repo, config).await?;
+            let mut matches = session::discover_sessions(repo, config)
+                .await?
                 .into_iter()
                 .filter(|session| session.branch == branch);
             let selected = matches
@@ -172,7 +195,7 @@ fn run_agent_command(
                     "multiple worktree sessions found for branch '{branch}'"
                 ));
             }
-            let ensured = agent_session::ensure_latest_session(repo, config, &selected)?;
+            let ensured = agent_session::ensure_latest_session(repo, config, &selected).await?;
             if !ensured.running {
                 return Err(format!(
                     "agent session for branch '{branch}' did not become ready"
@@ -251,18 +274,25 @@ fn run_static_command(command: CommandKind) -> Result<(), String> {
     }
 }
 
-fn workspace_state(repo: Option<&std::path::Path>) -> Result<WorkspaceState, String> {
+async fn workspace_state(repo: Option<&std::path::Path>) -> Result<WorkspaceState, String> {
     WorkspaceState::open(WorkspaceContext {
         repo: repo.map(std::path::Path::to_path_buf),
         cwd: std::env::current_dir().map_err(|error| format!("current directory: {error}"))?,
     })
+    .await
 }
 
-fn run_list_command(repo: Option<&std::path::Path>, options: InspectOptions) -> Result<(), String> {
-    let snapshot = workspace_state(repo)?.inspect(InspectRequest {
-        include_hidden: options.all,
-        include_terminal: options.all,
-    })?;
+async fn run_list_command(
+    repo: Option<&std::path::Path>,
+    options: InspectOptions,
+) -> Result<(), String> {
+    let snapshot = workspace_state(repo)
+        .await?
+        .inspect(InspectRequest {
+            include_hidden: options.all,
+            include_terminal: options.all,
+        })
+        .await?;
     print_snapshot_warnings(&snapshot);
     if options.json {
         println!(
@@ -276,15 +306,17 @@ fn run_list_command(repo: Option<&std::path::Path>, options: InspectOptions) -> 
     Ok(())
 }
 
-fn run_status_command(
+async fn run_status_command(
     repo: Option<&std::path::Path>,
     options: StatusOptions,
 ) -> Result<(), String> {
-    let state = workspace_state(repo)?;
-    let snapshot = state.inspect(InspectRequest {
-        include_hidden: true,
-        include_terminal: true,
-    })?;
+    let state = workspace_state(repo).await?;
+    let snapshot = state
+        .inspect(InspectRequest {
+            include_hidden: true,
+            include_terminal: true,
+        })
+        .await?;
     let subject = state.resolve_subject(&snapshot, options.selector.as_deref())?;
     print_snapshot_warnings(&snapshot);
     if options.json {
@@ -300,12 +332,20 @@ fn run_status_command(
     Ok(())
 }
 
-fn run_control_command(
+async fn run_control_command(
     repo: Option<&std::path::Path>,
     action: ControlAction,
     selector: Option<String>,
+    recovery_resolution: Option<crate::RecoveryResolution>,
 ) -> Result<(), String> {
-    let receipt = workspace_state(repo)?.control(ControlRequest { action, selector })?;
+    let receipt = workspace_state(repo)
+        .await?
+        .control(ControlRequest {
+            action,
+            selector,
+            recovery_resolution,
+        })
+        .await?;
     println!(
         "workflow = {}\nstate = {}",
         receipt.workflow.display_id, receipt.state
@@ -316,17 +356,30 @@ fn run_control_command(
     Ok(())
 }
 
-fn run_recover_command(
+async fn run_recover_command(
     repo: Option<&std::path::Path>,
-    selector: Option<String>,
+    options: RecoverOptions,
 ) -> Result<(), String> {
-    if selector.is_some() {
-        return run_control_command(repo, ControlAction::Recover, selector);
+    if options.selector.is_some() {
+        let resolution = recovery_resolution(options.outcome, options.evidence)?;
+        return run_control_command(
+            repo,
+            ControlAction::Recover,
+            options.selector,
+            Some(resolution),
+        )
+        .await;
     }
-    let snapshot = workspace_state(repo)?.inspect(InspectRequest {
-        include_hidden: true,
-        include_terminal: true,
-    })?;
+    if options.outcome.is_some() || options.evidence.is_some() {
+        return Err("recover outcome and evidence require a workflow selector".to_string());
+    }
+    let snapshot = workspace_state(repo)
+        .await?
+        .inspect(InspectRequest {
+            include_hidden: true,
+            include_terminal: true,
+        })
+        .await?;
     print_snapshot_warnings(&snapshot);
     let candidates = snapshot
         .repositories
@@ -353,6 +406,25 @@ fn run_recover_command(
         }
     }
     Ok(())
+}
+
+fn recovery_resolution(
+    outcome: Option<String>,
+    evidence: Option<String>,
+) -> Result<crate::RecoveryResolution, String> {
+    let evidence = evidence
+        .filter(|evidence| !evidence.trim().is_empty())
+        .ok_or_else(|| "recover requires --evidence <authoritative-evidence>".to_string())?;
+    match outcome.as_deref() {
+        Some("rejected-before-effect") => {
+            Ok(crate::RecoveryResolution::RejectedBeforeEffect { evidence })
+        }
+        Some("applied") => Ok(crate::RecoveryResolution::Applied { evidence }),
+        Some(other) => Err(format!(
+            "unknown recovery outcome '{other}'; expected rejected-before-effect or applied"
+        )),
+        None => Err("recover requires --outcome rejected-before-effect|applied".to_string()),
+    }
 }
 
 fn run_daemon_command(command: DaemonCommand) -> Result<(), String> {
@@ -658,32 +730,37 @@ fn daemon_state_label(state: &crate::worker::DaemonState) -> &'static str {
     }
 }
 
-fn load_single_repo_context(
+async fn load_single_repo_context(
     repo_arg: Option<&std::path::Path>,
 ) -> Result<(Repository, Config), String> {
-    let repo = observability::phase("discover_repo", || Repository::discover(repo_arg))?;
+    let repo =
+        observability::phase_async("discover_repo", || Repository::discover(repo_arg)).await?;
     observability::attach_repo(&repo)?;
     let config = observability::phase("load_config", || Ok(Config::load(&repo)))?;
-    warn_pending_recovery(&repo);
+    warn_pending_recovery(&repo).await;
     Ok((repo, config))
 }
 
-fn warn_pending_recovery(repo: &Repository) {
-    let count = workspace_state(Some(&repo.root))
-        .and_then(|state| {
-            state.inspect(InspectRequest {
-                include_hidden: true,
-                include_terminal: true,
-            })
-        })
-        .map(|snapshot| {
-            snapshot
-                .repositories
-                .iter()
-                .flat_map(|repo| &repo.workflows)
-                .filter(|workflow| workflow.dispatch.state.as_deref() == Some("recovery_pending"))
-                .count()
-        });
+async fn warn_pending_recovery(repo: &Repository) {
+    let count = match workspace_state(Some(&repo.root)).await {
+        Ok(state) => {
+            state
+                .inspect(InspectRequest {
+                    include_hidden: true,
+                    include_terminal: true,
+                })
+                .await
+        }
+        Err(error) => Err(error),
+    }
+    .map(|snapshot| {
+        snapshot
+            .repositories
+            .iter()
+            .flat_map(|repo| &repo.workflows)
+            .filter(|workflow| workflow.dispatch.state.as_deref() == Some("recovery_pending"))
+            .count()
+    });
     if let Ok(count) = count
         && count > 0
     {
@@ -693,9 +770,9 @@ fn warn_pending_recovery(repo: &Repository) {
     }
 }
 
-fn run_worker_command(command: WorkerCommand) -> Result<(), String> {
+async fn run_worker_command(command: WorkerCommand) -> Result<(), String> {
     match command {
-        WorkerCommand::Serve => crate::worker::serve(),
+        WorkerCommand::Serve => crate::worker::serve().await,
         WorkerCommand::Ensure => crate::worker::ensure_running(),
         WorkerCommand::Health => {
             println!("{}", crate::worker::health_response()?);
@@ -705,18 +782,18 @@ fn run_worker_command(command: WorkerCommand) -> Result<(), String> {
     }
 }
 
-fn load_db_repo_context(repo_arg: Option<&std::path::Path>) -> Result<Repository, String> {
+async fn load_db_repo_context(repo_arg: Option<&std::path::Path>) -> Result<Repository, String> {
     if repo_arg.is_some() {
-        let (repo, _) = load_single_repo_context(repo_arg)?;
+        let (repo, _) = load_single_repo_context(repo_arg).await?;
         return Ok(repo);
     }
-    match Repository::discover(None) {
+    match Repository::discover(None).await {
         Ok(repo) => {
             observability::attach_repo(&repo)?;
             Ok(repo)
         }
         Err(discover_error) => {
-            let entries = workspace::discover_valid_entries(workspace::load_entries()?);
+            let entries = workspace::discover_valid_entries(workspace::load_entries()?).await;
             let Some(entry) = entries.into_iter().next() else {
                 return Err(discover_error);
             };
@@ -726,13 +803,16 @@ fn load_db_repo_context(repo_arg: Option<&std::path::Path>) -> Result<Repository
     }
 }
 
-fn load_integrity_repo_context(repo_arg: Option<&std::path::Path>) -> Result<Repository, String> {
+async fn load_integrity_repo_context(
+    repo_arg: Option<&std::path::Path>,
+) -> Result<Repository, String> {
     if repo_arg.is_some() {
-        return Repository::discover(repo_arg);
+        return Repository::discover(repo_arg).await;
     }
-    match Repository::discover(None) {
+    match Repository::discover(None).await {
         Ok(repo) => Ok(repo),
         Err(discover_error) => workspace::discover_valid_entries(workspace::load_entries()?)
+            .await
             .into_iter()
             .next()
             .map(|entry| entry.repo)
@@ -752,109 +832,119 @@ fn observer_options(args: &Args) -> ObserverOptions {
     }
 }
 
-fn run_tui(repo_arg: Option<&std::path::Path>) -> Result<(), String> {
-    (|| {
-        let requested_repo = observability::phase("discover_requested_repository", || {
-            repo_arg
-                .map(|path| Repository::discover(Some(path)))
-                .transpose()
-        })?;
-        if let Some(repo) = requested_repo.as_ref() {
-            let config = Config::load(repo);
-            observability::phase("register_worktrunk_project", || {
-                crate::worktrunk::ensure_user_project_config(repo, &config)
-            })?;
-        }
-        let (entries, selected_repo) = observability::phase("load_workspace", || {
-            workspace::ensure_entries_for_tui(requested_repo.as_ref())
-        })?;
-        let (entries, selected_repo) = observability::phase("reconcile_workspace", || {
-            workspace::remove_missing_entries(entries, selected_repo)
-        })?;
-        let mut repos = Vec::new();
-        let discovered_entries = workspace::discover_valid_entries(entries);
-        let selected_repo = discovered_entries
-            .iter()
-            .position(|entry| entry.source_index == selected_repo)
-            .unwrap_or_else(|| selected_repo.min(discovered_entries.len().saturating_sub(1)));
-        for (index, entry) in discovered_entries.iter().enumerate() {
-            if index == selected_repo {
-                observability::attach_repo(&entry.repo)?;
-            } else {
-                observability::attach_run_repo(&entry.repo)?;
+async fn run_tui(repo_arg: Option<&std::path::Path>) -> Result<(), String> {
+    let requested_repo =
+        observability::phase_async("discover_requested_repository", || async move {
+            match repo_arg {
+                Some(path) => Repository::discover(Some(path)).await.map(Some),
+                None => Ok(None),
             }
+        })
+        .await?;
+    if let Some(repo) = requested_repo.as_ref() {
+        let config = Config::load(repo);
+        observability::phase_async("register_worktrunk_project", || {
+            crate::worktrunk::ensure_user_project_config(repo, &config)
+        })
+        .await?;
+    }
+    let (entries, selected_repo) = observability::phase("load_workspace", || {
+        workspace::ensure_entries_for_tui(requested_repo.as_ref())
+    })?;
+    let (entries, selected_repo) = observability::phase("reconcile_workspace", || {
+        workspace::remove_missing_entries(entries, selected_repo)
+    })?;
+    let mut repos = Vec::new();
+    let discovered_entries = workspace::discover_valid_entries(entries).await;
+    let selected_repo = discovered_entries
+        .iter()
+        .position(|entry| entry.source_index == selected_repo)
+        .unwrap_or_else(|| selected_repo.min(discovered_entries.len().saturating_sub(1)));
+    for (index, entry) in discovered_entries.iter().enumerate() {
+        if index == selected_repo {
+            observability::attach_repo(&entry.repo)?;
+        } else {
+            observability::attach_run_repo(&entry.repo)?;
         }
-        for entry in discovered_entries {
-            let repo = entry.repo;
-            let mut config = Config::load(&repo);
-            observability::phase("standard_pack_bootstrap", || {
-                setup::ensure_user_owned_resources(&config)
-            })?;
-            let worktrunk_version = observability::phase("ensure_tools", || {
-                config::ensure_required_tools(&repo, &config)
-            })?;
-            crate::flight_recorder::record(
-                "startup",
-                "worktrunk_version",
-                None,
-                vec![crate::flight_recorder::text(
-                    "version",
-                    &worktrunk_version.raw,
-                )],
-            );
-            if observability::phase("initial_harness_setup", || {
-                setup::maybe_prompt_harness(&config)
-            })?
-            .is_some()
-            {
-                config = Config::load(&repo);
-            }
-            observability::phase("ensure_default_agent", || {
-                config::ensure_default_agent(&mut config)
-            })?;
-            repos.push(ManagedRepo::new(repo, config, entry.key));
-        }
-        observability::phase("ensure_generic_worker", crate::worker::ensure_running)?;
-        if let Some(repo) = repos.get(selected_repo)
-            && setup::maybe_prompt_icon_style(&repo.config)?.is_some()
+    }
+    for entry in discovered_entries {
+        let repo = entry.repo;
+        let mut config = Config::load(&repo);
+        observability::phase("standard_pack_bootstrap", || {
+            setup::ensure_user_owned_resources(&config)
+        })?;
+        let worktrunk_version = observability::phase_async("ensure_tools", || {
+            config::ensure_required_tools(&repo, &config)
+        })
+        .await?;
+        crate::flight_recorder::record(
+            "startup",
+            "worktrunk_version",
+            None,
+            vec![crate::flight_recorder::text(
+                "version",
+                &worktrunk_version.raw,
+            )],
+        );
+        if observability::phase("initial_harness_setup", || {
+            setup::maybe_prompt_harness(&config)
+        })?
+        .is_some()
         {
-            for repo in &mut repos {
-                repo.config = Config::load(&repo.repo);
-            }
+            config = Config::load(&repo);
         }
-        let selected_repo = selected_repo.min(repos.len().saturating_sub(1));
-        if let Some(repo) = repos.get(selected_repo) {
-            observability::phase("startup_setup_prompt", || {
-                setup::maybe_prompt_startup_setup(&repo.repo, &repo.config)
-            })?;
+        observability::phase("ensure_default_agent", || {
+            config::ensure_default_agent(&mut config)
+        })?;
+        repos.push(ManagedRepo::new(repo, config, entry.key));
+    }
+    observability::phase("ensure_generic_worker", crate::worker::ensure_running)?;
+    if let Some(repo) = repos.get(selected_repo)
+        && setup::maybe_prompt_icon_style(&repo.config)?.is_some()
+    {
+        for repo in &mut repos {
+            repo.config = Config::load(&repo.repo);
         }
-        observability::phase("migrate_tmux_session_names", || {
-            for managed in &repos {
-                crate::tmux::migrate_legacy_agent_sessions(&managed.repo, &managed.config)?;
-            }
-            Ok(())
-        })?;
-        observability::phase("reconcile_worktrees", || {
-            for managed in &repos {
-                session::reconcile_worktree_state(&managed.repo, &managed.config)?;
-            }
-            Ok(())
-        })?;
-        let sessions =
-            observability::phase("discover_sessions", || discover_workspace_sessions(&repos))?;
-        let mut tui = observability::phase("initialize_tui", || {
-            Ok(tui::Tui::new(repos, selected_repo, sessions))
-        })?;
-        tui.use_persisted_ui_state(ui_state::path())?;
-        tui.select_repo(selected_repo);
-        observability::phase("run_tui", || tui.run())
-    })()
+    }
+    let selected_repo = selected_repo.min(repos.len().saturating_sub(1));
+    if let Some(repo) = repos.get(selected_repo) {
+        observability::phase_async("startup_setup_prompt", || {
+            setup::maybe_prompt_startup_setup(&repo.repo, &repo.config)
+        })
+        .await?;
+    }
+    observability::phase_async("migrate_tmux_session_names", || async {
+        for managed in &repos {
+            crate::tmux::migrate_legacy_agent_sessions(&managed.repo, &managed.config).await?;
+        }
+        Ok(())
+    })
+    .await?;
+    observability::phase_async("reconcile_worktrees", || async {
+        for managed in &repos {
+            session::reconcile_worktree_state(&managed.repo, &managed.config).await?;
+            crate::tui::maintain_workflow_storage(&managed.repo)?;
+        }
+        Ok(())
+    })
+    .await?;
+    let sessions =
+        observability::phase_async("discover_sessions", || discover_workspace_sessions(&repos))
+            .await?;
+    let mut tui = observability::phase("initialize_tui", || {
+        Ok(tui::Tui::new(repos, selected_repo, sessions))
+    })?;
+    tui.use_persisted_ui_state(ui_state::path())?;
+    tui.select_repo(selected_repo);
+    observability::phase_async("run_tui", || tui.run()).await
 }
 
-fn discover_workspace_sessions(repos: &[ManagedRepo]) -> Result<Vec<session::Session>, String> {
+async fn discover_workspace_sessions(
+    repos: &[ManagedRepo],
+) -> Result<Vec<session::Session>, String> {
     let mut all = Vec::new();
     for (index, managed) in repos.iter().enumerate() {
-        let mut sessions = session::discover_sessions(&managed.repo, &managed.config)?;
+        let mut sessions = session::discover_sessions(&managed.repo, &managed.config).await?;
         for session in &mut sessions {
             session.repo_index = index;
             session.repo_label = managed.label.clone();
@@ -865,7 +955,7 @@ fn discover_workspace_sessions(repos: &[ManagedRepo]) -> Result<Vec<session::Ses
     Ok(all)
 }
 
-fn run_debug_command(
+async fn run_debug_command(
     command: DebugCommand,
     repo: &Repository,
     config: &mut Config,
@@ -932,7 +1022,7 @@ fn run_debug_command(
             for (key, value) in &config.tools {
                 println!("  {key} = {value}");
             }
-            match setup::inspect_startup_setup(repo, config) {
+            match setup::inspect_startup_setup(repo, config).await {
                 Ok(setup) => {
                     println!("startup_setup_needs_prompt = {}", setup.needs_prompt);
                     println!(
@@ -984,7 +1074,7 @@ fn run_debug_command(
             }
             Ok(())
         }
-        DebugCommand::Startup => run_debug_startup(repo, config),
+        DebugCommand::Startup => run_debug_startup(repo, config).await,
         DebugCommand::Integrity => {
             unreachable!("integrity runs before observability initialization")
         }
@@ -994,18 +1084,20 @@ fn run_debug_command(
     }
 }
 
-fn run_debug_startup(repo: &Repository, config: &mut Config) -> Result<(), String> {
-    let result: Result<(), String> = (|| {
-        let worktrunk_version = observability::phase("ensure_tools", || {
+async fn run_debug_startup(repo: &Repository, config: &mut Config) -> Result<(), String> {
+    let result: Result<(), String> = async {
+        let worktrunk_version = observability::phase_async("ensure_tools", || {
             config::ensure_required_tools(repo, config)
-        })?;
+        })
+        .await?;
         println!("worktrunk_version = {}", worktrunk_version.raw);
         observability::phase("ensure_default_agent", || {
             config::ensure_default_agent_noninteractive(config)
         })?;
-        let setup = observability::phase("startup_setup_check", || {
+        let setup = observability::phase_async("startup_setup_check", || {
             setup::inspect_startup_setup(repo, config)
-        })?;
+        })
+        .await?;
         println!("startup_setup_needs_prompt = {}", setup.needs_prompt);
         println!(
             "startup_current_branch = {}",
@@ -1017,12 +1109,14 @@ fn run_debug_startup(repo: &Repository, config: &mut Config) -> Result<(), Strin
         );
         println!("startup_no_extra_worktrees = {}", setup.no_extra_worktrees);
         println!("startup_can_move_branch = {}", setup.can_move_branch);
-        let sessions = observability::phase("discover_sessions", || {
+        let sessions = observability::phase_async("discover_sessions", || {
             session::discover_sessions(repo, config)
-        })?;
+        })
+        .await?;
         println!("sessions = {}", sessions.len());
         Ok(())
-    })();
+    }
+    .await;
     print_startup_phases();
     result
 }
@@ -1046,9 +1140,9 @@ fn print_startup_phases() {
     }
 }
 
-fn run_db_command(command: DbCommand, repo: &Repository) -> Result<(), String> {
+async fn run_db_command(command: DbCommand, repo: &Repository) -> Result<(), String> {
     match command {
-        DbCommand::Shell => open_interactive_db(repo),
+        DbCommand::Shell => open_interactive_db(repo).await,
         DbCommand::Path => {
             println!("{}", observability::db_path(repo).display());
             Ok(())
@@ -1060,18 +1154,17 @@ fn run_db_command(command: DbCommand, repo: &Repository) -> Result<(), String> {
     }
 }
 
-fn open_interactive_db(repo: &Repository) -> Result<(), String> {
+async fn open_interactive_db(repo: &Repository) -> Result<(), String> {
     observability::with_writable_db(repo, |_| Ok(()))?;
     if !crate::process::command_exists("sqlite3") {
         return Err("sqlite3 not found; install sqlite3".to_string());
     }
 
     let path = observability::db_path(repo);
-    crate::process::run_status_inherited(
-        ProcessCommand::new("sqlite3")
-            .args(["-cmd", ".timeout 5000"])
-            .args(["-cmd", "PRAGMA foreign_keys=ON;"])
-            .args(["-cmd", "PRAGMA synchronous=FULL;"])
-            .arg(&path),
-    )
+    let command = ProcessCommand::new("sqlite3")
+        .args(["-cmd", ".timeout 5000"])
+        .args(["-cmd", "PRAGMA foreign_keys=ON;"])
+        .args(["-cmd", "PRAGMA synchronous=FULL;"])
+        .arg(&path);
+    crate::process::run_status_inherited(command).await
 }

@@ -122,9 +122,8 @@ pub(crate) fn classify_summary_evidence(
                 } => {
                     let summary = summaries.iter().find(|summary| {
                         summary.change_request_identity.as_ref() == Some(change_request)
-                            && (summary.merged
-                                || (summary.head_sha == *expected_head_sha
-                                    && summary.merge_is_authoritatively_pending()))
+                            && summary.head_sha == *expected_head_sha
+                            && (summary.merged || summary.merge_is_authoritatively_pending())
                     })?;
                     let outcome = if summary.merged {
                         crate::workflow::remote_operation::TuiRemoteMergeOutcome::Merged
@@ -300,7 +299,7 @@ impl Tui {
                 marker_version,
                 None,
                 "prism-remote-reconciliation".to_string(),
-                move |_| {
+                move |_| async move {
                     let target = command.marker.target.clone();
                     let result = (|| {
                         let mut applied = command.applied;

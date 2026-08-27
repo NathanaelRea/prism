@@ -162,30 +162,44 @@ impl Tui {
                 key.generation,
                 Some(TMUX_PORTAL_CAPTURE_TIMEOUT),
                 format!("prism-tmux-portal-{}", key.slot.worktree.branch),
-                move |_| {
-                    let (capture, resized_size) = (|| {
-                        if resize {
-                            crate::tmux::resize_agent_pane(
-                                &target.repo,
-                                &target.config,
-                                &target.key.slot.worktree.branch,
-                                target.key.generation,
-                                target.size.0,
-                                target.size.1,
-                            )?;
+                move |_| async move {
+                    let (capture, resized_size) = if resize {
+                        match crate::tmux::resize_agent_pane(
+                            &target.repo,
+                            &target.config,
+                            &target.key.slot.worktree.branch,
+                            target.key.generation,
+                            target.size.0,
+                            target.size.1,
+                        )
+                        .await
+                        {
+                            Ok(()) => (
+                                crate::tmux::capture_agent_pane(
+                                    &target.repo,
+                                    &target.config,
+                                    &target.key.slot.worktree.branch,
+                                    target.key.generation,
+                                )
+                                .await
+                                .map(normalize_capture),
+                                Some(target.size),
+                            ),
+                            Err(error) => (Err(error), None),
                         }
-                        Ok((
+                    } else {
+                        (
                             crate::tmux::capture_agent_pane(
                                 &target.repo,
                                 &target.config,
                                 &target.key.slot.worktree.branch,
                                 target.key.generation,
                             )
+                            .await
                             .map(normalize_capture),
-                            resize.then_some(target.size),
-                        ))
-                    })()
-                    .unwrap_or_else(|error| (Err(error), None));
+                            None,
+                        )
+                    };
                     Ok(Some(TuiJobPayload::TmuxPortal(TmuxPortalResult {
                         key,
                         started_at,

@@ -1,0 +1,42 @@
+[package]
+name = "prism-windows-spikes"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+file-id = "0.2.3"
+fs4 = { version = "1.1.0", default-features = false, features = ["sync"] }
+interprocess = { version = "2.4.3", features = ["tokio"] }
+portable-pty = { package = "portable-pty-psmux", version = "0.9.6" }
+process-wrap = { version = "9.1.0", default-features = false, features = [
+  "creation-flags",
+  "job-object",
+  "kill-on-drop",
+  "tokio1",
+] }
+tokio = { version = "1", default-features = false, features = [
+  "io-util",
+  "macros",
+  "net",
+  "process",
+  "rt-multi-thread",
+  "sync",
+  "time",
+] }
+wait-timeout = "0.2.1"
+widestring = "1.2.1"
+windows = { version = "0.62.2", features = [
+  "Win32_Foundation",
+  "Win32_Networking_WinSock",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Security_Cryptography",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Console",
+  "Win32_System_JobObjects",
+  "Win32_System_SystemServices",
+  "Win32_System_Threading",
+] }
+
+[workspace]

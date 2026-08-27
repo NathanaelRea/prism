@@ -341,7 +341,7 @@ impl Tui {
             0,
             None,
             "prism-load-remote-reconciliation".to_string(),
-            move |_| {
+            move |_| async move {
                 let mut loaded_repositories = std::collections::BTreeSet::new();
                 let mut marked = BTreeMap::new();
                 let mut errors = Vec::new();
@@ -557,18 +557,15 @@ impl Tui {
             .is_some_and(|repository| self.background.marker_blocks(repository, target))
     }
 
-    pub(crate) fn run_remote_action<F>(
+    pub(crate) fn run_remote_action<F, Fut>(
         &mut self,
         runtime: &mut dyn TerminalDriver,
         request: RemoteActionRequest<'_>,
         action: F,
     ) -> Result<RemoteActionValue, String>
     where
-        F: FnOnce(
-                JobContext<TuiJobKind, TuiJobKey, TuiJobPayload>,
-            ) -> Result<RemoteActionValue, String>
-            + Send
-            + 'static,
+        F: FnOnce(JobContext<TuiJobKind, TuiJobKey, TuiJobPayload>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<RemoteActionValue, String>> + Send + 'static,
     {
         if matches!(
             &request.effect,
@@ -602,12 +599,11 @@ impl Tui {
             request.generation,
             timeout,
             request.name.to_string(),
-            move |context| {
+            move |context| async move {
+                let id = context.id();
+                let result = action(context).await;
                 Ok(Some(TuiJobPayload::RemoteAction(Box::new(
-                    RemoteActionDelivery {
-                        id: context.id(),
-                        result: action(context),
-                    },
+                    RemoteActionDelivery { id, result },
                 ))))
             },
         );
@@ -660,6 +656,7 @@ impl Tui {
                     RuntimeEvent::Resize => self.draw(runtime)?,
                     RuntimeEvent::Key(_)
                     | RuntimeEvent::Mouse(_)
+                    | RuntimeEvent::Paste(_)
                     | RuntimeEvent::FocusGained
                     | RuntimeEvent::FocusLost => {}
                 }

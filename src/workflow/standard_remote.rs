@@ -60,7 +60,7 @@ impl StandardTriggerRemote for ProductionStandardTriggerRemote {
         context: &'a TriggerContext,
     ) -> StandardRemoteFuture<'a, StandardObservationResult> {
         Box::pin(async move {
-            let lane = lane_for_subject(&context.subject)?;
+            let lane = lane_for_subject(&context.subject).await?;
             let change_request = context.subject.change_request.clone().ok_or_else(|| {
                 TriggerError::Protocol("standard Trigger requires a Change Request".into())
             })?;
@@ -119,7 +119,7 @@ impl StandardTriggerRemote for ProductionStandardTriggerRemote {
                     "no captured review threads needed resolution".into(),
                 ));
             }
-            let lane = lane_for_subject(&context.subject)?;
+            let lane = lane_for_subject(&context.subject).await?;
             let change_request = context.subject.change_request.clone().ok_or_else(|| {
                 TriggerError::Protocol("review resolution requires a Change Request".into())
             })?;
@@ -185,13 +185,15 @@ fn observation_freshness(
         .not_before(cycle_started_unix_ms)
 }
 
-fn lane_for_subject(
+async fn lane_for_subject(
     subject: &TriggerSubject,
 ) -> Result<crate::remote::request_coordinator::RemoteLaneKey, TriggerError> {
-    lane_for_remote_paths(&subject.repository, &subject.worktree).map_err(TriggerError::Protocol)
+    lane_for_remote_paths(&subject.repository, &subject.worktree)
+        .await
+        .map_err(TriggerError::Protocol)
 }
 
-pub(crate) fn lane_for_remote_paths(
+pub(crate) async fn lane_for_remote_paths(
     repository: &std::path::Path,
     worktree: &std::path::Path,
 ) -> Result<crate::remote::request_coordinator::RemoteLaneKey, String> {
@@ -208,6 +210,7 @@ pub(crate) fn lane_for_remote_paths(
         "origin",
         crate::remote::RemoteUrlKind::Fetch,
     )
+    .await
     .map_err(|error| error.to_string())?;
     crate::remote::request_coordinator::RemoteLaneKey::new(
         discovered.repository.id.host().to_string(),
@@ -244,21 +247,11 @@ impl RemoteOperationExecutor for PrismProviderExecutor {
     ) -> Pin<
         Box<dyn Future<Output = Result<RemoteOperationOutput, RemoteOperationFailure>> + Send + 'a>,
     > {
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || execute_blocking(operation))
-                .await
-                .map_err(|error| RemoteOperationFailure {
-                    reason: format!("provider operation task failed: {error}"),
-                    retryable: true,
-                    mutation_disposition: RemoteMutationFailureDisposition::OutcomeUncertain,
-                    retry_after_unix_ms: None,
-                    rate_limit_reset_unix_ms: None,
-                })?
-        })
+        Box::pin(async move { execute_async(operation).await })
     }
 }
 
-fn execute_blocking(
+async fn execute_async(
     operation: CoordinatedRemoteOperation,
 ) -> Result<RemoteOperationOutput, RemoteOperationFailure> {
     let operation = match operation {
@@ -274,7 +267,7 @@ fn execute_blocking(
                 .map_err(|error| permanent(format!("invalid coordinated mutation: {error}")))?
         }
     };
-    execute_typed(operation)
+    execute_typed(operation).await
 }
 
 enum TypedCoordinatedRemoteOperation {
@@ -282,7 +275,7 @@ enum TypedCoordinatedRemoteOperation {
     Mutate(Box<super::remote_operation::RemoteMutationOperation>),
 }
 
-fn execute_typed(
+async fn execute_typed(
     operation: TypedCoordinatedRemoteOperation,
 ) -> Result<RemoteOperationOutput, RemoteOperationFailure> {
     use super::remote_operation::{
@@ -292,7 +285,9 @@ fn execute_typed(
         TypedCoordinatedRemoteOperation::Observe(Observation::ChangeRequestStabilization(
             subject,
         )) => {
-            let observation = observe_change_request(&subject).map_err(classify_failure)?;
+            let observation = observe_change_request(&subject)
+                .await
+                .map_err(classify_failure)?;
             let value = serde_json::to_value(&observation)
                 .map_err(|error| permanent(format!("serialize provider observation: {error}")))?;
             let response_bytes = serde_json::to_vec(&value)
@@ -313,6 +308,7 @@ fn execute_typed(
             let config = crate::config::Config::load(&repository);
             let summaries =
                 crate::remote::dispatcher::list_change_requests(&payload.worktree, &config)
+                    .await
                     .map_err(classify_failure)?;
             output(summaries, "list")
         }
@@ -326,6 +322,7 @@ fn execute_typed(
                 &payload.worktree,
                 &config,
             )
+            .await
             .map_err(classify_failure)?;
             output(true, "policy")
         }
@@ -340,11 +337,14 @@ fn execute_typed(
                 &payload.branch,
                 &config,
             )
+            .await
             .map_err(classify_failure)?;
             output(head, "remote-branch-head")
         }
         TypedCoordinatedRemoteOperation::Observe(Observation::TuiPushBranchResult(payload)) => {
-            let result = tui_push_reconciliation_result(&payload).map_err(classify_failure)?;
+            let result = tui_push_reconciliation_result(&payload)
+                .await
+                .map_err(classify_failure)?;
             output(result, "push-result")
         }
         TypedCoordinatedRemoteOperation::Observe(Observation::TuiLocalBranchHead(payload)) => {
@@ -353,7 +353,7 @@ fn execute_typed(
             };
             let config = crate::config::Config::load(&repository);
             let output_value = crate::process::run_output_named(
-                std::process::Command::new(config.tool("git"))
+                crate::process::Command::new(config.tool("git"))
                     .arg("-C")
                     .arg(&payload.worktree)
                     .args(["rev-parse", "--verify"])
@@ -361,11 +361,13 @@ fn execute_typed(
                 crate::process::ProcessPolicy::Metadata,
                 crate::process::ProcessDescriptor::new("git.reconciliation_local_branch_head"),
             )
+            .await
             .map_err(classify_failure)?;
-            let head = output_value
-                .status
-                .success()
-                .then(|| output_value.stdout.trim().to_string());
+            let head = output_value.status.success().then(|| {
+                String::from_utf8_lossy(&output_value.stdout)
+                    .trim()
+                    .to_string()
+            });
             output(head, "local-branch-head")
         }
         TypedCoordinatedRemoteOperation::Observe(Observation::TuiChangeRequestCache(payload)) => {
@@ -382,6 +384,7 @@ fn execute_typed(
                 &config,
                 payload.force_details,
             )
+            .await
             .map_err(classify_failure)?;
             let revision = cache
                 .summary()
@@ -394,7 +397,7 @@ fn execute_typed(
         }
         TypedCoordinatedRemoteOperation::Mutate(operation) => match *operation {
             Mutation::ChangeRequestResolveReviewThreads(payload) => {
-                resolve_threads(payload).map_err(classify_failure)?;
+                resolve_threads(payload).await.map_err(classify_failure)?;
                 output(serde_json::json!({"resolved": true}), "mutation")
             }
             Mutation::TuiResolveReviewThreads(payload) => {
@@ -409,6 +412,7 @@ fn execute_typed(
                         &payload.summary,
                         thread_id,
                     )
+                    .await
                     .map_err(classify_failure)?;
                 }
                 output(payload.thread_ids.len(), "mutation")
@@ -423,6 +427,7 @@ fn execute_typed(
                     &config,
                     &payload.branch,
                 )
+                .await
                 .map_err(classify_failure)?;
                 if !crate::remote::dispatcher::same_push_target(&payload.expected, &current) {
                     return Err(permanent(
@@ -435,8 +440,9 @@ fn execute_typed(
                     &payload.branch,
                     current.set_upstream,
                 )
+                .await
                 .map_err(classify_failure)?;
-                let result = tui_push_result(&payload).map_err(uncertain)?;
+                let result = tui_push_result(&payload).await.map_err(uncertain)?;
                 output(result, "mutation")
             }
             Mutation::TuiCreateChangeRequest(payload) => {
@@ -453,6 +459,7 @@ fn execute_typed(
                     &config,
                     false,
                 )
+                .await
                 .map_err(classify_failure)?;
                 if cache.has_summary() {
                     return output(
@@ -472,6 +479,7 @@ fn execute_typed(
                     },
                     &mut cache,
                 )
+                .await
                 .map_err(classify_failure)?;
                 output(
                     crate::remote::WorkerPrCacheSnapshot::capture(&cache),
@@ -489,6 +497,7 @@ fn execute_typed(
                     &payload.summary,
                     &payload.branch,
                 )
+                .await
                 .map_err(classify_failure)?;
                 output(true, "mutation")
             }
@@ -504,6 +513,7 @@ fn execute_typed(
                     payload.kind,
                     payload.body,
                 )
+                .await
                 .map_err(classify_failure)?;
                 output(serde_json::json!({"submitted": true}), "mutation")
             }
@@ -518,7 +528,9 @@ fn execute_typed(
                     &payload.change_request,
                     payload.display_number,
                     &payload.expected_head_sha,
-                ) {
+                )
+                .await
+                {
                     Ok(prepared) => prepared,
                     Err(reason) => {
                         return output(TuiRemoteMergeResult::Rejected { reason }, "mutation");
@@ -528,7 +540,9 @@ fn execute_typed(
                     &config,
                     &payload.worktree,
                     &prepared,
-                ) {
+                )
+                .await
+                {
                     crate::remote::dispatcher::GuardedMergeExecution::Applied(result) => *result,
                     crate::remote::dispatcher::GuardedMergeExecution::Rejected(reason) => {
                         return output(TuiRemoteMergeResult::Rejected { reason }, "mutation");
@@ -558,7 +572,7 @@ fn execute_typed(
     }
 }
 
-fn tui_push_result(
+async fn tui_push_result(
     payload: &super::remote_operation::TuiRemotePushPayload,
 ) -> Result<TuiRemotePushResult, String> {
     let repository = crate::repo::Repository {
@@ -566,7 +580,8 @@ fn tui_push_result(
     };
     let config = crate::config::Config::load(&repository);
     let pushed =
-        crate::remote::dispatcher::prepare_push(&payload.worktree, &config, &payload.branch)?;
+        crate::remote::dispatcher::prepare_push(&payload.worktree, &config, &payload.branch)
+            .await?;
     if !crate::remote::dispatcher::same_push_target(&payload.expected, &pushed) {
         return Err("push destination changed while pushing".into());
     }
@@ -578,12 +593,14 @@ fn tui_push_result(
         &payload.worktree,
         &config,
         false,
-    )?;
+    )
+    .await?;
     let create = if cache.has_summary() {
         None
     } else {
         let (origin_repository, upstream_repository) =
-            crate::remote::dispatcher::create_change_request_targets(&payload.worktree, &config)?;
+            crate::remote::dispatcher::create_change_request_targets(&payload.worktree, &config)
+                .await?;
         Some(TuiRemoteCreatePreparation {
             source_push: pushed,
             origin_repository,
@@ -596,7 +613,7 @@ fn tui_push_result(
     })
 }
 
-fn tui_push_reconciliation_result(
+async fn tui_push_reconciliation_result(
     payload: &super::remote_operation::TuiRemotePushPayload,
 ) -> Result<TuiRemotePushResult, String> {
     let repository = crate::repo::Repository {
@@ -604,7 +621,8 @@ fn tui_push_reconciliation_result(
     };
     let config = crate::config::Config::load(&repository);
     let current =
-        crate::remote::dispatcher::prepare_push(&payload.worktree, &config, &payload.branch)?;
+        crate::remote::dispatcher::prepare_push(&payload.worktree, &config, &payload.branch)
+            .await?;
     let expected = &payload.expected;
     if current.repository != expected.repository
         || current.remote != expected.remote
@@ -618,7 +636,8 @@ fn tui_push_reconciliation_result(
         &expected.remote,
         &expected.remote_branch,
         &config,
-    )?;
+    )
+    .await?;
     let remote_head = remote_head
         .ok_or_else(|| "pushed branch no longer exists on the authoritative remote".to_string())?;
     if remote_head != expected.expected_head_sha {
@@ -628,13 +647,16 @@ fn tui_push_reconciliation_result(
             &expected.remote_branch,
             &remote_head,
             &config,
-        )?;
+        )
+        .await?;
         if !crate::git::commit_is_ancestor(
             &payload.worktree,
             &expected.expected_head_sha,
             &fetched_remote_head,
             &config,
-        )? {
+        )
+        .await?
+        {
             return Err("pushed commit is not in the authoritative remote branch history".into());
         }
     }
@@ -646,12 +668,14 @@ fn tui_push_reconciliation_result(
         &payload.worktree,
         &config,
         false,
-    )?;
+    )
+    .await?;
     let create = if cache.has_summary() || current.expected_head_sha != expected.expected_head_sha {
         None
     } else {
         let (origin_repository, upstream_repository) =
-            crate::remote::dispatcher::create_change_request_targets(&payload.worktree, &config)?;
+            crate::remote::dispatcher::create_change_request_targets(&payload.worktree, &config)
+                .await?;
         Some(TuiRemoteCreatePreparation {
             source_push: current,
             origin_repository,
@@ -664,7 +688,9 @@ fn tui_push_reconciliation_result(
     })
 }
 
-fn observe_change_request(subject: &TriggerSubject) -> Result<ChangeRequestObservation, String> {
+async fn observe_change_request(
+    subject: &TriggerSubject,
+) -> Result<ChangeRequestObservation, String> {
     let repository = crate::repo::Repository {
         root: subject.repository.clone(),
     };
@@ -672,7 +698,8 @@ fn observe_change_request(subject: &TriggerSubject) -> Result<ChangeRequestObser
     if !config.config_errors.is_empty() {
         return Err(config.config_errors.join("; "));
     }
-    let branch = crate::git::current_branch_name(&subject.worktree, &config)?
+    let branch = crate::git::current_branch_name(&subject.worktree, &config)
+        .await?
         .ok_or_else(|| "standard Workflow Triggers do not support detached HEAD".to_string())?;
     let mut cache = crate::remote::load_pr_cache(&repository, &branch);
     crate::remote::dispatcher::refresh_change_request_cache(
@@ -682,7 +709,8 @@ fn observe_change_request(subject: &TriggerSubject) -> Result<ChangeRequestObser
         &subject.worktree,
         &config,
         true,
-    )?;
+    )
+    .await?;
     let summary = cache.summary().cloned().ok_or_else(|| {
         "no open Change Request is associated with the selected worktree".to_string()
     })?;
@@ -694,7 +722,8 @@ fn observe_change_request(subject: &TriggerSubject) -> Result<ChangeRequestObser
         &repository,
         &subject.worktree,
         &config,
-    )?;
+    )
+    .await?;
     let identity = summary
         .change_request_identity
         .as_ref()
@@ -732,7 +761,8 @@ fn observe_change_request(subject: &TriggerSubject) -> Result<ChangeRequestObser
         &subject.worktree,
         &config,
         &target_repository,
-    )?;
+    )
+    .await?;
     let merge_relation = match summary
         .merge_state_status
         .trim()
@@ -865,12 +895,13 @@ fn output(
     })
 }
 
-fn resolve_threads(payload: ResolveThreadsPayload) -> Result<(), String> {
+async fn resolve_threads(payload: ResolveThreadsPayload) -> Result<(), String> {
     let repository = crate::repo::Repository {
         root: payload.subject.repository.clone(),
     };
     let config = crate::config::Config::load(&repository);
-    let branch = crate::git::current_branch_name(&payload.subject.worktree, &config)?
+    let branch = crate::git::current_branch_name(&payload.subject.worktree, &config)
+        .await?
         .ok_or_else(|| "cannot resolve review threads from detached HEAD".to_string())?;
     let mut cache = crate::remote::load_pr_cache(&repository, &branch);
     crate::remote::dispatcher::refresh_change_request_cache(
@@ -880,7 +911,8 @@ fn resolve_threads(payload: ResolveThreadsPayload) -> Result<(), String> {
         &payload.subject.worktree,
         &config,
         true,
-    )?;
+    )
+    .await?;
     let summary = cache
         .summary()
         .ok_or_else(|| "Change Request summary is unavailable for review resolution".to_string())?;
@@ -916,7 +948,8 @@ fn resolve_threads(payload: ResolveThreadsPayload) -> Result<(), String> {
                 &config,
                 summary,
                 thread_id,
-            )?;
+            )
+            .await?;
         }
     }
     Ok(())
@@ -1151,5 +1184,15 @@ mod tests {
                 .retry_after_unix_ms
                 .is_some_and(|wake| wake >= before + 2_500)
         );
+    }
+
+    #[test]
+    fn provider_cancellation_is_not_retryable() {
+        let failure =
+            classify_failure("GitHub observe failed: cancelled; retry=not_retryable".into());
+
+        assert!(!failure.retryable);
+        assert!(failure.reason.contains("cancelled"));
+        assert!(failure.retry_after_unix_ms.is_none());
     }
 }

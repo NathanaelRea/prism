@@ -11,6 +11,18 @@ use crate::workflow::source::CompiledWorkflow;
 const SCHEMA_EPOCH: i64 = 4;
 static WORKFLOW_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/prompt-workflow");
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub(crate) struct WorkflowRunCursor {
+    pub(crate) updated_unix_ms: i64,
+    pub(crate) id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WorkflowRunPage {
+    pub(crate) runs: Vec<WorkflowRunState>,
+    pub(crate) next_cursor: Option<WorkflowRunCursor>,
+}
+
 #[derive(Clone)]
 pub struct DurableWorkflowRunStore {
     path: PathBuf,
@@ -28,6 +40,12 @@ impl DurableWorkflowRunStore {
             )
             .await
             .map_err(persistence)?;
+        {
+            let mut connection = pool.acquire().await.map_err(persistence)?;
+            super::pools::ensure_wal_journal_mode(&mut connection)
+                .await
+                .map_err(|error| WorkflowKernelError::Persistence(error.to_string()))?;
+        }
         WORKFLOW_MIGRATOR
             .run(&pool)
             .await
@@ -62,33 +80,105 @@ impl DurableWorkflowRunStore {
         repository: Option<&Path>,
         limit: usize,
     ) -> Result<Vec<WorkflowRunState>, WorkflowKernelError> {
-        let limit = i64::try_from(limit.min(10_000))
+        let target = limit.min(10_000);
+        let mut runs = Vec::with_capacity(target.min(256));
+        let mut cursor = None;
+        while runs.len() < target {
+            let page = self
+                .list_runs_page(repository, (target - runs.len()).min(256), cursor.as_ref())
+                .await?;
+            runs.extend(page.runs);
+            let Some(next) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next);
+        }
+        Ok(runs)
+    }
+
+    pub(crate) async fn list_runs_page(
+        &self,
+        repository: Option<&Path>,
+        page_size: usize,
+        cursor: Option<&WorkflowRunCursor>,
+    ) -> Result<WorkflowRunPage, WorkflowKernelError> {
+        if page_size == 0 {
+            return Ok(WorkflowRunPage {
+                runs: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let fetch_limit = i64::try_from(page_size.min(10_000).saturating_add(1))
             .map_err(|_| WorkflowKernelError::Persistence("run list limit overflow".into()))?;
-        let bodies = if let Some(repository) = repository {
-            sqlx::query_scalar::<_, String>(
-                "select state_json from workflow_run where repository=? order by updated_unix_ms desc, id limit ?",
-            )
-            .bind(repository.to_string_lossy().into_owned())
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(persistence)?
-        } else {
-            sqlx::query_scalar::<_, String>(
-                "select state_json from workflow_run order by updated_unix_ms desc, id limit ?",
-            )
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(persistence)?
+        let mut rows = match (repository, cursor) {
+            (Some(repository), Some(cursor)) => {
+                sqlx::query_as::<_, (i64, String, String)>(
+                    "select updated_unix_ms, id, state_json from workflow_run where repository=? and (updated_unix_ms < ? or (updated_unix_ms = ? and id < ?)) order by updated_unix_ms desc, id desc limit ?",
+                )
+                .bind(repository.to_string_lossy().into_owned())
+                .bind(cursor.updated_unix_ms)
+                .bind(cursor.updated_unix_ms)
+                .bind(&cursor.id)
+                .bind(fetch_limit)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(persistence)?
+            }
+            (Some(repository), None) => {
+                sqlx::query_as::<_, (i64, String, String)>(
+                    "select updated_unix_ms, id, state_json from workflow_run where repository=? order by updated_unix_ms desc, id desc limit ?",
+                )
+                .bind(repository.to_string_lossy().into_owned())
+                .bind(fetch_limit)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(persistence)?
+            }
+            (None, Some(cursor)) => {
+                sqlx::query_as::<_, (i64, String, String)>(
+                    "select updated_unix_ms, id, state_json from workflow_run where updated_unix_ms < ? or (updated_unix_ms = ? and id < ?) order by updated_unix_ms desc, id desc limit ?",
+                )
+                .bind(cursor.updated_unix_ms)
+                .bind(cursor.updated_unix_ms)
+                .bind(&cursor.id)
+                .bind(fetch_limit)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(persistence)?
+            }
+            (None, None) => {
+                sqlx::query_as::<_, (i64, String, String)>(
+                    "select updated_unix_ms, id, state_json from workflow_run order by updated_unix_ms desc, id desc limit ?",
+                )
+                .bind(fetch_limit)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(persistence)?
+            }
         };
-        bodies
+        let has_more = rows.len() > page_size;
+        rows.truncate(page_size);
+        let next_cursor = if has_more {
+            let Some((updated_unix_ms, id, _)) = rows.last() else {
+                return Err(WorkflowKernelError::Persistence(
+                    "run list page reported a continuation without a row".to_string(),
+                ));
+            };
+            Some(WorkflowRunCursor {
+                updated_unix_ms: *updated_unix_ms,
+                id: id.clone(),
+            })
+        } else {
+            None
+        };
+        let runs = rows
             .into_iter()
-            .map(|body| {
+            .map(|(_, _, body)| {
                 serde_json::from_str(&body)
                     .map_err(|error| WorkflowKernelError::Persistence(error.to_string()))
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(WorkflowRunPage { runs, next_cursor })
     }
 
     pub async fn active_run_ids(&self) -> Result<Vec<String>, WorkflowKernelError> {
@@ -98,6 +188,18 @@ impl DurableWorkflowRunStore {
         .fetch_all(&self.pool)
         .await
         .map_err(persistence)
+    }
+
+    pub(crate) async fn active_run_count(&self) -> Result<usize, WorkflowKernelError> {
+        let count = sqlx::query_scalar::<_, i64>(
+            "select count(*) from workflow_run where status in ('queued','running','waiting')",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(persistence)?;
+        usize::try_from(count).map_err(|_| {
+            WorkflowKernelError::Persistence("active Workflow count overflow".to_string())
+        })
     }
 }
 
@@ -155,10 +257,13 @@ async fn prepare_epoch(path: &Path) -> Result<(), WorkflowKernelError> {
             path.display()
         )));
     }
-    if crate::worker::socket_path().exists() {
+    let worker_may_be_live = crate::worker::probe_health()
+        .map(|health| health.state != crate::worker::DaemonState::Stopped)
+        .unwrap_or(true);
+    if worker_may_be_live {
         connection.close().await.map_err(persistence)?;
         return Err(WorkflowKernelError::Persistence(format!(
-            "cannot replace a pre-cutover Workflow database {} while a Prism worker socket exists",
+            "cannot replace a pre-cutover Workflow database {} while a Prism worker may be running",
             path.display()
         )));
     }
@@ -486,7 +591,7 @@ mod tests {
     use crate::workflow::step_trigger::TriggerSubject;
 
     #[test]
-    fn durable_store_open_waits_for_a_transient_write_lock() {
+    fn durable_store_open_establishes_wal_after_a_transient_read_lock() {
         let root = std::env::temp_dir().join(format!(
             "prism-workflow-open-lock-{}-{}",
             std::process::id(),
@@ -504,41 +609,45 @@ mod tests {
             .block_on(async {
                 let store = DurableWorkflowRunStore::open(&path).await.unwrap();
                 store.close().await;
+                drop(store);
 
                 let mut blocker = sqlx::SqliteConnection::connect_with(
                     &super::super::pools::options(&path, false, false).unwrap(),
                 )
                 .await
                 .unwrap();
-                sqlx::query("begin immediate")
-                    .execute(&mut blocker)
+                let journal_mode: String = sqlx::query_scalar("pragma journal_mode = delete")
+                    .fetch_one(&mut blocker)
                     .await
                     .unwrap();
-                sqlx::query(
-                    "update workflow_database_identity set schema_epoch = schema_epoch where singleton = 1",
-                )
-                .execute(&mut blocker)
-                .await
-                .unwrap();
+                assert_eq!(journal_mode, "delete");
+                sqlx::query("begin").execute(&mut blocker).await.unwrap();
+                let _: i64 = sqlx::query_scalar("select count(*) from workflow_database_identity")
+                    .fetch_one(&mut blocker)
+                    .await
+                    .unwrap();
 
                 let mut reopening = Box::pin(DurableWorkflowRunStore::open(&path));
                 assert!(
                     tokio::time::timeout(std::time::Duration::from_millis(50), &mut reopening)
                         .await
                         .is_err(),
-                    "workflow open should remain pending while the SQLite lock is held"
+                    "workflow open should remain pending while WAL initialization is locked"
                 );
 
-                sqlx::query("commit")
-                    .execute(&mut blocker)
-                    .await
-                    .unwrap();
+                sqlx::query("rollback").execute(&mut blocker).await.unwrap();
                 blocker.close().await.unwrap();
 
-                let reopened = tokio::time::timeout(super::super::pools::WRITER_BUSY_TIMEOUT, reopening)
+                let reopened =
+                    tokio::time::timeout(super::super::pools::WRITER_BUSY_TIMEOUT, reopening)
+                        .await
+                        .expect("workflow open should finish after the SQLite lock is released")
+                        .expect("workflow open should wait for a transient SQLite lock");
+                let journal_mode: String = sqlx::query_scalar("pragma journal_mode")
+                    .fetch_one(&reopened.pool)
                     .await
-                    .expect("workflow open should finish after the SQLite lock is released")
-                    .expect("workflow open should wait for a transient SQLite lock");
+                    .unwrap();
+                assert_eq!(journal_mode, "wal");
                 reopened.close().await;
             });
         let _ = std::fs::remove_dir_all(root);
@@ -698,6 +807,79 @@ mod tests {
         };
         store.create_run(&run).await.unwrap();
         assert_eq!(store.load_run("run").await.unwrap(), Some(run));
+        store.close().await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_list_pages_use_a_stable_timestamp_and_id_cursor() {
+        let root = std::env::temp_dir().join(format!(
+            "prism-prompt-pages-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = DurableWorkflowRunStore::open(&root.join("workflow.db"))
+            .await
+            .unwrap();
+        let workflow = compile_workflow(
+            Path::new("pages.toml"),
+            "[[step]]\nprompt='run'\n",
+            &TriggerCatalog::builtins(),
+        )
+        .unwrap();
+        store.retain_workflow(&workflow).await.unwrap();
+        for id in ["run-a", "run-b", "run-c", "run-d", "run-e"] {
+            store
+                .create_run(&WorkflowRunState {
+                    id: id.into(),
+                    workflow_digest: workflow.digest.clone(),
+                    workflow_name: workflow.name.clone(),
+                    subject: TriggerSubject {
+                        repository: "/repo".into(),
+                        worktree: format!("/repo/{id}").into(),
+                        change_request: None,
+                        change_request_head: None,
+                    },
+                    status: WorkflowRunStatus::Queued,
+                    cycle: 1,
+                    cycle_started_unix_ms: 10,
+                    max_agent_runs: 10,
+                    agent_runs_consumed: 0,
+                    cancellation_requested: false,
+                    created_unix_ms: 10,
+                    updated_unix_ms: 10,
+                    revision: 0,
+                    steps: Vec::new(),
+                    events: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let mut cursor = None;
+        let mut ids = Vec::new();
+        loop {
+            let page = store
+                .list_runs_page(None, 2, cursor.as_ref())
+                .await
+                .unwrap();
+            ids.extend(page.runs.into_iter().map(|run| run.id));
+            let Some(next) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next);
+        }
+        assert_eq!(ids, ["run-e", "run-d", "run-c", "run-b", "run-a"]);
+        let listed = store
+            .list_runs(None, 5)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|run| run.id)
+            .collect::<Vec<_>>();
+        assert_eq!(listed, ids);
+
         store.close().await;
         std::fs::remove_dir_all(root).unwrap();
     }

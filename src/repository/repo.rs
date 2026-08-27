@@ -1,11 +1,10 @@
 #[cfg(test)]
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 
-use crate::process::{ProcessPolicy, run_capture};
+use crate::process::{Command, ProcessPolicy, run_capture};
 use crate::util::{prism_config_dir, safe_path_component, stable_hash};
 
 #[cfg(test)]
@@ -17,7 +16,7 @@ pub struct Repository {
 }
 
 impl Repository {
-    pub fn discover(repo_arg: Option<&Path>) -> Result<Self, String> {
+    pub async fn discover(repo_arg: Option<&Path>) -> Result<Self, String> {
         let start = match repo_arg {
             Some(path) => path.to_path_buf(),
             None => {
@@ -30,7 +29,8 @@ impl Repository {
                 .arg(&start)
                 .args(["rev-parse", "--show-toplevel"]),
             ProcessPolicy::Metadata,
-        )?;
+        )
+        .await?;
         let root = PathBuf::from(output.trim());
         if root.as_os_str().is_empty() {
             return Err("not inside a Git repository".to_string());
@@ -85,8 +85,8 @@ mod tests {
 
     use super::{Repository, prism_repo_dir};
 
-    #[test]
-    fn prism_dir_uses_user_config_area_not_repo_root() {
+    #[tokio::test]
+    async fn prism_dir_uses_user_config_area_not_repo_root() {
         let repo = Repository {
             root: PathBuf::from("/work/my repo"),
         };

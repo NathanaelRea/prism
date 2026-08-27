@@ -79,6 +79,47 @@ pub(super) fn remote_pr_worktree_branch(head_ref: &str) -> String {
     head_ref.to_string()
 }
 
+fn summaries_identify_same_change_request(
+    existing: &crate::remote::PrSummary,
+    selected: &crate::remote::PrSummary,
+) -> bool {
+    match (
+        existing.change_request_identity.as_ref(),
+        selected.change_request_identity.as_ref(),
+    ) {
+        (Some(existing), Some(selected)) => existing == selected,
+        (None, None) => existing.number == selected.number,
+        _ => false,
+    }
+}
+
+pub(super) fn session_matches_change_request(
+    session: &crate::session::Session,
+    repo_index: usize,
+    selected: &crate::remote::PrSummary,
+) -> bool {
+    !session.hidden
+        && session.repo_index == repo_index
+        && session
+            .pr
+            .summary()
+            .is_some_and(|existing| summaries_identify_same_change_request(existing, selected))
+}
+
+pub(super) fn session_conflicts_with_change_request(
+    session: &crate::session::Session,
+    repo_index: usize,
+    branch: &str,
+    selected: &crate::remote::PrSummary,
+) -> bool {
+    session.repo_index == repo_index
+        && session.branch == branch
+        && session
+            .pr
+            .summary()
+            .is_some_and(|existing| !summaries_identify_same_change_request(existing, selected))
+}
+
 fn remote_pr_choice_label(summary: &crate::remote::PrSummary) -> String {
     format!(
         "#{}  {}  {} -> {}",
@@ -169,58 +210,38 @@ pub(super) fn pr_target_choice_list(origin: &str, upstream: &str) -> crate::view
     }
 }
 
-pub(super) fn open_url_in_browser(url: &str) -> Result<(), String> {
+pub(super) async fn open_url_in_browser(url: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    return crate::platform::open_url_with_shell_execute(url);
+    #[cfg(unix)]
     run_browser_opener(
         crate::platform::browser_candidates(crate::platform::current_os()),
         url,
     )
+    .await
     .map(|_| ())
 }
 
-pub(super) fn open_http_url_in_browser(url: &str) -> Result<(), String> {
+pub(super) async fn open_http_url_in_browser(url: &str) -> Result<(), String> {
     let scheme = url.split_once(':').map(|(scheme, _)| scheme);
     if !scheme.is_some_and(|scheme| {
         scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
     }) {
         return Err("development URL must use http or https".to_string());
     }
-    run_browser_opener_private(
+    #[cfg(windows)]
+    return crate::platform::open_url_with_shell_execute(url);
+    #[cfg(unix)]
+    run_browser_opener(
         crate::platform::browser_candidates(crate::platform::current_os()),
         url,
     )
+    .await
     .map(|_| ())
 }
 
-fn run_browser_opener_private(
-    candidates: &[crate::platform::CommandCandidate<'_>],
-    url: &str,
-) -> Result<String, String> {
-    for candidate in candidates {
-        if !command_exists(candidate.program) {
-            continue;
-        }
-        let mut command = Command::new(candidate.program);
-        command
-            .args(candidate.args)
-            .arg(url)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        match command.spawn() {
-            Ok(mut child) => {
-                let program = candidate.program.to_string();
-                std::thread::spawn(move || {
-                    let _ = child.wait();
-                });
-                return Ok(program);
-            }
-            Err(_) => continue,
-        }
-    }
-    Err("no usable browser opener found".to_string())
-}
-
-pub(super) fn run_browser_opener(
+#[cfg(unix)]
+pub(super) async fn run_browser_opener(
     candidates: &[crate::platform::CommandCandidate<'_>],
     url: &str,
 ) -> Result<String, String> {
@@ -229,12 +250,10 @@ pub(super) fn run_browser_opener(
         if !command_exists(candidate.program) {
             continue;
         }
-        match run_output_allow_failure(
-            Command::new(candidate.program)
-                .args(candidate.args)
-                .arg(url),
-            ProcessPolicy::LocalMutation,
-        ) {
+        let command = Command::new(candidate.program)
+            .args(candidate.args)
+            .arg(url);
+        match run_output_allow_failure(command, ProcessPolicy::LocalMutation).await {
             Ok(output) if output.status.success() => return Ok(candidate.program.to_string()),
             Ok(output) => errors.push(format!(
                 "{}: exited with {}",
@@ -286,7 +305,7 @@ impl Tui {
         self.queue_pr_persistence(session_index, false, true);
     }
 
-    pub(crate) fn merge_selected_change_request(
+    pub(crate) async fn merge_selected_change_request(
         &mut self,
         raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
@@ -353,7 +372,7 @@ impl Tui {
                     }),
                 },
             },
-            move |context| {
+            move |context| async move {
                 let progress = context.clone();
                 let cancellation = context;
                 let result: remote_operation::TuiRemoteMergeResult =
@@ -402,7 +421,7 @@ impl Tui {
             remote_operation::TuiRemoteMergeOutcome::Merged => {
                 self.select_worktree(selected);
                 self.focus_merges();
-                if !self.confirm_and_delete_session(raw, selected)? {
+                if !self.confirm_and_delete_session(raw, selected).await? {
                     self.show_message("pull request merged; worktree kept")?;
                 }
                 Ok(())
@@ -410,7 +429,7 @@ impl Tui {
             remote_operation::TuiRemoteMergeOutcome::Pending => {
                 self.select_worktree(selected);
                 self.focus_merges();
-                if !self.offer_deferred_merge_cleanup(raw, selected)? {
+                if !self.offer_deferred_merge_cleanup(raw, selected).await? {
                     self.show_message(
                         "pull request accepted by the provider and is pending merge; worktree kept",
                     )?;
@@ -424,7 +443,7 @@ impl Tui {
         }
     }
 
-    pub(crate) fn push_selected_branch(
+    pub(crate) async fn push_selected_branch(
         &mut self,
         raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
@@ -451,7 +470,7 @@ impl Tui {
             .get(&worktree)
             .copied()
             .unwrap_or_default();
-        let expected = crate::remote::dispatcher::prepare_push(&path, &config, &branch)?;
+        let expected = crate::remote::dispatcher::prepare_push(&path, &config, &branch).await?;
         let mutation = remote_push_mutation_target(&expected);
         let push_subject = format!("{}:{}", path.display(), branch);
         let push_operation = remote_operation::RemoteMutationOperation::TuiPushBranch(
@@ -483,7 +502,7 @@ impl Tui {
                     }),
                 },
             },
-            move |context| {
+            move |context| async move {
                 let progress = context.clone();
                 let cancellation = context.clone();
                 let result: remote_operation::TuiRemotePushResult =
@@ -581,7 +600,7 @@ impl Tui {
                     }),
                 },
             },
-            move |context| {
+            move |context| async move {
                 let progress = context.clone();
                 let cancellation = context.clone();
                 let snapshot = crate::worker::mutate_remote_with_progress(
@@ -674,7 +693,7 @@ impl Tui {
                     }),
                 },
             },
-            move |context| {
+            move |context| async move {
                 let mutation_progress = context.clone();
                 let mutation_cancellation = context.clone();
                 let count = crate::worker::mutate_remote_with_progress(
@@ -722,7 +741,7 @@ impl Tui {
         ))
     }
 
-    pub(crate) fn open_remote_pr_worktree(
+    pub(crate) async fn open_remote_pr_worktree(
         &mut self,
         raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
@@ -741,7 +760,7 @@ impl Tui {
                 abandon_cancelable: true,
                 effect: crate::tui::RemoteActionEffect::ReadOnly,
             },
-            move |context| {
+            move |context| async move {
                 let progress = context.clone();
                 let cancellation = context;
                 crate::worker::observe_remote_with_progress(
@@ -796,11 +815,11 @@ impl Tui {
             return Ok(());
         };
 
-        self.open_repo_pr_worktree(raw, &context, summary)?;
+        self.open_repo_pr_worktree(raw, &context, summary).await?;
         Ok(())
     }
 
-    pub(crate) fn open_selected_repo_pr_agent(
+    pub(crate) async fn open_selected_repo_pr_agent(
         &mut self,
         raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
@@ -814,13 +833,13 @@ impl Tui {
             self.show_message("review blocked: change request lifecycle is unknown or not open")?;
             return Ok(());
         }
-        let Some(index) = self.open_repo_pr_worktree(raw, &context, summary)? else {
+        let Some(index) = self.open_repo_pr_worktree(raw, &context, summary).await? else {
             return Ok(());
         };
-        self.enter_agent_mode_for_index(raw, index)
+        self.enter_agent_mode_for_index(raw, index).await
     }
 
-    fn open_repo_pr_worktree(
+    async fn open_repo_pr_worktree(
         &mut self,
         raw: &mut dyn crate::tui_runtime::TerminalDriver,
         context: &crate::tui::SelectedRepoContext,
@@ -837,6 +856,13 @@ impl Tui {
         }
 
         let branch = remote_pr_worktree_branch(&summary.head_ref);
+        if self.sessions.iter().any(|session| {
+            session_conflicts_with_change_request(session, context.repo_index, &branch, &summary)
+        }) {
+            return Err(format!(
+                "worktree branch {branch} is already associated with a different change request"
+            ));
+        }
         let path = context.repo.root.clone();
         let job_summary = summary.clone();
         let job_branch = branch.clone();
@@ -877,7 +903,7 @@ impl Tui {
                     }),
                 },
             },
-            move |context| {
+            move |context| async move {
                 let progress = context.clone();
                 let cancellation = context;
                 crate::worker::mutate_remote_with_progress::<bool, _, _>(
@@ -902,13 +928,16 @@ impl Tui {
             "Remote Pull Requests",
             &format!("Opening worktree for PR #{}", summary.number),
         )?;
-        let first_attempt = checkout_worktree_session(&context.repo, &context.config, &branch);
+        let first_attempt =
+            checkout_worktree_session(&context.repo, &context.config, &branch).await;
         self.request_wt_hook_log_refresh(context.repo_index);
         let creation = match first_attempt {
             Ok(outcome) => outcome,
             Err(error) => {
                 if !error.approval_required()
-                    || !self.offer_worktrunk_approval(raw, &context.repo, &context.config)?
+                    || !self
+                        .offer_worktrunk_approval(raw, &context.repo, &context.config)
+                        .await?
                 {
                     self.request_wt_poll(context.repo_index);
                     return Err(error.to_string());
@@ -918,7 +947,8 @@ impl Tui {
                     "Remote Pull Requests",
                     &format!("Opening worktree for PR #{}", summary.number),
                 )?;
-                let retry = checkout_worktree_session(&context.repo, &context.config, &branch);
+                let retry =
+                    checkout_worktree_session(&context.repo, &context.config, &branch).await;
                 self.request_wt_hook_log_refresh(context.repo_index);
                 match retry {
                     Ok(outcome) => outcome,
@@ -930,7 +960,7 @@ impl Tui {
             }
         };
         if let CreateWorktreeOutcome::CreatedMetadataFailed { error } = creation {
-            self.refresh_sessions()?;
+            self.refresh_sessions().await?;
             self.request_wt_poll(context.repo_index);
             self.show_message(&format!(
                 "worktree opened, but restoring Prism metadata failed: {error}"
@@ -938,48 +968,24 @@ impl Tui {
             return Ok(None);
         }
 
-        self.refresh_sessions()?;
+        self.refresh_sessions().await?;
         self.request_wt_poll(context.repo_index);
         self.start_tmux_agent_warmup();
-        self.select_pr_worktree_by_branch(context.repo_index, &branch, Some(summary.clone()));
+        let selected =
+            self.select_pr_worktree_by_branch(context.repo_index, &branch, Some(summary.clone()))?;
         self.focus_worktrees();
         self.show_message(&format!("opened worktree for PR #{}", summary.number))?;
-        Ok(self.selected_worktree_index())
+        Ok(Some(selected))
     }
 
-    fn existing_pr_worktree_index(
-        &mut self,
+    pub(super) fn existing_pr_worktree_index(
+        &self,
         repo_index: usize,
         summary: &crate::remote::PrSummary,
     ) -> Option<usize> {
-        if let Some(index) = self.sessions.iter().position(|session| {
-            !session.hidden
-                && session.repo_index == repo_index
-                && session.pr.summary().is_some_and(|existing| {
-                    match (
-                        existing.change_request_identity.as_ref(),
-                        summary.change_request_identity.as_ref(),
-                    ) {
-                        (Some(existing), Some(selected)) => existing == selected,
-                        (None, None) => existing.number == summary.number,
-                        _ => false,
-                    }
-                })
-        }) {
-            return Some(index);
-        }
-        let branch = remote_pr_worktree_branch(&summary.head_ref);
-        let index = self.sessions.iter().position(|session| {
-            !session.hidden && session.repo_index == repo_index && session.branch == branch
-        })?;
-        let repo = self
-            .repos
-            .get(repo_index)
-            .map(|managed| managed.repo.clone());
-        if repo.is_some() {
-            self.apply_remote_summary_result(index, summary.clone());
-        }
-        Some(index)
+        self.sessions
+            .iter()
+            .position(|session| session_matches_change_request(session, repo_index, summary))
     }
 
     fn select_pr_worktree_by_branch(
@@ -987,26 +993,31 @@ impl Tui {
         repo_index: usize,
         branch: &str,
         summary: Option<crate::remote::PrSummary>,
-    ) {
-        if let Some(index) = self
+    ) -> Result<usize, String> {
+        let index = self
             .sessions
             .iter()
             .position(|session| session.repo_index == repo_index && session.branch == branch)
-        {
-            let repo = self
-                .repos
-                .get(repo_index)
-                .map(|managed| managed.repo.clone());
-            if let Some(summary) = summary
-                && repo.is_some()
+            .ok_or_else(|| format!("opened worktree branch {branch} was not found"))?;
+        if let Some(summary) = summary {
+            if self.sessions[index]
+                .pr
+                .summary()
+                .is_some_and(|existing| !summaries_identify_same_change_request(existing, &summary))
             {
+                return Err(format!(
+                    "worktree branch {branch} became associated with a different change request"
+                ));
+            }
+            if self.repos.get(repo_index).is_some() {
                 self.apply_remote_summary_result(index, summary);
             }
-            if !self.visible_session_indices().contains(&index) {
-                self.worktree_filter.clear();
-            }
-            self.select_worktree(index);
         }
+        if !self.visible_session_indices().contains(&index) {
+            self.worktree_filter.clear();
+        }
+        self.select_worktree(index);
+        Ok(index)
     }
 
     pub(crate) fn submit_selected_repo_pr_review(
@@ -1133,7 +1144,7 @@ impl Tui {
                     }),
                 },
             },
-            move |context| {
+            move |context| async move {
                 let progress = context.clone();
                 let cancellation = context;
                 crate::worker::mutate_remote_with_progress::<serde_json::Value, _, _>(
@@ -1156,7 +1167,7 @@ impl Tui {
         self.show_message(&format!("{label} PR #{}", summary.number))
     }
 
-    pub(crate) fn open_selected_pr(
+    pub(crate) async fn open_selected_pr(
         &mut self,
         raw: &mut dyn crate::tui_runtime::TerminalDriver,
     ) -> Result<(), String> {
@@ -1195,7 +1206,7 @@ impl Tui {
                     abandon_cancelable: true,
                     effect: crate::tui::RemoteActionEffect::ReadOnly,
                 },
-                move |context| {
+                move |context| async move {
                     let progress = context.clone();
                     let cancellation = context;
                     let snapshot = crate::worker::observe_remote_with_progress(
@@ -1230,7 +1241,7 @@ impl Tui {
         if url.is_empty() {
             return Err(format!("PR #{} has no URL", summary.number));
         }
-        open_url_in_browser(url)?;
+        open_url_in_browser(url).await?;
         self.show_message(&format!("opened PR #{} in browser", summary.number))?;
         Ok(())
     }

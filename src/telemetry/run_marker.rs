@@ -103,6 +103,9 @@ fn begin_new(repo: &Repository, version: &str) -> Result<NewRun, String> {
             marker_dir.display()
         )
     })?;
+    #[cfg(windows)]
+    crate::system::windows_security::secure_path(&marker_dir, true)
+        .map_err(|error| format!("secure run marker directory: {error}"))?;
     let startup_lock_path = marker_dir.join("startup.lock");
     let startup_lock = open_lock(&startup_lock_path)?;
     acquire_startup_lock(&startup_lock, &startup_lock_path)?;
@@ -272,6 +275,9 @@ fn create_marker(path: &Path) -> Result<File, String> {
     let file = options
         .open(path)
         .map_err(|error| format!("create run marker {}: {error}", path.display()))?;
+    #[cfg(windows)]
+    crate::system::windows_security::secure_path(path, false)
+        .map_err(|error| format!("secure run marker {}: {error}", path.display()))?;
     file.try_lock().map_err(|error| match error {
         fs::TryLockError::WouldBlock => {
             format!("new run marker {} was unexpectedly locked", path.display())
@@ -284,13 +290,17 @@ fn create_marker(path: &Path) -> Result<File, String> {
 }
 
 fn open_lock(path: &Path) -> Result<File, String> {
-    OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .open(path)
-        .map_err(|error| format!("open repository startup lock {}: {error}", path.display()))
+        .map_err(|error| format!("open repository startup lock {}: {error}", path.display()))?;
+    #[cfg(windows)]
+    crate::system::windows_security::secure_path(path, false)
+        .map_err(|error| format!("secure repository startup lock {}: {error}", path.display()))?;
+    Ok(file)
 }
 
 fn acquire_startup_lock(file: &File, path: &Path) -> Result<(), String> {

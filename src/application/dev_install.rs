@@ -388,6 +388,12 @@ fn set_owner_only(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("set owner-only permissions on {}: {error}", path.display()))
 }
 
+#[cfg(windows)]
+fn set_owner_only(path: &Path) -> Result<(), String> {
+    crate::system::windows_security::secure_path(path, path.is_dir())
+        .map_err(|error| format!("set owner-only permissions on {}: {error}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::prepare;

@@ -29,7 +29,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-2022]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -39,9 +39,11 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - uses: taiki-e/install-action@b6ff580856c41316412a0b9b60540fbc6f8c82cc # v2
+        if: runner.os != 'Windows'
         with:
           tool: nextest@0.9.143
       - name: Install SQLx CLI 0.8.6
+        if: runner.os != 'Windows'
         run: >-
           cargo install sqlx-cli --version 0.8.6 --locked
           --no-default-features --features sqlite,rustls
@@ -61,6 +63,7 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install ripgrep tmux
       - name: Install Worktrunk 0.71.0
+        if: runner.os != 'Windows'
         run: |
           release="https://github.com/max-sixty/worktrunk/releases/download"
           installer="$(mktemp)"
@@ -70,11 +73,22 @@ jobs:
             --output "$installer"
           sh "$installer"
           wt --version
+      - name: Install pinned Windows Worktrunk and psmux
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: scripts/install-windows-smoke-tools.ps1
       - name: Native macOS platform smoke
         if: runner.os == 'macOS'
         run: scripts/platform-smoke.sh
-      - run: scripts/full-check.sh
+      - name: Full Linux/macOS gate
+        if: runner.os != 'Windows'
+        run: scripts/full-check.sh
+      - name: Full native Windows gate
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: scripts/windows-check.ps1
       - name: Smoke-test Prism's real Worktrunk integration
+        if: runner.os != 'Windows'
         run: |
           set -eu
           smoke_root="$(mktemp -d)"
@@ -101,3 +115,9 @@ jobs:
             cargo test \
               real_prism_opencode_tmux_stack_ensures_reusable_agent_session \
               -- --ignored --exact
+      - name: Native Windows Git, Worktrunk, OpenCode, and psmux smoke
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:PRISM_TEST_OPENCODE = (Get-Command opencode.cmd).Source
+          scripts/windows-platform-smoke.ps1

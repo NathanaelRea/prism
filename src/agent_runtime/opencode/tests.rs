@@ -159,8 +159,8 @@ fn stored_server_args_match_requires_expected_host_and_port() {
     ));
 }
 
-#[test]
-fn stored_server_shutdown_reports_argument_inspection_failure() {
+#[tokio::test]
+async fn stored_server_shutdown_reports_argument_inspection_failure() {
     let runtime = OpencodeRuntime {
         repo_root: "/repo".to_string(),
         harness_id: "opencode".to_string(),
@@ -181,6 +181,7 @@ fn stored_server_shutdown_reports_argument_inspection_failure() {
             source: std::io::Error::other("injected argument inspection failure"),
         })
     })
+    .await
     .unwrap_err();
 
     assert!(error.contains("inspect stored opencode server 42 before shutdown"));
@@ -315,8 +316,8 @@ fn runtime_metadata_round_trips_session_mapping() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
-fn worktrees_in_one_repository_reuse_one_healthy_server() {
+#[tokio::test(flavor = "multi_thread")]
+async fn worktrees_in_one_repository_reuse_one_healthy_server() {
     let temp = unique_temp_dir("prism-opencode-shared-server-test");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -347,6 +348,7 @@ fn worktrees_in_one_repository_reuse_one_healthy_server() {
         &second_worktree,
         "/definitely/missing/opencode",
     )
+    .await
     .unwrap();
 
     assert_eq!(second.server_url, first.server_url);
@@ -357,8 +359,189 @@ fn worktrees_in_one_repository_reuse_one_healthy_server() {
     let _ = fs::remove_dir_all(temp);
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn unhealthy_persisted_server_is_stopped_before_replacement() {
+    use std::os::unix::process::CommandExt as _;
+
+    let temp = unique_temp_dir("prism-opencode-unhealthy-server-test");
+    fs::create_dir_all(&temp).unwrap();
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let worktree = temp.join("worktree");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let mut command = std::process::Command::new("sh");
+    command
+        .arg("-c")
+        .arg("while :; do sleep 1; done")
+        .arg("opencode-fixture")
+        .args([
+            "serve",
+            "--hostname",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+        ])
+        .process_group(0);
+    let mut child = command.spawn().unwrap();
+    let recorded = crate::process::record_process(child.id()).unwrap();
+    let identity = recorded
+        .identity
+        .expect("fixture should expose reusable process identity")
+        .stored_value();
+    let (exit_tx, exit_rx) = mpsc::sync_channel(1);
+    let waiter = std::thread::spawn(move || {
+        let _ = exit_tx.send(child.wait());
+    });
+    let runtime = OpencodeRuntime {
+        repo_root: temp.display().to_string(),
+        harness_id: "opencode".to_string(),
+        branch: "feature".to_string(),
+        worktree_path: worktree.display().to_string(),
+        server_port: port,
+        server_url: server_url(port),
+        server_pid: Some(recorded.pid),
+        server_process_identity: Some(identity),
+        opencode_session_id: None,
+        generation: 0,
+        updated_unix_ms: 42,
+    };
+    let ready_deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let arguments = crate::process::process_arguments(recorded.pid)
+            .unwrap()
+            .expect("fixture should still be running");
+        let argument_refs = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+        if stored_server_args_match(&argument_refs, port)
+            && stored_server_identity_is_valid(&runtime)
+        {
+            break;
+        }
+        if Instant::now() >= ready_deadline {
+            let _ =
+                crate::process::terminate_recorded_process(recorded, Duration::from_millis(100))
+                    .await;
+            let _ = exit_rx.recv_timeout(Duration::from_secs(1));
+            waiter.join().unwrap();
+            panic!("fixture arguments did not become reusable OpenCode identity: {arguments:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    save_runtime(&repo, &runtime).unwrap();
+    let mut config = Config::load(&repo);
+    config.opencode_port_base = port;
+    config.opencode_port_span = 1;
+
+    let result = ensure_opencode_server_with_program(
+        &repo,
+        &config,
+        "opencode",
+        "feature",
+        &worktree,
+        "/definitely/missing/opencode",
+    )
+    .await;
+    if exit_rx.recv_timeout(Duration::from_secs(2)).is_err() {
+        let _ =
+            crate::process::terminate_recorded_process(recorded, Duration::from_millis(100)).await;
+        let _ = exit_rx.recv_timeout(Duration::from_secs(1));
+        waiter.join().unwrap();
+        panic!("unhealthy persisted server survived replacement");
+    }
+    waiter.join().unwrap();
+    let error = result.expect_err("replacement fixture should fail after stale-server cleanup");
+    assert!(error.contains("start opencode server"), "{error}");
+    let _ = fs::remove_dir_all(temp);
+}
+
+#[cfg(windows)]
 #[test]
-fn legacy_worktree_servers_converge_to_one_canonical_server() {
+#[ignore = "child fixture for Windows supervisor lifecycle coverage"]
+fn windows_unhealthy_supervisor_fixture() {
+    std::thread::sleep(Duration::from_secs(30));
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn windows_unhealthy_persisted_supervisor_is_stopped_before_replacement() {
+    use std::os::windows::process::CommandExt as _;
+    use windows::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
+
+    let temp = unique_temp_dir("prism-opencode-windows-unhealthy-server-test");
+    fs::create_dir_all(&temp).unwrap();
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let worktree = temp.join("worktree");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "agent_runtime::opencode::tests::windows_unhealthy_supervisor_fixture",
+            "--ignored",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags((CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS).0);
+    let mut child = command.spawn().unwrap();
+    let recorded = crate::process::record_process(child.id()).unwrap();
+    let identity = recorded
+        .identity
+        .expect("fixture should expose reusable process identity")
+        .stored_value();
+    let (exit_tx, exit_rx) = mpsc::sync_channel(1);
+    let waiter = std::thread::spawn(move || {
+        let _ = exit_tx.send(child.wait());
+    });
+    let runtime = OpencodeRuntime {
+        repo_root: temp.display().to_string(),
+        harness_id: "opencode".to_string(),
+        branch: "feature".to_string(),
+        worktree_path: worktree.display().to_string(),
+        server_port: port,
+        server_url: server_url(port),
+        server_pid: Some(recorded.pid),
+        server_process_identity: Some(identity),
+        opencode_session_id: None,
+        generation: 0,
+        updated_unix_ms: 42,
+    };
+    let ready_deadline = Instant::now() + Duration::from_secs(1);
+    while !stored_server_identity_is_valid(&runtime) {
+        if Instant::now() >= ready_deadline {
+            let _ =
+                crate::process::terminate_recorded_process(recorded, Duration::from_millis(100))
+                    .await;
+            let _ = exit_rx.recv_timeout(Duration::from_secs(1));
+            waiter.join().unwrap();
+            panic!("Windows fixture did not become a reusable supervisor identity");
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    save_runtime(&repo, &runtime).unwrap();
+    let runtimes = load_runtimes_for_harness(&repo, "opencode").unwrap();
+
+    let stored_port = stop_unhealthy_stored_servers(&runtimes).await.unwrap();
+
+    assert_eq!(stored_port, Some(port));
+    if exit_rx.recv_timeout(Duration::from_secs(2)).is_err() {
+        let _ =
+            crate::process::terminate_recorded_process(recorded, Duration::from_millis(100)).await;
+        let _ = exit_rx.recv_timeout(Duration::from_secs(1));
+        waiter.join().unwrap();
+        panic!("unhealthy persisted Windows supervisor survived replacement cleanup");
+    }
+    waiter.join().unwrap();
+    let _ = fs::remove_dir_all(temp);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_worktree_servers_converge_to_one_canonical_server() {
     let temp = unique_temp_dir("prism-opencode-legacy-server-test");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -403,6 +586,7 @@ fn legacy_worktree_servers_converge_to_one_canonical_server() {
         Path::new(&noncanonical.worktree_path),
         "/definitely/missing/opencode",
     )
+    .await
     .unwrap();
 
     assert_eq!(selected.server_url, canonical_url);
@@ -579,10 +763,10 @@ fn runtime_identity_is_isolated_by_harness_id() {
     let _ = fs::remove_dir_all(temp);
 }
 
-#[test]
+#[tokio::test]
 #[cfg(target_os = "linux")]
-fn legacy_runtime_without_start_time_cannot_stop_a_matching_live_process() {
-    let mut child = Command::new("sh")
+async fn legacy_runtime_without_start_time_cannot_stop_a_matching_live_process() {
+    let mut child = std::process::Command::new("sh")
         .arg("-c")
         .arg("while :; do sleep 1; done")
         .arg("legacy-opencode-fixture")
@@ -612,7 +796,8 @@ fn legacy_runtime_without_start_time_cannot_stop_a_matching_live_process() {
             "--port".to_string(),
             "41222".to_string(),
         ]))
-    });
+    })
+    .await;
     let child_was_running = child.try_wait().unwrap().is_none();
     child.kill().unwrap();
     child.wait().unwrap();
@@ -708,6 +893,31 @@ fn newest_session_for_worktree_prefers_latest_matching_update_time() {
     let selected = newest_session_for_worktree(&sessions, "/repo/wt").unwrap();
 
     assert_eq!(selected.id, "new");
+}
+
+#[cfg(windows)]
+#[test]
+fn session_matching_normalizes_windows_separators_and_case() {
+    let session = OpencodeSession {
+        id: "windows".to_string(),
+        directory: Some(r"C:\RÉPO\worktree feature 雪".to_string()),
+        title: None,
+        time_updated: Some("1".to_string()),
+        parent_id: None,
+    };
+
+    assert!(session_matches_worktree(
+        &session,
+        "c:/répo/worktree feature 雪/"
+    ));
+    assert_eq!(
+        newest_session_for_worktree(
+            std::slice::from_ref(&session),
+            "c:/répo/worktree feature 雪"
+        )
+        .map(|session| session.id.as_str()),
+        Some("windows")
+    );
 }
 
 #[test]
@@ -1159,10 +1369,10 @@ fn http_response_completion_uses_content_length_without_waiting_for_eof() {
     assert_eq!(parse_response(chunked_with_trailer).unwrap().body, "[]");
 }
 
-#[test]
+#[tokio::test(flavor = "multi_thread")]
 #[cfg(unix)]
 #[ignore = "requires PRISM_TEST_OPENCODE pointing to a real OpenCode binary"]
-fn real_opencode_server_round_trips_prism_session_api() {
+async fn real_opencode_server_round_trips_prism_session_api() {
     let opencode = std::env::var("PRISM_TEST_OPENCODE")
         .expect("set PRISM_TEST_OPENCODE to the real OpenCode binary");
     let temp = unique_temp_dir("prism-real-opencode-test");
@@ -1208,13 +1418,15 @@ fn real_opencode_server_round_trips_prism_session_api() {
         .tools
         .insert("opencode".to_string(), wrapper.display().to_string());
 
-    let runtime = ensure_opencode_server(&repo, &config, "feature/smoke", &worktree).unwrap();
-    let result = (|| -> Result<(), String> {
+    let runtime = ensure_opencode_server(&repo, &config, "feature/smoke", &worktree)
+        .await
+        .unwrap();
+    let result: Result<(), String> = async {
         if !super::check_health(&runtime.server_url) {
             return Err("OpenCode server did not remain healthy".to_string());
         }
         let second_runtime =
-            ensure_opencode_server(&repo, &config, "feature/second", &second_worktree)?;
+            ensure_opencode_server(&repo, &config, "feature/second", &second_worktree).await?;
         if second_runtime.server_url != runtime.server_url
             || second_runtime.server_pid != runtime.server_pid
         {
@@ -1235,7 +1447,7 @@ fn real_opencode_server_round_trips_prism_session_api() {
                 created.id
             ));
         }
-        let resolved = ensure_opencode_session(&repo, &config, "feature/smoke", &worktree)?;
+        let resolved = ensure_opencode_session(&repo, &config, "feature/smoke", &worktree).await?;
         if resolved.opencode_session_id.as_deref() != Some(created.id.as_str()) {
             return Err(format!(
                 "Prism did not select created OpenCode session {} for {}",
@@ -1266,28 +1478,30 @@ fn real_opencode_server_round_trips_prism_session_api() {
             return Err("submitted OpenCode prompt was not persisted".to_string());
         }
         Ok(())
-    })();
-    let shutdown = shutdown_owned_server(&runtime);
+    }
+    .await;
+    let shutdown = shutdown_owned_server(&runtime).await;
     let _ = fs::remove_dir_all(temp);
 
     result.unwrap();
     shutdown.unwrap();
 }
 
-#[test]
+#[tokio::test(flavor = "multi_thread")]
 #[cfg(unix)]
-fn worktree_cleanup_keeps_a_server_referenced_by_another_worktree() {
+async fn worktree_cleanup_keeps_a_server_referenced_by_another_worktree() {
     let temp = unique_temp_dir("prism-shared-opencode-cleanup");
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
-    let mut command = Command::new("sh");
-    command
-        .args(["-c", "while :; do sleep 1; done"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let child = crate::process::SupervisedChild::spawn(&mut command, None, None).unwrap();
-    let process_id = child.id();
-    record_owned_server_process(child);
+    let control = crate::process::spawn_owned(
+        crate::process::Command::new("sh").args(["-c", "while :; do sleep 1; done"]),
+        crate::process::ProcessDescriptor::new("test.opencode.shared-server"),
+    )
+    .await
+    .unwrap();
+    let process_id = control.pid();
+    let process_identity = control.identity();
+    record_owned_server_process(control).await;
     let runtime = |branch: &str, worktree: &str| OpencodeRuntime {
         repo_root: repo.root.display().to_string(),
         harness_id: "opencode".to_string(),
@@ -1296,7 +1510,7 @@ fn worktree_cleanup_keeps_a_server_referenced_by_another_worktree() {
         server_port: 41_000,
         server_url: "http://127.0.0.1:41000".to_string(),
         server_pid: Some(process_id),
-        server_process_identity: stored_process_identity(process_id),
+        server_process_identity: process_identity,
         opencode_session_id: None,
         generation: 0,
         updated_unix_ms: 0,
@@ -1307,22 +1521,67 @@ fn worktree_cleanup_keeps_a_server_referenced_by_another_worktree() {
     save_runtime(&repo, &second).unwrap();
 
     shutdown_worktree_session_runtime_processes_with_lock_held(&repo, std::slice::from_ref(&first))
+        .await
         .unwrap();
-    assert!(owned_server_process(process_id));
+    assert!(owned_server_process(process_id).await);
 
     crate::persistence::session::delete_runtime(&observability::db_path(&repo), &first).unwrap();
     shutdown_worktree_session_runtime_processes_with_lock_held(
         &repo,
         std::slice::from_ref(&second),
     )
+    .await
     .unwrap();
-    assert!(!owned_server_process(process_id));
+    assert!(!owned_server_process(process_id).await);
     fs::remove_dir_all(temp).unwrap();
 }
 
-#[test]
+#[tokio::test(flavor = "multi_thread")]
 #[cfg(unix)]
-fn owned_server_shutdown_kills_term_ignoring_descendant_and_reaps_leader() {
+async fn owned_server_identity_mismatch_preserves_the_registered_control() {
+    let control = crate::process::spawn_owned(
+        crate::process::Command::new("sh").args(["-c", "sleep 30"]),
+        crate::process::ProcessDescriptor::new("test.opencode.identity-mismatch"),
+    )
+    .await
+    .unwrap();
+    let process_id = control.pid();
+    let identity = control
+        .identity()
+        .expect("owned process has reusable identity");
+    let recorded = crate::process::RecordedProcess::from_stored(process_id, Some(identity));
+    record_owned_server_process(control).await;
+    let runtime = |stored_identity| OpencodeRuntime {
+        repo_root: "/repo".to_string(),
+        harness_id: "opencode".to_string(),
+        branch: "feature/test".to_string(),
+        worktree_path: "/repo/worktree".to_string(),
+        server_port: 41_000,
+        server_url: "http://127.0.0.1:41000".to_string(),
+        server_pid: Some(process_id),
+        server_process_identity: Some(stored_identity),
+        opencode_session_id: None,
+        generation: 0,
+        updated_unix_ms: 0,
+    };
+
+    let error = shutdown_owned_server(&runtime(identity ^ 1))
+        .await
+        .unwrap_err();
+    assert!(error.contains("registry identity disagrees"), "{error}");
+    assert!(owned_server_process(process_id).await);
+    assert_eq!(
+        crate::process::observe_process(recorded).unwrap(),
+        crate::process::ProcessObservation::RunningSameProcess
+    );
+
+    shutdown_owned_server(&runtime(identity)).await.unwrap();
+    assert!(!owned_server_process(process_id).await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(unix)]
+async fn owned_server_shutdown_kills_term_ignoring_descendant_and_reaps_leader() {
     let temp = unique_temp_dir("prism-owned-opencode-process");
     fs::create_dir_all(&temp).unwrap();
     let descendant_path = temp.join("descendant.pid");
@@ -1336,18 +1595,19 @@ fn owned_server_shutdown_kills_term_ignoring_descendant_and_reaps_leader() {
             printf '%s\n' "$descendant" > "$1"
             wait "$descendant"
         "#;
-    let mut command = Command::new("sh");
-    command
-        .arg("-c")
-        .arg(script)
-        .arg("owned-opencode-fixture")
-        .arg(&descendant_path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let child = crate::process::SupervisedChild::spawn(&mut command, None, None).unwrap();
-    let process_id = child.id();
+    let control = crate::process::spawn_owned(
+        crate::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .arg("owned-opencode-fixture")
+            .arg(&descendant_path),
+        crate::process::ProcessDescriptor::new("test.opencode.owned-server"),
+    )
+    .await
+    .unwrap();
+    let process_id = control.pid();
     let recorded_process = crate::process::record_process(process_id).unwrap();
-    record_owned_server_process(child);
+    record_owned_server_process(control).await;
     let runtime = OpencodeRuntime {
         repo_root: "/repo".to_string(),
         harness_id: "opencode".to_string(),
@@ -1376,10 +1636,10 @@ fn owned_server_shutdown_kills_term_ignoring_descendant_and_reaps_leader() {
     let recorded_descendant = crate::process::record_process(descendant_id).unwrap();
 
     let started = std::time::Instant::now();
-    shutdown_owned_server(&runtime).unwrap();
+    shutdown_owned_server(&runtime).await.unwrap();
 
     assert!(started.elapsed() < Duration::from_secs(3));
-    assert!(!owned_server_process(process_id));
+    assert!(!owned_server_process(process_id).await);
     for process in [recorded_process, recorded_descendant] {
         let gone_deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
@@ -1399,8 +1659,9 @@ fn owned_server_shutdown_kills_term_ignoring_descendant_and_reaps_leader() {
     fs::remove_dir_all(temp).unwrap();
 }
 
-#[test]
-fn stored_server_shutdown_uses_verified_bounded_process_group_recovery() {
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(unix)]
+async fn stored_server_shutdown_uses_verified_bounded_process_group_recovery() {
     let temp = unique_temp_dir("prism-stored-opencode-process");
     fs::create_dir_all(&temp).unwrap();
     let descendant_path = temp.join("descendant.pid");
@@ -1414,17 +1675,15 @@ fn stored_server_shutdown_uses_verified_bounded_process_group_recovery() {
             printf '%s\n' "$descendant" > "$1"
             wait "$descendant"
         "#;
-    let mut command = Command::new("sh");
-    command
+    let child = crate::process::Command::new("sh")
         .arg("-c")
         .arg(script)
         .arg("stored-opencode-fixture")
         .arg(&descendant_path)
         .args(["serve", "--hostname", "127.0.0.1", "--port", "41000"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let mut child = crate::process::SupervisedChild::spawn(&mut command, None, None).unwrap();
-    let process_id = child.id();
+        .spawn_detached()
+        .unwrap();
+    let process_id = child.pid();
     let recorded_process = crate::process::record_process(process_id).unwrap();
     let runtime = OpencodeRuntime {
         repo_root: "/repo".to_string(),
@@ -1452,26 +1711,28 @@ fn stored_server_shutdown_uses_verified_bounded_process_group_recovery() {
         .parse::<u32>()
         .unwrap();
     let recorded_descendant = crate::process::record_process(descendant_id).unwrap();
-    let reaper = std::thread::spawn(move || child.wait().unwrap());
 
     let started = std::time::Instant::now();
-    shutdown_stored_server(&runtime).unwrap();
+    shutdown_stored_server(&runtime).await.unwrap();
 
     assert!(started.elapsed() < Duration::from_secs(3));
-    reaper.join().unwrap();
-    let gone_deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while crate::process::observe_process(recorded_descendant).unwrap()
-        != crate::process::ProcessObservation::Missing
-    {
-        assert!(
-            std::time::Instant::now() < gone_deadline,
-            "stored server descendant {descendant_id} survived shutdown"
-        );
-        std::thread::sleep(Duration::from_millis(10));
+    for process in [recorded_process, recorded_descendant] {
+        let gone_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while crate::process::observe_process(process).unwrap()
+            != crate::process::ProcessObservation::Missing
+        {
+            assert!(
+                std::time::Instant::now() < gone_deadline,
+                "stored server process {} survived shutdown",
+                process.pid
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
     fs::remove_dir_all(temp).unwrap();
 }
 
+#[cfg(unix)]
 fn shell_quote_for_test(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
@@ -1504,7 +1765,19 @@ fn start_health_server(
             };
             stream.set_nonblocking(false).unwrap();
             let mut request = [0_u8; 1024];
-            let count = stream.read(&mut request).unwrap();
+            let count = match stream.read(&mut request) {
+                Ok(0) => continue,
+                Ok(count) => count,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => panic!("read health request: {error}"),
+            };
             let request = String::from_utf8_lossy(&request[..count]);
             let body = if request.starts_with("GET /global/health ") {
                 r#"{"healthy":true}"#.to_string()
@@ -1514,12 +1787,16 @@ fn start_health_server(
                     worktree.display()
                 )
             };
-            write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                )
-                .unwrap();
+            if let Err(error) = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ) && !matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+            ) {
+                panic!("write health response: {error}");
+            }
         }
     });
     (url, stop, server)
