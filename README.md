@@ -9,7 +9,7 @@
 ```
 
 Prism is a meta-harness for managing agents in parallel on separate worktrees
-with tmux on Linux/macOS or psmux on Windows. Its provider-neutral change-request workflows integrate with GitHub,
+with tmux. Its provider-neutral change-request workflows integrate with GitHub,
 GitLab, Forgejo, and Codeberg, so you don't need to switch between worktrees,
 terminals, browsers, or repositories.
 
@@ -23,7 +23,7 @@ It's a local dashboard for code-change lifecycles: planning, implementation,
 change-request creation, CI checks, and review fixes. It keeps parallel work in
 one place.
 
-- Isolate tasks with Git worktrees and tmux-compatible sessions
+- Isolate tasks with git worktrees and tmux sessions
 - See repository, worktree, change-request, CI, and agent state in one TUI.
 - Kick off repeatable agent flows for implementing a plan or fixing review, CI,
   and merge issues.
@@ -34,11 +34,10 @@ one place.
 
 Core runtime requirements:
 
-- Linux, macOS, or native x86-64 Windows 10/11
-- native `git`
-- `tmux` on Linux/macOS or psmux 3.3.7 on Windows
-- Worktrunk 0.58.0 or newer: `wt` on Linux/macOS and `git-wt.exe` on Windows to avoid the Windows Terminal `wt.exe` alias. Prism currently tests against 0.71.0.
-- PowerShell 7 on Windows; WSL, Cygwin, and MSYS2 are not Windows runtime backends
+- Linux or macOS
+- `git`
+- `tmux`
+- Worktrunk (`wt`) 0.58.0 or newer. Prism currently tests against 0.71.0.
 
 Install the transport required by each repository:
 
@@ -63,9 +62,9 @@ Optional integrations:
 
 - `fzf` for interactive plan selection
 - `lazygit` for the tmux Git window
-- Desktop notifications on Linux or macOS, enabled in [configuration](docs/config.md#desktop-notifications). Windows notification absence is non-fatal; unpackaged native toasts are not currently claimed.
+- Desktop notifications on Linux or macOS, enabled in [configuration](docs/config.md#desktop-notifications)
 
-On first interactive startup, Prism lists the installed built-in harnesses and saves your selection in the platform configuration directory (`~/.config/prism/config.toml` on Linux or `%APPDATA%\Prism\config.toml` on Windows). OpenCode remains the fallback for non-interactive startup when no harness is configured. To use a generic command, configure it from the `H` chooser; see [Configuration](docs/config.md#harnesses).
+On first interactive startup, Prism lists the installed built-in harnesses and saves your selection to `~/.config/prism/config.toml`. OpenCode remains the fallback for non-interactive startup when no harness is configured. To use a generic command, configure it from the `H` chooser; see [Configuration](docs/config.md#harnesses).
 
 ## Install
 
@@ -74,16 +73,15 @@ Prism provides prebuilt archives for:
 - Linux x86_64 with glibc 2.35 or newer (for example, Ubuntu 22.04)
 - macOS x86_64 (Intel)
 - macOS aarch64 (Apple Silicon)
-- Windows x86_64 (`x86_64-pc-windows-msvc` zip)
 
-Linux, macOS, and native x86-64 Windows are supported. Other targets fail during
+Linux and macOS are the supported operating systems. Other targets fail during
 the build with an explicit unsupported-platform diagnostic rather than using
-partial platform fallbacks.
+partial Windows or generic Unix fallbacks.
 
 Download the archive for your platform from the
 [latest GitHub Release](https://github.com/NathanaelRea/prism/releases/latest),
 verify it against the matching `.sha256` file, extract it, and place `prism`
-(or `prism.exe`) somewhere on your `PATH`, such as `~/.local/bin` or a Windows user tools directory.
+somewhere on your `PATH`, such as `~/.local/bin`.
 
 To build from source, install Rust 1.95 or newer, clone this repository, check
 out the desired release tag, and run:
@@ -93,8 +91,7 @@ out the desired release tag, and run:
 ```
 
 This installs a copy to `~/.local/bin/prism`. Set `PRISM_INSTALL_DIR` to choose
-another directory. On Windows, build from a native PowerShell 7 prompt with
-`cargo build --locked --release`, then copy `target\release\prism.exe` to a directory on `PATH`.
+another directory.
 
 ## Start
 

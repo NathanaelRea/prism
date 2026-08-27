@@ -160,14 +160,7 @@ impl Tui {
                             } else {
                                 Err(adapter.as_ref().unwrap_err().clone())
                             };
-                        let capabilities = if summaries.is_ok() {
-                            crate::remote::dispatcher::capabilities(&path, &config)
-                                .await
-                                .ok()
-                                .or_else(|| adapter.ok())
-                        } else {
-                            adapter.ok()
-                        };
+                        let capabilities = adapter.ok();
                         let observations = match &summaries {
                             Ok(summaries) => {
                                 let mut observations = Vec::with_capacity(session_snapshots.len());
