@@ -33,6 +33,11 @@ pub enum CommandKind {
         source: PathBuf,
         destination: PathBuf,
     },
+    OpencodeServerSupervisor {
+        program: PathBuf,
+        repository: PathBuf,
+        port: u16,
+    },
     List(InspectOptions),
     Status(StatusOptions),
     Pause(Option<String>),
@@ -263,6 +268,34 @@ impl Args {
                     } else {
                         command = CommandKind::Db(DbCommand::Query(parts.join(" ")));
                     }
+                    break;
+                }
+                "__opencode-server" => {
+                    let program = iter.next().ok_or_else(|| {
+                        "__opencode-server requires <program> <repository> <port>".to_string()
+                    })?;
+                    let repository = iter.next().ok_or_else(|| {
+                        "__opencode-server requires <program> <repository> <port>".to_string()
+                    })?;
+                    let port = iter
+                        .next()
+                        .ok_or_else(|| {
+                            "__opencode-server requires <program> <repository> <port>".to_string()
+                        })?
+                        .to_string_lossy()
+                        .parse::<u16>()
+                        .map_err(|_| "__opencode-server requires a valid TCP port".to_string())?;
+                    if let Some(extra) = iter.next() {
+                        return Err(format!(
+                            "unknown __opencode-server argument: {}",
+                            extra.to_string_lossy()
+                        ));
+                    }
+                    command = CommandKind::OpencodeServerSupervisor {
+                        program: PathBuf::from(program),
+                        repository: PathBuf::from(repository),
+                        port,
+                    };
                     break;
                 }
                 "__prepare-dev-state" => {
@@ -582,6 +615,32 @@ mod tests {
         ] {
             assert_eq!(parse(&["worker", name]), CommandKind::Worker(expected));
         }
+    }
+
+    #[test]
+    fn internal_opencode_server_supervisor_parses_exact_launch_contract() {
+        assert_eq!(
+            parse(&[
+                "__opencode-server",
+                "C:/tools/opencode.cmd",
+                "C:/repo with spaces",
+                "43123",
+            ]),
+            CommandKind::OpencodeServerSupervisor {
+                program: PathBuf::from("C:/tools/opencode.cmd"),
+                repository: PathBuf::from("C:/repo with spaces"),
+                port: 43123,
+            }
+        );
+        assert!(Args::parse(["__opencode-server".into()]).is_err());
+        assert!(
+            Args::parse(
+                ["__opencode-server", "opencode", "repo", "not-a-port"]
+                    .into_iter()
+                    .map(OsString::from)
+            )
+            .is_err()
+        );
     }
 
     #[test]

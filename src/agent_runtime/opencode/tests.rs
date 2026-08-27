@@ -359,6 +359,187 @@ async fn worktrees_in_one_repository_reuse_one_healthy_server() {
     let _ = fs::remove_dir_all(temp);
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn unhealthy_persisted_server_is_stopped_before_replacement() {
+    use std::os::unix::process::CommandExt as _;
+
+    let temp = unique_temp_dir("prism-opencode-unhealthy-server-test");
+    fs::create_dir_all(&temp).unwrap();
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let worktree = temp.join("worktree");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let mut command = std::process::Command::new("sh");
+    command
+        .arg("-c")
+        .arg("while :; do sleep 1; done")
+        .arg("opencode-fixture")
+        .args([
+            "serve",
+            "--hostname",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+        ])
+        .process_group(0);
+    let mut child = command.spawn().unwrap();
+    let recorded = crate::process::record_process(child.id()).unwrap();
+    let identity = recorded
+        .identity
+        .expect("fixture should expose reusable process identity")
+        .stored_value();
+    let (exit_tx, exit_rx) = mpsc::sync_channel(1);
+    let waiter = std::thread::spawn(move || {
+        let _ = exit_tx.send(child.wait());
+    });
+    let runtime = OpencodeRuntime {
+        repo_root: temp.display().to_string(),
+        harness_id: "opencode".to_string(),
+        branch: "feature".to_string(),
+        worktree_path: worktree.display().to_string(),
+        server_port: port,
+        server_url: server_url(port),
+        server_pid: Some(recorded.pid),
+        server_process_identity: Some(identity),
+        opencode_session_id: None,
+        generation: 0,
+        updated_unix_ms: 42,
+    };
+    let ready_deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let arguments = crate::process::process_arguments(recorded.pid)
+            .unwrap()
+            .expect("fixture should still be running");
+        let argument_refs = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+        if stored_server_args_match(&argument_refs, port)
+            && stored_server_identity_is_valid(&runtime)
+        {
+            break;
+        }
+        if Instant::now() >= ready_deadline {
+            let _ =
+                crate::process::terminate_recorded_process(recorded, Duration::from_millis(100))
+                    .await;
+            let _ = exit_rx.recv_timeout(Duration::from_secs(1));
+            waiter.join().unwrap();
+            panic!("fixture arguments did not become reusable OpenCode identity: {arguments:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    save_runtime(&repo, &runtime).unwrap();
+    let mut config = Config::load(&repo);
+    config.opencode_port_base = port;
+    config.opencode_port_span = 1;
+
+    let result = ensure_opencode_server_with_program(
+        &repo,
+        &config,
+        "opencode",
+        "feature",
+        &worktree,
+        "/definitely/missing/opencode",
+    )
+    .await;
+    if exit_rx.recv_timeout(Duration::from_secs(2)).is_err() {
+        let _ =
+            crate::process::terminate_recorded_process(recorded, Duration::from_millis(100)).await;
+        let _ = exit_rx.recv_timeout(Duration::from_secs(1));
+        waiter.join().unwrap();
+        panic!("unhealthy persisted server survived replacement");
+    }
+    waiter.join().unwrap();
+    let error = result.expect_err("replacement fixture should fail after stale-server cleanup");
+    assert!(error.contains("start opencode server"), "{error}");
+    let _ = fs::remove_dir_all(temp);
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "child fixture for Windows supervisor lifecycle coverage"]
+fn windows_unhealthy_supervisor_fixture() {
+    std::thread::sleep(Duration::from_secs(30));
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn windows_unhealthy_persisted_supervisor_is_stopped_before_replacement() {
+    use std::os::windows::process::CommandExt as _;
+    use windows::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
+
+    let temp = unique_temp_dir("prism-opencode-windows-unhealthy-server-test");
+    fs::create_dir_all(&temp).unwrap();
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let worktree = temp.join("worktree");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "agent_runtime::opencode::tests::windows_unhealthy_supervisor_fixture",
+            "--ignored",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags((CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS).0);
+    let mut child = command.spawn().unwrap();
+    let recorded = crate::process::record_process(child.id()).unwrap();
+    let identity = recorded
+        .identity
+        .expect("fixture should expose reusable process identity")
+        .stored_value();
+    let (exit_tx, exit_rx) = mpsc::sync_channel(1);
+    let waiter = std::thread::spawn(move || {
+        let _ = exit_tx.send(child.wait());
+    });
+    let runtime = OpencodeRuntime {
+        repo_root: temp.display().to_string(),
+        harness_id: "opencode".to_string(),
+        branch: "feature".to_string(),
+        worktree_path: worktree.display().to_string(),
+        server_port: port,
+        server_url: server_url(port),
+        server_pid: Some(recorded.pid),
+        server_process_identity: Some(identity),
+        opencode_session_id: None,
+        generation: 0,
+        updated_unix_ms: 42,
+    };
+    let ready_deadline = Instant::now() + Duration::from_secs(1);
+    while !stored_server_identity_is_valid(&runtime) {
+        if Instant::now() >= ready_deadline {
+            let _ =
+                crate::process::terminate_recorded_process(recorded, Duration::from_millis(100))
+                    .await;
+            let _ = exit_rx.recv_timeout(Duration::from_secs(1));
+            waiter.join().unwrap();
+            panic!("Windows fixture did not become a reusable supervisor identity");
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    save_runtime(&repo, &runtime).unwrap();
+    let runtimes = load_runtimes_for_harness(&repo, "opencode").unwrap();
+
+    let stored_port = stop_unhealthy_stored_servers(&runtimes).await.unwrap();
+
+    assert_eq!(stored_port, Some(port));
+    if exit_rx.recv_timeout(Duration::from_secs(2)).is_err() {
+        let _ =
+            crate::process::terminate_recorded_process(recorded, Duration::from_millis(100)).await;
+        let _ = exit_rx.recv_timeout(Duration::from_secs(1));
+        waiter.join().unwrap();
+        panic!("unhealthy persisted Windows supervisor survived replacement cleanup");
+    }
+    waiter.join().unwrap();
+    let _ = fs::remove_dir_all(temp);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn legacy_worktree_servers_converge_to_one_canonical_server() {
     let temp = unique_temp_dir("prism-opencode-legacy-server-test");
@@ -712,6 +893,31 @@ fn newest_session_for_worktree_prefers_latest_matching_update_time() {
     let selected = newest_session_for_worktree(&sessions, "/repo/wt").unwrap();
 
     assert_eq!(selected.id, "new");
+}
+
+#[cfg(windows)]
+#[test]
+fn session_matching_normalizes_windows_separators_and_case() {
+    let session = OpencodeSession {
+        id: "windows".to_string(),
+        directory: Some(r"C:\RÉPO\worktree feature 雪".to_string()),
+        title: None,
+        time_updated: Some("1".to_string()),
+        parent_id: None,
+    };
+
+    assert!(session_matches_worktree(
+        &session,
+        "c:/répo/worktree feature 雪/"
+    ));
+    assert_eq!(
+        newest_session_for_worktree(
+            std::slice::from_ref(&session),
+            "c:/répo/worktree feature 雪"
+        )
+        .map(|session| session.id.as_str()),
+        Some("windows")
+    );
 }
 
 #[test]

@@ -239,6 +239,7 @@ fn sqlite_error_code(error: &sqlx::Error) -> Option<i32> {
 fn database_error_code(error: &crate::persistence::error::DatabaseError) -> Option<i32> {
     let source = match error {
         crate::persistence::error::DatabaseError::Connect { source, .. }
+        | crate::persistence::error::DatabaseError::BackupQuery { source, .. }
         | crate::persistence::error::DatabaseError::Query(source) => source,
         _ => return None,
     };
@@ -855,6 +856,27 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn cached_database_open_restores_externally_changed_journal_mode() {
+        let path = test_path("cached-journal-mode");
+        let writer = open_writable(&path).unwrap();
+        finish_connection(writer, Ok(()), "close initialized writer").unwrap();
+
+        let options = crate::persistence::pools::options(&path, false, false).unwrap();
+        let mut external = run_sqlx(SqliteConnection::connect_with(&options)).unwrap();
+        let mode: String =
+            run_sqlx(sqlx::query_scalar("pragma journal_mode = delete").fetch_one(&mut external))
+                .unwrap();
+        assert_eq!(mode, "delete");
+        run_sqlx(external.close()).unwrap();
+
+        let mut reopened = open_writable(&path).unwrap();
+        assert_eq!(text_pragma(&mut reopened, "journal_mode"), "wal");
+        finish_connection(reopened, Ok(()), "close revalidated writer").unwrap();
+        remove_database(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn database_replacement_at_same_path_is_revalidated() {
         let path = test_path("replacement");
         drop(open_writable(&path).unwrap());
@@ -884,6 +906,45 @@ mod tests {
         fs::write(&path, b"not a sqlite database").unwrap();
         let error = open_writable(&path).unwrap_err();
         assert_eq!(error.kind(), StorageErrorKind::Corruption);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn backup_query_lock_errors_preserve_sqlite_classification() {
+        let path = test_path("backup-query-classification");
+        let mut blocker = open_writable(&path).unwrap();
+        run_sqlx(sqlx::query("begin immediate").execute(&mut blocker)).unwrap();
+        let options = crate::persistence::pools::options_with_writer_busy_timeout(
+            &path,
+            false,
+            false,
+            Duration::ZERO,
+        )
+        .unwrap();
+        let mut contender = run_sqlx(SqliteConnection::connect_with(&options)).unwrap();
+        let source = run_sqlx(sqlx::query("begin immediate").execute(&mut contender))
+            .expect_err("fixture should encounter the held write lock");
+        let elapsed = Duration::from_millis(123);
+        let error = StorageError::from_database(
+            crate::persistence::error::DatabaseError::BackupQuery {
+                path: path.clone(),
+                backup: path.with_extension("backup"),
+                source,
+            },
+            elapsed,
+        );
+
+        assert_eq!(error.kind(), StorageErrorKind::Busy);
+        assert_eq!(error.primary_code(), Some(SQLITE_BUSY));
+        assert_eq!(
+            error.extended_code().map(|code| code & 0xff),
+            Some(SQLITE_BUSY)
+        );
+        assert_eq!(error.busy_elapsed(), Some(elapsed));
+
+        run_sqlx(contender.close()).unwrap();
+        run_sqlx(sqlx::query("rollback").execute(&mut blocker)).unwrap();
+        finish_connection(blocker, Ok(()), "close classification blocker").unwrap();
         remove_database(&path);
     }
 

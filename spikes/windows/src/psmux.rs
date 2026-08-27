@@ -272,6 +272,7 @@ pub fn run_spike() -> SpikeResult {
             "80",
             "-y",
             "24",
+            "pwsh.exe -NoLogo -NoProfile",
         ],
     )?;
     run_mux_strings(

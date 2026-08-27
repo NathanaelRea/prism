@@ -1873,14 +1873,39 @@ pub(super) fn newest_session_for_worktree<'a>(
 }
 
 fn listed_session_matches_worktree(session: &OpencodeSession, worktree_path: &str) -> bool {
-    session.directory.as_deref() == Some(worktree_path)
+    session
+        .directory
+        .as_deref()
+        .is_some_and(|directory| worktree_paths_match(directory, worktree_path))
 }
 
 pub(super) fn session_matches_worktree(session: &OpencodeSession, worktree_path: &str) -> bool {
     session
         .directory
         .as_deref()
-        .is_none_or(|directory| directory == worktree_path)
+        .is_none_or(|directory| worktree_paths_match(directory, worktree_path))
+}
+
+#[cfg(not(windows))]
+fn worktree_paths_match(left: &str, right: &str) -> bool {
+    left == right
+}
+
+#[cfg(windows)]
+fn worktree_paths_match(left: &str, right: &str) -> bool {
+    use windows::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
+
+    let left = left.replace('\\', "/");
+    let right = right.replace('\\', "/");
+    let left = left.trim_end_matches('/');
+    let right = right.trim_end_matches('/');
+    if left.is_empty() || right.is_empty() {
+        return left == right;
+    }
+    let left = left.encode_utf16().collect::<Vec<_>>();
+    let right = right.encode_utf16().collect::<Vec<_>>();
+    // SAFETY: both arguments are valid UTF-16 slices whose lengths are passed to Win32.
+    unsafe { CompareStringOrdinal(&left, &right, true) == CSTR_EQUAL }
 }
 
 pub(super) fn request_path(path: &str, directory: Option<&Path>) -> String {

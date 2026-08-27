@@ -40,6 +40,12 @@ impl DurableWorkflowRunStore {
             )
             .await
             .map_err(persistence)?;
+        {
+            let mut connection = pool.acquire().await.map_err(persistence)?;
+            super::pools::ensure_wal_journal_mode(&mut connection)
+                .await
+                .map_err(|error| WorkflowKernelError::Persistence(error.to_string()))?;
+        }
         WORKFLOW_MIGRATOR
             .run(&pool)
             .await
@@ -585,7 +591,7 @@ mod tests {
     use crate::workflow::step_trigger::TriggerSubject;
 
     #[test]
-    fn durable_store_open_waits_for_a_transient_write_lock() {
+    fn durable_store_open_establishes_wal_after_a_transient_read_lock() {
         let root = std::env::temp_dir().join(format!(
             "prism-workflow-open-lock-{}-{}",
             std::process::id(),
@@ -603,41 +609,45 @@ mod tests {
             .block_on(async {
                 let store = DurableWorkflowRunStore::open(&path).await.unwrap();
                 store.close().await;
+                drop(store);
 
                 let mut blocker = sqlx::SqliteConnection::connect_with(
                     &super::super::pools::options(&path, false, false).unwrap(),
                 )
                 .await
                 .unwrap();
-                sqlx::query("begin immediate")
-                    .execute(&mut blocker)
+                let journal_mode: String = sqlx::query_scalar("pragma journal_mode = delete")
+                    .fetch_one(&mut blocker)
                     .await
                     .unwrap();
-                sqlx::query(
-                    "update workflow_database_identity set schema_epoch = schema_epoch where singleton = 1",
-                )
-                .execute(&mut blocker)
-                .await
-                .unwrap();
+                assert_eq!(journal_mode, "delete");
+                sqlx::query("begin").execute(&mut blocker).await.unwrap();
+                let _: i64 = sqlx::query_scalar("select count(*) from workflow_database_identity")
+                    .fetch_one(&mut blocker)
+                    .await
+                    .unwrap();
 
                 let mut reopening = Box::pin(DurableWorkflowRunStore::open(&path));
                 assert!(
                     tokio::time::timeout(std::time::Duration::from_millis(50), &mut reopening)
                         .await
                         .is_err(),
-                    "workflow open should remain pending while the SQLite lock is held"
+                    "workflow open should remain pending while WAL initialization is locked"
                 );
 
-                sqlx::query("commit")
-                    .execute(&mut blocker)
-                    .await
-                    .unwrap();
+                sqlx::query("rollback").execute(&mut blocker).await.unwrap();
                 blocker.close().await.unwrap();
 
-                let reopened = tokio::time::timeout(super::super::pools::WRITER_BUSY_TIMEOUT, reopening)
+                let reopened =
+                    tokio::time::timeout(super::super::pools::WRITER_BUSY_TIMEOUT, reopening)
+                        .await
+                        .expect("workflow open should finish after the SQLite lock is released")
+                        .expect("workflow open should wait for a transient SQLite lock");
+                let journal_mode: String = sqlx::query_scalar("pragma journal_mode")
+                    .fetch_one(&reopened.pool)
                     .await
-                    .expect("workflow open should finish after the SQLite lock is released")
-                    .expect("workflow open should wait for a transient SQLite lock");
+                    .unwrap();
+                assert_eq!(journal_mode, "wal");
                 reopened.close().await;
             });
         let _ = std::fs::remove_dir_all(root);

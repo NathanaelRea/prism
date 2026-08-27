@@ -609,7 +609,18 @@ mod tests {
     #[tokio::test]
     async fn timeout_covers_blocked_stdin_delivery() {
         let invocation = crate::harness::Invocation {
-            argv: vec!["/bin/sh".into(), "-c".into(), "sleep 10".into()],
+            argv: if cfg!(windows) {
+                vec![
+                    "powershell.exe".into(),
+                    "-NoLogo".into(),
+                    "-NoProfile".into(),
+                    "-NonInteractive".into(),
+                    "-Command".into(),
+                    "Start-Sleep -Seconds 10".into(),
+                ]
+            } else {
+                vec!["/bin/sh".into(), "-c".into(), "sleep 10".into()]
+            },
             environment: std::collections::BTreeMap::new(),
             stdin: Some("x".repeat(1024 * 1024)),
             prompt_file: None,
@@ -649,11 +660,27 @@ mod tests {
     #[tokio::test]
     async fn successful_leader_cleans_up_descendants_before_output_drain() {
         let invocation = crate::harness::Invocation {
-            argv: vec![
-                "/bin/sh".into(),
-                "-c".into(),
-                "sleep 30 & printf '%s\\n' '{\"result\":\"done\"}'".into(),
-            ],
+            argv: if cfg!(windows) {
+                vec![
+                    "powershell.exe".into(),
+                    "-NoLogo".into(),
+                    "-NoProfile".into(),
+                    "-NonInteractive".into(),
+                    "-Command".into(),
+                    concat!(
+                        "$null = Start-Process -FilePath ping.exe ",
+                        "-ArgumentList '-n','31','127.0.0.1' -NoNewWindow; ",
+                        "Write-Output '{\"result\":\"done\"}'"
+                    )
+                    .into(),
+                ]
+            } else {
+                vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "sleep 30 & printf '%s\\n' '{\"result\":\"done\"}'".into(),
+                ]
+            },
             environment: std::collections::BTreeMap::new(),
             stdin: None,
             prompt_file: None,

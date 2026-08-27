@@ -1235,19 +1235,60 @@ fn deferred_merge_cleanup_classification_distinguishes_absence_from_errors() {
 async fn authoritative_pr_absence_cancels_deferred_cleanup_but_errors_preserve_it() {
     let temp = unique_temp_dir("prism-deferred-cleanup-observation-test");
     fs::create_dir_all(&temp).unwrap();
-    let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
+    let worktree = temp.join("worktree");
+    let repo = Repository::with_config_dir_for_test(worktree.clone(), temp.join("config"));
     let mut config = test_config();
+    #[cfg(unix)]
     crate::test_support::install_tool(
         &mut config,
         &temp,
         "git",
         "#!/bin/sh\ncase \"$*\" in\n  *rev-parse*) echo oid-one ;;\n  *status*) echo '## feature' ;;\n  *) exit 1 ;;\nesac\n",
     );
-    let session = test_session(temp.join("worktree"), "feature");
+    #[cfg(windows)]
+    {
+        crate::test_support::use_real_tool(&mut config, "git");
+        let run_git = |command: &mut std::process::Command| {
+            let output = command.output().expect("run Git fixture command");
+            assert!(
+                output.status.success(),
+                "Git fixture command failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run_git(
+            std::process::Command::new("git")
+                .arg("init")
+                .arg("--initial-branch=feature")
+                .arg(&worktree),
+        );
+        run_git(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&worktree)
+                .args([
+                    "-c",
+                    "user.name=Prism Test",
+                    "-c",
+                    "user.email=prism@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "fixture",
+                ]),
+        );
+    }
+    let mut session = test_session(worktree, "feature");
     let warnings = crate::session::deferred_merge_cleanup_warnings(&config, &session).await;
     crate::session::schedule_deferred_merge_cleanup(&repo, &config, &session, &warnings)
         .await
         .unwrap();
+    let initial_cache = PrCache::observed(phase_1_pr_summary("old-head"), None);
+    crate::remote::persist_pr_cache_snapshot(&repo, "feature", &initial_cache).unwrap();
+    session.pr = initial_cache;
     let persisted_session = session.background_job_snapshot();
     let mut tui = Tui::new_single(repo.clone(), config.clone(), vec![session]);
     let repository = tui.repos[0].identity.clone();
@@ -1278,6 +1319,14 @@ async fn authoritative_pr_absence_cancels_deferred_cleanup_but_errors_preserve_i
         assert!(Instant::now() < deadline, "cleanup cancellation timed out");
         std::thread::sleep(Duration::from_millis(10));
     }
+    wait_for_pr_persistence(&mut tui);
+    assert!(
+        crate::remote::load_pr_cache(&repo, "feature")
+            .trusted_summary()
+            .unwrap()
+            .is_none(),
+        "authoritative PR absence was not persisted"
+    );
     assert_eq!(
         crate::session::deferred_merge_cleanup_status(&repo, &config, &persisted_session)
             .await
@@ -1308,6 +1357,7 @@ async fn authoritative_pr_absence_cancels_deferred_cleanup_but_errors_preserve_i
 
     tui.drain_pr_poll_results();
     assert!(tui.deferred_merge_cleanups_in_flight.is_empty());
+    wait_for_pr_persistence(&mut tui);
     assert_eq!(
         crate::session::deferred_merge_cleanup_status(&repo, &config, &persisted_session)
             .await

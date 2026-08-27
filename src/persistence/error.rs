@@ -17,6 +17,11 @@ pub(crate) enum DatabaseError {
         backup: PathBuf,
         source: std::io::Error,
     },
+    BackupQuery {
+        path: PathBuf,
+        backup: PathBuf,
+        source: sqlx::Error,
+    },
     SetPermissions {
         path: PathBuf,
         source: std::io::Error,
@@ -68,6 +73,16 @@ impl fmt::Display for DatabaseError {
                 path.display(),
                 backup.display()
             ),
+            Self::BackupQuery {
+                path,
+                backup,
+                source,
+            } => write!(
+                formatter,
+                "back up database {} to {}: {source}",
+                path.display(),
+                backup.display()
+            ),
             Self::SetPermissions { path, source } => write!(
                 formatter,
                 "set owner-only permissions on {}: {source}",
@@ -101,7 +116,7 @@ impl Error for DatabaseError {
             | Self::Backup { source, .. }
             | Self::SetPermissions { source, .. }
             | Self::Runtime(source) => Some(source),
-            Self::Connect { source, .. } => Some(source),
+            Self::BackupQuery { source, .. } | Self::Connect { source, .. } => Some(source),
             Self::Migrate(source) => Some(source),
             Self::Query(source) => Some(source),
             Self::UnknownHistoricalSchema { .. }

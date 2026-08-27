@@ -90,17 +90,11 @@ pub async fn shutdown_owned_server(runtime: &OpencodeRuntime) -> Result<(), Stri
     let Some(pid) = runtime.server_pid else {
         return Ok(());
     };
-    let owned = match take_matching_owned_server_process(pid, runtime.server_process_identity)
-        .await?
-    {
-        Some(owned) => owned,
-        None => {
-            #[cfg(unix)]
-            return shutdown_external_server_with(runtime, crate::process::process_arguments).await;
-            #[cfg(windows)]
-            return Ok(());
-        }
-    };
+    let owned =
+        match take_matching_owned_server_process(pid, runtime.server_process_identity).await? {
+            Some(owned) => owned,
+            None => return shutdown_external_server(runtime).await,
+        };
     owned
         .control
         .shutdown()
@@ -109,9 +103,15 @@ pub async fn shutdown_owned_server(runtime: &OpencodeRuntime) -> Result<(), Stri
 }
 
 pub(crate) async fn shutdown_stored_server(runtime: &OpencodeRuntime) -> Result<(), String> {
-    shutdown_stored_server_with(runtime, crate::process::process_arguments).await
+    if let Some(pid) = runtime.server_pid
+        && owned_server_process(pid).await
+    {
+        return shutdown_owned_server(runtime).await;
+    }
+    shutdown_external_server(runtime).await
 }
 
+#[cfg(test)]
 pub(super) async fn shutdown_stored_server_with(
     runtime: &OpencodeRuntime,
     inspect_arguments: impl FnOnce(
@@ -127,6 +127,19 @@ pub(super) async fn shutdown_stored_server_with(
     shutdown_external_server_with(runtime, inspect_arguments).await
 }
 
+async fn shutdown_external_server(runtime: &OpencodeRuntime) -> Result<(), String> {
+    let Some(pid) = runtime.server_pid else {
+        return Ok(());
+    };
+    if !stored_server_process_matches(pid, runtime.server_port)
+        .map_err(|error| format!("inspect stored opencode server {pid} before shutdown: {error}"))?
+    {
+        return Ok(());
+    }
+    terminate_external_server(runtime, pid).await
+}
+
+#[cfg(test)]
 async fn shutdown_external_server_with(
     runtime: &OpencodeRuntime,
     inspect_arguments: impl FnOnce(
@@ -142,6 +155,10 @@ async fn shutdown_external_server_with(
     {
         return Ok(());
     }
+    terminate_external_server(runtime, pid).await
+}
+
+async fn terminate_external_server(runtime: &OpencodeRuntime, pid: u32) -> Result<(), String> {
     let recorded =
         crate::process::RecordedProcess::from_stored(pid, runtime.server_process_identity);
     match crate::process::terminate_recorded_process(recorded, Duration::from_secs(1))
@@ -157,6 +174,7 @@ async fn shutdown_external_server_with(
     }
 }
 
+#[cfg(unix)]
 fn stored_server_process_matches(
     pid: u32,
     port: u16,
@@ -164,6 +182,23 @@ fn stored_server_process_matches(
     stored_server_process_matches_with(pid, port, crate::process::process_arguments)
 }
 
+#[cfg(windows)]
+fn stored_server_process_matches(
+    pid: u32,
+    _port: u16,
+) -> Result<bool, crate::process::ProcessLifecycleError> {
+    let Some(observed) = crate::process::process_executable(pid)? else {
+        return Ok(false);
+    };
+    let expected = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .map_err(|source| crate::process::ProcessLifecycleError::Inspect { pid, source })?;
+    let observed = std::fs::canonicalize(observed)
+        .map_err(|source| crate::process::ProcessLifecycleError::Inspect { pid, source })?;
+    Ok(expected == observed)
+}
+
+#[cfg(any(unix, test))]
 fn stored_server_process_matches_with(
     pid: u32,
     port: u16,
@@ -178,6 +213,7 @@ fn stored_server_process_matches_with(
     }))
 }
 
+#[cfg(any(unix, test))]
 pub(super) fn stored_server_args_match(args: &[&str], port: u16) -> bool {
     let port = port.to_string();
     args.windows(2).any(|window| window[1] == "serve")
@@ -193,7 +229,7 @@ fn owned_server_processes() -> &'static tokio::sync::Mutex<BTreeMap<u32, OwnedSe
     OWNED_SERVER_PROCESSES.get_or_init(|| tokio::sync::Mutex::new(BTreeMap::new()))
 }
 
-#[cfg(any(windows, test))]
+#[cfg(all(test, unix))]
 pub(super) async fn record_owned_server_process(control: crate::process::ProcessControl) {
     let pid = control.pid();
     let process = OwnedServerProcess {

@@ -20,7 +20,7 @@ use crate::util::{safe_branch_filename, stable_hash};
 const EXISTING_SESSION_READY_WAIT: Duration = Duration::from_millis(250);
 const CREATED_SESSION_READY_WAIT: Duration = Duration::from_secs(2);
 const SESSION_READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
-const AGENT_INPUT_READY_WAIT: Duration = Duration::from_secs(5);
+const AGENT_INPUT_READY_WAIT: Duration = Duration::from_secs(30);
 const OPENCODE_RUNTIME_OPTION: &str = "@prism-opencode-runtime";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -173,18 +173,14 @@ async fn ensure_tmux_agent_session(
             )
             .await?;
             ensure_companion_windows(config, session, runtime_session).await?;
-            return Ok(wait_for_agent_session_running(
+            return Ok(wait_for_agent_session_ready(
                 config,
                 runtime_session,
                 CREATED_SESSION_READY_WAIT,
             )
             .await);
-        } else if wait_for_agent_session_running(
-            config,
-            runtime_session,
-            EXISTING_SESSION_READY_WAIT,
-        )
-        .await
+        } else if wait_for_agent_session_ready(config, runtime_session, EXISTING_SESSION_READY_WAIT)
+            .await
         {
             ensure_companion_windows(config, session, runtime_session).await?;
             return Ok(true);
@@ -203,7 +199,7 @@ async fn ensure_tmux_agent_session(
     )
     .await?;
     ensure_companion_windows(config, session, runtime_session).await?;
-    Ok(wait_for_agent_session_running(config, runtime_session, CREATED_SESSION_READY_WAIT).await)
+    Ok(wait_for_agent_session_ready(config, runtime_session, CREATED_SESSION_READY_WAIT).await)
 }
 
 pub async fn paste_agent_prompt(
@@ -897,8 +893,32 @@ async fn wait_for_agent_session_running(
     }
 }
 
+async fn wait_for_agent_session_ready(
+    config: &Config,
+    runtime: &TmuxAgentSession,
+    running_timeout: Duration,
+) -> bool {
+    if !wait_for_agent_session_running(config, runtime, running_timeout).await {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        wait_for_agent_input_ready(
+            config,
+            &runtime.target(TmuxWindow::Agent),
+            AGENT_INPUT_READY_WAIT,
+        )
+        .await
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = config;
+        true
+    }
+}
+
 async fn wait_for_agent_input_ready(config: &Config, name: &str, timeout: Duration) -> bool {
-    if config.default_agent != "opencode" {
+    if !selected_agent_uses_opencode_adapter(config) {
         return true;
     }
     let started = Instant::now();
@@ -917,8 +937,12 @@ async fn wait_for_agent_input_ready(config: &Config, name: &str, timeout: Durati
     }
 }
 
+fn selected_agent_uses_opencode_adapter(config: &Config) -> bool {
+    config.selected_adapter_is("opencode")
+}
+
 fn opencode_input_ready(output: &str) -> bool {
-    output.contains("Ask anything") || output.contains("ctrl+p commands")
+    output.contains("Ask anything") || (output.contains("ctrl+p") && output.contains("commands"))
 }
 
 pub(crate) async fn capture_agent_pane(
@@ -967,9 +991,27 @@ async fn capture_pane(
     target: &str,
     include_styles: bool,
 ) -> Result<String, String> {
+    #[cfg(windows)]
+    if selected_agent_uses_opencode_adapter(config)
+        && let Ok(output) = capture_pane_mode(config, target, include_styles, true).await
+    {
+        return Ok(output);
+    }
+    capture_pane_mode(config, target, include_styles, false).await
+}
+
+async fn capture_pane_mode(
+    config: &Config,
+    target: &str,
+    include_styles: bool,
+    alternate_screen: bool,
+) -> Result<String, String> {
     let mut command = Command::new(config.tool("tmux"))
         .env_remove("TMUX")
         .args(["capture-pane", "-p"]);
+    if alternate_screen {
+        command = command.arg("-a");
+    }
     if include_styles {
         command = command.args(["-e", "-N"]);
     }
@@ -1235,7 +1277,33 @@ fn pane_command_matches_agent(config: &Config, pane_command: &str) -> bool {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(&expected);
-    pane_command == expected
+    executable_names_match(expected, pane_command)
+}
+
+fn executable_names_match(expected: &str, observed: &str) -> bool {
+    #[cfg(windows)]
+    {
+        fn without_launcher_extension(name: &str) -> &str {
+            let Some((stem, extension)) = name.rsplit_once('.') else {
+                return name;
+            };
+            if ["exe", "cmd", "bat", "com"]
+                .iter()
+                .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+            {
+                stem
+            } else {
+                name
+            }
+        }
+
+        without_launcher_extension(expected)
+            .eq_ignore_ascii_case(without_launcher_extension(observed))
+    }
+    #[cfg(not(windows))]
+    {
+        expected == observed
+    }
 }
 
 fn selected_adapter_is(config: &Config, adapter: &str) -> bool {
@@ -1377,9 +1445,15 @@ mod tests {
         InteractiveAgentLaunch, TmuxAgentSession, TmuxWindow, attach_or_create_agent,
         attach_or_create_window, capture_agent_pane, create_configured_agent_session,
         ensure_agent_session, latest_agent_session_generation, migrate_legacy_agent_sessions,
-        pane_command_matches_agent, pane_start_command_matches_agent, paste_agent_prompt,
-        run_tmux_daemonizing_status, session_exists,
+        opencode_input_ready, pane_command_matches_agent, pane_start_command_matches_agent,
+        paste_agent_prompt, run_tmux_daemonizing_status, session_exists,
     };
+
+    #[test]
+    fn opencode_readiness_accepts_a_wrapped_command_hint() {
+        assert!(opencode_input_ready("ctrl+p\ncommands"));
+        assert!(!opencode_input_ready("starting OpenCode"));
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn daemonizing_tmux_client_observes_task_local_cancellation() {
@@ -1667,7 +1741,10 @@ exit 0
             .insert("opencode".to_string(), "opencode".to_string());
 
         assert!(pane_command_matches_agent(&config, "opencode"));
+        #[cfg(not(windows))]
         assert!(!pane_command_matches_agent(&config, "opencode.exe"));
+        #[cfg(windows)]
+        assert!(pane_command_matches_agent(&config, "opencode.exe"));
         assert!(!pane_command_matches_agent(&config, "bash"));
         assert!(!pane_command_matches_agent(&config, "zsh"));
         assert!(pane_start_command_matches_agent(
@@ -1679,6 +1756,16 @@ exit 0
             r#"& '/usr/local/bin/opencode' 'attach' 'http://127.0.0.1:41000'"#
         ));
         assert!(!pane_start_command_matches_agent(&config, r#""/bin/bash""#));
+
+        #[cfg(windows)]
+        {
+            config.tools.insert(
+                "opencode".to_string(),
+                r"C:\Users\tester\AppData\Roaming\npm\opencode.cmd".to_string(),
+            );
+            assert!(pane_command_matches_agent(&config, "opencode"));
+            assert!(pane_command_matches_agent(&config, "OPENCODE.EXE"));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2965,5 +3052,21 @@ exit 0
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+    }
+}
+
+#[cfg(test)]
+mod adapter_tests {
+    #[test]
+    fn custom_opencode_harness_uses_opencode_terminal_contract() {
+        let mut config = crate::test_support::test_config();
+        config.default_harness = "company".to_string();
+        config.default_agent = "company".to_string();
+        config.harnesses.insert(
+            "company".to_string(),
+            crate::harness::HarnessConfig::opencode("opencode"),
+        );
+
+        assert!(super::selected_agent_uses_opencode_adapter(&config));
     }
 }

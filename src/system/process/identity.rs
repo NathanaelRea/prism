@@ -270,6 +270,13 @@ pub fn process_arguments(pid: u32) -> Result<Option<Vec<String>>, ProcessLifecyc
     native_process_arguments(pid).map_err(|source| ProcessLifecycleError::Inspect { pid, source })
 }
 
+#[cfg(windows)]
+pub fn process_executable(pid: u32) -> Result<Option<std::path::PathBuf>, ProcessLifecycleError> {
+    process_arguments(pid).map(|arguments| {
+        arguments.and_then(|arguments| arguments.into_iter().next().map(std::path::PathBuf::from))
+    })
+}
+
 fn native_process_observation(pid: u32) -> Result<NativeProcessObservation, ProcessLifecycleError> {
     if !probe_process(pid).map_err(|source| ProcessLifecycleError::Inspect { pid, source })? {
         return Ok(NativeProcessObservation::Missing);

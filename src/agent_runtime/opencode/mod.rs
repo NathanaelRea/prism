@@ -116,13 +116,7 @@ async fn ensure_opencode_server_locked(
     }
 
     let runtime_identity = format!("{}:{harness_id}", repo.root.display());
-    let stored_port = runtimes
-        .iter()
-        .filter(|runtime| {
-            runtime.server_pid.is_some() && server::stored_server_identity_is_valid(runtime)
-        })
-        .min_by_key(|runtime| (runtime.server_port, runtime.server_url.as_str()))
-        .map(|runtime| runtime.server_port);
+    let stored_port = stop_unhealthy_stored_servers(&runtimes).await?;
     let port = server::allocate_port(
         &runtime_identity,
         "",
@@ -152,23 +146,18 @@ async fn ensure_opencode_server_locked(
         return Ok(runtime);
     }
 
+    #[cfg(unix)]
     let command = crate::process::Command::new(program)
         .arg("serve")
         .args(["--hostname", "127.0.0.1"])
         .args(["--port", &port.to_string()])
         .current_dir(&repo.root);
+    #[cfg(windows)]
+    let command = windows_server_supervisor_command(program, &repo.root, port)?;
 
-    #[cfg(unix)]
     let mut started_server = crate::process::spawn_verified_detached(command)
         .await
         .map_err(|error| format!("start opencode server: {error}"))?;
-    #[cfg(windows)]
-    let mut started_server = crate::process::spawn_owned(
-        command,
-        crate::process::ProcessDescriptor::new("opencode.server.serve"),
-    )
-    .await
-    .map_err(|error| format!("start opencode server: {error}"))?;
     let server_pid = started_server.pid();
     let server_process_identity = match started_server.identity() {
         Some(identity) => Some(identity),
@@ -233,7 +222,10 @@ async fn ensure_opencode_server_locked(
             Err(cleanup) => Err(format!("{error}; startup cleanup failed: {cleanup}")),
         };
     }
-    commit_started_server(started_server).await;
+    if let Err(error) = commit_started_server(started_server).await {
+        rollback_starting_runtime(repo, &runtime, existing.as_ref());
+        return Err(format!("commit opencode server startup: {error}"));
+    }
     Ok(runtime)
 }
 
@@ -250,49 +242,61 @@ fn rollback_starting_runtime(
     }
 }
 
-#[cfg(unix)]
+#[cfg(windows)]
+fn windows_server_supervisor_command(
+    program: &str,
+    repository: &Path,
+    port: u16,
+) -> Result<crate::process::Command, String> {
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("locate Prism for OpenCode server supervision: {error}"))?;
+    Ok(crate::process::Command::new(executable)
+        .arg("__opencode-server")
+        .arg(program)
+        .arg(repository)
+        .arg(port.to_string()))
+}
+
+#[cfg(windows)]
+pub(crate) async fn run_server_supervisor(
+    program: &Path,
+    repository: &Path,
+    port: u16,
+) -> Result<(), String> {
+    let command = crate::process::Command::new(program)
+        .arg("serve")
+        .args(["--hostname", "127.0.0.1"])
+        .args(["--port", &port.to_string()])
+        .current_dir(repository);
+    let control = crate::process::spawn_owned(
+        command,
+        crate::process::ProcessDescriptor::new("opencode.server.supervised"),
+    )
+    .await
+    .map_err(|error| format!("start supervised opencode server: {error}"))?;
+    let pid = control.pid();
+    let completion = control.wait().await;
+    Err(format!(
+        "supervised opencode server {pid} exited unexpectedly: {completion:?}"
+    ))
+}
+
 fn validate_started_server(
     server: &mut crate::process::VerifiedDetachedProcess,
 ) -> Result<(), String> {
     server.ensure_leader_running()
 }
 
-#[cfg(windows)]
-fn validate_started_server(server: &mut crate::process::ProcessControl) -> Result<(), String> {
-    if server.is_finished() {
-        Err(format!(
-            "opencode server {} exited during startup",
-            server.pid()
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(unix)]
 async fn stop_started_server(
     server: crate::process::VerifiedDetachedProcess,
 ) -> Result<(), String> {
     server.shutdown().await
 }
 
-#[cfg(windows)]
-async fn stop_started_server(server: crate::process::ProcessControl) -> Result<(), String> {
-    let pid = server.pid();
-    server
-        .shutdown()
-        .await
-        .map_err(|error| format!("stop opencode server {pid}: {error}"))
-}
-
-#[cfg(unix)]
-async fn commit_started_server(server: crate::process::VerifiedDetachedProcess) {
-    server.detach();
-}
-
-#[cfg(windows)]
-async fn commit_started_server(server: crate::process::ProcessControl) {
-    server::record_owned_server_process(server).await;
+async fn commit_started_server(
+    server: crate::process::VerifiedDetachedProcess,
+) -> Result<(), String> {
+    server.detach().map(|_| ())
 }
 
 async fn healthy_shared_runtime(runtimes: &[OpencodeRuntime]) -> Option<OpencodeRuntime> {
@@ -312,6 +316,30 @@ async fn healthy_shared_runtime(runtimes: &[OpencodeRuntime]) -> Option<Opencode
         }
     }
     None
+}
+
+async fn stop_unhealthy_stored_servers(
+    runtimes: &[OpencodeRuntime],
+) -> Result<Option<u16>, String> {
+    let mut servers = BTreeMap::new();
+    for runtime in runtimes {
+        let Some(pid) = runtime.server_pid else {
+            continue;
+        };
+        if server::stored_server_identity_is_valid(runtime) {
+            servers
+                .entry((pid, runtime.server_process_identity))
+                .or_insert(runtime);
+        }
+    }
+    let stored_port = servers
+        .values()
+        .min_by_key(|runtime| (runtime.server_port, runtime.server_url.as_str()))
+        .map(|runtime| runtime.server_port);
+    for runtime in servers.into_values() {
+        server::shutdown_stored_server(runtime).await?;
+    }
+    Ok(stored_port)
 }
 
 #[allow(dead_code, reason = "optional OpenCode session lifecycle API")]

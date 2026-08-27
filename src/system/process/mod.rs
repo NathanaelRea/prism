@@ -1,7 +1,6 @@
 //! Async process execution built directly on ProcessKit.
 
 mod capture;
-#[cfg(unix)]
 mod detached;
 mod execution;
 mod identity;
@@ -14,7 +13,6 @@ use std::env;
 use std::future::Future;
 use std::path::Path;
 
-#[cfg(unix)]
 pub(crate) use detached::{VerifiedDetachedProcess, spawn_verified_detached};
 #[cfg(all(test, unix))]
 pub use execution::run_output;
@@ -23,10 +21,13 @@ pub use execution::{
     run_capture, run_capture_named, run_output_allow_failure, run_output_allow_failure_named,
     run_output_named, run_status, run_status_named, run_status_with_stdin_named,
 };
+#[cfg(unix)]
+pub use identity::process_arguments;
+#[cfg(windows)]
+pub use identity::process_executable;
 pub use identity::{
     ProcessIdentity, ProcessLifecycleError, ProcessObservation, RecordedProcess,
-    TerminationOutcome, observe_process, process_arguments, record_process,
-    terminate_recorded_process,
+    TerminationOutcome, observe_process, record_process, terminate_recorded_process,
 };
 pub use interactive::{
     run_status_attached_named, run_status_inherited, run_status_inherited_named,

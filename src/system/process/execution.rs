@@ -129,7 +129,6 @@ pub enum ProcessInput<'a> {
 #[derive(Debug)]
 pub struct ProcessExecutionError {
     source: Option<ProcessKitError>,
-    message: Option<&'static str>,
     pub stdout: CapturedBytes,
     pub stderr: CapturedBytes,
     pub elapsed: Duration,
@@ -149,7 +148,7 @@ impl fmt::Display for ProcessExecutionError {
         if let Some(source) = self.source.as_ref() {
             source.fmt(formatter)
         } else {
-            formatter.write_str(self.message.unwrap_or("subprocess capture was incomplete"))
+            formatter.write_str("subprocess output pipes did not fully drain before completion")
         }
     }
 }
@@ -297,7 +296,6 @@ async fn execute_configured(
             );
             return Err(ProcessExecutionError {
                 source: Some(source),
-                message: None,
                 stdout,
                 stderr,
                 elapsed: started.elapsed(),
@@ -322,7 +320,6 @@ async fn execute_configured(
             );
             return Err(ProcessExecutionError {
                 source: Some(source),
-                message: None,
                 stdout,
                 stderr,
                 elapsed: started.elapsed(),
@@ -343,7 +340,6 @@ async fn execute_configured(
         );
         return Err(ProcessExecutionError {
             source: None,
-            message: Some("subprocess output pipes did not fully drain before completion"),
             stdout,
             stderr,
             elapsed: started.elapsed(),
@@ -541,6 +537,11 @@ mod tests {
 
     fn shell(script: &str) -> Command {
         Command::new("sh").args(["-c", script])
+    }
+
+    #[test]
+    fn process_execution_error_stays_below_clippys_large_error_threshold() {
+        assert!(std::mem::size_of::<ProcessExecutionError>() < 128);
     }
 
     #[tokio::test]

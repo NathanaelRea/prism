@@ -36,7 +36,43 @@ pub(crate) fn open_writable(path: &Path) -> Result<SqliteConnection, DatabaseErr
 
 pub(crate) fn connect_writable(path: &Path) -> Result<SqliteConnection, DatabaseError> {
     let options = writable_options(path, false)?;
-    connect(path, options)
+    let mut connection = connect(path, options)?;
+    let journal_mode = match writable_journal_mode(&mut connection) {
+        Ok(mode) => mode,
+        Err(error) => return finish_connection(connection, Err(error)),
+    };
+    if journal_mode.eq_ignore_ascii_case("wal") {
+        return Ok(connection);
+    }
+
+    // A supported external writer such as `prism db` can change the persistent journal mode
+    // after Unix inode validation was cached. Close the checked connection before restoring WAL;
+    // changing journal mode while it remains open would require an unavailable exclusive lock.
+    finish_connection(connection, Ok(()))?;
+    initialize(path)?;
+
+    let options = writable_options(path, false)?;
+    let mut connection = connect(path, options)?;
+    let journal_mode = match writable_journal_mode(&mut connection) {
+        Ok(mode) => mode,
+        Err(error) => return finish_connection(connection, Err(error)),
+    };
+    if journal_mode.eq_ignore_ascii_case("wal") {
+        Ok(connection)
+    } else {
+        finish_connection(
+            connection,
+            Err(DatabaseError::InvalidValue {
+                field: "journal_mode",
+                value: journal_mode,
+            }),
+        )
+    }
+}
+
+fn writable_journal_mode(connection: &mut SqliteConnection) -> Result<String, DatabaseError> {
+    // SQLX_RUNTIME_SQL: SQLite journal policy is verified with a read-only PRAGMA.
+    block_on(sqlx::query_scalar::<_, String>("pragma journal_mode").fetch_one(connection))
 }
 
 pub(crate) fn open_readonly(path: &Path) -> Result<SqliteConnection, DatabaseError> {

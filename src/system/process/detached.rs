@@ -1,7 +1,9 @@
-//! Verified warm-daemon spawning for the Unix lifecycle exceptions.
+//! Verified warm-daemon spawning for lifecycle exceptions that must survive Prism.
 
+#[cfg(unix)]
 use std::io;
 
+#[cfg(unix)]
 use processkit::StdioMode;
 
 use super::{Command, ProcessLifecycleError, RecordedProcess, record_process};
@@ -14,7 +16,10 @@ use super::{Command, ProcessLifecycleError, RecordedProcess, record_process};
 #[derive(Debug)]
 pub(crate) struct VerifiedDetachedProcess {
     recorded: RecordedProcess,
+    #[cfg(unix)]
     child: Option<tokio::process::Child>,
+    #[cfg(windows)]
+    process_handle: Option<std::os::windows::io::OwnedHandle>,
 }
 
 impl VerifiedDetachedProcess {
@@ -28,16 +33,13 @@ impl VerifiedDetachedProcess {
             .map(super::ProcessIdentity::stored_value)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn recorded(&self) -> RecordedProcess {
         self.recorded
     }
 
     /// Confirm that the persisted leader is still the warm server process.
-    ///
-    /// If it exited after starting descendants, kill the session immediately;
-    /// persisting only the dead leader would otherwise lose the authority to
-    /// clean those descendants up safely.
+    #[cfg(unix)]
     pub(crate) fn ensure_leader_running(&mut self) -> Result<(), String> {
         let Some(child) = self.child.as_mut() else {
             return Err("detached process startup capability was already released".to_string());
@@ -51,8 +53,8 @@ impl VerifiedDetachedProcess {
 
         let cleanup = signal_session(self.recorded.pid);
         // try_wait reaped the leader. Signal the session before releasing the
-        // handle so any surviving process-group identifier cannot outlive this
-        // startup capability.
+        // handle so surviving group members cannot outlive this startup
+        // capability.
         self.child.take();
         match cleanup {
             Ok(()) => Err(format!(
@@ -66,40 +68,108 @@ impl VerifiedDetachedProcess {
         }
     }
 
+    #[cfg(windows)]
+    pub(crate) fn ensure_leader_running(&mut self) -> Result<(), String> {
+        let Some(handle) = self.process_handle.as_ref() else {
+            return Err("detached process startup capability was already released".to_string());
+        };
+        if windows_process_running(handle)? {
+            Ok(())
+        } else {
+            self.process_handle.take();
+            Err(format!(
+                "detached process {} exited during startup",
+                self.recorded.pid
+            ))
+        }
+    }
+
+    #[cfg(unix)]
     pub(crate) async fn shutdown(mut self) -> Result<(), String> {
+        let Some(mut child) = self.child.take() else {
+            return Ok(());
+        };
         let signal_result = signal_session(self.recorded.pid);
-        let wait_result =
-            if let Some(mut child) = self.child.take() {
-                if signal_result.is_err() {
-                    let _ = child.start_kill();
-                }
-                child.wait().await.map(|_| ()).map_err(|error| {
-                    format!("reap detached process {}: {error}", self.recorded.pid)
-                })
-            } else {
-                Ok(())
-            };
+        if signal_result.is_err() {
+            let _ = child.start_kill();
+        }
+        let wait_result = child
+            .wait()
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("reap detached process {}: {error}", self.recorded.pid));
         signal_result?;
         wait_result
     }
 
-    /// Commit the warm daemon and reap its leader in the background while this
-    /// Prism process remains alive. Runtime shutdown deliberately leaves the
-    /// verified daemon running.
-    pub(crate) fn detach(mut self) -> RecordedProcess {
+    #[cfg(windows)]
+    pub(crate) async fn shutdown(mut self) -> Result<(), String> {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::Threading::TerminateProcess;
+
+        let Some(handle) = self.process_handle.take() else {
+            return Ok(());
+        };
+        if windows_process_running(&handle)? {
+            // SAFETY: this retained handle was returned by CreateProcessW with
+            // PROCESS_TERMINATE access and remains valid for this scope.
+            unsafe {
+                TerminateProcess(HANDLE(handle.as_raw_handle()), 1).map_err(|error| {
+                    format!("terminate detached process {}: {error}", self.recorded.pid)
+                })?;
+            }
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        while windows_process_running(&handle)? {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "detached process {} did not stop within one second",
+                    self.recorded.pid
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        Ok(())
+    }
+
+    /// Commit the warm daemon after every fallible startup check has passed.
+    #[cfg(unix)]
+    pub(crate) fn detach(mut self) -> Result<RecordedProcess, String> {
         if let Some(mut child) = self.child.take() {
             tokio::spawn(async move {
                 let _ = child.wait().await;
             });
         }
-        self.recorded
+        Ok(self.recorded)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn detach(mut self) -> Result<RecordedProcess, String> {
+        self.process_handle.take();
+        Ok(self.recorded)
     }
 }
 
+#[cfg(unix)]
 impl Drop for VerifiedDetachedProcess {
     fn drop(&mut self) {
         if self.child.is_some() {
             let _ = signal_session(self.recorded.pid);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for VerifiedDetachedProcess {
+    fn drop(&mut self) {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::Threading::TerminateProcess;
+
+        if let Some(handle) = self.process_handle.as_ref() {
+            // SAFETY: the retained CreateProcessW handle remains valid here.
+            let _ = unsafe { TerminateProcess(HANDLE(handle.as_raw_handle()), 1) };
         }
     }
 }
@@ -119,6 +189,7 @@ pub(crate) async fn spawn_verified_detached(
     spawn_verified_detached_with(command, record_process).await
 }
 
+#[cfg(unix)]
 async fn spawn_verified_detached_with(
     command: Command,
     recorder: impl FnOnce(u32) -> Result<RecordedProcess, ProcessLifecycleError>,
@@ -159,6 +230,175 @@ async fn spawn_verified_detached_with(
     }
 }
 
+#[cfg(windows)]
+async fn spawn_verified_detached_with(
+    command: Command,
+    recorder: impl FnOnce(u32) -> Result<RecordedProcess, ProcessLifecycleError>,
+) -> Result<VerifiedDetachedProcess, String> {
+    let display = crate::observability::sanitize_command_text(&command.command_line());
+    let (pid, process_handle) = spawn_windows_without_inherited_handles(&command)
+        .map_err(|error| format!("{display}: {error}"))?;
+    let mut process = VerifiedDetachedProcess {
+        recorded: RecordedProcess::from_stored(pid, None),
+        process_handle: Some(process_handle),
+    };
+
+    let identity_error = match recorder(pid) {
+        Ok(recorded) if recorded.identity.is_some() => {
+            process.recorded = recorded;
+            return Ok(process);
+        }
+        Ok(_) => {
+            format!("{display}: record process {pid} identity: reusable identity is unavailable")
+        }
+        Err(error) => format!("{display}: record process {pid} identity: {error}"),
+    };
+    match process.shutdown().await {
+        Ok(()) => Err(identity_error),
+        Err(cleanup) => Err(format!("{identity_error}; cleanup failed: {cleanup}")),
+    }
+}
+
+#[cfg(windows)]
+fn spawn_windows_without_inherited_handles(
+    command: &Command,
+) -> Result<(u32, std::os::windows::io::OwnedHandle), String> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::io::FromRawHandle as _;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        CREATE_NEW_PROCESS_GROUP, CreateProcessW, DETACHED_PROCESS, PROCESS_INFORMATION,
+        STARTUPINFOW,
+    };
+    use windows::core::{PCWSTR, PWSTR};
+
+    if command.configured_arg0().is_some() || !command.env_overrides().is_empty() {
+        return Err(
+            "detached Windows launch does not support argv[0] or environment overrides".to_string(),
+        );
+    }
+
+    let mut application = command.program().encode_wide().collect::<Vec<_>>();
+    if application.contains(&0) {
+        return Err("detached Windows program contains a NUL code unit".to_string());
+    }
+    application.push(0);
+
+    let mut command_line = Vec::new();
+    push_windows_quoted_argument(&mut command_line, command.program())?;
+    for argument in command.arguments() {
+        command_line.push(u16::from(b' '));
+        push_windows_quoted_argument(&mut command_line, argument)?;
+    }
+    command_line.push(0);
+
+    let current_directory = command
+        .working_dir()
+        .map(|path| {
+            let mut value = path.as_os_str().encode_wide().collect::<Vec<_>>();
+            if value.contains(&0) {
+                return Err(
+                    "detached Windows working directory contains a NUL code unit".to_string(),
+                );
+            }
+            value.push(0);
+            Ok(value)
+        })
+        .transpose()?;
+    let current_directory = current_directory
+        .as_ref()
+        .map_or(PCWSTR::null(), |value| PCWSTR(value.as_ptr()));
+
+    let startup = STARTUPINFOW {
+        cb: u32::try_from(std::mem::size_of::<STARTUPINFOW>())
+            .expect("STARTUPINFOW size fits in u32"),
+        ..Default::default()
+    };
+    let mut process = PROCESS_INFORMATION::default();
+    // SAFETY: every string is NUL-terminated and remains live across the call;
+    // the output structure is valid. Handle inheritance is deliberately false
+    // so a warm server cannot keep a caller's PowerShell capture pipe open.
+    unsafe {
+        CreateProcessW(
+            PCWSTR(application.as_ptr()),
+            Some(PWSTR(command_line.as_mut_ptr())),
+            None,
+            None,
+            false,
+            DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+            None,
+            current_directory,
+            &startup,
+            &mut process,
+        )
+        .map_err(|error| format!("CreateProcessW failed: {error}"))?;
+    }
+    // SAFETY: CreateProcessW returned two owned handles. The process handle is
+    // transferred to OwnedHandle; the initial thread handle is no longer needed.
+    let process_handle = unsafe {
+        let handle = std::os::windows::io::OwnedHandle::from_raw_handle(process.hProcess.0);
+        let _ = CloseHandle(process.hThread);
+        handle
+    };
+    Ok((process.dwProcessId, process_handle))
+}
+
+#[cfg(windows)]
+fn push_windows_quoted_argument(
+    output: &mut Vec<u16>,
+    argument: &std::ffi::OsStr,
+) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    let argument = argument.encode_wide().collect::<Vec<_>>();
+    if argument.contains(&0) {
+        return Err("detached Windows argument contains a NUL code unit".to_string());
+    }
+
+    output.push(u16::from(b'"'));
+    let mut backslashes = 0_usize;
+    for unit in argument {
+        match unit {
+            value if value == u16::from(b'\\') => backslashes += 1,
+            value if value == u16::from(b'"') => {
+                output.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes * 2 + 1));
+                output.push(value);
+                backslashes = 0;
+            }
+            value => {
+                output.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes));
+                output.push(value);
+                backslashes = 0;
+            }
+        }
+    }
+    output.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes * 2));
+    output.push(u16::from(b'"'));
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_process_running(handle: &std::os::windows::io::OwnedHandle) -> Result<bool, String> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows::Win32::Foundation::{HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::WaitForSingleObject;
+
+    // SAFETY: the retained CreateProcessW handle remains valid for this call.
+    let status = unsafe { WaitForSingleObject(HANDLE(handle.as_raw_handle()), 0) };
+    match status {
+        WAIT_OBJECT_0 => Ok(false),
+        WAIT_TIMEOUT => Ok(true),
+        WAIT_FAILED => Err(format!(
+            "wait for detached Windows process: {}",
+            std::io::Error::last_os_error()
+        )),
+        status => Err(format!(
+            "wait for detached Windows process returned unexpected status {status:?}"
+        )),
+    }
+}
+
+#[cfg(unix)]
 fn signal_session(pid: u32) -> Result<(), String> {
     let native_pid = i32::try_from(pid)
         .map_err(|_| format!("cannot terminate detached process group for invalid pid {pid}"))?;
@@ -175,7 +415,75 @@ fn signal_session(pid: u32) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use crate::process::{ProcessObservation, observe_process};
+    use std::ffi::OsStr;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    fn quoted(argument: &OsStr) -> String {
+        let mut output = Vec::new();
+        push_windows_quoted_argument(&mut output, argument).expect("quote Windows argument");
+        String::from_utf16(&output).expect("quoted argument is valid UTF-16")
+    }
+
+    #[test]
+    fn windows_argument_quoting_escapes_quotes_and_trailing_backslashes() {
+        assert_eq!(quoted(OsStr::new("plain")), "\"plain\"");
+        assert_eq!(quoted(OsStr::new("two words")), "\"two words\"");
+        assert_eq!(quoted(OsStr::new("say\"hi")), "\"say\\\"hi\"");
+        assert_eq!(quoted(OsStr::new("ends\\")), "\"ends\\\\\"");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn windows_identity_capture_failure_terminates_detached_process() {
+        let observed = Arc::new(Mutex::new(None));
+        let recorder_observation = Arc::clone(&observed);
+        let powershell = std::path::PathBuf::from(
+            std::env::var_os("SystemRoot").expect("Windows SystemRoot is available"),
+        )
+        .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let command = Command::new(powershell).args([
+            "-NoLogo",
+            "-NoProfile",
+            "-Command",
+            "Start-Sleep -Seconds 30",
+        ]);
+
+        let error = spawn_verified_detached_with(command, move |pid| {
+            *recorder_observation
+                .lock()
+                .expect("lock detached process observation") =
+                Some(record_process(pid).expect("record detached Windows process"));
+            Err(ProcessLifecycleError::Inspect {
+                pid,
+                source: std::io::Error::other("injected identity failure"),
+            })
+        })
+        .await
+        .expect_err("injected identity capture should fail");
+
+        assert!(error.contains("injected identity failure"));
+        let recorded = observed
+            .lock()
+            .expect("lock detached process result")
+            .expect("detached Windows process was recorded");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while observe_process(recorded).expect("observe detached Windows process")
+            != ProcessObservation::Missing
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "detached Windows process survived failed identity capture"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::process::{ProcessObservation, observe_process};
@@ -314,7 +622,7 @@ mod tests {
             observe_process(recorded).expect("observe verified detached fixture"),
             ProcessObservation::RunningSameProcess
         );
-        process.detach();
+        process.detach().expect("commit verified detached fixture");
         crate::process::terminate_recorded_process(recorded, Duration::from_millis(100))
             .await
             .expect("terminate verified detached fixture");

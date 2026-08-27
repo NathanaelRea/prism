@@ -21,8 +21,21 @@ pub fn run() -> Pin<Box<dyn Future<Output = Result<(), String>>>> {
 }
 
 async fn run_inner() -> Result<(), String> {
-    let _dev_install_reader = dev_install::reader_lease_from_environment()?;
     let args = Args::parse(std::env::args_os().skip(1))?;
+    #[cfg(windows)]
+    if let CommandKind::OpencodeServerSupervisor {
+        program,
+        repository,
+        port,
+    } = &args.command
+    {
+        return crate::opencode::run_server_supervisor(program, repository, *port).await;
+    }
+    #[cfg(not(windows))]
+    if matches!(args.command, CommandKind::OpencodeServerSupervisor { .. }) {
+        return Err("the OpenCode server supervisor is only available on Windows".to_string());
+    }
+    let _dev_install_reader = dev_install::reader_lease_from_environment()?;
     if let CommandKind::PrepareDevState {
         source,
         destination,
@@ -116,6 +129,9 @@ async fn run_inner() -> Result<(), String> {
         }
         CommandKind::Worker(command) => run_worker_command(command).await,
         CommandKind::PrepareDevState { .. } => unreachable!("handled before logging setup"),
+        CommandKind::OpencodeServerSupervisor { .. } => {
+            unreachable!("handled before logging setup")
+        }
         CommandKind::List(options) => run_list_command(args.repo.as_deref(), options).await,
         CommandKind::Status(options) => run_status_command(args.repo.as_deref(), options).await,
         CommandKind::Pause(selector) => {

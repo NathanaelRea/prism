@@ -2,6 +2,10 @@
 param()
 
 $ErrorActionPreference = "Stop"
+$utf8NoBom = [Text.UTF8Encoding]::new($false)
+$OutputEncoding = $utf8NoBom
+[Console]::InputEncoding = $utf8NoBom
+[Console]::OutputEncoding = $utf8NoBom
 if (-not $IsWindows -or $PSVersionTable.PSEdition -ne "Core") {
     throw "scripts/windows-platform-smoke.ps1 requires native Windows and PowerShell 7"
 }
@@ -155,7 +159,7 @@ git = "$(ConvertTo-TomlString $git)"
         throw "replacement ensure did not retain the durable psmux/OpenCode identity"
     }
     $replacementWindows = @(& $psmux list-windows -t $session -F "#{window_name}")
-    if ($LASTEXITCODE -ne 0 -or $replacementWindows -contains "stale" -or $replacementWindows -notcontains "agent") {
+    if ($LASTEXITCODE -ne 0 -or $replacementWindows -contains "stale" -or $replacementWindows -notcontains "opencode") {
         throw "Prism did not replace the stale psmux session with a configured agent session"
     }
 
@@ -166,7 +170,7 @@ git = "$(ConvertTo-TomlString $git)"
     Invoke-Checked $psmux "paste-buffer" "-d" "-b" "prism-windows-smoke" "-t" "${session}:1"
     $deadline = [DateTime]::UtcNow.AddSeconds(10)
     do {
-        $capture = @(& $psmux capture-pane -p -t "${session}:1" 2>$null) -join "`n"
+        $capture = @(& $psmux capture-pane -p -a -t "${session}:1" 2>$null) -join "`n"
         if ($capture.Contains($marker)) { break }
         Start-Sleep -Milliseconds 100
     } while ([DateTime]::UtcNow -lt $deadline)
@@ -195,6 +199,7 @@ git = "$(ConvertTo-TomlString $git)"
     Invoke-Checked $psmux "kill-session" "-t" $session
     & $psmux has-session -t $session 2>$null
     if ($LASTEXITCODE -eq 0) { throw "psmux session survived cleanup" }
+    $global:LASTEXITCODE = 0
     $session = $null
     Write-Host "Windows full-stack smoke PASS"
 }

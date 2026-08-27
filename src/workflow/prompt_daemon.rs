@@ -1763,14 +1763,19 @@ mod tests {
             .expect("remove stale worker endpoint");
         let listener = endpoint.bind().expect("bind impersonating endpoint");
         let client = endpoint.connect().expect("connect impersonating endpoint");
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
         let server = thread::spawn(move || {
             let mut stream = worker_ipc::accept(&listener).expect("accept client");
+            accepted_tx.send(()).expect("report accepted client");
             let request = read_request_line(&mut stream);
             assert!(
                 request.as_ref().map_or(true, String::is_empty),
                 "unowned endpoint received request bytes: {request:?}"
             );
         });
+        accepted_rx
+            .recv_timeout(SOCKET_IO_TIMEOUT)
+            .expect("impersonating endpoint must accept client");
 
         let error =
             request_authenticated_with_timeout(&endpoint, client, "health", SOCKET_IO_TIMEOUT)
