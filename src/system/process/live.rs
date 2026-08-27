@@ -264,6 +264,8 @@ pub(crate) async fn spawn_streaming_configured(
         stdout_capture.clone(),
         stderr_capture.clone(),
         descriptor,
+        Some(deadline),
+        settings.termination_grace,
         true,
     )
     .await?;
@@ -288,12 +290,13 @@ pub async fn spawn_owned(
     let stdout = BoundedCapture::prefix(0);
     let stderr = BoundedCapture::prefix(0);
     let telemetry = ProcessTelemetry::begin_owned(&command, descriptor);
+    let termination_grace = Duration::from_secs(1);
     start_actor(
         command
             .stdin(Stdin::empty())
             .stdout(StdioMode::Null)
             .stderr(StdioMode::Null)
-            .cancel_grace(Duration::from_secs(1))
+            .cancel_grace(termination_grace)
             .cancel_on(cancellation.clone()),
         cancellation,
         termination,
@@ -302,9 +305,68 @@ pub async fn spawn_owned(
         stdout,
         stderr,
         descriptor,
+        None,
+        termination_grace,
         false,
     )
     .await
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GroupTerminationCause {
+    Deadline,
+    Cancellation,
+}
+
+/// Await one ProcessKit operation while making the external containment group
+/// react to the same deadline and cancellation token. The cause is selected and
+/// retained before group teardown starts, so a fast Windows Job termination
+/// cannot turn a deadline into a signal-shaped public completion.
+async fn await_with_group_termination<T>(
+    group: &processkit::ProcessGroup,
+    deadline: Option<Duration>,
+    cancellation: &CancellationToken,
+    termination_grace: Duration,
+    operation: impl Future<Output = processkit::Result<T>>,
+) -> (
+    processkit::Result<T>,
+    Option<processkit::Result<GroupTerminationCause>>,
+) {
+    let deadline_elapsed = async move {
+        match deadline {
+            Some(deadline) => tokio::time::sleep(deadline).await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::pin!(operation);
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => {
+            let stopped = group
+                .stop(termination_grace, true)
+                .await
+                .map(|_| GroupTerminationCause::Cancellation);
+            (operation.await, Some(stopped))
+        }
+        result = &mut operation => (result, None),
+        () = deadline_elapsed => {
+            let stopped = group
+                .stop(termination_grace, true)
+                .await
+                .map(|_| GroupTerminationCause::Deadline);
+            (operation.await, Some(stopped))
+        }
+    }
+}
+
+fn normalize_group_termination(
+    mut finished: processkit::Finished,
+    cause: Option<GroupTerminationCause>,
+) -> processkit::Finished {
+    if cause == Some(GroupTerminationCause::Deadline) {
+        finished.outcome = Outcome::TimedOut;
+    }
+    finished
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -317,6 +379,8 @@ async fn start_actor(
     stdout: BoundedCapture,
     stderr: BoundedCapture,
     descriptor: ProcessDescriptor,
+    deadline: Option<Duration>,
+    termination_grace: Duration,
     pump_output: bool,
 ) -> Result<ProcessControl, String> {
     let started = Instant::now();
@@ -385,24 +449,52 @@ async fn start_actor(
     let (completion_sender, completion) = watch::channel(None);
     let finish_sender = completion_sender.clone();
     let finish_termination = Arc::clone(&termination);
+    let finish_cancellation = cancellation.clone();
     tokio::spawn(async move {
         let mut process = process;
         // `events` starts bounded pumps for both output streams and arms the
-        // command deadline. `wait_any` then observes the leader's exit without
-        // waiting for descendant-held pipe descriptors. Once the leader is
-        // reaped, kill the remaining private group before joining the pumps.
+        // command deadline. Race the leader against whole-group teardown so a
+        // descendant cannot hold stdin or output open inside `wait_any` before
+        // Prism reaches the external group. The final hard kill remains an
+        // idempotent backstop for natural exit and interrupted graceful stops.
         let result = if pump_output {
             match process.events() {
                 Ok(events) => {
-                    let leader = processkit::wait_any(&mut [&mut process]).await;
+                    let (leader, proactive_stop) = {
+                        let mut processes = [&mut process];
+                        await_with_group_termination(
+                            &group,
+                            deadline,
+                            &finish_cancellation,
+                            termination_grace,
+                            processkit::wait_any(&mut processes),
+                        )
+                        .await
+                    };
                     let killed = group.kill_all();
                     drop(events);
-                    match killed {
-                        Ok(()) => match (leader, process.finish().await) {
-                            (Err(error), _) => Err(error),
-                            (Ok(_), finished) => finished,
+                    let finished = process.finish().await;
+                    match (leader, finished) {
+                        (Err(error), _) if error.kind() == processkit::ErrorKind::Cancelled => {
+                            Err(error)
+                        }
+                        (_, Err(error)) if error.kind() == processkit::ErrorKind::Cancelled => {
+                            Err(error)
+                        }
+                        (leader, finished) => match proactive_stop.transpose() {
+                            Err(error) => Err(error),
+                            Ok(cause) => {
+                                let finished = finished
+                                    .map(|finished| normalize_group_termination(finished, cause));
+                                match killed {
+                                    Err(error) => Err(error),
+                                    Ok(()) => match (leader, finished) {
+                                        (Err(error), _) => Err(error),
+                                        (Ok(_), finished) => finished,
+                                    },
+                                }
+                            }
                         },
-                        Err(error) => Err(error),
                     }
                 }
                 Err(error) => {
@@ -411,14 +503,30 @@ async fn start_actor(
                 }
             }
         } else {
-            // Owned processes need no output pumps. Let ProcessKit enforce the
-            // configured deadline/cancellation while waiting for the leader,
-            // then tear down any surviving members of the private group.
-            let finished = process.finish().await;
+            // Owned processes need no output pumps, but cancellation must still
+            // reach the whole external group while ProcessKit waits on its leader.
+            let (finished, proactive_stop) = await_with_group_termination(
+                &group,
+                deadline,
+                &finish_cancellation,
+                termination_grace,
+                process.finish(),
+            )
+            .await;
             let killed = group.kill_all();
-            match (finished, killed) {
-                (Err(error), _) | (Ok(_), Err(error)) => Err(error),
-                (Ok(finished), Ok(())) => Ok(finished),
+            match finished {
+                Err(error) if error.kind() == processkit::ErrorKind::Cancelled => Err(error),
+                finished => match proactive_stop.transpose() {
+                    Err(error) => Err(error),
+                    Ok(cause) => {
+                        let finished =
+                            finished.map(|finished| normalize_group_termination(finished, cause));
+                        match (finished, killed) {
+                            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+                            (Ok(finished), Ok(())) => Ok(finished),
+                        }
+                    }
+                },
             }
         };
         if let Some(forwarder) = cancellation_forwarder {
@@ -848,6 +956,42 @@ mod tests {
             ),
             LiveProcessCompletion::Canceled
         );
+    }
+
+    #[tokio::test]
+    async fn proactive_group_deadline_is_reported_as_timeout() {
+        let descriptor = ProcessDescriptor::new("test.live.proactive_timeout");
+        let cancellation = CancellationToken::new();
+        let command = Command::new("sh")
+            .args(["-c", "trap '' TERM; exec sleep 30"])
+            .stdin(Stdin::empty())
+            .stdout(StdioMode::Null)
+            .stderr(StdioMode::Null)
+            // Keep ProcessKit's own deadline far away so Prism's group timer
+            // deterministically owns the initiating cause in this regression.
+            .timeout(Duration::from_secs(30))
+            .cancel_on(cancellation.clone());
+        let telemetry = ProcessTelemetry::begin_owned(&command, descriptor);
+        let control = start_actor(
+            command,
+            cancellation,
+            Arc::new(AtomicU8::new(TERMINATION_NATURAL)),
+            None,
+            telemetry,
+            BoundedCapture::prefix(0),
+            BoundedCapture::prefix(0),
+            descriptor,
+            Some(Duration::from_millis(20)),
+            Duration::ZERO,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let completion = tokio::time::timeout(Duration::from_secs(2), control.wait())
+            .await
+            .expect("proactive group deadline must remain bounded");
+        assert_eq!(completion, LiveProcessCompletion::Exited(Outcome::TimedOut));
     }
 
     #[tokio::test]

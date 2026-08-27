@@ -619,7 +619,11 @@ mod tests {
                     "Start-Sleep -Seconds 10".into(),
                 ]
             } else {
-                vec!["/bin/sh".into(), "-c".into(), "sleep 10".into()]
+                vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "trap '' TERM; sleep 10 <&0 & wait".into(),
+                ]
             },
             environment: std::collections::BTreeMap::new(),
             stdin: Some("x".repeat(1024 * 1024)),
@@ -687,8 +691,21 @@ mod tests {
             structured_events: true,
             attach: false,
         };
+        // A cold PowerShell plus `Start-Process` can exceed two seconds on the
+        // hosted Windows runner. Keep the cleanup guard below the subprocess's
+        // own deadline so this still proves that leader exit reaps descendants.
+        let cleanup_timeout = if cfg!(windows) {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_secs(2)
+        };
+        let process_timeout = if cfg!(windows) {
+            Duration::from_secs(10)
+        } else {
+            Duration::from_secs(5)
+        };
         let outcome = tokio::time::timeout(
-            Duration::from_secs(2),
+            cleanup_timeout,
             execute_invocation(
                 invocation,
                 AgentRequest {
@@ -706,7 +723,7 @@ mod tests {
                     cancellation: AgentCancellation::default(),
                 },
                 "pi".into(),
-                Duration::from_secs(5),
+                process_timeout,
                 1024,
                 1024,
             ),
