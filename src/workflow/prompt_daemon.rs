@@ -31,6 +31,7 @@ const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_LIST_PAGE_SIZE: usize = 64;
+const INCOMPLETE_RESPONSE_ERROR: &str = "closed connection without a complete response";
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 struct WorkerOwnerRecord {
@@ -422,7 +423,7 @@ fn is_worker_transition_error(error: &str) -> bool {
         || error.contains("Broken pipe")
         || error.contains("connection refused")
         || error.contains("Connection refused")
-        || error.contains("closed connection without a response")
+        || error.contains(INCOMPLETE_RESPONSE_ERROR)
 }
 
 pub async fn serve() -> Result<(), String> {
@@ -1426,10 +1427,9 @@ fn request_stream_with_limit(
                 wait_for_io(deadline)
                     .map_err(|error| format!("read Prism worker response: {error}"))?;
                 #[cfg(unix)]
-                return Err(
-                    "read Prism worker response: closed connection without a complete response"
-                        .to_string(),
-                );
+                return Err(format!(
+                    "read Prism worker response: {INCOMPLETE_RESPONSE_ERROR}"
+                ));
             }
             Ok(count) => {
                 let newline = buffer[..count].iter().position(|byte| *byte == b'\n');
@@ -1820,6 +1820,28 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("response exceeds the size limit"), "{error}");
         writer.join().expect("join oversized response writer");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn closed_incomplete_response_is_a_worker_transition() {
+        let (mut server, client) =
+            std::os::unix::net::UnixStream::pair().expect("create response socket pair");
+        let closer = thread::spawn(move || {
+            let mut request = [0_u8; 16];
+            let _ = server.read(&mut request).expect("read client request");
+        });
+
+        let error = request_stream(client, "health").unwrap_err();
+        assert!(
+            error.contains("closed connection without a complete response"),
+            "{error}"
+        );
+        assert!(
+            is_worker_transition_error(&error),
+            "closed response must be retried while the worker exits: {error}"
+        );
+        closer.join().expect("join response closer");
     }
 
     #[test]
