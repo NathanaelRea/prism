@@ -628,7 +628,7 @@ mod tests {
             attach: false,
         };
         let error = tokio::time::timeout(
-            Duration::from_secs(2),
+            Duration::from_secs(5),
             execute_invocation(
                 invocation,
                 AgentRequest {

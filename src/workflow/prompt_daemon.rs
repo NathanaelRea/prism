@@ -1393,9 +1393,18 @@ fn request_stream(stream: WorkerStream, command: &str) -> Result<String, String>
 }
 
 fn request_stream_with_timeout(
+    stream: WorkerStream,
+    command: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    request_stream_with_limit(stream, command, timeout, MAX_RESPONSE_BYTES)
+}
+
+fn request_stream_with_limit(
     mut stream: WorkerStream,
     command: &str,
     timeout: Duration,
+    response_byte_limit: usize,
 ) -> Result<String, String> {
     worker_ipc::set_stream_nonblocking(&stream, true)
         .map_err(|error| format!("configure Prism worker endpoint: {error}"))?;
@@ -1406,7 +1415,7 @@ fn request_stream_with_timeout(
     let mut response = Vec::new();
     let mut buffer = [0_u8; 4096];
     loop {
-        let available = MAX_RESPONSE_BYTES + 1 - response.len();
+        let available = response_byte_limit + 1 - response.len();
         if available == 0 {
             return Err("read Prism worker response: response exceeds the size limit".to_string());
         }
@@ -1426,7 +1435,7 @@ fn request_stream_with_timeout(
                 let newline = buffer[..count].iter().position(|byte| *byte == b'\n');
                 let frame_len = newline.map_or(count, |index| index + 1);
                 response.extend_from_slice(&buffer[..frame_len]);
-                if response.len() > MAX_RESPONSE_BYTES {
+                if response.len() > response_byte_limit {
                     return Err(
                         "read Prism worker response: response exceeds the size limit".to_string(),
                     );
@@ -1790,17 +1799,25 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn response_reader_rejects_a_frame_over_the_byte_limit() {
+        const TEST_RESPONSE_BYTE_LIMIT: usize = 1024;
+
         let (mut server, client) =
             std::os::unix::net::UnixStream::pair().expect("create response socket pair");
         let writer = thread::spawn(move || {
             let mut request = [0_u8; 16];
             let _ = server.read(&mut request).expect("read client request");
             server
-                .write_all(&vec![b'x'; MAX_RESPONSE_BYTES + 1])
+                .write_all(&vec![b'x'; TEST_RESPONSE_BYTE_LIMIT + 1])
                 .expect("write oversized response");
         });
 
-        let error = request_stream_with_timeout(client, "health", SOCKET_IO_TIMEOUT).unwrap_err();
+        let error = request_stream_with_limit(
+            client,
+            "health",
+            SOCKET_IO_TIMEOUT,
+            TEST_RESPONSE_BYTE_LIMIT,
+        )
+        .unwrap_err();
         assert!(error.contains("response exceeds the size limit"), "{error}");
         writer.join().expect("join oversized response writer");
     }

@@ -1096,7 +1096,10 @@ fn assert_canonical_database_contract(db_path: &str) {
             .expect("read canonical database contract");
     assert_eq!(
         migrations,
-        include_str!("fixtures/sql/migrations.txt").trim()
+        include_str!("fixtures/sql/migrations.txt")
+            .lines()
+            .collect::<Vec<_>>()
+            .join("\n")
     );
     assert_eq!(
         schema_fingerprint,
